@@ -551,4 +551,278 @@ mod tests {
         let client = ApnsClient::mock(config, false);
         assert!(client.is_configured());
     }
+
+    #[test]
+    fn test_is_configured_certificate_auth_missing_path() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "certificate".to_string(),
+            key_id: String::new(),
+            team_id: String::new(),
+            private_key_path: String::new(),
+            certificate_path: String::new(), // Missing
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::mock(config, false);
+        assert!(!client.is_configured());
+    }
+
+    #[test]
+    fn test_is_configured_missing_team_id() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: String::new(), // Missing
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::mock(config, true);
+        assert!(!client.is_configured());
+    }
+
+    #[test]
+    fn test_is_configured_missing_bundle_id() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: String::new(), // Missing
+        };
+
+        let client = ApnsClient::mock(config, true);
+        assert!(!client.is_configured());
+    }
+
+    #[test]
+    fn test_is_configured_missing_encoding_key() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::mock(config, false); // No encoding key
+        assert!(!client.is_configured());
+    }
+
+    #[tokio::test]
+    async fn test_send_unexpected_status() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!("{}/3/device/{}", mock_server.uri(), "abc123def456");
+
+        let payload = ApnsPayload::default();
+        let response = http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 500);
+    }
+
+    #[test]
+    fn test_generate_token_no_encoding_key() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::mock(config, false);
+        let result = client.generate_token();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("No encoding key"));
+    }
+
+    #[tokio::test]
+    async fn test_get_token_uses_cache() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::mock(config, true);
+
+        // Pre-populate the cache
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: "cached-test-token".to_string(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            });
+        }
+
+        // Should return cached token
+        let token = client.get_token().await.unwrap();
+        assert_eq!(token, "cached-test-token");
+    }
+
+    #[tokio::test]
+    async fn test_get_token_expired_cache_regenerates() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        // Create a client without an encoding key to test the error case
+        let client = ApnsClient::mock(config, false);
+
+        // Pre-populate the cache with an expired token
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: "expired-token".to_string(),
+                expires_at: SystemTime::now() - Duration::from_secs(1), // Already expired
+            });
+        }
+
+        // Should try to generate new token but fail since no encoding key
+        let result = client.get_token().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_token_cache_not_expired() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::mock(config, false); // No encoding key
+
+        // Pre-populate the cache with a valid (non-expired) token
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: "valid-cached-token".to_string(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600), // 1 hour in the future
+            });
+        }
+
+        // Should return cached token (no encoding key needed since we have valid cache)
+        let token = client.get_token().await.unwrap();
+        assert_eq!(token, "valid-cached-token");
+    }
+
+    #[tokio::test]
+    async fn test_new_client_without_key_path() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(), // Empty path
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::new(config).await.unwrap();
+        assert!(client.encoding_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_client_certificate_auth() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "certificate".to_string(),
+            key_id: String::new(),
+            team_id: String::new(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::new(config).await.unwrap();
+        assert!(client.encoding_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_client_invalid_key_path() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: "/nonexistent/key.p8".to_string(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let result = ApnsClient::new(config).await;
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(e.to_string().contains("Failed to read APNs key file")),
+            Ok(_) => panic!("Expected error"),
+        }
+    }
 }

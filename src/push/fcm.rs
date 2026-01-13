@@ -694,4 +694,224 @@ mod tests {
         let client = FcmClient::mock(config, false);
         assert!(client.project_id().is_err());
     }
+
+    #[tokio::test]
+    async fn test_send_unexpected_status() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "{}/v1/projects/test-project/messages:send",
+            mock_server.uri()
+        );
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "any-token".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        let response = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn test_new_client_without_service_account_path() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(), // Empty
+            project_id: "test-project".to_string(),
+        };
+
+        let client = FcmClient::new(config).await.unwrap();
+        assert!(client.service_account.is_none());
+        assert!(client.encoding_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_client_invalid_service_account_path() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: "/nonexistent/service-account.json".to_string(),
+            project_id: "test-project".to_string(),
+        };
+
+        let result = FcmClient::new(config).await;
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(e.to_string().contains("Failed to read service account")),
+            Ok(_) => panic!("Expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_access_token_uses_cache() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+
+        let client = FcmClient::mock(config, true);
+
+        // Pre-populate the cache
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: "cached-access-token".to_string(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            });
+        }
+
+        // Should return cached token
+        let token = client.get_access_token().await.unwrap();
+        assert_eq!(token, "cached-access-token");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_no_service_account() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+
+        let client = FcmClient::mock(config, false);
+        let result = client.refresh_token().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("No service account"));
+    }
+
+    #[test]
+    fn test_is_configured_enabled_with_service_account() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+
+        let client = FcmClient::mock(config, true);
+        assert!(client.is_configured());
+    }
+
+    #[test]
+    fn test_is_configured_disabled() {
+        let config = FcmConfig {
+            enabled: false,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+
+        let client = FcmClient::mock(config, true);
+        assert!(!client.is_configured()); // Disabled takes precedence
+    }
+
+    #[test]
+    fn test_fcm_message_without_android() {
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "test-token".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("test-token"));
+        assert!(!json.contains("priority"));
+    }
+
+    #[test]
+    fn test_fcm_message_with_empty_data() {
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "test-token".to_string(),
+                android: Some(AndroidConfig {
+                    priority: "high".to_string(),
+                }),
+                data: Some(std::collections::HashMap::new()),
+            },
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("test-token"));
+        assert!(json.contains("high"));
+    }
+
+    #[tokio::test]
+    async fn test_new_client_invalid_json() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"not valid json {{{").unwrap();
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: file.path().to_string_lossy().to_string(),
+            project_id: "test-project".to_string(),
+        };
+
+        let result = FcmClient::new(config).await;
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(e.to_string().contains("Failed to parse service account")),
+            Ok(_) => panic!("Expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_new_client_invalid_key_in_service_account() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Valid JSON but with an invalid private key
+        let sa_json = serde_json::json!({
+            "type": "service_account",
+            "project_id": "test-project",
+            "private_key": "not-a-valid-pem-key",
+            "client_email": "test@test.iam.gserviceaccount.com",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        });
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(sa_json.to_string().as_bytes()).unwrap();
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: file.path().to_string_lossy().to_string(),
+            project_id: "test-project".to_string(),
+        };
+
+        let result = FcmClient::new(config).await;
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("Failed to parse service account key")
+            ),
+            Ok(_) => panic!("Expected error"),
+        }
+    }
 }

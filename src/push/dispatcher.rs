@@ -234,4 +234,199 @@ mod tests {
         assert!(dispatcher.has_fcm());
         assert!(dispatcher.is_ready());
     }
+
+    #[tokio::test]
+    async fn test_dispatch_apns_without_apns_client() {
+        use crate::config::FcmConfig;
+        use crate::push::FcmClient;
+
+        // Only FCM client configured
+        let fcm_config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let fcm_client = FcmClient::mock(fcm_config, true);
+        let dispatcher = PushDispatcher::new(None, Some(fcm_client));
+
+        // Try to dispatch an APNs payload - should be skipped
+        let payloads = vec![TokenPayload {
+            platform: Platform::Apns,
+            device_token: vec![0xaa, 0xbb, 0xcc],
+        }];
+
+        dispatcher.dispatch(payloads).await;
+        // Should not panic, just skip the notification
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_fcm_without_fcm_client() {
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+
+        // Only APNs client configured
+        let apns_config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+        let apns_client = ApnsClient::mock(apns_config, true);
+        let dispatcher = PushDispatcher::new(Some(apns_client), None);
+
+        // Try to dispatch an FCM payload - should be skipped
+        let payloads = vec![TokenPayload {
+            platform: Platform::Fcm,
+            device_token: b"fcm-token-123".to_vec(),
+        }];
+
+        dispatcher.dispatch(payloads).await;
+        // Should not panic, just skip the notification
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_fcm_invalid_utf8_token() {
+        use crate::config::FcmConfig;
+        use crate::push::FcmClient;
+
+        let fcm_config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let fcm_client = FcmClient::mock(fcm_config, true);
+        let dispatcher = PushDispatcher::new(None, Some(fcm_client));
+
+        // Invalid UTF-8 FCM token - should be skipped
+        let payloads = vec![TokenPayload {
+            platform: Platform::Fcm,
+            device_token: vec![0xff, 0xfe, 0x00, 0x01], // Invalid UTF-8
+        }];
+
+        dispatcher.dispatch(payloads).await;
+        // Should not panic, just skip the notification
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_both_platforms() {
+        use crate::config::{ApnsConfig, FcmConfig};
+        use crate::push::{ApnsClient, FcmClient};
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+        let apns_client = ApnsClient::mock(apns_config, true);
+
+        let fcm_config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let fcm_client = FcmClient::mock(fcm_config, true);
+
+        let dispatcher = PushDispatcher::new(Some(apns_client), Some(fcm_client));
+
+        // Dispatch both APNs and FCM payloads
+        let payloads = vec![
+            TokenPayload {
+                platform: Platform::Apns,
+                device_token: vec![0xaa, 0xbb, 0xcc],
+            },
+            TokenPayload {
+                platform: Platform::Fcm,
+                device_token: b"fcm-token-123".to_vec(),
+            },
+        ];
+
+        dispatcher.dispatch(payloads).await;
+        // Tasks are spawned - give them time to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_is_ready_both_clients() {
+        use crate::config::{ApnsConfig, FcmConfig};
+        use crate::push::{ApnsClient, FcmClient};
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+        let apns_client = ApnsClient::mock(apns_config, true);
+
+        let fcm_config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let fcm_client = FcmClient::mock(fcm_config, true);
+
+        let dispatcher = PushDispatcher::new(Some(apns_client), Some(fcm_client));
+
+        assert!(dispatcher.has_apns());
+        assert!(dispatcher.has_fcm());
+        assert!(dispatcher.is_ready());
+    }
+
+    #[tokio::test]
+    async fn test_has_apns_unconfigured_client() {
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+
+        // APNs client that is not properly configured
+        let apns_config = ApnsConfig {
+            enabled: false, // Disabled
+            auth_method: "token".to_string(),
+            key_id: String::new(),
+            team_id: String::new(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: String::new(),
+        };
+        let apns_client = ApnsClient::mock(apns_config, false);
+        let dispatcher = PushDispatcher::new(Some(apns_client), None);
+
+        assert!(!dispatcher.has_apns()); // Client exists but not configured
+        assert!(!dispatcher.is_ready());
+    }
+
+    #[tokio::test]
+    async fn test_has_fcm_unconfigured_client() {
+        use crate::config::FcmConfig;
+        use crate::push::FcmClient;
+
+        // FCM client that is not properly configured
+        let fcm_config = FcmConfig {
+            enabled: false, // Disabled
+            service_account_path: String::new(),
+            project_id: String::new(),
+        };
+        let fcm_client = FcmClient::mock(fcm_config, false);
+        let dispatcher = PushDispatcher::new(None, Some(fcm_client));
+
+        assert!(!dispatcher.has_fcm()); // Client exists but not configured
+        assert!(!dispatcher.is_ready());
+    }
 }

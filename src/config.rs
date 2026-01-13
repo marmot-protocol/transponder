@@ -473,4 +473,115 @@ mod tests {
         let result = AppConfig::load(file.path());
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_from_env_with_defaults() {
+        // Clear any existing TRANSPONDER_ env vars that might interfere
+        // This test verifies from_env works with defaults
+        let config = AppConfig::from_env().unwrap();
+
+        // Should have default values
+        assert!(config.relays.clearnet.is_empty());
+        assert!(config.relays.onion.is_empty());
+        assert_eq!(config.relays.reconnect_interval_secs, 5);
+        assert_eq!(config.relays.max_reconnect_attempts, 10);
+        assert!(!config.apns.enabled);
+        assert_eq!(config.apns.auth_method, "token");
+        assert_eq!(config.apns.environment, "production");
+        assert!(!config.fcm.enabled);
+        assert!(config.health.enabled);
+        assert_eq!(config.health.bind_address, "0.0.0.0:8080");
+        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.format, "json");
+    }
+
+    #[test]
+    fn test_config_nonexistent_file() {
+        let result = AppConfig::load("/nonexistent/path/to/config.toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_relay_config_defaults() {
+        // Test that default functions return correct values
+        assert_eq!(default_reconnect_interval(), 5);
+        assert_eq!(default_max_reconnect_attempts(), 10);
+    }
+
+    #[test]
+    fn test_apns_config_defaults() {
+        assert_eq!(default_auth_method(), "token");
+        assert_eq!(default_apns_environment(), "production");
+    }
+
+    #[test]
+    fn test_health_config_defaults() {
+        assert!(default_health_enabled());
+        assert_eq!(default_health_bind_address(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn test_logging_config_defaults() {
+        assert_eq!(default_log_level(), "info");
+        assert_eq!(default_log_format(), "json");
+    }
+
+    #[test]
+    fn test_apns_is_production_true() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: String::new(),
+            team_id: String::new(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "production".to_string(),
+            bundle_id: String::new(),
+        };
+        assert!(config.is_production());
+    }
+
+    #[test]
+    fn test_apns_is_production_false() {
+        let config = ApnsConfig {
+            enabled: true,
+            auth_method: "token".to_string(),
+            key_id: String::new(),
+            team_id: String::new(),
+            private_key_path: String::new(),
+            certificate_path: String::new(),
+            certificate_password: String::new(),
+            environment: "development".to_string(),
+            bundle_id: String::new(),
+        };
+        assert!(!config.is_production());
+    }
+
+    #[test]
+    fn test_config_partial_sections() {
+        // Config that only specifies some sections - others should get defaults
+        let config_content = r#"
+            [server]
+            private_key = "test-key"
+
+            [relays]
+            clearnet = ["wss://relay.example.com"]
+
+            [apns]
+            enabled = true
+            key_id = "MYKEY"
+            # Missing other fields - should get defaults
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = AppConfig::load(file.path()).unwrap();
+
+        assert_eq!(config.server.private_key, "test-key");
+        assert!(config.apns.enabled);
+        assert_eq!(config.apns.key_id, "MYKEY");
+        assert_eq!(config.apns.auth_method, "token"); // default
+        assert_eq!(config.apns.environment, "production"); // default
+        assert!(!config.fcm.enabled); // default
+    }
 }
