@@ -71,6 +71,13 @@ pub struct ApnsClient {
 impl ApnsClient {
     /// Create a new APNs client.
     pub async fn new(config: ApnsConfig) -> Result<Self> {
+        // Certificate-based authentication is not yet implemented
+        if config.is_certificate_auth() {
+            return Err(Error::Apns(
+                "Certificate-based authentication is not yet implemented. Please use token auth (auth_method = \"token\").".to_string()
+            ));
+        }
+
         let http_client = Client::builder()
             .http2_prior_knowledge()
             .timeout(Duration::from_secs(30))
@@ -225,21 +232,20 @@ impl ApnsClient {
     }
 
     /// Check if the client is properly configured.
+    ///
+    /// Only token-based authentication is currently supported.
     #[must_use]
     pub fn is_configured(&self) -> bool {
         if !self.config.enabled {
             return false;
         }
 
-        if self.config.is_token_auth() {
-            self.encoding_key.is_some()
-                && !self.config.key_id.is_empty()
-                && !self.config.team_id.is_empty()
-                && !self.config.bundle_id.is_empty()
-        } else {
-            // Certificate auth - would need additional validation
-            !self.config.certificate_path.is_empty()
-        }
+        // Only token auth is supported
+        self.config.is_token_auth()
+            && self.encoding_key.is_some()
+            && !self.config.key_id.is_empty()
+            && !self.config.team_id.is_empty()
+            && !self.config.bundle_id.is_empty()
     }
 }
 
@@ -538,7 +544,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_configured_certificate_auth() {
+    fn test_is_configured_certificate_auth_not_supported() {
+        // Certificate auth is not supported, so is_configured() should return false
         let config = ApnsConfig {
             enabled: true,
             auth_method: "certificate".to_string(),
@@ -546,24 +553,6 @@ mod tests {
             team_id: String::new(),
             private_key_path: String::new(),
             certificate_path: "/path/to/cert.p12".to_string(),
-            certificate_password: String::new(),
-            environment: "production".to_string(),
-            bundle_id: "com.example.app".to_string(),
-        };
-
-        let client = ApnsClient::mock(config, false);
-        assert!(client.is_configured());
-    }
-
-    #[test]
-    fn test_is_configured_certificate_auth_missing_path() {
-        let config = ApnsConfig {
-            enabled: true,
-            auth_method: "certificate".to_string(),
-            key_id: String::new(),
-            team_id: String::new(),
-            private_key_path: String::new(),
-            certificate_path: String::new(), // Missing
             certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
@@ -790,21 +779,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_client_certificate_auth() {
+    async fn test_new_client_certificate_auth_returns_error() {
         let config = ApnsConfig {
             enabled: true,
             auth_method: "certificate".to_string(),
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
+            certificate_path: "/path/to/cert.p12".to_string(),
             certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
 
-        let client = ApnsClient::new(config).await.unwrap();
-        assert!(client.encoding_key.is_none());
+        let result = ApnsClient::new(config).await;
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("Certificate-based authentication is not yet implemented")
+            ),
+            Ok(_) => panic!("Expected error for certificate auth"),
+        }
     }
 
     #[tokio::test]

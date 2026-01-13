@@ -261,7 +261,6 @@ impl ApnsConfig {
 
     /// Returns true if using certificate-based authentication.
     #[must_use]
-    #[allow(dead_code)]
     pub fn is_certificate_auth(&self) -> bool {
         self.auth_method == "certificate"
     }
