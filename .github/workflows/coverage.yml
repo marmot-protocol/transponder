@@ -1,0 +1,189 @@
+name: Code Coverage
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --all-features --json --output-path coverage.json
+
+      - name: Extract coverage percentage
+        id: coverage
+        run: |
+          COVERAGE=$(jq '.data[0].totals.lines.percent' coverage.json)
+          echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "Current coverage: $COVERAGE%"
+
+      - name: Upload coverage JSON artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-json-${{ github.event_name == 'push' && 'master' || github.event.number }}
+          path: coverage.json
+          retention-days: 90
+
+      # For PRs, download master baseline and compare
+      - name: Download baseline coverage from master
+        if: github.event_name == 'pull_request'
+        id: download-baseline
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: coverage.yml
+          branch: master
+          name: coverage-json-master
+          path: baseline
+          if_no_artifact_found: warn
+
+      - name: Compare coverage against baseline
+        if: github.event_name == 'pull_request'
+        id: compare
+        run: |
+          if [ -f baseline/coverage.json ]; then
+            BASELINE=$(jq '.data[0].totals.lines.percent' baseline/coverage.json)
+            CURRENT=$(jq '.data[0].totals.lines.percent' coverage.json)
+            
+            echo "baseline=$BASELINE" >> $GITHUB_OUTPUT
+            echo "Baseline coverage (master): $BASELINE%"
+            echo "Current coverage (PR): $CURRENT%"
+            
+            # Compare using awk for floating point comparison
+            DECREASED=$(awk "BEGIN {print ($CURRENT < $BASELINE) ? 1 : 0}")
+            
+            if [ "$DECREASED" -eq 1 ]; then
+              DIFF=$(awk "BEGIN {printf \"%.2f\", $BASELINE - $CURRENT}")
+              echo "::error::Coverage decreased by ${DIFF}% (from ${BASELINE}% to ${CURRENT}%)"
+              echo "Coverage must not decrease. Please add tests to maintain or improve coverage."
+              echo "decreased=true" >> $GITHUB_OUTPUT
+              exit 1
+            else
+              DIFF=$(awk "BEGIN {printf \"%.2f\", $CURRENT - $BASELINE}")
+              echo "Coverage change: +${DIFF}%"
+              echo "decreased=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No baseline coverage found on master. Skipping comparison."
+            echo "baseline=N/A" >> $GITHUB_OUTPUT
+            echo "decreased=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate HTML report
+        run: cargo llvm-cov --all-features --html
+
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: target/llvm-cov/html
+          retention-days: 30
+
+      - name: Add coverage comment to PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const coverage = JSON.parse(fs.readFileSync('coverage.json', 'utf8'));
+            const percent = coverage.data[0].totals.lines.percent.toFixed(2);
+            const covered = coverage.data[0].totals.lines.covered;
+            const total = coverage.data[0].totals.lines.count;
+            
+            let baselineInfo = '';
+            const baseline = '${{ steps.compare.outputs.baseline }}';
+            const decreased = '${{ steps.compare.outputs.decreased }}';
+            
+            if (baseline && baseline !== 'N/A') {
+              const diff = (parseFloat(percent) - parseFloat(baseline)).toFixed(2);
+              const sign = diff >= 0 ? '+' : '';
+              const status = decreased === 'true' ? ' :x:' : ' :white_check_mark:';
+              baselineInfo = `| Change from master | **${sign}${diff}%**${status} |`;
+            }
+            
+            const statusEmoji = decreased === 'true' ? ':x:' : ':white_check_mark:';
+            
+            const body = `## ${statusEmoji} Code Coverage Report
+            
+            | Metric | Value |
+            |--------|-------|
+            | Line Coverage | **${percent}%** |
+            | Lines Covered | ${covered} / ${total} |
+            ${baselineInfo}
+            
+            ${decreased === 'true' ? '> :warning: **Coverage has decreased!** Please add tests to maintain or improve coverage.' : ''}
+            
+            <details>
+            <summary>View detailed coverage</summary>
+            
+            Download the \`coverage-html\` artifact from this workflow run to view the detailed coverage report.
+            
+            Or run locally:
+            \`\`\`bash
+            cargo llvm-cov --html
+            open target/llvm-cov/html/index.html
+            \`\`\`
+            
+            </details>`;
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('Code Coverage Report')
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
