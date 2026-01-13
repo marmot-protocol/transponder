@@ -1,8 +1,9 @@
 # Transponder Justfile
 # Run `just --list` to see all available commands
 
-# Default recipe: run checks
-default: check
+# Default recipe: list all commands
+default:
+    @just --list
 
 # Build the project
 build:

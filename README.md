@@ -47,7 +47,7 @@ Transponder uses TOML configuration files with environment variable overrides. T
 ```toml
 [server]
 # Server's Nostr private key in hex format (64 hex characters)
-# REQUIRED - Generate with: openssl rand -hex 32
+# REQUIRED - Generate with: transponder generate-keys
 # SECURITY: Store in environment variable for production
 private_key = ""
 
@@ -147,19 +147,31 @@ export TRANSPONDER_LOGGING_LEVEL="debug"
 export TRANSPONDER_LOGGING_FORMAT="pretty"
 ```
 
-### Generating a Server Private Key
+### Generating a Server Key Pair
 
-The server requires a secp256k1 private key for Nostr identity and token decryption:
+The server requires a secp256k1 private key for Nostr identity and token decryption. Use the built-in command to generate a new key pair:
 
 ```bash
-# Using OpenSSL
-openssl rand -hex 32
-
-# Using Python
-python3 -c "import secrets; print(secrets.token_hex(32))"
+# Using transponder (recommended)
+./target/release/transponder generate-keys
 ```
 
-The corresponding public key will be logged on startup. Share this public key with clients so they can encrypt notification tokens for your server.
+This outputs:
+- **Private key (hex)**: 64-character hex string for your config
+- **Public key (hex)**: For clients that need the raw public key
+- **Public key (npub)**: Bech32-encoded format, easier to share
+
+Alternatively, you can use [nak](https://github.com/fiatjaf/nak), a general-purpose Nostr CLI tool:
+
+```bash
+# Install nak (requires Go)
+go install github.com/fiatjaf/nak@latest
+
+# Generate a new key pair
+nak key generate
+```
+
+Share the public key with clients so they can encrypt notification tokens for your server.
 
 ## Docker
 

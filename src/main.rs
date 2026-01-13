@@ -36,14 +36,28 @@ use shutdown::ShutdownHandler;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to configuration file
-    #[arg(short, long, default_value = "config/default.toml")]
+    #[arg(short, long, default_value = "config/default.toml", global = true)]
     config: String,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Generate a new Nostr key pair for the server
+    GenerateKeys,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Handle subcommands
+    if let Some(Command::GenerateKeys) = args.command {
+        return generate_keys();
+    }
 
     // Load configuration
     let config = AppConfig::load(&args.config)
@@ -253,6 +267,31 @@ async fn main() -> Result<()> {
     let _ = tokio::join!(event_handle, health_handle, cleanup_handle);
 
     info!("Transponder stopped");
+    Ok(())
+}
+
+/// Generate a new Nostr key pair and print to stdout.
+fn generate_keys() -> Result<()> {
+    let keys = Keys::generate();
+
+    println!("Generated new Nostr key pair:\n");
+    println!("Private key (hex): {}", keys.secret_key().to_secret_hex());
+    println!("Public key (hex):  {}", keys.public_key().to_hex());
+    println!("Public key (npub): {}", keys.public_key().to_bech32()?);
+    println!();
+    println!("Add the private key to your configuration:");
+    println!("  [server]");
+    println!("  private_key = \"{}\"", keys.secret_key().to_secret_hex());
+    println!();
+    println!("Or set via environment variable:");
+    println!(
+        "  export TRANSPONDER_SERVER_PRIVATE_KEY=\"{}\"",
+        keys.secret_key().to_secret_hex()
+    );
+    println!();
+    println!("Share the public key (hex or npub) with clients so they can");
+    println!("encrypt notification tokens for your server.");
+
     Ok(())
 }
 
