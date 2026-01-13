@@ -105,7 +105,7 @@ impl ApnsClient {
 
     /// Get a valid JWT token, refreshing if necessary.
     async fn get_token(&self) -> Result<String> {
-        // Check cached token
+        // First check with read lock (fast path)
         {
             let cached = self.cached_token.read().await;
             if let Some(ref token) = *cached
@@ -115,17 +115,20 @@ impl ApnsClient {
             }
         }
 
-        // Generate new token
-        let token = self.generate_token()?;
-
-        // Cache it
+        // Acquire write lock and double-check to avoid TOCTOU race
+        let mut cached = self.cached_token.write().await;
+        if let Some(ref token) = *cached
+            && token.expires_at > SystemTime::now()
         {
-            let mut cached = self.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: token.clone(),
-                expires_at: SystemTime::now() + TOKEN_LIFETIME,
-            });
+            return Ok(token.token.clone());
         }
+
+        // Generate and cache new token
+        let token = self.generate_token()?;
+        *cached = Some(CachedToken {
+            token: token.clone(),
+            expires_at: SystemTime::now() + TOKEN_LIFETIME,
+        });
 
         Ok(token)
     }
