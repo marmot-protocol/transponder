@@ -146,7 +146,7 @@ impl FcmClient {
 
     /// Get a valid access token, refreshing if necessary.
     async fn get_access_token(&self) -> Result<String> {
-        // Check cached token
+        // First check with read lock (fast path)
         {
             let cached = self.cached_token.read().await;
             if let Some(ref token) = *cached
@@ -156,14 +156,25 @@ impl FcmClient {
             }
         }
 
-        // Generate new token
-        let token = self.refresh_token().await?;
+        // Acquire write lock and double-check to avoid TOCTOU race
+        let mut cached = self.cached_token.write().await;
+        if let Some(ref token) = *cached
+            && token.expires_at > SystemTime::now()
+        {
+            return Ok(token.token.clone());
+        }
+
+        // Generate new token while holding write lock
+        let token = self.refresh_token_inner(&mut cached).await?;
 
         Ok(token)
     }
 
-    /// Refresh the OAuth2 access token.
-    async fn refresh_token(&self) -> Result<String> {
+    /// Refresh the OAuth2 access token, caching it in the provided guard.
+    async fn refresh_token_inner(
+        &self,
+        cached: &mut tokio::sync::RwLockWriteGuard<'_, Option<CachedToken>>,
+    ) -> Result<String> {
         let sa = self
             .service_account
             .as_ref()
@@ -214,14 +225,11 @@ impl FcmClient {
 
         let token_response: TokenResponse = response.json().await?;
 
-        // Cache the token
-        {
-            let mut cached = self.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: token_response.access_token.clone(),
-                expires_at: SystemTime::now() + TOKEN_LIFETIME,
-            });
-        }
+        // Cache the token while still holding the write lock
+        **cached = Some(CachedToken {
+            token: token_response.access_token.clone(),
+            expires_at: SystemTime::now() + TOKEN_LIFETIME,
+        });
 
         trace!("Refreshed FCM access token");
         Ok(token_response.access_token)
@@ -789,15 +797,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_refresh_token_no_service_account() {
+    async fn test_get_access_token_no_service_account() {
         let config = FcmConfig {
             enabled: true,
             service_account_path: String::new(),
             project_id: "test-project".to_string(),
         };
 
+        // Client without service account - cache is empty, so it will try to refresh
         let client = FcmClient::mock(config, false);
-        let result = client.refresh_token().await;
+        let result = client.get_access_token().await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("No service account"));
