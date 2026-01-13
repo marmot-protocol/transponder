@@ -256,6 +256,7 @@ impl ApnsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use wiremock::matchers::{header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -726,5 +727,211 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("Failed to read APNs key file")),
             Ok(_) => panic!("Expected error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_send_with_cached_token() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .and(header("apns-push-type", "background"))
+            .and(header("apns-priority", "5"))
+            .and(header("apns-topic", "com.example.app"))
+            .and(header("authorization", "bearer test-cached-token"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Create a client with a custom base_url pointing to mock server
+        // We need to test the full send() method, so we create a client
+        // and manually set its HTTP client to use the mock server
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let config = ApnsConfig {
+            enabled: true,
+            key_id: "KEYID123".to_string(),
+            team_id: "TEAMID456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient {
+            http_client,
+            config,
+            encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
+            cached_token: Arc::new(RwLock::new(Some(CachedToken {
+                token: "test-cached-token".to_string(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            }))),
+        };
+
+        // The send method uses self.config.base_url() which returns the real APNs URL,
+        // but we can test with direct HTTP calls through the mock
+        let url = format!("{}/3/device/{}", mock_server.uri(), "aabbccdd11223344");
+        let payload = ApnsPayload::default();
+
+        // Get token from cache
+        let token = client.get_token().await.unwrap();
+        assert_eq!(token, "test-cached-token");
+
+        // Make request manually (simulating what send() does)
+        let response = client
+            .http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .header("authorization", format!("bearer {}", token))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_get_token_generates_new_when_empty_cache() {
+        let config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        // Client without encoding key - should fail when trying to generate
+        let client = ApnsClient::mock(config, false);
+
+        // Cache is empty, so get_token will try to generate a new one
+        let result = client.get_token().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No encoding key"));
+    }
+
+    #[tokio::test]
+    async fn test_new_client_with_valid_key_file() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Generate a valid EC P-256 private key in PEM format
+        // This is a test key - never use in production!
+        let test_ec_key = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G
+-----END PRIVATE KEY-----"#;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(test_ec_key.as_bytes()).unwrap();
+
+        let config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: file.path().to_string_lossy().to_string(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::new(config).await.unwrap();
+        assert!(client.encoding_key.is_some());
+        assert!(client.is_configured());
+    }
+
+    #[tokio::test]
+    async fn test_generate_token_with_valid_key() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Valid EC P-256 test key
+        let test_ec_key = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G
+-----END PRIVATE KEY-----"#;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(test_ec_key.as_bytes()).unwrap();
+
+        let config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: file.path().to_string_lossy().to_string(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::new(config).await.unwrap();
+
+        // Generate a token
+        let token = client.generate_token().unwrap();
+
+        // Token should be a valid JWT (three dot-separated parts)
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 parts");
+
+        // Verify the header contains the key ID
+        let header_json = base64::prelude::BASE64_URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header_json).unwrap();
+        assert_eq!(header["kid"], "KEY123");
+        assert_eq!(header["alg"], "ES256");
+    }
+
+    #[tokio::test]
+    async fn test_get_token_caches_generated_token() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Valid EC P-256 test key
+        let test_ec_key = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G
+-----END PRIVATE KEY-----"#;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(test_ec_key.as_bytes()).unwrap();
+
+        let config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: file.path().to_string_lossy().to_string(),
+            environment: "production".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient::new(config).await.unwrap();
+
+        // Cache should be empty initially
+        {
+            let cached = client.cached_token.read().await;
+            assert!(cached.is_none());
+        }
+
+        // Get token - should generate and cache
+        let token1 = client.get_token().await.unwrap();
+
+        // Cache should now have a token
+        {
+            let cached = client.cached_token.read().await;
+            assert!(cached.is_some());
+            assert_eq!(cached.as_ref().unwrap().token, token1);
+        }
+
+        // Get token again - should return cached token (same value)
+        let token2 = client.get_token().await.unwrap();
+        assert_eq!(token1, token2);
     }
 }

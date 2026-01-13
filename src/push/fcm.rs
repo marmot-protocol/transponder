@@ -923,4 +923,115 @@ mod tests {
             Ok(_) => panic!("Expected error"),
         }
     }
+
+    #[tokio::test]
+    async fn test_get_access_token_expired_cache_tries_refresh() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+
+        // Client without service account - will fail when trying to refresh
+        let client = FcmClient::mock(config, false);
+
+        // Pre-populate with expired token
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: "expired-token".to_string(),
+                expires_at: SystemTime::now() - Duration::from_secs(1),
+            });
+        }
+
+        // Should try to refresh but fail since no service account
+        let result = client.get_access_token().await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No service account")
+        );
+    }
+
+    #[test]
+    fn test_project_id_empty_config_no_service_account() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: String::new(), // Empty
+        };
+
+        let client = FcmClient::mock(config, false);
+        let result = client.project_id();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No project ID"));
+    }
+
+    #[tokio::test]
+    async fn test_send_without_project_id() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: String::new(), // Empty - will fail
+        };
+
+        let client = FcmClient::mock(config, false);
+
+        // Pre-populate cache so it doesn't fail on get_access_token first
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: "test-token".to_string(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            });
+        }
+
+        let result = client.send("test-device-token").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No project ID"));
+    }
+
+    #[tokio::test]
+    async fn test_send_without_access_token() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+
+        // Client without service account - will fail to get access token
+        let client = FcmClient::mock(config, false);
+
+        let result = client.send("test-device-token").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No service account")
+        );
+    }
+
+    #[test]
+    fn test_is_configured_missing_service_account_and_encoding_key() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+
+        // Create client with no service account and no encoding key
+        let client = FcmClient {
+            http_client: Client::new(),
+            config,
+            service_account: None,
+            encoding_key: None,
+            cached_token: Arc::new(RwLock::new(None)),
+        };
+
+        // Should not be configured - no encoding key
+        assert!(!client.is_configured());
+    }
 }

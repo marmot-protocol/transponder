@@ -385,4 +385,85 @@ mod tests {
         receiver.disconnect().await.unwrap();
         sender.disconnect().await;
     }
+
+    #[tokio::test]
+    async fn test_inner_returns_client() {
+        let keys = Keys::generate();
+        let config = test_relay_config(vec![]);
+
+        let relay_client = RelayClient::new(keys, config).await.unwrap();
+
+        // Verify inner() returns the underlying client
+        let inner = relay_client.inner();
+        assert!(inner.relays().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_publish_inbox_relays_with_no_relays() {
+        let keys = Keys::generate();
+        let config = RelayConfig {
+            clearnet: vec![],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+        };
+
+        let client = RelayClient::new(keys, config).await.unwrap();
+
+        // Should return Ok even with no relays (just logs warning)
+        let result = client.publish_inbox_relays().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_publish_inbox_relays_with_configured_relays() {
+        use nostr_relay_builder::MockRelay;
+        use std::time::Duration;
+
+        // Start a mock relay
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let keys = Keys::generate();
+        let config = RelayConfig {
+            clearnet: vec![relay_url.to_string()],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+        };
+
+        let client = RelayClient::new(keys.clone(), config).await.unwrap();
+
+        // Connect to the relay first
+        client.client.add_relay(&relay_url).await.unwrap();
+        client.client.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Publish inbox relays
+        let result = client.publish_inbox_relays().await;
+        assert!(result.is_ok());
+
+        // Give it time to publish
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        client.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_publish_inbox_relays_with_onion_relays() {
+        let keys = Keys::generate();
+        let config = RelayConfig {
+            clearnet: vec![],
+            onion: vec!["ws://example.onion".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+        };
+
+        let client = RelayClient::new(keys, config).await.unwrap();
+
+        // Should attempt to publish (will fail since no real connection, but tests the path)
+        let result = client.publish_inbox_relays().await;
+        // The function always returns Ok, even if publishing fails
+        assert!(result.is_ok());
+    }
 }
