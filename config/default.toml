@@ -1,0 +1,67 @@
+# Transponder Configuration
+# MIP-05 Push Notification Server
+
+[server]
+# Server's Nostr private key (hex format)
+# REQUIRED: Set via TRANSPONDER_SERVER_PRIVATE_KEY environment variable
+private_key = ""
+
+[relays]
+# ClearNet relays to subscribe to
+clearnet = [
+    "wss://relay.damus.io",
+    "wss://nos.lol"
+]
+
+# Tor/onion relays (optional, requires tor feature)
+onion = []
+
+# Reconnection settings
+reconnect_interval_secs = 5
+max_reconnect_attempts = 10
+
+[apns]
+# Whether APNs (iOS) push notifications are enabled
+enabled = false
+
+# Authentication method: "token" (recommended) or "certificate"
+auth_method = "token"
+
+# For token auth (.p8 key from Apple Developer Console)
+key_id = ""
+team_id = ""
+private_key_path = ""
+
+# For certificate auth (.p12 file)
+certificate_path = ""
+certificate_password = ""
+
+# APNs environment: "production" or "sandbox"
+environment = "production"
+
+# iOS app bundle identifier
+bundle_id = ""
+
+[fcm]
+# Whether FCM (Android) push notifications are enabled
+enabled = false
+
+# Path to Firebase service account JSON file
+service_account_path = ""
+
+# Firebase project ID (optional, can be read from service account)
+project_id = ""
+
+[health]
+# Whether the health check HTTP server is enabled
+enabled = true
+
+# Address to bind the health check server to
+bind_address = "0.0.0.0:8080"
+
+[logging]
+# Log level: "trace", "debug", "info", "warn", "error", "off"
+level = "info"
+
+# Log format: "json" (for production) or "pretty" (for development)
+format = "json"

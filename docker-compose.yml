@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  transponder:
+    build: .
+    container_name: transponder
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount custom config (create this from config/default.toml)
+      - ./config/local.toml:/etc/transponder/config.toml:ro
+      # Mount credentials directory
+      - ./credentials:/credentials:ro
+    environment:
+      # Override config values via environment variables
+      # TRANSPONDER_SERVER_PRIVATE_KEY: "your-hex-private-key"
+      # TRANSPONDER_APNS_ENABLED: "true"
+      # TRANSPONDER_FCM_ENABLED: "true"
+      RUST_LOG: "info"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Optional: Local development with hot reload
+  transponder-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: transponder-dev
+    profiles:
+      - dev
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
+      - ./credentials:/credentials:ro
+    environment:
+      RUST_LOG: "debug"
+      TRANSPONDER_LOGGING_FORMAT: "pretty"
