@@ -24,17 +24,10 @@ max_reconnect_attempts = 10
 # Whether APNs (iOS) push notifications are enabled
 enabled = false
 
-# Authentication method: "token" (recommended) or "certificate"
-auth_method = "token"
-
-# For token auth (.p8 key from Apple Developer Console)
+# Token auth credentials (.p8 key from Apple Developer Console)
 key_id = ""
 team_id = ""
 private_key_path = ""
-
-# For certificate auth (.p12 file)
-certificate_path = ""
-certificate_password = ""
 
 # APNs environment: "production" or "sandbox"
 environment = "production"

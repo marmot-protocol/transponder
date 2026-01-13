@@ -164,17 +164,11 @@ tokio-test = "0.4.5"
 
   [apns]
   enabled = true
-  # Authentication method: "certificate" or "token"
-  auth_method = "token"
 
-  # For token auth (.p8 key)
+  # Token auth credentials (.p8 key)
   key_id = ""
   team_id = ""
   private_key_path = ""
-
-  # For certificate auth (.p12)
-  certificate_path = ""
-  certificate_password = ""
 
   # Environment: "production" or "sandbox"
   environment = "production"
@@ -324,7 +318,7 @@ tokio-test = "0.4.5"
   { "iss": "<team_id>", "iat": <timestamp> }
   ```
 
-- [ ] Support certificate-based authentication (.p12)
+
 - [ ] Implement APNs endpoints:
   - Production: `https://api.push.apple.com`
   - Sandbox: `https://api.sandbox.push.apple.com`
@@ -500,7 +494,7 @@ tokio-test = "0.4.5"
 3. **Configuration**: Config file + environment variable overrides
 4. **Logging**: Configurable (JSON/pretty/off) using tracing
 5. **Tor Support**: Use nostr-sdk's built-in Tor support (arti)
-6. **APNs Auth**: Support both certificate and token-based authentication
+6. **APNs Auth**: Token-based authentication only
 7. **FCM API**: FCM v1 API with OAuth2 service account auth
 8. **Health Checks**: HTTP endpoint for /health and /ready
 9. **Project Name**: transponder

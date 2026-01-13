@@ -1,6 +1,6 @@
 //! Apple Push Notification Service (APNs) client.
 //!
-//! Supports both token-based (JWT) and certificate-based authentication.
+//! Uses token-based (JWT) authentication with a .p8 key file.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -71,20 +71,13 @@ pub struct ApnsClient {
 impl ApnsClient {
     /// Create a new APNs client.
     pub async fn new(config: ApnsConfig) -> Result<Self> {
-        // Certificate-based authentication is not yet implemented
-        if config.is_certificate_auth() {
-            return Err(Error::Apns(
-                "Certificate-based authentication is not yet implemented. Please use token auth (auth_method = \"token\").".to_string()
-            ));
-        }
-
         let http_client = Client::builder()
             .http2_prior_knowledge()
             .timeout(Duration::from_secs(30))
             .build()?;
 
         // Load encoding key for token auth
-        let encoding_key = if config.is_token_auth() && !config.private_key_path.is_empty() {
+        let encoding_key = if !config.private_key_path.is_empty() {
             let key_data = tokio::fs::read(&config.private_key_path)
                 .await
                 .map_err(|e| {
@@ -183,11 +176,9 @@ impl ApnsClient {
             .header("apns-topic", &self.config.bundle_id)
             .json(&payload);
 
-        // Add authorization header for token auth
-        if self.config.is_token_auth() {
-            let token = self.get_token().await?;
-            request = request.header("authorization", format!("bearer {token}"));
-        }
+        // Add authorization header
+        let token = self.get_token().await?;
+        request = request.header("authorization", format!("bearer {token}"));
 
         let response = request.send().await?;
         let status = response.status();
@@ -232,17 +223,13 @@ impl ApnsClient {
     }
 
     /// Check if the client is properly configured.
-    ///
-    /// Only token-based authentication is currently supported.
     #[must_use]
     pub fn is_configured(&self) -> bool {
         if !self.config.enabled {
             return false;
         }
 
-        // Only token auth is supported
-        self.config.is_token_auth()
-            && self.encoding_key.is_some()
+        self.encoding_key.is_some()
             && !self.config.key_id.is_empty()
             && !self.config.team_id.is_empty()
             && !self.config.bundle_id.is_empty()
@@ -275,12 +262,9 @@ mod tests {
     fn test_config() -> ApnsConfig {
         ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEYID123".to_string(),
             team_id: "TEAMID456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
         }
@@ -298,12 +282,9 @@ mod tests {
     async fn test_client_not_configured_when_disabled() {
         let config = ApnsConfig {
             enabled: false,
-            auth_method: "token".to_string(),
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: String::new(),
         };
@@ -335,22 +316,22 @@ mod tests {
             .build()
             .unwrap();
 
-        // Create client with custom HTTP client
+        // Create client with custom HTTP client and pre-populated token cache
         let client = ApnsClient {
             http_client,
             config: ApnsConfig {
                 enabled: true,
-                auth_method: "certificate".to_string(), // Skip token auth for this test
                 key_id: "KEYID123".to_string(),
                 team_id: "TEAMID456".to_string(),
                 private_key_path: String::new(),
-                certificate_path: "dummy".to_string(), // Use cert auth to skip JWT
-                certificate_password: String::new(),
                 environment: "sandbox".to_string(),
                 bundle_id: "com.example.app".to_string(),
             },
             encoding_key: None,
-            cached_token: Arc::new(RwLock::new(None)),
+            cached_token: Arc::new(RwLock::new(Some(CachedToken {
+                token: "test-token".to_string(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            }))),
         };
 
         // We need to override the base_url - let's test with a modified approach
@@ -507,16 +488,12 @@ mod tests {
     }
 
     #[test]
-    fn test_is_configured_token_auth() {
-        // Token auth requires key_id, team_id, bundle_id, and encoding_key
+    fn test_is_configured_with_all_fields() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -529,12 +506,9 @@ mod tests {
     fn test_is_configured_missing_key_id() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: String::new(), // Missing
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -544,34 +518,12 @@ mod tests {
     }
 
     #[test]
-    fn test_is_configured_certificate_auth_not_supported() {
-        // Certificate auth is not supported, so is_configured() should return false
-        let config = ApnsConfig {
-            enabled: true,
-            auth_method: "certificate".to_string(),
-            key_id: String::new(),
-            team_id: String::new(),
-            private_key_path: String::new(),
-            certificate_path: "/path/to/cert.p12".to_string(),
-            certificate_password: String::new(),
-            environment: "production".to_string(),
-            bundle_id: "com.example.app".to_string(),
-        };
-
-        let client = ApnsClient::mock(config, false);
-        assert!(!client.is_configured());
-    }
-
-    #[test]
     fn test_is_configured_missing_team_id() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: String::new(), // Missing
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -584,12 +536,9 @@ mod tests {
     fn test_is_configured_missing_bundle_id() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: String::new(), // Missing
         };
@@ -602,12 +551,9 @@ mod tests {
     fn test_is_configured_missing_encoding_key() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -652,12 +598,9 @@ mod tests {
     fn test_generate_token_no_encoding_key() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -673,12 +616,9 @@ mod tests {
     async fn test_get_token_uses_cache() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -703,12 +643,9 @@ mod tests {
     async fn test_get_token_expired_cache_regenerates() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -734,12 +671,9 @@ mod tests {
     async fn test_get_token_cache_not_expired() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -764,12 +698,9 @@ mod tests {
     async fn test_new_client_without_key_path() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(), // Empty path
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -779,40 +710,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_client_certificate_auth_returns_error() {
-        let config = ApnsConfig {
-            enabled: true,
-            auth_method: "certificate".to_string(),
-            key_id: String::new(),
-            team_id: String::new(),
-            private_key_path: String::new(),
-            certificate_path: "/path/to/cert.p12".to_string(),
-            certificate_password: String::new(),
-            environment: "production".to_string(),
-            bundle_id: "com.example.app".to_string(),
-        };
-
-        let result = ApnsClient::new(config).await;
-        assert!(result.is_err());
-        match result {
-            Err(e) => assert!(
-                e.to_string()
-                    .contains("Certificate-based authentication is not yet implemented")
-            ),
-            Ok(_) => panic!("Expected error for certificate auth"),
-        }
-    }
-
-    #[tokio::test]
     async fn test_new_client_invalid_key_path() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: "/nonexistent/key.p8".to_string(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
