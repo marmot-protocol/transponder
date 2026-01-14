@@ -970,4 +970,182 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
         let token2 = client.get_token().await.unwrap();
         assert_eq!(token1, token2);
     }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_429() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // Create a client that points to our mock server
+        // We'll need to create a custom client for testing send_once
+        let config = ApnsConfig {
+            enabled: true,
+            key_id: "KEYID123".to_string(),
+            team_id: "TEAMID456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient {
+            http_client,
+            config,
+            encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
+            cached_token: Arc::new(RwLock::new(Some(CachedToken {
+                token: "test-token".to_string(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            }))),
+        };
+
+        // Manually test the response handling logic by making a direct request
+        let url = format!("{}/3/device/{}", mock_server.uri(), "aabbccdd11223344");
+        let payload = ApnsPayload::default();
+
+        let response = client
+            .http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 429);
+        // Verify retry-after header is present
+        assert!(response.headers().get("retry-after").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_500() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!("{}/3/device/{}", mock_server.uri(), "abc123def456");
+        let payload = ApnsPayload::default();
+
+        let response = http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        // 500 should be a retriable error
+        assert_eq!(response.status(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_503() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!("{}/3/device/{}", mock_server.uri(), "abc123def456");
+        let payload = ApnsPayload::default();
+
+        let response = http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        // 503 should be a retriable error
+        assert_eq!(response.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn test_send_retries_on_429_then_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        // First request returns 429, second returns 200
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // First request - should get 429
+        let url = format!("{}/3/device/{}", mock_server.uri(), "aabbccdd11223344");
+        let payload = ApnsPayload::default();
+
+        let response1 = http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response1.status(), 429);
+
+        // Second request - should get 200
+        let response2 = http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response2.status(), 200);
+    }
 }

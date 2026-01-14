@@ -55,6 +55,7 @@ pub enum SendAttemptResult {
 ///
 /// The `operation` closure should return a `SendAttemptResult` indicating
 /// whether to retry or return the result.
+#[must_use = "retry result indicates success/failure and should not be ignored"]
 pub async fn with_retry<F, Fut>(
     config: &RetryConfig,
     service_name: &str,
@@ -175,7 +176,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
     }
 
@@ -205,7 +206,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
     }
 
@@ -231,7 +232,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false); // Returns false when max retries exceeded
+        assert!(!result.unwrap()); // Returns false when max retries exceeded
         // Initial attempt + max_retries = 1 + 2 = 3
         assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
     }
@@ -297,6 +298,6 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 }

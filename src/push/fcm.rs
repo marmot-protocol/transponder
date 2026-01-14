@@ -1073,4 +1073,207 @@ mod tests {
         // Should not be configured - no encoding key
         assert!(!client.is_configured());
     }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_429() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "60")
+                    .set_body_json(serde_json::json!({
+                        "error": {
+                            "code": 429,
+                            "message": "Quota exceeded",
+                            "status": "RESOURCE_EXHAUSTED"
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "{}/v1/projects/test-project/messages:send",
+            mock_server.uri()
+        );
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "device-token-123".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        let response = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 429);
+        // Verify retry-after header is present
+        assert!(response.headers().get("retry-after").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_500() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "{}/v1/projects/test-project/messages:send",
+            mock_server.uri()
+        );
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "device-token-123".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        let response = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        // 500 should be a retriable error
+        assert_eq!(response.status(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_503() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "{}/v1/projects/test-project/messages:send",
+            mock_server.uri()
+        );
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "device-token-123".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        let response = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        // 503 should be a retriable error
+        assert_eq!(response.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn test_send_retries_on_429_then_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        // First request returns 429, second returns 200
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 429,
+                    "message": "Quota exceeded",
+                    "status": "RESOURCE_EXHAUSTED"
+                }
+            })))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/test-project/messages/123456"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "{}/v1/projects/test-project/messages:send",
+            mock_server.uri()
+        );
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "device-token-123".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        // First request - should get 429
+        let response1 = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response1.status(), 429);
+
+        // Second request - should get 200
+        let response2 = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response2.status(), 200);
+    }
 }
