@@ -10,7 +10,6 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use hkdf::Hkdf;
-use nostr_sdk::prelude::Keys;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sha2::Sha256;
 
@@ -180,12 +179,12 @@ pub struct TokenDecryptor {
 }
 
 impl TokenDecryptor {
-    /// Create a new token decryptor with the given server keys.
-    pub fn new(keys: Keys) -> Self {
-        // Extract secret key bytes from nostr Keys and convert to secp256k1 SecretKey
-        let secret_bytes = keys.secret_key().to_secret_bytes();
-        let secret_key = SecretKey::from_slice(&secret_bytes)
-            .expect("Keys should always contain a valid secret key");
+    /// Create a new token decryptor with the given secret key.
+    ///
+    /// # Arguments
+    ///
+    /// * `secret_key` - The server's secp256k1 secret key for ECDH key agreement
+    pub fn new(secret_key: SecretKey) -> Self {
         Self {
             secret_key,
             secp: Secp256k1::new(),
@@ -303,8 +302,12 @@ mod tests {
 
     #[test]
     fn test_token_decryptor_creation() {
+        use nostr_sdk::prelude::Keys;
+
         let keys = Keys::generate();
-        let decryptor = TokenDecryptor::new(keys.clone());
+        let secret_bytes = keys.secret_key().to_secret_bytes();
+        let secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
+        let decryptor = TokenDecryptor::new(secret_key);
         assert_eq!(decryptor.public_key_hex(), keys.public_key().to_hex());
     }
 
