@@ -14,6 +14,7 @@ use tracing::{debug, trace, warn};
 
 use crate::crypto::{Nip59Handler, TokenDecryptor};
 use crate::error::Result;
+use crate::metrics::Metrics;
 use crate::push::PushDispatcher;
 
 /// Duration to keep event IDs for deduplication (5 minutes).
@@ -54,6 +55,7 @@ pub struct EventProcessor {
     token_decryptor: TokenDecryptor,
     push_dispatcher: Arc<PushDispatcher>,
     seen_events: Arc<RwLock<LruCache<EventId, Instant>>>,
+    metrics: Option<Metrics>,
 }
 
 impl EventProcessor {
@@ -82,6 +84,23 @@ impl EventProcessor {
         push_dispatcher: Arc<PushDispatcher>,
         max_cache_size: usize,
     ) -> Self {
+        Self::with_cache_size_and_metrics(
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+            max_cache_size,
+            None,
+        )
+    }
+
+    /// Create a new event processor with a custom cache size limit and metrics.
+    pub fn with_cache_size_and_metrics(
+        nip59_handler: Nip59Handler,
+        token_decryptor: TokenDecryptor,
+        push_dispatcher: Arc<PushDispatcher>,
+        max_cache_size: usize,
+        metrics: Option<Metrics>,
+    ) -> Self {
         let cache_size = NonZeroUsize::new(max_cache_size).unwrap_or(
             NonZeroUsize::new(DEFAULT_MAX_DEDUP_CACHE_SIZE)
                 .expect("DEFAULT_MAX_DEDUP_CACHE_SIZE is non-zero"),
@@ -91,6 +110,7 @@ impl EventProcessor {
             token_decryptor,
             push_dispatcher,
             seen_events: Arc::new(RwLock::new(LruCache::new(cache_size))),
+            metrics,
         }
     }
 
@@ -99,9 +119,17 @@ impl EventProcessor {
     /// Returns `Ok(true)` if the event was processed, `Ok(false)` if it was
     /// deduplicated (already seen), or an error if processing failed.
     pub async fn process(&self, event: &Event) -> Result<bool> {
+        // Record event received
+        if let Some(ref m) = self.metrics {
+            m.record_event_received();
+        }
+
         // Check for duplicates
         if self.is_duplicate(&event.id).await {
             trace!(event_id = %event.id, "Skipping duplicate event");
+            if let Some(ref m) = self.metrics {
+                m.record_event_deduplicated();
+            }
             return Ok(false);
         }
 
@@ -117,6 +145,10 @@ impl EventProcessor {
                     notifications_sent = count,
                     "Processed notification event"
                 );
+
+                if let Some(ref m) = self.metrics {
+                    m.record_event_processed();
+                }
                 Ok(true)
             }
             Err(e) => {
@@ -126,6 +158,9 @@ impl EventProcessor {
                     error = %e,
                     "Failed to process event"
                 );
+                if let Some(ref m) = self.metrics {
+                    m.record_event_failed();
+                }
                 Ok(false)
             }
         }
@@ -155,11 +190,17 @@ impl EventProcessor {
         for bytes in token_bytes {
             match self.token_decryptor.decrypt_bytes(&bytes) {
                 Ok(payload) => {
+                    if let Some(ref m) = self.metrics {
+                        m.record_token_decrypted();
+                    }
                     payloads.push(payload);
                 }
                 Err(e) => {
                     // Silently ignore invalid tokens per MIP-05 spec
                     trace!(error = %e, "Failed to decrypt token (ignoring)");
+                    if let Some(ref m) = self.metrics {
+                        m.record_token_decryption_failed();
+                    }
                 }
             }
         }
@@ -188,6 +229,11 @@ impl EventProcessor {
     async fn mark_seen(&self, event_id: EventId) {
         let mut seen = self.seen_events.write().await;
         seen.put(event_id, Instant::now());
+
+        // Update cache size metric
+        if let Some(ref m) = self.metrics {
+            m.set_dedup_cache_size(seen.len());
+        }
     }
 
     /// Clean up the deduplication cache by removing entries older than `DEDUP_WINDOW`.
@@ -219,10 +265,19 @@ impl EventProcessor {
         }
 
         let after = seen.len();
+        let evicted = before - after;
+
+        // Update metrics
+        if let Some(ref m) = self.metrics {
+            m.set_dedup_cache_size(after);
+            if evicted > 0 {
+                m.record_dedup_evictions(evicted);
+            }
+        }
 
         if before != after {
             debug!(
-                removed = before - after,
+                removed = evicted,
                 remaining = after,
                 "Cleaned up deduplication cache"
             );

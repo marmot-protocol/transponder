@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::RelayConfig;
 use crate::error::{Error, Result};
+use crate::metrics::Metrics;
 
 // Type alias to avoid confusion with our RelayStatus
 use nostr_sdk::RelayStatus as NostrRelayStatus;
@@ -32,14 +33,29 @@ pub struct RelayClient {
     client: Client,
     config: RelayConfig,
     status: Arc<RwLock<RelayStatus>>,
+    metrics: Option<Metrics>,
 }
 
 impl RelayClient {
     /// Create a new relay client with the given keys and configuration.
+    #[allow(dead_code)]
     pub async fn new(keys: Keys, config: RelayConfig) -> Result<Self> {
+        Self::with_metrics(keys, config, None).await
+    }
+
+    /// Create a new relay client with metrics.
+    pub async fn with_metrics(
+        keys: Keys,
+        config: RelayConfig,
+        metrics: Option<Metrics>,
+    ) -> Result<Self> {
         let client = Client::builder().signer(keys).build();
 
         let total = config.clearnet.len() + config.onion.len();
+
+        if let Some(metrics) = &metrics {
+            metrics.set_relay_counts(config.clearnet.len(), config.onion.len());
+        }
 
         Ok(Self {
             client,
@@ -49,6 +65,7 @@ impl RelayClient {
                 tor_connected: 0,
                 total_configured: total,
             })),
+            metrics,
         })
     }
 
@@ -167,6 +184,11 @@ impl RelayClient {
                     clearnet += 1;
                 }
             }
+        }
+
+        if let Some(metrics) = &self.metrics {
+            metrics.set_relays_connected("clearnet", clearnet);
+            metrics.set_relays_connected("onion", tor);
         }
 
         let mut status = self.status.write().await;

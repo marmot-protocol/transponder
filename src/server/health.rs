@@ -5,13 +5,15 @@
 use std::sync::Arc;
 
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::config::HealthConfig;
 use crate::error::Result;
+use crate::metrics::Metrics;
 use crate::nostr::client::RelayClient;
 use crate::push::PushDispatcher;
 
@@ -36,6 +38,7 @@ struct ReadyResponse {
 struct HealthState {
     relay_client: Arc<RelayClient>,
     push_dispatcher: Arc<PushDispatcher>,
+    metrics: Option<Metrics>,
 }
 
 /// Health check HTTP server.
@@ -43,6 +46,7 @@ pub struct HealthServer {
     config: HealthConfig,
     relay_client: Arc<RelayClient>,
     push_dispatcher: Arc<PushDispatcher>,
+    metrics: Option<Metrics>,
 }
 
 impl HealthServer {
@@ -51,11 +55,13 @@ impl HealthServer {
         config: HealthConfig,
         relay_client: Arc<RelayClient>,
         push_dispatcher: Arc<PushDispatcher>,
+        metrics: Option<Metrics>,
     ) -> Self {
         Self {
             config,
             relay_client,
             push_dispatcher,
+            metrics,
         }
     }
 
@@ -71,11 +77,13 @@ impl HealthServer {
         let state = Arc::new(HealthState {
             relay_client: self.relay_client.clone(),
             push_dispatcher: self.push_dispatcher.clone(),
+            metrics: self.metrics.clone(),
         });
 
         let app = Router::new()
             .route("/health", get(health_handler))
             .route("/ready", get(ready_handler))
+            .route("/metrics", get(metrics_handler))
             .with_state(state);
 
         let listener = TcpListener::bind(&self.config.bind_address)
@@ -129,6 +137,36 @@ async fn ready_handler(State(state): State<Arc<HealthState>>) -> impl IntoRespon
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(response))
     }
+}
+
+/// Prometheus metrics handler.
+async fn metrics_handler(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
+    let Some(metrics) = &state.metrics else {
+        return (
+            StatusCode::NOT_FOUND,
+            [("content-type", "text/plain")],
+            vec![],
+        );
+    };
+
+    let metric_families = metrics.gather();
+    let encoder = TextEncoder::new();
+    let mut buffer = vec![];
+
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        error!(error = %e, "Failed to encode metrics");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("content-type", "text/plain")],
+            b"Failed to encode metrics".to_vec(),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        buffer,
+    )
 }
 
 #[cfg(test)]
@@ -190,7 +228,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
 
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -249,7 +287,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -300,7 +338,7 @@ mod tests {
             bind_address: "127.0.0.1:0".to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -344,7 +382,7 @@ mod tests {
             bind_address: invalid_address.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -363,5 +401,185 @@ mod tests {
             "Error message '{}' should contain context about the health server",
             error_message
         );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        use crate::metrics::Metrics;
+
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 1,
+            connection_timeout_secs: 1,
+        };
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        let metrics = Metrics::default();
+        metrics.init_server_info("0.0.0");
+        let metrics = Some(metrics);
+
+        // Find a free port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = HealthConfig {
+            enabled: true,
+            bind_address: addr.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher, metrics);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(async move {
+            server.run(shutdown_rx).await.unwrap();
+        });
+
+        // Wait for server to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Check metrics endpoint
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("transponder_server_info"));
+
+        // Shutdown
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_disabled() {
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 1,
+            connection_timeout_secs: 1,
+        };
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        // No metrics provided
+        let metrics = None;
+
+        // Find a free port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = HealthConfig {
+            enabled: true,
+            bind_address: addr.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher, metrics);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(async move {
+            server.run(shutdown_rx).await.unwrap();
+        });
+
+        // Wait for server to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Check metrics endpoint
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Shutdown
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_ready_endpoint_ready() {
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+        use nostr_relay_builder::MockRelay;
+
+        // Start mock relay
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![relay_url.to_string()],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        // Create relay client and connect it
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        // Connect to the relay so is_connected() returns true
+        relay_client.connect().await.unwrap();
+
+        // Create mock APNs client that is configured
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+        let apns_client = ApnsClient::mock(apns_config, true);
+        let push_dispatcher = Arc::new(PushDispatcher::new(Some(apns_client), None));
+
+        // Find a free port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = HealthConfig {
+            enabled: true,
+            bind_address: addr.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{}/ready", addr))
+            .send()
+            .await
+            .unwrap();
+
+        // Should be 200 OK because relays are connected and APNs is configured
+        assert_eq!(response.status(), 200);
+        let body: ReadyResponse = response.json().await.unwrap();
+        assert_eq!(body.status, "ready");
+        assert!(body.relays_connected);
+        assert!(body.apns_configured);
+        assert!(!body.fcm_configured);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
     }
 }

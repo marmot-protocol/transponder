@@ -24,6 +24,7 @@ use tracing::{debug, trace, warn};
 use zeroize::Zeroizing;
 
 use crate::crypto::{Platform, TokenPayload};
+use crate::metrics::Metrics;
 use crate::push::{ApnsClient, FcmClient};
 
 /// Maximum concurrent outbound push requests.
@@ -61,18 +62,36 @@ pub struct PushDispatcher {
     semaphore: Arc<Semaphore>,
     sender: mpsc::Sender<PushMessage>,
     shutting_down: Arc<AtomicBool>,
+    metrics: Option<Metrics>,
 }
 
 impl PushDispatcher {
     /// Create a new push dispatcher.
     ///
     /// This spawns worker tasks that process the bounded queue of notifications.
+    #[allow(dead_code)]
     pub fn new(apns_client: Option<ApnsClient>, fcm_client: Option<FcmClient>) -> Self {
+        Self::with_metrics(apns_client, fcm_client, None)
+    }
+
+    /// Create a new push dispatcher with metrics.
+    ///
+    /// This spawns worker tasks that process the bounded queue of notifications.
+    pub fn with_metrics(
+        apns_client: Option<ApnsClient>,
+        fcm_client: Option<FcmClient>,
+        metrics: Option<Metrics>,
+    ) -> Self {
         let apns_client = apns_client.map(Arc::new);
         let fcm_client = fcm_client.map(Arc::new);
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSHES));
         let (sender, receiver) = mpsc::channel(MAX_PENDING_QUEUE_SIZE);
         let shutting_down = Arc::new(AtomicBool::new(false));
+
+        // Initialize semaphore metric
+        if let Some(ref m) = metrics {
+            m.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
+        }
 
         // Spawn worker tasks
         Self::spawn_workers(
@@ -81,6 +100,7 @@ impl PushDispatcher {
             fcm_client.clone(),
             semaphore.clone(),
             shutting_down.clone(),
+            metrics.clone(),
         );
 
         Self {
@@ -89,6 +109,7 @@ impl PushDispatcher {
             semaphore,
             sender,
             shutting_down,
+            metrics,
         }
     }
 
@@ -99,6 +120,7 @@ impl PushDispatcher {
         fcm_client: Option<Arc<FcmClient>>,
         semaphore: Arc<Semaphore>,
         shutting_down: Arc<AtomicBool>,
+        metrics: Option<Metrics>,
     ) {
         // Wrap receiver in Arc<Mutex> so workers can share it
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
@@ -109,6 +131,7 @@ impl PushDispatcher {
             let fcm_client = fcm_client.clone();
             let semaphore = semaphore.clone();
             let shutting_down = shutting_down.clone();
+            let metrics = metrics.clone();
 
             tokio::spawn(async move {
                 loop {
@@ -147,26 +170,68 @@ impl PushDispatcher {
                                 }
                             };
 
+                            // Update semaphore metric after acquiring permit
+                            if let Some(ref m) = metrics {
+                                m.set_push_semaphore_available(semaphore.available_permits());
+                            }
+
+                            let platform_str = match platform {
+                                Platform::Apns => "apns",
+                                Platform::Fcm => "fcm",
+                            };
+
                             match platform {
                                 Platform::Apns => {
                                     if let Some(ref client) = apns_client {
                                         match client.send(token.as_str()).await {
-                                            Ok(true) => trace!("APNs notification sent"),
-                                            Ok(false) => {
-                                                trace!("APNs notification failed (invalid token)")
+                                            Ok(true) => {
+                                                trace!("APNs notification sent");
+                                                if let Some(ref m) = metrics {
+                                                    m.record_push_success(platform_str);
+                                                }
                                             }
-                                            Err(e) => debug!(error = %e, "APNs send error"),
+                                            Ok(false) => {
+                                                trace!("APNs notification failed (invalid token)");
+                                                if let Some(ref m) = metrics {
+                                                    m.record_push_failed(
+                                                        platform_str,
+                                                        "invalid_token",
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                debug!(error = %e, "APNs send error");
+                                                if let Some(ref m) = metrics {
+                                                    m.record_push_failed(platform_str, "error");
+                                                }
+                                            }
                                         }
                                     }
                                 }
                                 Platform::Fcm => {
                                     if let Some(ref client) = fcm_client {
                                         match client.send(token.as_str()).await {
-                                            Ok(true) => trace!("FCM notification sent"),
-                                            Ok(false) => {
-                                                trace!("FCM notification failed (invalid token)")
+                                            Ok(true) => {
+                                                trace!("FCM notification sent");
+                                                if let Some(ref m) = metrics {
+                                                    m.record_push_success(platform_str);
+                                                }
                                             }
-                                            Err(e) => debug!(error = %e, "FCM send error"),
+                                            Ok(false) => {
+                                                trace!("FCM notification failed (invalid token)");
+                                                if let Some(ref m) = metrics {
+                                                    m.record_push_failed(
+                                                        platform_str,
+                                                        "invalid_token",
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                debug!(error = %e, "FCM send error");
+                                                if let Some(ref m) = metrics {
+                                                    m.record_push_failed(platform_str, "error");
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -174,6 +239,11 @@ impl PushDispatcher {
                             // Token is automatically zeroed when dropped here
 
                             drop(permit);
+
+                            // Update semaphore metric after releasing permit
+                            if let Some(ref m) = metrics {
+                                m.set_push_semaphore_available(semaphore.available_permits());
+                            }
                         }
                         Some(PushMessage::Shutdown) => {
                             debug!(worker_id, "Worker received shutdown signal");
@@ -228,14 +298,28 @@ impl PushDispatcher {
             // Note: payload (TokenPayload) is automatically zeroed when dropped here
             // due to its ZeroizeOnDrop implementation
 
+            let platform_str = match platform {
+                Platform::Apns => "apns",
+                Platform::Fcm => "fcm",
+            };
+
             // Try to send to the bounded queue
             match self.sender.try_send(PushMessage::Send { platform, token }) {
                 Ok(()) => {
-                    // Successfully queued
+                    // Successfully queued - record metric
+                    if let Some(ref m) = self.metrics {
+                        m.record_push_dispatched(platform_str);
+                        // Update queue size (approximate - capacity minus available)
+                        // tokio::mpsc::Sender::capacity() returns available permits
+                        m.set_push_queue_size(MAX_PENDING_QUEUE_SIZE - self.sender.capacity());
+                    }
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // Token is automatically zeroed when dropped here
                     warn!("Push queue full, dropping notification (DoS protection)");
+                    if let Some(ref m) = self.metrics {
+                        m.record_push_queue_dropped();
+                    }
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     // Token is automatically zeroed when dropped here
@@ -485,6 +569,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_both_platforms() {
         use crate::config::{ApnsConfig, FcmConfig};
+        use crate::metrics::Metrics;
         use crate::push::{ApnsClient, FcmClient};
 
         let apns_config = ApnsConfig {
@@ -504,7 +589,12 @@ mod tests {
         };
         let fcm_client = FcmClient::mock(fcm_config, true);
 
-        let dispatcher = PushDispatcher::new(Some(apns_client), Some(fcm_client));
+        let metrics = Metrics::default();
+        let dispatcher = PushDispatcher::with_metrics(
+            Some(apns_client),
+            Some(fcm_client),
+            Some(metrics.clone()),
+        );
 
         // Dispatch both APNs and FCM payloads
         let payloads = vec![
@@ -521,6 +611,32 @@ mod tests {
         dispatcher.dispatch(payloads).await;
         // Tasks are spawned - give them time to start
         tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Verify metrics
+        let families = metrics.gather();
+        let mut apns_dispatched = false;
+        let mut fcm_dispatched = false;
+
+        for family in families {
+            if family.name() == "transponder_push_dispatched_total" {
+                for metric in family.get_metric() {
+                    for label in metric.get_label() {
+                        if label.name() == "platform" {
+                            if label.value() == "apns" {
+                                assert_eq!(metric.get_counter().value, Some(1.0));
+                                apns_dispatched = true;
+                            } else if label.value() == "fcm" {
+                                assert_eq!(metric.get_counter().value, Some(1.0));
+                                fcm_dispatched = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(apns_dispatched, "APNs dispatch metric missing");
+        assert!(fcm_dispatched, "FCM dispatch metric missing");
     }
 
     #[tokio::test]

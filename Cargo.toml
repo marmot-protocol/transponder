@@ -39,6 +39,9 @@ axum = "0.8"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Metrics
+prometheus = "0.14"
+
 # Utilities
 thiserror = "2"
 zeroize = { version = "1.8", features = ["derive"] }

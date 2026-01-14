@@ -16,6 +16,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 mod config;
 mod crypto;
 mod error;
+mod metrics;
 mod nostr;
 mod push;
 mod server;
@@ -26,6 +27,7 @@ mod test_vectors;
 
 use config::AppConfig;
 use crypto::{Nip59Handler, TokenDecryptor};
+use metrics::Metrics;
 use nostr::client::RelayClient;
 use nostr::events::EventProcessor;
 use push::{ApnsClient, FcmClient, PushDispatcher};
@@ -66,6 +68,23 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&config.logging)?;
 
+    // Initialize metrics
+    let metrics = if config.metrics.enabled {
+        match Metrics::new() {
+            Ok(m) => {
+                m.init_server_info(env!("CARGO_PKG_VERSION"));
+                Some(m)
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to initialize metrics");
+                None
+            }
+        }
+    } else {
+        debug!("Metrics disabled");
+        None
+    };
+
     info!(
         version = env!("CARGO_PKG_VERSION"),
         config_path = %args.config,
@@ -100,7 +119,7 @@ async fn main() -> Result<()> {
 
     // Initialize push clients
     let apns_client = if config.apns.enabled {
-        match ApnsClient::new(config.apns.clone()).await {
+        match ApnsClient::with_metrics(config.apns.clone(), metrics.clone()).await {
             Ok(client) => {
                 if client.is_configured() {
                     info!("APNs client initialized");
@@ -121,7 +140,7 @@ async fn main() -> Result<()> {
     };
 
     let fcm_client = if config.fcm.enabled {
-        match FcmClient::new(config.fcm.clone()).await {
+        match FcmClient::with_metrics(config.fcm.clone(), metrics.clone()).await {
             Ok(client) => {
                 if client.is_configured() {
                     info!("FCM client initialized");
@@ -142,7 +161,11 @@ async fn main() -> Result<()> {
     };
 
     // Create push dispatcher
-    let push_dispatcher = Arc::new(PushDispatcher::new(apns_client, fcm_client));
+    let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
+        apns_client,
+        fcm_client,
+        metrics.clone(),
+    ));
 
     if !push_dispatcher.is_ready() {
         warn!("No push services configured - notifications will not be sent");
@@ -150,7 +173,7 @@ async fn main() -> Result<()> {
 
     // Initialize relay client
     let relay_client = Arc::new(
-        RelayClient::new(keys.clone(), config.relays.clone())
+        RelayClient::with_metrics(keys.clone(), config.relays.clone(), metrics.clone())
             .await
             .context("Failed to create relay client")?,
     );
@@ -173,11 +196,12 @@ async fn main() -> Result<()> {
     }
 
     // Create event processor with configured cache size
-    let event_processor = Arc::new(EventProcessor::with_cache_size(
+    let event_processor = Arc::new(EventProcessor::with_cache_size_and_metrics(
         nip59_handler,
         token_decryptor,
         push_dispatcher.clone(),
         config.server.max_dedup_cache_size,
+        metrics.clone(),
     ));
 
     // Initialize shutdown handler
@@ -188,6 +212,7 @@ async fn main() -> Result<()> {
         config.health.clone(),
         relay_client.clone(),
         push_dispatcher.clone(),
+        metrics.clone(),
     );
 
     let health_shutdown = shutdown.subscribe();

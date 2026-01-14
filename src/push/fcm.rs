@@ -3,7 +3,7 @@
 //! Uses service account credentials for OAuth2 authentication.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
@@ -13,6 +13,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::config::FcmConfig;
 use crate::error::{Error, Result};
+use crate::metrics::Metrics;
 use crate::push::retry::{self, RetryConfig, SendAttemptResult};
 
 /// FCM OAuth2 token endpoint.
@@ -107,11 +108,18 @@ pub struct FcmClient {
     pub(crate) service_account: Option<ServiceAccount>,
     pub(crate) encoding_key: Option<EncodingKey>,
     pub(crate) cached_token: Arc<RwLock<Option<CachedToken>>>,
+    pub(crate) metrics: Option<Metrics>,
 }
 
 impl FcmClient {
     /// Create a new FCM client.
+    #[allow(dead_code)]
     pub async fn new(config: FcmConfig) -> Result<Self> {
+        Self::with_metrics(config, None).await
+    }
+
+    /// Create a new FCM client with metrics.
+    pub async fn with_metrics(config: FcmConfig, metrics: Option<Metrics>) -> Result<Self> {
         let http_client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
         // Load service account if configured
@@ -142,6 +150,7 @@ impl FcmClient {
             service_account,
             encoding_key,
             cached_token: Arc::new(RwLock::new(None)),
+            metrics,
         })
     }
 
@@ -232,6 +241,10 @@ impl FcmClient {
             expires_at: SystemTime::now() + TOKEN_LIFETIME,
         });
 
+        if let Some(metrics) = &self.metrics {
+            metrics.record_auth_token_refresh("fcm_oauth");
+        }
+
         trace!("Refreshed FCM access token");
         Ok(token_response.access_token)
     }
@@ -257,13 +270,20 @@ impl FcmClient {
     /// exponential backoff.
     pub async fn send(&self, device_token: &str) -> Result<bool> {
         let retry_config = RetryConfig::default();
-        retry::with_retry(&retry_config, "FCM", || self.send_once(device_token)).await
+        retry::with_retry(
+            &retry_config,
+            "FCM",
+            || self.send_once(device_token),
+            self.metrics.as_ref(),
+        )
+        .await
     }
 
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
     async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+        let start = Instant::now();
         let project_id = match self.project_id() {
             Ok(id) => id,
             Err(e) => return SendAttemptResult::Permanent(e),
@@ -301,6 +321,11 @@ impl FcmClient {
         };
 
         let status = response.status();
+
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_push_duration("fcm", start.elapsed().as_secs_f64());
+            metrics.record_push_response_status("fcm", status.as_u16());
+        }
 
         match status.as_u16() {
             200 => {
@@ -395,6 +420,7 @@ impl FcmClient {
             service_account,
             encoding_key,
             cached_token: Arc::new(RwLock::new(None)),
+            metrics: None,
         }
     }
 }
@@ -1068,6 +1094,7 @@ mod tests {
             service_account: None,
             encoding_key: None,
             cached_token: Arc::new(RwLock::new(None)),
+            metrics: None,
         };
 
         // Should not be configured - no encoding key
