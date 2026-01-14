@@ -75,10 +75,6 @@ pub struct ApnsConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Authentication method: "certificate" or "token".
-    #[serde(default = "default_auth_method")]
-    pub auth_method: String,
-
     /// Key ID for token-based auth.
     #[serde(default)]
     pub key_id: String,
@@ -91,14 +87,6 @@ pub struct ApnsConfig {
     #[serde(default)]
     pub private_key_path: String,
 
-    /// Path to the .p12 certificate file for certificate auth.
-    #[serde(default)]
-    pub certificate_path: String,
-
-    /// Password for the .p12 certificate (for certificate auth).
-    #[serde(default)]
-    pub certificate_password: String,
-
     /// APNs environment: "production" or "sandbox".
     #[serde(default = "default_apns_environment")]
     pub environment: String,
@@ -106,10 +94,6 @@ pub struct ApnsConfig {
     /// Bundle ID for the iOS app.
     #[serde(default)]
     pub bundle_id: String,
-}
-
-fn default_auth_method() -> String {
-    "token".to_string()
 }
 
 fn default_apns_environment() -> String {
@@ -186,12 +170,9 @@ impl AppConfig {
             .set_default("relays.reconnect_interval_secs", 5)?
             .set_default("relays.max_reconnect_attempts", 10)?
             .set_default("apns.enabled", false)?
-            .set_default("apns.auth_method", "token")?
             .set_default("apns.key_id", "")?
             .set_default("apns.team_id", "")?
             .set_default("apns.private_key_path", "")?
-            .set_default("apns.certificate_path", "")?
-            .set_default("apns.certificate_password", "")?
             .set_default("apns.environment", "production")?
             .set_default("apns.bundle_id", "")?
             .set_default("fcm.enabled", false)?
@@ -225,12 +206,9 @@ impl AppConfig {
             .set_default("relays.reconnect_interval_secs", 5)?
             .set_default("relays.max_reconnect_attempts", 10)?
             .set_default("apns.enabled", false)?
-            .set_default("apns.auth_method", "token")?
             .set_default("apns.key_id", "")?
             .set_default("apns.team_id", "")?
             .set_default("apns.private_key_path", "")?
-            .set_default("apns.certificate_path", "")?
-            .set_default("apns.certificate_password", "")?
             .set_default("apns.environment", "production")?
             .set_default("apns.bundle_id", "")?
             .set_default("fcm.enabled", false)?
@@ -253,19 +231,6 @@ impl AppConfig {
 }
 
 impl ApnsConfig {
-    /// Returns true if using token-based authentication.
-    #[must_use]
-    pub fn is_token_auth(&self) -> bool {
-        self.auth_method == "token"
-    }
-
-    /// Returns true if using certificate-based authentication.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn is_certificate_auth(&self) -> bool {
-        self.auth_method == "certificate"
-    }
-
     /// Returns true if targeting production APNs environment.
     #[must_use]
     pub fn is_production(&self) -> bool {
@@ -330,18 +295,13 @@ mod tests {
     fn test_apns_config_helpers() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM123".to_string(),
             private_key_path: "/path/to/key.p8".to_string(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
 
-        assert!(config.is_token_auth());
-        assert!(!config.is_certificate_auth());
         assert!(config.is_production());
         assert_eq!(config.base_url(), "https://api.push.apple.com");
     }
@@ -350,36 +310,15 @@ mod tests {
     fn test_apns_sandbox_url() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: String::new(),
         };
 
         assert!(!config.is_production());
         assert_eq!(config.base_url(), "https://api.sandbox.push.apple.com");
-    }
-
-    #[test]
-    fn test_apns_certificate_auth() {
-        let config = ApnsConfig {
-            enabled: true,
-            auth_method: "certificate".to_string(),
-            key_id: String::new(),
-            team_id: String::new(),
-            private_key_path: String::new(),
-            certificate_path: "/path/to/cert.p12".to_string(),
-            certificate_password: "secret".to_string(),
-            environment: "production".to_string(),
-            bundle_id: "com.example.app".to_string(),
-        };
-
-        assert!(!config.is_token_auth());
-        assert!(config.is_certificate_auth());
     }
 
     #[test]
@@ -456,7 +395,6 @@ mod tests {
         assert_eq!(config.relays.reconnect_interval_secs, 5);
         assert_eq!(config.relays.max_reconnect_attempts, 10);
         assert!(!config.apns.enabled);
-        assert_eq!(config.apns.auth_method, "token");
         assert_eq!(config.apns.environment, "production");
         assert!(!config.fcm.enabled);
         assert!(config.health.enabled);
@@ -486,7 +424,6 @@ mod tests {
         assert_eq!(config.relays.reconnect_interval_secs, 5);
         assert_eq!(config.relays.max_reconnect_attempts, 10);
         assert!(!config.apns.enabled);
-        assert_eq!(config.apns.auth_method, "token");
         assert_eq!(config.apns.environment, "production");
         assert!(!config.fcm.enabled);
         assert!(config.health.enabled);
@@ -510,7 +447,6 @@ mod tests {
 
     #[test]
     fn test_apns_config_defaults() {
-        assert_eq!(default_auth_method(), "token");
         assert_eq!(default_apns_environment(), "production");
     }
 
@@ -530,12 +466,9 @@ mod tests {
     fn test_apns_is_production_true() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "production".to_string(),
             bundle_id: String::new(),
         };
@@ -546,12 +479,9 @@ mod tests {
     fn test_apns_is_production_false() {
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "development".to_string(),
             bundle_id: String::new(),
         };
@@ -580,7 +510,6 @@ mod tests {
         assert_eq!(config.server.private_key, "test-key");
         assert!(config.apns.enabled);
         assert_eq!(config.apns.key_id, "MYKEY");
-        assert_eq!(config.apns.auth_method, "token"); // default
         assert_eq!(config.apns.environment, "production"); // default
         assert!(!config.fcm.enabled); // default
     }

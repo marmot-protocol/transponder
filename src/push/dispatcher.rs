@@ -198,12 +198,9 @@ mod tests {
 
         let config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -267,12 +264,9 @@ mod tests {
         // Only APNs client configured
         let apns_config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -319,12 +313,9 @@ mod tests {
 
         let apns_config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -363,12 +354,9 @@ mod tests {
 
         let apns_config = ApnsConfig {
             enabled: true,
-            auth_method: "token".to_string(),
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
         };
@@ -396,12 +384,9 @@ mod tests {
         // APNs client that is not properly configured
         let apns_config = ApnsConfig {
             enabled: false, // Disabled
-            auth_method: "token".to_string(),
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            certificate_path: String::new(),
-            certificate_password: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: String::new(),
         };
