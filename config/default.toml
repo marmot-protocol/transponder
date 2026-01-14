@@ -6,6 +6,11 @@
 # REQUIRED: Set via TRANSPONDER_SERVER_PRIVATE_KEY environment variable
 private_key = ""
 
+# Maximum size for the event deduplication cache.
+# The cache uses LRU eviction to prevent unbounded memory growth.
+# Default: 100000
+# max_dedup_cache_size = 100000
+
 [relays]
 # ClearNet relays to subscribe to
 clearnet = [
