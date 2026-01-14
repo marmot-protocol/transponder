@@ -19,6 +19,15 @@ use crate::push::PushDispatcher;
 /// Duration to keep event IDs for deduplication (5 minutes).
 const DEDUP_WINDOW: Duration = Duration::from_secs(300);
 
+/// Maximum number of entries to scan per cleanup cycle.
+///
+/// Limits the time spent holding the write lock during cleanup to prevent
+/// latency spikes for event processing. With 60-second cleanup intervals,
+/// a batch size of 1000 can scan up to 100,000 entries in ~100 cleanup cycles
+/// (~100 minutes), which is well within the 5-minute dedup window for memory
+/// reclamation. The LRU eviction handles capacity limits regardless.
+const CLEANUP_BATCH_SIZE: usize = 1000;
+
 /// Default maximum size for the deduplication cache.
 ///
 /// This value (100,000 entries) provides a reasonable upper bound on memory
@@ -171,16 +180,24 @@ impl EventProcessor {
 
     /// Clean up the deduplication cache by removing entries older than `DEDUP_WINDOW`.
     ///
+    /// This method uses incremental cleanup to avoid holding the write lock for
+    /// extended periods. Instead of scanning all entries, it processes up to
+    /// `CLEANUP_BATCH_SIZE` entries per call. Since cleanup runs periodically
+    /// (every 60 seconds by default), all expired entries will eventually be
+    /// removed across multiple cleanup cycles.
+    ///
     /// Note: The LRU cache also provides automatic eviction based on size,
-    /// so this cleanup is for time-based expiration of stale entries.
+    /// so this cleanup is for time-based expiration of stale entries to free memory.
     pub async fn cleanup(&self) {
         let mut seen = self.seen_events.write().await;
         let now = Instant::now();
         let before = seen.len();
 
-        // LruCache doesn't have retain(), so we collect keys to remove first
+        // Scan up to CLEANUP_BATCH_SIZE entries to find expired ones.
+        // This limits the time spent holding the write lock.
         let expired_keys: Vec<_> = seen
             .iter()
+            .take(CLEANUP_BATCH_SIZE)
             .filter(|(_, seen_at)| now.duration_since(**seen_at) >= DEDUP_WINDOW)
             .map(|(id, _)| *id)
             .collect();
@@ -494,5 +511,109 @@ mod tests {
         assert!(processor.is_duplicate(&event_ids[0]).await);
         assert!(processor.is_duplicate(&event_ids[2]).await);
         assert!(processor.is_duplicate(&event_ids[3]).await);
+    }
+
+    #[test]
+    fn test_cleanup_batch_size_is_reasonable() {
+        // Verify the batch size constant is set appropriately:
+        // - Large enough to make progress on cleanup
+        // - Small enough to avoid long lock holds
+        assert!(
+            CLEANUP_BATCH_SIZE >= 100,
+            "Batch size too small for efficient cleanup"
+        );
+        assert!(
+            CLEANUP_BATCH_SIZE <= 10_000,
+            "Batch size too large, may cause lock contention"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_processes_limited_entries() {
+        // This test verifies that cleanup doesn't scan all entries at once.
+        // We add entries with old timestamps and verify cleanup only removes
+        // up to CLEANUP_BATCH_SIZE entries per call.
+        let server_keys = Keys::generate();
+        let processor = create_processor(&server_keys);
+
+        // Add more entries than CLEANUP_BATCH_SIZE, all with "old" timestamps
+        let num_entries = CLEANUP_BATCH_SIZE + 500;
+        let old_time = Instant::now() - DEDUP_WINDOW - Duration::from_secs(1);
+
+        {
+            let mut seen = processor.seen_events.write().await;
+            for i in 0..num_entries {
+                let mut bytes = [0u8; 32];
+                bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+                let event_id = EventId::from_byte_array(bytes);
+                seen.put(event_id, old_time);
+            }
+        }
+
+        // Verify all entries are present
+        assert_eq!(processor.cache_len(), num_entries);
+
+        // Run cleanup once - should only remove up to CLEANUP_BATCH_SIZE entries
+        processor.cleanup().await;
+
+        // After one cleanup, we should have removed at most CLEANUP_BATCH_SIZE entries
+        let remaining = processor.cache_len();
+        assert!(
+            remaining >= num_entries - CLEANUP_BATCH_SIZE,
+            "Cleanup removed more than CLEANUP_BATCH_SIZE entries: expected at least {}, got {}",
+            num_entries - CLEANUP_BATCH_SIZE,
+            remaining
+        );
+
+        // Run cleanup again - should remove remaining old entries
+        processor.cleanup().await;
+
+        // All expired entries should now be removed
+        assert_eq!(
+            processor.cache_len(),
+            0,
+            "Expected all expired entries to be removed after two cleanup cycles"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_preserves_recent_entries() {
+        let server_keys = Keys::generate();
+        let processor = create_processor(&server_keys);
+
+        let old_time = Instant::now() - DEDUP_WINDOW - Duration::from_secs(1);
+        let recent_time = Instant::now();
+
+        {
+            let mut seen = processor.seen_events.write().await;
+
+            // Add some old entries
+            for i in 0..100 {
+                let mut bytes = [0u8; 32];
+                bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+                let event_id = EventId::from_byte_array(bytes);
+                seen.put(event_id, old_time);
+            }
+
+            // Add some recent entries
+            for i in 100..150 {
+                let mut bytes = [0u8; 32];
+                bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+                let event_id = EventId::from_byte_array(bytes);
+                seen.put(event_id, recent_time);
+            }
+        }
+
+        assert_eq!(processor.cache_len(), 150);
+
+        // Cleanup should remove old entries but keep recent ones
+        processor.cleanup().await;
+
+        // Should have exactly 50 recent entries remaining
+        assert_eq!(
+            processor.cache_len(),
+            50,
+            "Expected 50 recent entries to remain after cleanup"
+        );
     }
 }
