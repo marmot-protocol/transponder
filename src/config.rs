@@ -36,6 +36,14 @@ pub struct AppConfig {
 pub struct ServerConfig {
     /// Server's Nostr private key (hex or nsec format).
     pub private_key: String,
+
+    /// Graceful shutdown timeout in seconds.
+    #[serde(default = "default_shutdown_timeout")]
+    pub shutdown_timeout_secs: u64,
+}
+
+fn default_shutdown_timeout() -> u64 {
+    10
 }
 
 /// Relay connection configuration.
@@ -165,6 +173,7 @@ impl AppConfig {
         let config = Config::builder()
             // Start with default values
             .set_default("server.private_key", "")?
+            .set_default("server.shutdown_timeout_secs", 10)?
             .set_default("relays.clearnet", Vec::<String>::new())?
             .set_default("relays.onion", Vec::<String>::new())?
             .set_default("relays.reconnect_interval_secs", 5)?
@@ -201,6 +210,7 @@ impl AppConfig {
         let config = Config::builder()
             // Set defaults
             .set_default("server.private_key", "")?
+            .set_default("server.shutdown_timeout_secs", 10)?
             .set_default("relays.clearnet", Vec::<String>::new())?
             .set_default("relays.onion", Vec::<String>::new())?
             .set_default("relays.reconnect_interval_secs", 5)?
@@ -286,6 +296,7 @@ mod tests {
         let config = AppConfig::load(file.path()).unwrap();
 
         assert_eq!(config.server.private_key, "abc123");
+        assert_eq!(config.server.shutdown_timeout_secs, 10); // default
         assert_eq!(config.relays.clearnet.len(), 1);
         assert!(!config.apns.enabled);
         assert!(!config.fcm.enabled);
@@ -326,6 +337,7 @@ mod tests {
         let config_content = r#"
             [server]
             private_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            shutdown_timeout_secs = 30
 
             [relays]
             clearnet = ["wss://relay1.example.com", "wss://relay2.example.com"]
@@ -363,6 +375,7 @@ mod tests {
             config.server.private_key,
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
+        assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.relays.clearnet.len(), 2);
         assert_eq!(config.relays.onion.len(), 1);
         assert_eq!(config.relays.reconnect_interval_secs, 10);
@@ -390,6 +403,7 @@ mod tests {
         let config = AppConfig::load(file.path()).unwrap();
 
         // Check defaults
+        assert_eq!(config.server.shutdown_timeout_secs, 10);
         assert!(config.relays.clearnet.is_empty());
         assert!(config.relays.onion.is_empty());
         assert_eq!(config.relays.reconnect_interval_secs, 5);
@@ -419,6 +433,7 @@ mod tests {
         let config = AppConfig::from_env().unwrap();
 
         // Should have default values
+        assert_eq!(config.server.shutdown_timeout_secs, 10);
         assert!(config.relays.clearnet.is_empty());
         assert!(config.relays.onion.is_empty());
         assert_eq!(config.relays.reconnect_interval_secs, 5);
@@ -460,6 +475,11 @@ mod tests {
     fn test_logging_config_defaults() {
         assert_eq!(default_log_level(), "info");
         assert_eq!(default_log_format(), "json");
+    }
+
+    #[test]
+    fn test_server_config_defaults() {
+        assert_eq!(default_shutdown_timeout(), 10);
     }
 
     #[test]

@@ -6,6 +6,10 @@
 # REQUIRED: Set via TRANSPONDER_SERVER_PRIVATE_KEY environment variable
 private_key = ""
 
+# Graceful shutdown timeout in seconds
+# Increase this for environments with slow networks or high in-flight notification counts
+shutdown_timeout_secs = 10
+
 [relays]
 # ClearNet relays to subscribe to
 clearnet = [
