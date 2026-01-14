@@ -41,6 +41,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Utilities
 thiserror = "2"
+zeroize = { version = "1.8", features = ["derive"] }
 anyhow = "1.0"
 base64 = "0.22"
 hex = "0.4.3"
