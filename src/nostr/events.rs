@@ -28,6 +28,18 @@ const DEDUP_WINDOW: Duration = Duration::from_secs(300);
 /// reclamation. The LRU eviction handles capacity limits regardless.
 const CLEANUP_BATCH_SIZE: usize = 1000;
 
+// Compile-time assertions to ensure CLEANUP_BATCH_SIZE is reasonable:
+// - Large enough to make progress on cleanup (>= 100)
+// - Small enough to avoid long lock holds (<= 10,000)
+const _: () = assert!(
+    CLEANUP_BATCH_SIZE >= 100,
+    "Batch size too small for efficient cleanup"
+);
+const _: () = assert!(
+    CLEANUP_BATCH_SIZE <= 10_000,
+    "Batch size too large, may cause lock contention"
+);
+
 /// Default maximum size for the deduplication cache.
 ///
 /// This value (100,000 entries) provides a reasonable upper bound on memory
@@ -511,21 +523,6 @@ mod tests {
         assert!(processor.is_duplicate(&event_ids[0]).await);
         assert!(processor.is_duplicate(&event_ids[2]).await);
         assert!(processor.is_duplicate(&event_ids[3]).await);
-    }
-
-    #[test]
-    fn test_cleanup_batch_size_is_reasonable() {
-        // Verify the batch size constant is set appropriately:
-        // - Large enough to make progress on cleanup
-        // - Small enough to avoid long lock holds
-        assert!(
-            CLEANUP_BATCH_SIZE >= 100,
-            "Batch size too small for efficient cleanup"
-        );
-        assert!(
-            CLEANUP_BATCH_SIZE <= 10_000,
-            "Batch size too large, may cause lock contention"
-        );
     }
 
     #[tokio::test]
