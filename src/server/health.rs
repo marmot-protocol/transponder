@@ -5,13 +5,15 @@
 use std::sync::Arc;
 
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::config::HealthConfig;
 use crate::error::Result;
+use crate::metrics::Metrics;
 use crate::nostr::client::RelayClient;
 use crate::push::PushDispatcher;
 
@@ -36,6 +38,7 @@ struct ReadyResponse {
 struct HealthState {
     relay_client: Arc<RelayClient>,
     push_dispatcher: Arc<PushDispatcher>,
+    metrics: Option<Metrics>,
 }
 
 /// Health check HTTP server.
@@ -43,6 +46,7 @@ pub struct HealthServer {
     config: HealthConfig,
     relay_client: Arc<RelayClient>,
     push_dispatcher: Arc<PushDispatcher>,
+    metrics: Option<Metrics>,
 }
 
 impl HealthServer {
@@ -51,11 +55,13 @@ impl HealthServer {
         config: HealthConfig,
         relay_client: Arc<RelayClient>,
         push_dispatcher: Arc<PushDispatcher>,
+        metrics: Option<Metrics>,
     ) -> Self {
         Self {
             config,
             relay_client,
             push_dispatcher,
+            metrics,
         }
     }
 
@@ -71,11 +77,13 @@ impl HealthServer {
         let state = Arc::new(HealthState {
             relay_client: self.relay_client.clone(),
             push_dispatcher: self.push_dispatcher.clone(),
+            metrics: self.metrics.clone(),
         });
 
         let app = Router::new()
             .route("/health", get(health_handler))
             .route("/ready", get(ready_handler))
+            .route("/metrics", get(metrics_handler))
             .with_state(state);
 
         let listener = TcpListener::bind(&self.config.bind_address)
@@ -128,6 +136,36 @@ async fn ready_handler(State(state): State<Arc<HealthState>>) -> impl IntoRespon
         (StatusCode::OK, Json(response))
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(response))
+    }
+}
+
+/// Prometheus metrics handler.
+async fn metrics_handler(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
+    let Some(metrics) = &state.metrics else {
+        return (StatusCode::NOT_FOUND, "Metrics disabled".to_string());
+    };
+
+    let metric_families = metrics.gather();
+    let encoder = TextEncoder::new();
+    let mut buffer = vec![];
+
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        error!(error = %e, "Failed to encode metrics");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to encode metrics".to_string(),
+        );
+    }
+
+    match String::from_utf8(buffer) {
+        Ok(s) => (StatusCode::OK, s),
+        Err(e) => {
+            error!(error = %e, "Failed to convert metrics buffer to string");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to convert metrics to string".to_string(),
+            )
+        }
     }
 }
 
@@ -190,7 +228,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
 
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -249,7 +287,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -300,7 +338,7 @@ mod tests {
             bind_address: "127.0.0.1:0".to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -344,7 +382,7 @@ mod tests {
             bind_address: invalid_address.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 

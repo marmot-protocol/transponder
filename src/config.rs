@@ -27,6 +27,9 @@ pub struct AppConfig {
     /// Health check server configuration.
     pub health: HealthConfig,
 
+    /// Metrics configuration.
+    pub metrics: MetricsConfig,
+
     /// Logging configuration.
     pub logging: LoggingConfig,
 }
@@ -167,6 +170,18 @@ fn default_health_bind_address() -> String {
     "0.0.0.0:8080".to_string()
 }
 
+/// Metrics configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Whether metrics are enabled.
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+
 /// Logging configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
@@ -217,6 +232,7 @@ impl AppConfig {
             .set_default("fcm.project_id", "")?
             .set_default("health.enabled", true)?
             .set_default("health.bind_address", "0.0.0.0:8080")?
+            .set_default("metrics.enabled", true)?
             .set_default("logging.level", "info")?
             .set_default("logging.format", "json")?
             // Load from config file
@@ -259,6 +275,7 @@ impl AppConfig {
             .set_default("fcm.project_id", "")?
             .set_default("health.enabled", true)?
             .set_default("health.bind_address", "0.0.0.0:8080")?
+            .set_default("metrics.enabled", true)?
             .set_default("logging.level", "info")?
             .set_default("logging.format", "json")?
             // Load from environment
@@ -321,6 +338,9 @@ mod tests {
             [health]
             enabled = true
 
+            [metrics]
+            enabled = true
+
             [logging]
             level = "info"
         "#;
@@ -333,6 +353,7 @@ mod tests {
         assert_eq!(config.relays.clearnet.len(), 1);
         assert!(!config.apns.enabled);
         assert!(!config.fcm.enabled);
+        assert!(config.metrics.enabled);
     }
 
     #[test]
@@ -396,6 +417,9 @@ mod tests {
             enabled = true
             bind_address = "127.0.0.1:9090"
 
+            [metrics]
+            enabled = true
+
             [logging]
             level = "debug"
             format = "pretty"
@@ -420,6 +444,7 @@ mod tests {
         assert!(config.fcm.enabled);
         assert_eq!(config.fcm.project_id, "my-project");
         assert_eq!(config.health.bind_address, "127.0.0.1:9090");
+        assert!(config.metrics.enabled);
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.format, "pretty");
     }
@@ -505,6 +530,11 @@ mod tests {
     fn test_health_config_defaults() {
         assert!(default_health_enabled());
         assert_eq!(default_health_bind_address(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn test_metrics_config_defaults() {
+        assert!(default_metrics_enabled());
     }
 
     #[test]

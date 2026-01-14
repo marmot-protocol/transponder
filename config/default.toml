@@ -66,6 +66,11 @@ enabled = true
 # Address to bind the health check server to
 bind_address = "0.0.0.0:8080"
 
+[metrics]
+# Whether Prometheus metrics are enabled
+# Metrics are exposed at /metrics on the health server port
+enabled = true
+
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error", "off"
 level = "info"

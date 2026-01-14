@@ -8,6 +8,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::warn;
 
+use crate::metrics::Metrics;
+
 /// Default maximum number of retry attempts.
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
 
@@ -60,6 +62,7 @@ pub async fn with_retry<F, Fut>(
     config: &RetryConfig,
     service_name: &str,
     mut operation: F,
+    metrics: Option<&Metrics>,
 ) -> crate::error::Result<bool>
 where
     F: FnMut() -> Fut,
@@ -76,6 +79,10 @@ where
                 retry_after,
             } if retries < config.max_retries => {
                 retries += 1;
+
+                if let Some(metrics) = metrics {
+                    metrics.record_push_retry(service_name.to_lowercase().as_str());
+                }
 
                 // Use Retry-After header if provided, otherwise use exponential backoff
                 let wait_duration = retry_after.unwrap_or(backoff).min(MAX_BACKOFF);
@@ -166,13 +173,18 @@ mod tests {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let attempt_count_clone = attempt_count.clone();
 
-        let result = with_retry(&config, "test", || {
-            let count = attempt_count_clone.clone();
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                SendAttemptResult::Success(true)
-            }
-        })
+        let result = with_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    SendAttemptResult::Success(true)
+                }
+            },
+            None,
+        )
         .await;
 
         assert!(result.is_ok());
@@ -189,20 +201,25 @@ mod tests {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let attempt_count_clone = attempt_count.clone();
 
-        let result = with_retry(&config, "test", || {
-            let count = attempt_count_clone.clone();
-            async move {
-                let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
-                if attempts < 3 {
-                    SendAttemptResult::Retriable {
-                        status_code: 429,
-                        retry_after: None,
+        let result = with_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempts < 3 {
+                        SendAttemptResult::Retriable {
+                            status_code: 429,
+                            retry_after: None,
+                        }
+                    } else {
+                        SendAttemptResult::Success(true)
                     }
-                } else {
-                    SendAttemptResult::Success(true)
                 }
-            }
-        })
+            },
+            None,
+        )
         .await;
 
         assert!(result.is_ok());
@@ -219,16 +236,21 @@ mod tests {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let attempt_count_clone = attempt_count.clone();
 
-        let result = with_retry(&config, "test", || {
-            let count = attempt_count_clone.clone();
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                SendAttemptResult::Retriable {
-                    status_code: 503,
-                    retry_after: None,
+        let result = with_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    SendAttemptResult::Retriable {
+                        status_code: 503,
+                        retry_after: None,
+                    }
                 }
-            }
-        })
+            },
+            None,
+        )
         .await;
 
         assert!(result.is_ok());
@@ -243,13 +265,20 @@ mod tests {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let attempt_count_clone = attempt_count.clone();
 
-        let result = with_retry(&config, "test", || {
-            let count = attempt_count_clone.clone();
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                SendAttemptResult::Permanent(crate::error::Error::Apns("Auth error".to_string()))
-            }
-        })
+        let result = with_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    SendAttemptResult::Permanent(crate::error::Error::Apns(
+                        "Auth error".to_string(),
+                    ))
+                }
+            },
+            None,
+        )
         .await;
 
         assert!(result.is_err());
@@ -267,20 +296,25 @@ mod tests {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let attempt_count_clone = attempt_count.clone();
 
-        let _ = with_retry(&config, "test", || {
-            let count = attempt_count_clone.clone();
-            async move {
-                let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
-                if attempts == 1 {
-                    SendAttemptResult::Retriable {
-                        status_code: 429,
-                        retry_after: Some(Duration::from_millis(10)), // Short retry-after
+        let _ = with_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempts == 1 {
+                        SendAttemptResult::Retriable {
+                            status_code: 429,
+                            retry_after: Some(Duration::from_millis(10)), // Short retry-after
+                        }
+                    } else {
+                        SendAttemptResult::Success(true)
                     }
-                } else {
-                    SendAttemptResult::Success(true)
                 }
-            }
-        })
+            },
+            None,
+        )
         .await;
 
         let elapsed = start.elapsed();
@@ -292,9 +326,12 @@ mod tests {
     async fn test_with_retry_success_false() {
         let config = RetryConfig::default();
 
-        let result = with_retry(&config, "test", || async {
-            SendAttemptResult::Success(false)
-        })
+        let result = with_retry(
+            &config,
+            "test",
+            || async { SendAttemptResult::Success(false) },
+            None,
+        )
         .await;
 
         assert!(result.is_ok());

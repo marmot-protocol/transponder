@@ -3,7 +3,7 @@
 //! Uses token-based (JWT) authentication with a .p8 key file.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
@@ -13,6 +13,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::config::ApnsConfig;
 use crate::error::{Error, Result};
+use crate::metrics::Metrics;
 use crate::push::retry::{self, RetryConfig, SendAttemptResult};
 
 /// APNs JWT token lifetime (50 minutes, less than the 1 hour max).
@@ -85,11 +86,18 @@ pub struct ApnsClient {
     pub(crate) config: ApnsConfig,
     pub(crate) encoding_key: Option<EncodingKey>,
     pub(crate) cached_token: Arc<RwLock<Option<CachedToken>>>,
+    pub(crate) metrics: Option<Metrics>,
 }
 
 impl ApnsClient {
     /// Create a new APNs client.
+    #[allow(dead_code)]
     pub async fn new(config: ApnsConfig) -> Result<Self> {
+        Self::with_metrics(config, None).await
+    }
+
+    /// Create a new APNs client with metrics.
+    pub async fn with_metrics(config: ApnsConfig, metrics: Option<Metrics>) -> Result<Self> {
         let http_client = Client::builder()
             .http2_prior_knowledge()
             .timeout(Duration::from_secs(30))
@@ -119,6 +127,7 @@ impl ApnsClient {
             config,
             encoding_key,
             cached_token: Arc::new(RwLock::new(None)),
+            metrics,
         })
     }
 
@@ -175,6 +184,10 @@ impl ApnsClient {
 
         let token = encode(&header, &claims, encoding_key)?;
 
+        if let Some(metrics) = &self.metrics {
+            metrics.record_auth_token_refresh("apns_jwt");
+        }
+
         trace!("Generated new APNs JWT token");
         Ok(token)
     }
@@ -197,13 +210,20 @@ impl ApnsClient {
         }
 
         let retry_config = RetryConfig::default();
-        retry::with_retry(&retry_config, "APNs", || self.send_once(device_token)).await
+        retry::with_retry(
+            &retry_config,
+            "APNs",
+            || self.send_once(device_token),
+            self.metrics.as_ref(),
+        )
+        .await
     }
 
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
     async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+        let start = Instant::now();
         let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
 
         let payload = ApnsPayload::default();
@@ -229,6 +249,11 @@ impl ApnsClient {
         };
 
         let status = response.status();
+
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_push_duration("apns", start.elapsed().as_secs_f64());
+            metrics.record_push_response_status("apns", status.as_u16());
+        }
 
         match status.as_u16() {
             200 => {
@@ -313,6 +338,7 @@ impl ApnsClient {
                 None
             },
             cached_token: Arc::new(RwLock::new(None)),
+            metrics: None,
         }
     }
 }
@@ -420,6 +446,7 @@ mod tests {
                 token: "test-token".to_string(),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
+            metrics: None,
         };
 
         // Test with token that's too short
@@ -495,6 +522,7 @@ mod tests {
                 token: "test-token".to_string(),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
+            metrics: None,
         };
 
         // We need to override the base_url - let's test with a modified approach
@@ -931,6 +959,7 @@ mod tests {
                 token: "test-cached-token".to_string(),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
+            metrics: None,
         };
 
         // The send method uses self.config.base_url() which returns the real APNs URL,
@@ -1146,6 +1175,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
                 token: "test-token".to_string(),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
+            metrics: None,
         };
 
         // Manually test the response handling logic by making a direct request
