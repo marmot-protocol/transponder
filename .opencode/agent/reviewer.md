@@ -139,9 +139,56 @@ Analyze code for these concern types:
 
 ## Output Format
 
-Output a **Review Summary** then create individual **GitHub Issues** using the `gh` tool for each finding (all severities get their own issue).
+For each finding, you **MUST run `gh issue create`** to create a GitHub issue. Do not just output markdown — actually execute the command.
+
+After creating all issues, output a **Review Summary** listing the created issue numbers.
+
+### Creating GitHub Issues
+
+For each finding, **run this command** (substitute the actual values):
+
+```bash
+gh issue create \
+  --title "[SEVERITY] Brief description of the problem" \
+  --label "severity:high" \
+  --label "area:security" \
+  --body "## Summary
+
+One-sentence description of the issue.
+
+## Location
+
+- **File:** \`path/to/file.rs\`
+- **Lines:** 42-48
+- **Function:** \`decrypt_token()\`
+
+## Problem
+
+Explain what's wrong and why it matters. Be specific about the failure mode, attack vector, or improvement opportunity.
+
+## Evidence
+
+\`\`\`rust
+// The problematic code snippet
+\`\`\`
+
+## Recommendation
+
+What should be done instead (conceptually, not a code patch). Reference relevant docs/RFCs if applicable.
+
+## References
+
+- Related issues: #N (if any)
+- Docs: Link to relevant specification or security guidance"
+```
+
+**Label values:**
+- Severity: `severity:critical`, `severity:high`, `severity:medium`, `severity:low`, `severity:info`
+- Area: `area:security`, `area:crypto`, `area:performance`, `area:logic`, `area:api`
 
 ### Review Summary
+
+After creating all issues, output a summary:
 
 ```markdown
 ## Review Summary
@@ -156,49 +203,6 @@ Output a **Review Summary** then create individual **GitHub Issues** using the `
 | medium   | N     | #4, #5 |
 | low      | N     | #6     |
 | info     | N     | #7     |
-```
-
-### GitHub Issue Format
-
-For each finding, output a structured issue:
-
-```markdown
----
-**Issue Title:** [SEVERITY] Brief description of the problem
-
-**Labels:** `severity:critical|high|medium|low|info`, `area:security|crypto|performance|logic|api`
-
-**Body:**
-
-## Summary
-
-One-sentence description of the issue.
-
-## Location
-
-- **File:** `path/to/file.rs`
-- **Lines:** 42-48
-- **Function:** `decrypt_token()`
-
-## Problem
-
-Explain what's wrong and why it matters. Be specific about the failure mode, attack vector, or improvement opportunity.
-
-## Evidence
-
-```rust
-// The problematic code snippet
-```
-
-## Recommendation
-
-What should be done instead (conceptually, not a code patch). Reference relevant docs/RFCs if applicable.
-
-## References
-
-- Related issues: #N (if any)
-- Docs: Link to relevant specification or security guidance
----
 ```
 
 ## Review Process
