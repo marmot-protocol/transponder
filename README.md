@@ -104,6 +104,11 @@ enabled = true
 # Use "127.0.0.1:8080" to restrict to localhost only
 bind_address = "0.0.0.0:8080"
 
+[metrics]
+# Whether Prometheus metrics are enabled
+# Metrics are exposed at /metrics on the health server port
+enabled = true
+
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error", "off"
 level = "info"
@@ -186,24 +191,25 @@ docker run -d \
 
 ### Docker Compose
 
-```yaml
-version: '3.8'
-services:
-  transponder:
-    build: .
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config/local.toml:/etc/transponder/config.toml:ro
-      - ./credentials:/credentials:ro
-    environment:
-      TRANSPONDER_SERVER_PRIVATE_KEY: "${TRANSPONDER_PRIVATE_KEY}"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+A `docker-compose.yml` is included with Transponder, Prometheus, and Grafana services:
+
+```bash
+# Start all services (Transponder + monitoring stack)
+docker compose up -d
+
+# Start only Transponder
+docker compose up -d transponder
+
+# View logs
+docker compose logs -f transponder
 ```
+
+Services and ports:
+- **Transponder**: `http://localhost:8080` (health, readiness, metrics)
+- **Prometheus**: `http://localhost:9090` (metrics storage and queries)
+- **Grafana**: `http://localhost:3000` (dashboards, default login: admin/admin)
+
+See [Monitoring with Prometheus & Grafana](#monitoring-with-prometheus--grafana) for more details.
 
 ## Health Checks
 
@@ -213,6 +219,7 @@ When enabled, Transponder exposes HTTP endpoints for monitoring:
 |----------|-------------|---------|
 | `GET /health` | Liveness check - is the server running? | Always 200 OK |
 | `GET /ready` | Readiness check - can the server process requests? | 200 if relays connected and at least one push service configured |
+| `GET /metrics` | Prometheus metrics (when metrics enabled) | 200 with metrics in Prometheus text format |
 
 ### Readiness Response
 
@@ -223,6 +230,134 @@ When enabled, Transponder exposes HTTP endpoints for monitoring:
   "apns_configured": true,
   "fcm_configured": false
 }
+```
+
+## Metrics
+
+Transponder exposes Prometheus metrics at `/metrics` on the health server port (default 8080). Metrics are enabled by default and can be disabled via configuration.
+
+### Available Metrics
+
+#### Event Processing
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `transponder_events_received_total` | Counter | Total events received from relays |
+| `transponder_events_processed_total` | Counter | Total events successfully processed |
+| `transponder_events_deduplicated_total` | Counter | Total events skipped (already processed) |
+| `transponder_events_failed_total` | Counter | Total events that failed processing |
+| `transponder_dedup_cache_size` | Gauge | Current deduplication cache size |
+| `transponder_dedup_cache_evictions_total` | Counter | Total dedup cache evictions |
+| `transponder_tokens_decrypted_total` | Counter | Total tokens successfully decrypted |
+| `transponder_tokens_decryption_failed_total` | Counter | Total token decryption failures |
+
+#### Push Notifications
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `transponder_push_dispatched_total` | Counter | `platform` | Notifications dispatched to push services |
+| `transponder_push_success_total` | Counter | `platform` | Successful push notifications |
+| `transponder_push_failed_total` | Counter | `platform`, `reason` | Failed push notifications |
+| `transponder_push_queue_size` | Gauge | - | Current push queue size |
+| `transponder_push_queue_dropped_total` | Counter | - | Notifications dropped (queue full) |
+| `transponder_push_semaphore_available` | Gauge | - | Available concurrent push permits |
+| `transponder_push_retries_total` | Counter | `platform` | Push retry attempts |
+| `transponder_push_request_duration_seconds` | Histogram | `platform` | Push request duration |
+| `transponder_push_response_status_total` | Counter | `platform`, `status` | Push responses by HTTP status |
+| `transponder_auth_token_refreshes_total` | Counter | `service` | Auth token refreshes (JWT/OAuth) |
+
+#### Relay Connections
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `transponder_relays_connected` | Gauge | `type` | Currently connected relays |
+| `transponder_relays_configured` | Gauge | `type` | Configured relays |
+
+#### Server Info
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `transponder_server_start_time_seconds` | Gauge | - | Unix timestamp when server started |
+| `transponder_server_info` | Gauge | `version` | Server version info |
+
+### Security Note
+
+All metrics are designed to be safe for exposure. They do not include device tokens, user identifiers, message content, or relay URLs.
+
+## Monitoring with Prometheus & Grafana
+
+The repository includes a ready-to-use monitoring stack with Prometheus and Grafana via Docker Compose.
+
+### Quick Start
+
+```bash
+# Start Transponder with the full monitoring stack
+docker compose up -d
+
+# Access the services:
+# - Transponder health: http://localhost:8080/health
+# - Transponder metrics: http://localhost:8080/metrics
+# - Prometheus: http://localhost:9090
+# - Grafana: http://localhost:3000 (admin/admin)
+```
+
+### Architecture
+
+```
+┌─────────────┐     scrape      ┌────────────┐     query     ┌─────────┐
+│ Transponder │◄────────────────│ Prometheus │◄──────────────│ Grafana │
+│  :8080      │    /metrics     │  :9090     │               │  :3000  │
+└─────────────┘                 └────────────┘               └─────────┘
+```
+
+### Configuration Files
+
+| File | Description |
+|------|-------------|
+| `docker-compose.yml` | Service definitions for all containers |
+| `monitoring/prometheus/prometheus.yml` | Prometheus scrape configuration |
+| `monitoring/grafana/provisioning/datasources/datasource.yml` | Grafana datasource setup |
+
+### Prometheus Configuration
+
+The default Prometheus configuration scrapes Transponder metrics every 15 seconds:
+
+```yaml
+# monitoring/prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'transponder'
+    static_configs:
+      - targets: ['transponder:8080']
+```
+
+### Example PromQL Queries
+
+```promql
+# Push notification success rate (last 5 minutes)
+sum(rate(transponder_push_success_total[5m])) / sum(rate(transponder_push_dispatched_total[5m]))
+
+# Events processed per second
+rate(transponder_events_processed_total[1m])
+
+# Push request latency (p99)
+histogram_quantile(0.99, rate(transponder_push_request_duration_seconds_bucket[5m]))
+
+# Current relay connections by type
+transponder_relays_connected
+
+# Token decryption failure rate
+rate(transponder_tokens_decryption_failed_total[5m]) / rate(transponder_tokens_decrypted_total[5m])
+```
+
+### Running Without Monitoring
+
+To run only Transponder without Prometheus and Grafana:
+
+```bash
+docker compose up -d transponder
 ```
 
 ## How It Works

@@ -91,9 +91,22 @@ src/
 │   ├── apns.rs       # APNs HTTP/2 client with JWT token auth
 │   ├── fcm.rs        # FCM v1 API client with OAuth2
 │   └── dispatcher.rs # Push routing with semaphore-based concurrency (100 max)
-└── server/
-    ├── mod.rs        # Module exports
-    └── health.rs     # Health check HTTP endpoints (/health, /ready)
+├── server/
+│   ├── mod.rs        # Module exports
+│   └── health.rs     # Health check HTTP endpoints (/health, /ready, /metrics)
+└── metrics.rs        # Prometheus metrics collection
+```
+
+### Monitoring Stack
+
+```
+monitoring/
+├── prometheus/
+│   └── prometheus.yml    # Prometheus scrape config (targets transponder:8080)
+└── grafana/
+    └── provisioning/
+        └── datasources/
+            └── datasource.yml  # Auto-provisions Prometheus datasource
 ```
 
 ## Key Implementation Details
@@ -118,6 +131,16 @@ src/
 ### Health Server (server/health.rs)
 - `/health` - Always returns 200 OK (liveness)
 - `/ready` - Returns 200 if relays connected AND at least one push service configured
+- `/metrics` - Prometheus metrics endpoint (when metrics enabled)
+
+### Metrics (metrics.rs)
+- All metrics prefixed with `transponder_`
+- Event processing: received, processed, deduplicated, failed counts
+- Push notifications: dispatched, success, failed (by platform/reason), queue size, retries
+- Push client: request duration histogram, response status codes, auth token refreshes
+- Relay connections: connected/configured counts by type (clearnet/onion)
+- Server info: start time, version
+- **Security**: No sensitive data (tokens, user IDs, relay URLs) in metrics
 
 ## Security Considerations
 
@@ -142,6 +165,7 @@ src/
 | `tokio` | Async runtime |
 | `tracing` | Structured logging |
 | `config` | Configuration loading with env overrides |
+| `prometheus` | Prometheus metrics collection |
 
 ## Configuration
 
