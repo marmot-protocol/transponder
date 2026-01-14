@@ -254,9 +254,12 @@ async fn main() -> Result<()> {
     info!("Initiating graceful shutdown");
 
     // Wait for in-flight push notifications
-    shutdown::graceful_shutdown(|| async {
-        push_dispatcher.wait_for_completion().await;
-    })
+    shutdown::graceful_shutdown(
+        || async {
+            push_dispatcher.wait_for_completion().await;
+        },
+        config.server.shutdown_timeout_secs,
+    )
     .await;
 
     // Disconnect from relays

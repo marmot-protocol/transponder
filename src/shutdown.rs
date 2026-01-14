@@ -70,21 +70,23 @@ impl Default for ShutdownHandler {
     }
 }
 
-/// Graceful shutdown timeout.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Perform graceful shutdown with timeout.
-pub async fn graceful_shutdown<F, Fut>(shutdown_fn: F)
+/// Perform graceful shutdown with configurable timeout.
+///
+/// # Arguments
+/// * `shutdown_fn` - The async function to execute during shutdown
+/// * `timeout_secs` - Timeout in seconds before forcefully terminating
+pub async fn graceful_shutdown<F, Fut>(shutdown_fn: F, timeout_secs: u64)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    match timeout(SHUTDOWN_TIMEOUT, shutdown_fn()).await {
+    let timeout_duration = Duration::from_secs(timeout_secs);
+    match timeout(timeout_duration, shutdown_fn()).await {
         Ok(()) => {
             info!("Graceful shutdown completed");
         }
         Err(_) => {
-            warn!("Graceful shutdown timed out after {:?}", SHUTDOWN_TIMEOUT);
+            warn!("Graceful shutdown timed out after {:?}", timeout_duration);
         }
     }
 }
@@ -140,10 +142,13 @@ mod tests {
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
 
-        graceful_shutdown(|| async move {
-            // Simulate quick shutdown
-            completed_clone.store(true, Ordering::SeqCst);
-        })
+        graceful_shutdown(
+            || async move {
+                // Simulate quick shutdown
+                completed_clone.store(true, Ordering::SeqCst);
+            },
+            10,
+        )
         .await;
 
         assert!(completed.load(Ordering::SeqCst));
@@ -154,19 +159,42 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Note: This test would take 10 seconds if we actually waited for the timeout.
-        // We're testing that the function handles long-running tasks.
-        // For now, we just verify the function accepts our closure.
+        // Test that shutdown times out after the specified duration
         let started = Arc::new(AtomicBool::new(false));
         let started_clone = started.clone();
 
-        graceful_shutdown(|| async move {
-            started_clone.store(true, Ordering::SeqCst);
-            // Don't actually sleep for 20 seconds in tests
-        })
+        // Use a very short timeout (1 second) and a task that takes longer
+        graceful_shutdown(
+            || async move {
+                started_clone.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            },
+            1,
+        )
         .await;
 
+        // The task started but the function should have returned due to timeout
         assert!(started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_custom_timeout() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = completed.clone();
+
+        // Test with a custom timeout value
+        graceful_shutdown(
+            || async move {
+                completed_clone.store(true, Ordering::SeqCst);
+            },
+            30,
+        )
+        .await;
+
+        assert!(completed.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

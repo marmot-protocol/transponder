@@ -6,6 +6,10 @@
 # REQUIRED: Set via TRANSPONDER_SERVER_PRIVATE_KEY environment variable
 private_key = ""
 
+# Graceful shutdown timeout in seconds
+# Increase this for environments with slow networks or high in-flight notification counts
+shutdown_timeout_secs = 10
+
 # Maximum size for the event deduplication cache.
 # The cache uses LRU eviction to prevent unbounded memory growth.
 # Default: 100000
