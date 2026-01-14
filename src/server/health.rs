@@ -142,7 +142,11 @@ async fn ready_handler(State(state): State<Arc<HealthState>>) -> impl IntoRespon
 /// Prometheus metrics handler.
 async fn metrics_handler(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
     let Some(metrics) = &state.metrics else {
-        return (StatusCode::NOT_FOUND, "Metrics disabled".to_string());
+        return (
+            StatusCode::NOT_FOUND,
+            [("content-type", "text/plain")],
+            vec![],
+        );
     };
 
     let metric_families = metrics.gather();
@@ -153,20 +157,16 @@ async fn metrics_handler(State(state): State<Arc<HealthState>>) -> impl IntoResp
         error!(error = %e, "Failed to encode metrics");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to encode metrics".to_string(),
+            [("content-type", "text/plain")],
+            b"Failed to encode metrics".to_vec(),
         );
     }
 
-    match String::from_utf8(buffer) {
-        Ok(s) => (StatusCode::OK, s),
-        Err(e) => {
-            error!(error = %e, "Failed to convert metrics buffer to string");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to convert metrics to string".to_string(),
-            )
-        }
-    }
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        buffer,
+    )
 }
 
 #[cfg(test)]

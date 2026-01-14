@@ -310,6 +310,7 @@ impl PushDispatcher {
                     if let Some(ref m) = self.metrics {
                         m.record_push_dispatched(platform_str);
                         // Update queue size (approximate - capacity minus available)
+                        // tokio::mpsc::Sender::capacity() returns available permits
                         m.set_push_queue_size(MAX_PENDING_QUEUE_SIZE - self.sender.capacity());
                     }
                 }
