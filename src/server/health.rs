@@ -174,6 +174,7 @@ mod tests {
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
         };
 
         let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
@@ -231,6 +232,7 @@ mod tests {
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
         };
 
         // Client not connected, no push services
@@ -287,6 +289,7 @@ mod tests {
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
         };
 
         let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
@@ -328,6 +331,7 @@ mod tests {
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
         };
 
         let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());

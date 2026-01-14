@@ -4,6 +4,7 @@
 //! and automatic reconnection.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 use tokio::sync::{RwLock, broadcast};
@@ -52,6 +53,10 @@ impl RelayClient {
     }
 
     /// Connect to all configured relays.
+    ///
+    /// This method initiates connections to all configured relays and waits up to
+    /// `connection_timeout_secs` for at least one relay to establish a connection.
+    /// The timeout allows for network latency and relay responsiveness during startup.
     pub async fn connect(&self) -> Result<()> {
         // Add ClearNet relays
         for url in &self.config.clearnet {
@@ -77,25 +82,50 @@ impl RelayClient {
             }
         }
 
-        // Connect to all added relays
+        // Connect to all added relays (nostr-sdk connects in the background)
         self.client.connect().await;
 
-        // Update status
-        self.update_status().await;
+        // Wait for at least one relay to connect with timeout
+        let timeout = Duration::from_secs(self.config.connection_timeout_secs);
+        let poll_interval = Duration::from_millis(100);
+        let start = std::time::Instant::now();
 
-        let status = self.status.read().await;
         info!(
-            clearnet = status.clearnet_connected,
-            tor = status.tor_connected,
-            total = status.total_configured,
-            "Connected to relays"
+            timeout_secs = self.config.connection_timeout_secs,
+            "Waiting for relay connections"
         );
 
-        if status.clearnet_connected + status.tor_connected == 0 {
-            return Err(Error::Nostr("Failed to connect to any relay".to_string()));
-        }
+        loop {
+            self.update_status().await;
+            let status = self.status.read().await;
+            let connected = status.clearnet_connected + status.tor_connected;
 
-        Ok(())
+            if connected > 0 {
+                info!(
+                    clearnet = status.clearnet_connected,
+                    tor = status.tor_connected,
+                    total = status.total_configured,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "Connected to relays"
+                );
+                return Ok(());
+            }
+
+            if start.elapsed() >= timeout {
+                warn!(
+                    timeout_secs = self.config.connection_timeout_secs,
+                    total_configured = status.total_configured,
+                    "Timeout waiting for relay connections"
+                );
+                return Err(Error::Nostr(format!(
+                    "Failed to connect to any relay within {} seconds",
+                    self.config.connection_timeout_secs
+                )));
+            }
+
+            drop(status); // Release lock before sleeping
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Subscribe to gift-wrapped events for the server's public key.
@@ -218,6 +248,7 @@ mod tests {
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
+            connection_timeout_secs: 5, // Short timeout for tests
         }
     }
 
@@ -284,13 +315,25 @@ mod tests {
     #[tokio::test]
     async fn test_relay_client_fails_with_no_relays() {
         let keys = Keys::generate();
-        let config = test_relay_config(vec![]);
+        let config = RelayConfig {
+            clearnet: vec![],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 1, // Very short timeout for test
+        };
 
         let client = RelayClient::new(keys, config).await.unwrap();
 
-        // Should fail because no relays are configured
+        // Should fail because no relays are configured (times out)
         let result = client.connect().await;
         assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to connect to any relay")
+        );
     }
 
     #[tokio::test]
@@ -406,6 +449,7 @@ mod tests {
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
         };
 
         let client = RelayClient::new(keys, config).await.unwrap();
@@ -418,7 +462,6 @@ mod tests {
     #[tokio::test]
     async fn test_publish_inbox_relays_with_configured_relays() {
         use nostr_relay_builder::MockRelay;
-        use std::time::Duration;
 
         // Start a mock relay
         let mock = MockRelay::run().await.unwrap();
@@ -430,6 +473,7 @@ mod tests {
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
         };
 
         let client = RelayClient::new(keys.clone(), config).await.unwrap();
@@ -457,6 +501,7 @@ mod tests {
             onion: vec!["ws://example.onion".to_string()],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
         };
 
         let client = RelayClient::new(keys, config).await.unwrap();
@@ -465,5 +510,67 @@ mod tests {
         let result = client.publish_inbox_relays().await;
         // The function always returns Ok, even if publishing fails
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_connect_waits_for_connection() {
+        use nostr_relay_builder::MockRelay;
+
+        // Start a mock relay
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let keys = Keys::generate();
+        let config = RelayConfig {
+            clearnet: vec![relay_url.to_string()],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 10, // Generous timeout
+        };
+
+        let client = RelayClient::new(keys, config).await.unwrap();
+
+        // The new connect() method should wait for the connection to establish
+        let result = client.connect().await;
+        assert!(result.is_ok(), "Should successfully connect to mock relay");
+
+        // Verify we're connected
+        let status = client.get_status().await;
+        assert_eq!(status.clearnet_connected, 1);
+
+        client.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_connect_times_out_with_unreachable_relay() {
+        let keys = Keys::generate();
+        let config = RelayConfig {
+            // Use a relay URL that won't connect
+            clearnet: vec!["ws://192.0.2.1:9999".to_string()], // TEST-NET address, won't route
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 2, // Short timeout for test
+        };
+
+        let client = RelayClient::new(keys, config).await.unwrap();
+
+        // Should fail after timeout because relay is unreachable
+        let start = std::time::Instant::now();
+        let result = client.connect().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "Should wait at least 2 seconds before timing out"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to connect to any relay within 2 seconds")
+        );
     }
 }
