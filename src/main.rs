@@ -93,7 +93,10 @@ async fn main() -> Result<()> {
 
     // Initialize crypto handlers
     let nip59_handler = Nip59Handler::new(keys.clone());
-    let token_decryptor = TokenDecryptor::new(keys.clone());
+    // Convert nostr_sdk SecretKey to secp256k1 SecretKey for TokenDecryptor
+    let secp_secret_key = secp256k1::SecretKey::from_slice(&keys.secret_key().to_secret_bytes())
+        .context("Failed to create secp256k1 secret key")?;
+    let token_decryptor = TokenDecryptor::new(secp_secret_key);
 
     // Initialize push clients
     let apns_client = if config.apns.enabled {
