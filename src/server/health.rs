@@ -509,4 +509,77 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
     }
+
+    #[tokio::test]
+    async fn test_ready_endpoint_ready() {
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+        use nostr_relay_builder::MockRelay;
+
+        // Start mock relay
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![relay_url.to_string()],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        // Create relay client and connect it
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        // Connect to the relay so is_connected() returns true
+        relay_client.connect().await.unwrap();
+
+        // Create mock APNs client that is configured
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+        let apns_client = ApnsClient::mock(apns_config, true);
+        let push_dispatcher = Arc::new(PushDispatcher::new(Some(apns_client), None));
+
+        // Find a free port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = HealthConfig {
+            enabled: true,
+            bind_address: addr.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{}/ready", addr))
+            .send()
+            .await
+            .unwrap();
+
+        // Should be 200 OK because relays are connected and APNs is configured
+        assert_eq!(response.status(), 200);
+        let body: ReadyResponse = response.json().await.unwrap();
+        assert_eq!(body.status, "ready");
+        assert!(body.relays_connected);
+        assert!(body.apns_configured);
+        assert!(!body.fcm_configured);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+    }
 }

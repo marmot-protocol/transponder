@@ -472,6 +472,7 @@ mod tests {
         assert!(!config.fcm.enabled);
         assert!(config.health.enabled);
         assert_eq!(config.health.bind_address, "0.0.0.0:8080");
+        assert!(config.metrics.enabled);
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, "json");
     }

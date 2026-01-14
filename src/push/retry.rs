@@ -337,4 +337,46 @@ mod tests {
         assert!(result.is_ok());
         assert!(!result.unwrap());
     }
+
+    #[tokio::test]
+    async fn test_with_retry_records_metrics() {
+        use crate::metrics::Metrics;
+
+        let config = RetryConfig {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(1),
+        };
+        let metrics = Metrics::new().unwrap();
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+
+        let result = with_retry(
+            &config,
+            "APNS",
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempts < 2 {
+                        SendAttemptResult::Retriable {
+                            status_code: 429,
+                            retry_after: None,
+                        }
+                    } else {
+                        SendAttemptResult::Success(true)
+                    }
+                }
+            },
+            Some(&metrics),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+
+        // Verify metrics were recorded - gather metrics and check they're non-empty
+        let families = metrics.registry.gather();
+        assert!(!families.is_empty());
+    }
 }
