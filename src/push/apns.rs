@@ -17,6 +17,9 @@ use crate::error::{Error, Result};
 /// APNs JWT token lifetime (50 minutes, less than the 1 hour max).
 const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
 
+/// APNs JWT expiration time (1 hour, Apple's maximum).
+const TOKEN_EXPIRATION_SECS: u64 = 3600;
+
 /// JWT claims for APNs authentication.
 #[derive(Debug, Serialize)]
 struct ApnsClaims {
@@ -24,6 +27,8 @@ struct ApnsClaims {
     iss: String,
     /// Issued at timestamp.
     iat: u64,
+    /// Expiration timestamp.
+    exp: u64,
 }
 
 /// Cached JWT token.
@@ -148,6 +153,7 @@ impl ApnsClient {
         let claims = ApnsClaims {
             iss: self.config.team_id.clone(),
             iat: now,
+            exp: now + TOKEN_EXPIRATION_SECS,
         };
 
         let mut header = Header::new(Algorithm::ES256);
@@ -886,6 +892,20 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
         let header: serde_json::Value = serde_json::from_slice(&header_json).unwrap();
         assert_eq!(header["kid"], "KEY123");
         assert_eq!(header["alg"], "ES256");
+
+        // Verify the claims contain iss, iat, and exp
+        let claims_json = base64::prelude::BASE64_URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&claims_json).unwrap();
+        assert_eq!(claims["iss"], "TEAM456");
+        assert!(claims["iat"].is_u64(), "iat should be a u64 timestamp");
+        assert!(claims["exp"].is_u64(), "exp should be a u64 timestamp");
+
+        // Verify exp is iat + 3600 (1 hour)
+        let iat = claims["iat"].as_u64().unwrap();
+        let exp = claims["exp"].as_u64().unwrap();
+        assert_eq!(exp - iat, 3600, "exp should be iat + 3600 seconds");
     }
 
     #[tokio::test]
