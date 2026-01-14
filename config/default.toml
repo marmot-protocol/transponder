@@ -29,6 +29,11 @@ onion = []
 reconnect_interval_secs = 5
 max_reconnect_attempts = 10
 
+# Timeout in seconds to wait for at least one relay to connect during startup.
+# Increase this for environments with slow networks or when using Tor relays.
+# Default: 30
+connection_timeout_secs = 30
+
 [apns]
 # Whether APNs (iOS) push notifications are enabled
 enabled = false

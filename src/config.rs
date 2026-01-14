@@ -79,6 +79,15 @@ pub struct RelayConfig {
     /// Maximum reconnection attempts (reserved for future use).
     #[serde(default = "default_max_reconnect_attempts")]
     pub max_reconnect_attempts: u32,
+
+    /// Timeout in seconds to wait for at least one relay to connect during startup.
+    /// Default: 30 seconds.
+    #[serde(default = "default_connection_timeout")]
+    pub connection_timeout_secs: u64,
+}
+
+fn default_connection_timeout() -> u64 {
+    30
 }
 
 fn default_reconnect_interval() -> u64 {
@@ -196,6 +205,7 @@ impl AppConfig {
             .set_default("relays.onion", Vec::<String>::new())?
             .set_default("relays.reconnect_interval_secs", 5)?
             .set_default("relays.max_reconnect_attempts", 10)?
+            .set_default("relays.connection_timeout_secs", 30)?
             .set_default("apns.enabled", false)?
             .set_default("apns.key_id", "")?
             .set_default("apns.team_id", "")?
@@ -237,6 +247,7 @@ impl AppConfig {
             .set_default("relays.onion", Vec::<String>::new())?
             .set_default("relays.reconnect_interval_secs", 5)?
             .set_default("relays.max_reconnect_attempts", 10)?
+            .set_default("relays.connection_timeout_secs", 30)?
             .set_default("apns.enabled", false)?
             .set_default("apns.key_id", "")?
             .set_default("apns.team_id", "")?
@@ -430,6 +441,7 @@ mod tests {
         assert!(config.relays.onion.is_empty());
         assert_eq!(config.relays.reconnect_interval_secs, 5);
         assert_eq!(config.relays.max_reconnect_attempts, 10);
+        assert_eq!(config.relays.connection_timeout_secs, 30);
         assert!(!config.apns.enabled);
         assert_eq!(config.apns.environment, "production");
         assert!(!config.fcm.enabled);
@@ -460,6 +472,7 @@ mod tests {
         assert!(config.relays.onion.is_empty());
         assert_eq!(config.relays.reconnect_interval_secs, 5);
         assert_eq!(config.relays.max_reconnect_attempts, 10);
+        assert_eq!(config.relays.connection_timeout_secs, 30);
         assert!(!config.apns.enabled);
         assert_eq!(config.apns.environment, "production");
         assert!(!config.fcm.enabled);
@@ -480,6 +493,7 @@ mod tests {
         // Test that default functions return correct values
         assert_eq!(default_reconnect_interval(), 5);
         assert_eq!(default_max_reconnect_attempts(), 10);
+        assert_eq!(default_connection_timeout(), 30);
     }
 
     #[test]
