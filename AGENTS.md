@@ -10,6 +10,10 @@ Key properties:
 - **Nostr-native**: Subscribes to relays for incoming events (not an HTTP server for notifications)
 - **Multi-network**: Supports both ClearNet and Tor (.onion) relays
 
+## Git Worktrees
+
+When working on tasks that require separate git worktrees (e.g., any time you're working on a distinct task like an issue or bug fix), always create them in the `trees/` directory at the project root. This keeps worktrees organized and separated from the main working directory.
+
 ## Build Commands
 
 ```bash
