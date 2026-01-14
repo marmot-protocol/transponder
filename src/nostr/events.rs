@@ -20,6 +20,11 @@ use crate::push::PushDispatcher;
 const DEDUP_WINDOW: Duration = Duration::from_secs(300);
 
 /// Default maximum size for the deduplication cache.
+///
+/// This value (100,000 entries) provides a reasonable upper bound on memory
+/// usage while allowing sufficient capacity for high-traffic scenarios.
+/// Each entry consists of an `EventId` (32 bytes) and an `Instant` (16 bytes),
+/// so the maximum memory usage is approximately 4.8 MB at full capacity.
 pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
 
 /// Event processor for handling incoming gift-wrapped notifications.
