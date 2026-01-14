@@ -402,4 +402,111 @@ mod tests {
             error_message
         );
     }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        use crate::metrics::Metrics;
+
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 1,
+            connection_timeout_secs: 1,
+        };
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        let metrics = Metrics::default();
+        metrics.init_server_info("0.0.0");
+        let metrics = Some(metrics);
+
+        // Find a free port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = HealthConfig {
+            enabled: true,
+            bind_address: addr.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher, metrics);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(async move {
+            server.run(shutdown_rx).await.unwrap();
+        });
+
+        // Wait for server to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Check metrics endpoint
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("transponder_server_info"));
+
+        // Shutdown
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_disabled() {
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 1,
+            connection_timeout_secs: 1,
+        };
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        // No metrics provided
+        let metrics = None;
+
+        // Find a free port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = HealthConfig {
+            enabled: true,
+            bind_address: addr.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher, metrics);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(async move {
+            server.run(shutdown_rx).await.unwrap();
+        });
+
+        // Wait for server to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Check metrics endpoint
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Shutdown
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
 }

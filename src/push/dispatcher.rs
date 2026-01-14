@@ -568,6 +568,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_both_platforms() {
         use crate::config::{ApnsConfig, FcmConfig};
+        use crate::metrics::Metrics;
         use crate::push::{ApnsClient, FcmClient};
 
         let apns_config = ApnsConfig {
@@ -587,7 +588,12 @@ mod tests {
         };
         let fcm_client = FcmClient::mock(fcm_config, true);
 
-        let dispatcher = PushDispatcher::new(Some(apns_client), Some(fcm_client));
+        let metrics = Metrics::default();
+        let dispatcher = PushDispatcher::with_metrics(
+            Some(apns_client),
+            Some(fcm_client),
+            Some(metrics.clone()),
+        );
 
         // Dispatch both APNs and FCM payloads
         let payloads = vec![
@@ -604,6 +610,32 @@ mod tests {
         dispatcher.dispatch(payloads).await;
         // Tasks are spawned - give them time to start
         tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Verify metrics
+        let families = metrics.gather();
+        let mut apns_dispatched = false;
+        let mut fcm_dispatched = false;
+
+        for family in families {
+            if family.name() == "transponder_push_dispatched_total" {
+                for metric in family.get_metric() {
+                    for label in metric.get_label() {
+                        if label.name() == "platform" {
+                            if label.value() == "apns" {
+                                assert_eq!(metric.get_counter().value, Some(1.0));
+                                apns_dispatched = true;
+                            } else if label.value() == "fcm" {
+                                assert_eq!(metric.get_counter().value, Some(1.0));
+                                fcm_dispatched = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(apns_dispatched, "APNs dispatch metric missing");
+        assert!(fcm_dispatched, "FCM dispatch metric missing");
     }
 
     #[tokio::test]

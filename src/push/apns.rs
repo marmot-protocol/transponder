@@ -1039,6 +1039,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
 
     #[tokio::test]
     async fn test_generate_token_with_valid_key() {
+        use crate::metrics::Metrics;
         use std::io::Write;
         use tempfile::NamedTempFile;
 
@@ -1061,7 +1062,10 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             bundle_id: "com.example.app".to_string(),
         };
 
-        let client = ApnsClient::new(config).await.unwrap();
+        let metrics = Metrics::default();
+        let client = ApnsClient::with_metrics(config, Some(metrics.clone()))
+            .await
+            .unwrap();
 
         // Generate a token
         let token = client.generate_token().unwrap();
@@ -1069,6 +1073,38 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
         // Token should be a valid JWT (three dot-separated parts)
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT should have 3 parts");
+
+        // Verify metrics
+        let metric_families = metrics.gather();
+        let mut found = false;
+        for family in &metric_families {
+            if family.name() == "transponder_auth_token_refreshes_total" {
+                for metric in family.get_metric() {
+                    for label in metric.get_label() {
+                        if label.name() == "service" && label.value() == "apns_jwt" {
+                            assert_eq!(metric.get_counter().value, Some(1.0));
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found {
+            println!("Available metrics:");
+            for f in &metric_families {
+                println!(" - {}", f.name());
+            }
+        }
+
+        assert!(
+            found,
+            "Metric transponder_auth_token_refreshes_total not found"
+        );
+        assert!(
+            found,
+            "Metric transponder_auth_token_refresh_total not found"
+        );
 
         // Verify the header contains the key ID
         let header_json = base64::prelude::BASE64_URL_SAFE_NO_PAD
