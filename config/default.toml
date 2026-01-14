@@ -10,6 +10,11 @@ private_key = ""
 # Increase this for environments with slow networks or high in-flight notification counts
 shutdown_timeout_secs = 10
 
+# Maximum size for the event deduplication cache.
+# The cache uses LRU eviction to prevent unbounded memory growth.
+# Default: 100000
+# max_dedup_cache_size = 100000
+
 [relays]
 # ClearNet relays to subscribe to
 clearnet = [

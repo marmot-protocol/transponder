@@ -169,11 +169,12 @@ async fn main() -> Result<()> {
         warn!(error = %e, "Failed to publish inbox relay list");
     }
 
-    // Create event processor
-    let event_processor = Arc::new(EventProcessor::new(
+    // Create event processor with configured cache size
+    let event_processor = Arc::new(EventProcessor::with_cache_size(
         nip59_handler,
         token_decryptor,
         push_dispatcher.clone(),
+        config.server.max_dedup_cache_size,
     ));
 
     // Initialize shutdown handler

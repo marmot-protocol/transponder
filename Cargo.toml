@@ -45,6 +45,7 @@ anyhow = "1.0"
 base64 = "0.22"
 hex = "0.4.3"
 bytes = "1.11"
+lru = "0.16"
 
 [dev-dependencies]
 tokio-test = "0.4.5"
