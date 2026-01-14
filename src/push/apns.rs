@@ -66,6 +66,19 @@ struct ApnsErrorResponse {
     reason: String,
 }
 
+/// Expected length of an APNs device token in hexadecimal format (32 bytes = 64 hex chars).
+const APNS_DEVICE_TOKEN_LENGTH: usize = 64;
+
+/// Validate an APNs device token format.
+///
+/// APNs device tokens should be exactly 64 hexadecimal characters (representing 32 bytes).
+/// This validation prevents malformed tokens from being sent to APNs, which is more
+/// efficient than waiting for a server-side rejection.
+#[must_use]
+fn is_valid_device_token(token: &str) -> bool {
+    token.len() == APNS_DEVICE_TOKEN_LENGTH && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// APNs client for sending push notifications.
 pub struct ApnsClient {
     pub(crate) http_client: Client,
@@ -174,6 +187,15 @@ impl ApnsClient {
     /// This method automatically retries transient failures (429, 5xx) with
     /// exponential backoff.
     pub async fn send(&self, device_token: &str) -> Result<bool> {
+        // Validate token format before sending
+        if !is_valid_device_token(device_token) {
+            trace!(
+                token_len = device_token.len(),
+                "Invalid APNs device token format"
+            );
+            return Ok(false);
+        }
+
         let retry_config = RetryConfig::default();
         retry::with_retry(&retry_config, "APNs", || self.send_once(device_token)).await
     }
@@ -319,6 +341,104 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("content-available"));
         assert!(json.contains("1"));
+    }
+
+    #[test]
+    fn test_valid_device_token() {
+        // Valid 64-character hex token (lowercase)
+        assert!(is_valid_device_token(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+
+        // Valid 64-character hex token (uppercase)
+        assert!(is_valid_device_token(
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+        ));
+
+        // Valid 64-character hex token (mixed case)
+        assert!(is_valid_device_token(
+            "0123456789AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789AbCdEf"
+        ));
+    }
+
+    #[test]
+    fn test_invalid_device_token_wrong_length() {
+        // Too short
+        assert!(!is_valid_device_token("0123456789abcdef"));
+        assert!(!is_valid_device_token(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"
+        )); // 63 chars
+
+        // Too long
+        assert!(!is_valid_device_token(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+        )); // 65 chars
+
+        // Empty
+        assert!(!is_valid_device_token(""));
+    }
+
+    #[test]
+    fn test_invalid_device_token_non_hex_chars() {
+        // Contains 'g' which is not hex
+        assert!(!is_valid_device_token(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"
+        ));
+
+        // Contains spaces
+        assert!(!is_valid_device_token(
+            "0123456789abcdef 123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+
+        // Contains special characters
+        assert!(!is_valid_device_token(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde!"
+        ));
+
+        // Contains unicode
+        assert!(!is_valid_device_token(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdéf"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_send_rejects_invalid_device_token() {
+        let config = ApnsConfig {
+            enabled: true,
+            key_id: "KEYID123".to_string(),
+            team_id: "TEAMID456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient {
+            http_client: Client::new(),
+            config,
+            encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
+            cached_token: Arc::new(RwLock::new(Some(CachedToken {
+                token: "test-token".to_string(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            }))),
+        };
+
+        // Test with token that's too short
+        let result = client.send("tooshort").await.unwrap();
+        assert!(!result, "Should return false for token that's too short");
+
+        // Test with token that has invalid characters
+        let result = client
+            .send("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg")
+            .await
+            .unwrap();
+        assert!(
+            !result,
+            "Should return false for token with invalid characters"
+        );
+
+        // Test with empty token
+        let result = client.send("").await.unwrap();
+        assert!(!result, "Should return false for empty token");
     }
 
     #[tokio::test]
