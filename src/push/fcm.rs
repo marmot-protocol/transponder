@@ -13,6 +13,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::config::FcmConfig;
 use crate::error::{Error, Result};
+use crate::push::retry::{self, RetryConfig, SendAttemptResult};
 
 /// FCM OAuth2 token endpoint.
 const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -251,11 +252,28 @@ impl FcmClient {
     ///
     /// Returns `Ok(true)` if successful, `Ok(false)` if the token is invalid/expired,
     /// or `Err` for other failures.
+    ///
+    /// This method automatically retries transient failures (429, 5xx) with
+    /// exponential backoff.
     pub async fn send(&self, device_token: &str) -> Result<bool> {
-        let project_id = self.project_id()?;
+        let retry_config = RetryConfig::default();
+        retry::with_retry(&retry_config, "FCM", || self.send_once(device_token)).await
+    }
+
+    /// Send a single push notification attempt without retry.
+    ///
+    /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
+    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+        let project_id = match self.project_id() {
+            Ok(id) => id,
+            Err(e) => return SendAttemptResult::Permanent(e),
+        };
         let url = format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
 
-        let access_token = self.get_access_token().await?;
+        let access_token = match self.get_access_token().await {
+            Ok(t) => t,
+            Err(e) => return SendAttemptResult::Permanent(e),
+        };
 
         let mut data = std::collections::HashMap::new();
         data.insert("content_available".to_string(), "true".to_string());
@@ -270,20 +288,24 @@ impl FcmClient {
             },
         };
 
-        let response = self
+        let response = match self
             .http_client
             .post(&url)
             .header("authorization", format!("Bearer {access_token}"))
             .json(&request)
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return SendAttemptResult::Permanent(Error::from(e)),
+        };
 
         let status = response.status();
 
         match status.as_u16() {
             200 => {
                 trace!("FCM notification sent successfully");
-                Ok(true)
+                SendAttemptResult::Success(true)
             }
             400 => {
                 let error: FcmErrorResponse = response.json().await.unwrap_or(FcmErrorResponse {
@@ -298,26 +320,43 @@ impl FcmClient {
                     message = %error.error.message,
                     "FCM bad request"
                 );
-                Ok(false)
+                SendAttemptResult::Success(false)
             }
             401 => {
-                // Auth error - try to refresh token
+                // Auth error - permanent, don't retry
                 error!("FCM authentication error");
-                Err(Error::Fcm("Authentication error".to_string()))
+                SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
             }
             404 => {
                 // Token not found (device unregistered)
                 debug!("FCM token not found (device unregistered)");
-                Ok(false)
+                SendAttemptResult::Success(false)
             }
             429 => {
-                warn!("FCM rate limited");
-                Ok(false)
+                // Rate limited - retriable
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| retry::parse_retry_after(Some(v)));
+                SendAttemptResult::Retriable {
+                    status_code: 429,
+                    retry_after,
+                }
+            }
+            500..=599 => {
+                // Server error - retriable
+                let body = response.text().await.unwrap_or_default();
+                debug!(status = %status, body = %body, "FCM server error (retriable)");
+                SendAttemptResult::Retriable {
+                    status_code: status.as_u16(),
+                    retry_after: None,
+                }
             }
             _ => {
                 let body = response.text().await.unwrap_or_default();
                 warn!(status = %status, body = %body, "FCM unexpected response");
-                Ok(false)
+                SendAttemptResult::Success(false)
             }
         }
     }
