@@ -31,11 +31,25 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
 }
 
+/// Default maximum size for the deduplication cache.
+const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
+
+fn default_max_dedup_cache_size() -> usize {
+    DEFAULT_MAX_DEDUP_CACHE_SIZE
+}
+
 /// Server-specific configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Server's Nostr private key (hex or nsec format).
     pub private_key: String,
+
+    /// Maximum size for the event deduplication cache.
+    ///
+    /// The cache uses LRU eviction to prevent unbounded memory growth.
+    /// Default: 100,000 entries.
+    #[serde(default = "default_max_dedup_cache_size")]
+    pub max_dedup_cache_size: usize,
 }
 
 /// Relay connection configuration.
@@ -165,6 +179,10 @@ impl AppConfig {
         let config = Config::builder()
             // Start with default values
             .set_default("server.private_key", "")?
+            .set_default(
+                "server.max_dedup_cache_size",
+                DEFAULT_MAX_DEDUP_CACHE_SIZE as i64,
+            )?
             .set_default("relays.clearnet", Vec::<String>::new())?
             .set_default("relays.onion", Vec::<String>::new())?
             .set_default("relays.reconnect_interval_secs", 5)?
@@ -201,6 +219,10 @@ impl AppConfig {
         let config = Config::builder()
             // Set defaults
             .set_default("server.private_key", "")?
+            .set_default(
+                "server.max_dedup_cache_size",
+                DEFAULT_MAX_DEDUP_CACHE_SIZE as i64,
+            )?
             .set_default("relays.clearnet", Vec::<String>::new())?
             .set_default("relays.onion", Vec::<String>::new())?
             .set_default("relays.reconnect_interval_secs", 5)?
@@ -512,5 +534,37 @@ mod tests {
         assert_eq!(config.apns.key_id, "MYKEY");
         assert_eq!(config.apns.environment, "production"); // default
         assert!(!config.fcm.enabled); // default
+    }
+
+    #[test]
+    fn test_max_dedup_cache_size_default() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = AppConfig::load(file.path()).unwrap();
+
+        assert_eq!(config.server.max_dedup_cache_size, 100_000);
+    }
+
+    #[test]
+    fn test_max_dedup_cache_size_custom() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+            max_dedup_cache_size = 50000
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = AppConfig::load(file.path()).unwrap();
+
+        assert_eq!(config.server.max_dedup_cache_size, 50_000);
+    }
+
+    #[test]
+    fn test_server_config_defaults() {
+        assert_eq!(default_max_dedup_cache_size(), 100_000);
     }
 }

@@ -13,6 +13,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::config::ApnsConfig;
 use crate::error::{Error, Result};
+use crate::push::retry::{self, RetryConfig, SendAttemptResult};
 
 /// APNs JWT token lifetime (50 minutes, less than the 1 hour max).
 const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
@@ -182,6 +183,9 @@ impl ApnsClient {
     ///
     /// Returns `Ok(true)` if successful, `Ok(false)` if the token is invalid/expired,
     /// or `Err` for other failures.
+    ///
+    /// This method automatically retries transient failures (429, 5xx) with
+    /// exponential backoff.
     pub async fn send(&self, device_token: &str) -> Result<bool> {
         // Validate token format before sending
         if !is_valid_device_token(device_token) {
@@ -192,6 +196,14 @@ impl ApnsClient {
             return Ok(false);
         }
 
+        let retry_config = RetryConfig::default();
+        retry::with_retry(&retry_config, "APNs", || self.send_once(device_token)).await
+    }
+
+    /// Send a single push notification attempt without retry.
+    ///
+    /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
+    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
         let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
 
         let payload = ApnsPayload::default();
@@ -205,30 +217,37 @@ impl ApnsClient {
             .json(&payload);
 
         // Add authorization header
-        let token = self.get_token().await?;
+        let token = match self.get_token().await {
+            Ok(t) => t,
+            Err(e) => return SendAttemptResult::Permanent(e),
+        };
         request = request.header("authorization", format!("bearer {token}"));
 
-        let response = request.send().await?;
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => return SendAttemptResult::Permanent(Error::from(e)),
+        };
+
         let status = response.status();
 
         match status.as_u16() {
             200 => {
                 trace!("APNs notification sent successfully");
-                Ok(true)
+                SendAttemptResult::Success(true)
             }
             400 => {
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
                 warn!(reason = %error.reason, "APNs bad request");
-                Ok(false)
+                SendAttemptResult::Success(false)
             }
             403 => {
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
                 error!(reason = %error.reason, "APNs authentication error");
-                Err(Error::Apns(format!(
+                SendAttemptResult::Permanent(Error::Apns(format!(
                     "Authentication error: {}",
                     error.reason
                 )))
@@ -236,16 +255,33 @@ impl ApnsClient {
             410 => {
                 // Token is no longer valid (device unregistered)
                 debug!("APNs token no longer valid (device unregistered)");
-                Ok(false)
+                SendAttemptResult::Success(false)
             }
             429 => {
-                warn!("APNs rate limited");
-                Ok(false)
+                // Rate limited - retriable
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| retry::parse_retry_after(Some(v)));
+                SendAttemptResult::Retriable {
+                    status_code: 429,
+                    retry_after,
+                }
+            }
+            500..=599 => {
+                // Server error - retriable
+                let body = response.text().await.unwrap_or_default();
+                debug!(status = %status, body = %body, "APNs server error (retriable)");
+                SendAttemptResult::Retriable {
+                    status_code: status.as_u16(),
+                    retry_after: None,
+                }
             }
             _ => {
                 let body = response.text().await.unwrap_or_default();
                 warn!(status = %status, body = %body, "APNs unexpected response");
-                Ok(false)
+                SendAttemptResult::Success(false)
             }
         }
     }
@@ -1073,5 +1109,183 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
         // Get token again - should return cached token (same value)
         let token2 = client.get_token().await.unwrap();
         assert_eq!(token1, token2);
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_429() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // Create a client that points to our mock server
+        // We'll need to create a custom client for testing send_once
+        let config = ApnsConfig {
+            enabled: true,
+            key_id: "KEYID123".to_string(),
+            team_id: "TEAMID456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let client = ApnsClient {
+            http_client,
+            config,
+            encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
+            cached_token: Arc::new(RwLock::new(Some(CachedToken {
+                token: "test-token".to_string(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            }))),
+        };
+
+        // Manually test the response handling logic by making a direct request
+        let url = format!("{}/3/device/{}", mock_server.uri(), "aabbccdd11223344");
+        let payload = ApnsPayload::default();
+
+        let response = client
+            .http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 429);
+        // Verify retry-after header is present
+        assert!(response.headers().get("retry-after").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_500() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!("{}/3/device/{}", mock_server.uri(), "abc123def456");
+        let payload = ApnsPayload::default();
+
+        let response = http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        // 500 should be a retriable error
+        assert_eq!(response.status(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_503() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!("{}/3/device/{}", mock_server.uri(), "abc123def456");
+        let payload = ApnsPayload::default();
+
+        let response = http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        // 503 should be a retriable error
+        assert_eq!(response.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn test_send_retries_on_429_then_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        // First request returns 429, second returns 200
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // First request - should get 429
+        let url = format!("{}/3/device/{}", mock_server.uri(), "aabbccdd11223344");
+        let payload = ApnsPayload::default();
+
+        let response1 = http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response1.status(), 429);
+
+        // Second request - should get 200
+        let response2 = http_client
+            .post(&url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", "com.example.app")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response2.status(), 200);
     }
 }

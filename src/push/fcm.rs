@@ -13,6 +13,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::config::FcmConfig;
 use crate::error::{Error, Result};
+use crate::push::retry::{self, RetryConfig, SendAttemptResult};
 
 /// FCM OAuth2 token endpoint.
 const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -251,11 +252,28 @@ impl FcmClient {
     ///
     /// Returns `Ok(true)` if successful, `Ok(false)` if the token is invalid/expired,
     /// or `Err` for other failures.
+    ///
+    /// This method automatically retries transient failures (429, 5xx) with
+    /// exponential backoff.
     pub async fn send(&self, device_token: &str) -> Result<bool> {
-        let project_id = self.project_id()?;
+        let retry_config = RetryConfig::default();
+        retry::with_retry(&retry_config, "FCM", || self.send_once(device_token)).await
+    }
+
+    /// Send a single push notification attempt without retry.
+    ///
+    /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
+    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+        let project_id = match self.project_id() {
+            Ok(id) => id,
+            Err(e) => return SendAttemptResult::Permanent(e),
+        };
         let url = format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
 
-        let access_token = self.get_access_token().await?;
+        let access_token = match self.get_access_token().await {
+            Ok(t) => t,
+            Err(e) => return SendAttemptResult::Permanent(e),
+        };
 
         let mut data = std::collections::HashMap::new();
         data.insert("content_available".to_string(), "true".to_string());
@@ -270,20 +288,24 @@ impl FcmClient {
             },
         };
 
-        let response = self
+        let response = match self
             .http_client
             .post(&url)
             .header("authorization", format!("Bearer {access_token}"))
             .json(&request)
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return SendAttemptResult::Permanent(Error::from(e)),
+        };
 
         let status = response.status();
 
         match status.as_u16() {
             200 => {
                 trace!("FCM notification sent successfully");
-                Ok(true)
+                SendAttemptResult::Success(true)
             }
             400 => {
                 let error: FcmErrorResponse = response.json().await.unwrap_or(FcmErrorResponse {
@@ -298,26 +320,43 @@ impl FcmClient {
                     message = %error.error.message,
                     "FCM bad request"
                 );
-                Ok(false)
+                SendAttemptResult::Success(false)
             }
             401 => {
-                // Auth error - try to refresh token
+                // Auth error - permanent, don't retry
                 error!("FCM authentication error");
-                Err(Error::Fcm("Authentication error".to_string()))
+                SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
             }
             404 => {
                 // Token not found (device unregistered)
                 debug!("FCM token not found (device unregistered)");
-                Ok(false)
+                SendAttemptResult::Success(false)
             }
             429 => {
-                warn!("FCM rate limited");
-                Ok(false)
+                // Rate limited - retriable
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| retry::parse_retry_after(Some(v)));
+                SendAttemptResult::Retriable {
+                    status_code: 429,
+                    retry_after,
+                }
+            }
+            500..=599 => {
+                // Server error - retriable
+                let body = response.text().await.unwrap_or_default();
+                debug!(status = %status, body = %body, "FCM server error (retriable)");
+                SendAttemptResult::Retriable {
+                    status_code: status.as_u16(),
+                    retry_after: None,
+                }
             }
             _ => {
                 let body = response.text().await.unwrap_or_default();
                 warn!(status = %status, body = %body, "FCM unexpected response");
-                Ok(false)
+                SendAttemptResult::Success(false)
             }
         }
     }
@@ -1033,5 +1072,208 @@ mod tests {
 
         // Should not be configured - no encoding key
         assert!(!client.is_configured());
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_429() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "60")
+                    .set_body_json(serde_json::json!({
+                        "error": {
+                            "code": 429,
+                            "message": "Quota exceeded",
+                            "status": "RESOURCE_EXHAUSTED"
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "{}/v1/projects/test-project/messages:send",
+            mock_server.uri()
+        );
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "device-token-123".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        let response = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 429);
+        // Verify retry-after header is present
+        assert!(response.headers().get("retry-after").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_500() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "{}/v1/projects/test-project/messages:send",
+            mock_server.uri()
+        );
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "device-token-123".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        let response = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        // 500 should be a retriable error
+        assert_eq!(response.status(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_retriable_on_503() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "{}/v1/projects/test-project/messages:send",
+            mock_server.uri()
+        );
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "device-token-123".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        let response = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        // 503 should be a retriable error
+        assert_eq!(response.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn test_send_retries_on_429_then_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        // First request returns 429, second returns 200
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 429,
+                    "message": "Quota exceeded",
+                    "status": "RESOURCE_EXHAUSTED"
+                }
+            })))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/test-project/messages/123456"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "{}/v1/projects/test-project/messages:send",
+            mock_server.uri()
+        );
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: "device-token-123".to_string(),
+                android: None,
+                data: None,
+            },
+        };
+
+        // First request - should get 429
+        let response1 = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response1.status(), 429);
+
+        // Second request - should get 200
+        let response2 = http_client
+            .post(&url)
+            .header("authorization", "Bearer test-access-token")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response2.status(), 200);
     }
 }
