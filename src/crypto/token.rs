@@ -4,6 +4,11 @@
 //! - ECDH key agreement with secp256k1
 //! - HKDF-SHA256 key derivation
 //! - ChaCha20-Poly1305 authenticated encryption
+//!
+//! # Security
+//!
+//! All sensitive cryptographic material (keys, shared secrets, decrypted tokens)
+//! is automatically zeroed from memory when dropped using the `zeroize` crate.
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
@@ -12,6 +17,7 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sha2::Sha256;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -62,7 +68,13 @@ impl Platform {
 }
 
 /// Parsed encrypted token structure.
-#[derive(Debug, Clone)]
+///
+/// # Security
+///
+/// This struct implements `ZeroizeOnDrop` to ensure all fields are zeroed
+/// when the token goes out of scope, preventing sensitive data from lingering
+/// in memory.
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptedToken {
     /// Compressed ephemeral public key (33 bytes).
     pub ephemeral_pubkey: [u8; PUBKEY_SIZE],
@@ -104,9 +116,16 @@ impl EncryptedToken {
 }
 
 /// Decrypted token payload.
-#[derive(Debug, Clone)]
+///
+/// # Security
+///
+/// This struct implements `ZeroizeOnDrop` to ensure the device token is zeroed
+/// when the payload goes out of scope, preventing sensitive data from lingering
+/// in memory.
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct TokenPayload {
     /// Target platform (APNs or FCM).
+    #[zeroize(skip)]
     pub platform: Platform,
     /// Device token for push notification.
     pub device_token: Vec<u8>,
@@ -199,32 +218,48 @@ impl TokenDecryptor {
     /// 3. Derive encryption key using HKDF
     /// 4. Decrypt ciphertext using ChaCha20-Poly1305
     /// 5. Parse and return the payload
+    ///
+    /// # Security
+    ///
+    /// All intermediate cryptographic material (shared secrets, derived keys,
+    /// plaintext buffers) is automatically zeroed when this function returns.
     pub fn decrypt(&self, token: &EncryptedToken) -> Result<TokenPayload> {
         // Parse ephemeral public key
         let ephemeral_pubkey = PublicKey::from_slice(&token.ephemeral_pubkey)
             .map_err(|e| Error::Crypto(format!("Invalid ephemeral public key: {e}")))?;
 
-        // Perform ECDH to get shared point
-        let shared_point =
-            secp256k1::ecdh::shared_secret_point(&ephemeral_pubkey, &self.secret_key);
+        // Perform ECDH to get shared point (wrapped for zeroization)
+        let shared_point: Zeroizing<[u8; 64]> = Zeroizing::new(
+            secp256k1::ecdh::shared_secret_point(&ephemeral_pubkey, &self.secret_key),
+        );
 
         // Use only the x-coordinate (first 32 bytes) as the shared secret
-        let shared_x = &shared_point[..32];
+        let shared_x: Zeroizing<[u8; 32]> = {
+            let mut x = [0u8; 32];
+            x.copy_from_slice(&shared_point[..32]);
+            Zeroizing::new(x)
+        };
 
-        // Derive encryption key using HKDF
-        let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_x);
-        let mut encryption_key = [0u8; 32];
-        hkdf.expand(HKDF_INFO, &mut encryption_key)
-            .map_err(|e| Error::Crypto(format!("HKDF expansion failed: {e}")))?;
+        // Derive encryption key using HKDF (wrapped for zeroization)
+        let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_x.as_ref());
+        let encryption_key: Zeroizing<[u8; 32]> = {
+            let mut key = [0u8; 32];
+            hkdf.expand(HKDF_INFO, &mut key)
+                .map_err(|e| Error::Crypto(format!("HKDF expansion failed: {e}")))?;
+            Zeroizing::new(key)
+        };
 
         // Decrypt using ChaCha20-Poly1305
-        let cipher = ChaCha20Poly1305::new_from_slice(&encryption_key)
+        let cipher = ChaCha20Poly1305::new_from_slice(encryption_key.as_ref())
             .map_err(|e| Error::Crypto(format!("Failed to create cipher: {e}")))?;
         let nonce = Nonce::from_slice(&token.nonce);
 
-        let plaintext = cipher
-            .decrypt(nonce, token.ciphertext.as_ref())
-            .map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
+        // Wrap plaintext for zeroization
+        let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+            cipher
+                .decrypt(nonce, token.ciphertext.as_ref())
+                .map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?,
+        );
 
         // Parse the decrypted payload
         TokenPayload::from_decrypted(&plaintext)

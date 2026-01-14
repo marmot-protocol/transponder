@@ -9,6 +9,11 @@
 //! uses a bounded channel. When the queue is full, new notifications are dropped
 //! and logged as warnings. This provides backpressure and protects against OOM
 //! conditions during traffic spikes.
+//!
+//! # Security
+//!
+//! Device tokens are wrapped in `Zeroizing<String>` to ensure they are zeroed
+//! from memory when no longer needed, preventing sensitive data from lingering.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
+use zeroize::Zeroizing;
 
 use crate::crypto::{Platform, TokenPayload};
 use crate::push::{ApnsClient, FcmClient};
@@ -33,9 +39,17 @@ const MAX_PENDING_QUEUE_SIZE: usize = 10_000;
 const NUM_WORKERS: usize = 4;
 
 /// Internal message for the push queue.
+///
+/// # Security
+///
+/// The token field is wrapped in `Zeroizing<String>` to ensure device tokens
+/// are zeroed from memory when the message is dropped.
 enum PushMessage {
     /// Send a notification to the given platform with the given token.
-    Send { platform: Platform, token: String },
+    Send {
+        platform: Platform,
+        token: Zeroizing<String>,
+    },
     /// Shutdown signal for workers.
     Shutdown,
 }
@@ -119,6 +133,7 @@ impl PushDispatcher {
                                     worker_id,
                                     "Worker detected shutdown during processing, exiting"
                                 );
+                                // Token is automatically zeroed when dropped here
                                 break;
                             }
 
@@ -127,6 +142,7 @@ impl PushDispatcher {
                                 Ok(p) => p,
                                 Err(_) => {
                                     debug!(worker_id, "Semaphore closed, worker exiting");
+                                    // Token is automatically zeroed when dropped here
                                     break;
                                 }
                             };
@@ -134,7 +150,7 @@ impl PushDispatcher {
                             match platform {
                                 Platform::Apns => {
                                     if let Some(ref client) = apns_client {
-                                        match client.send(&token).await {
+                                        match client.send(token.as_str()).await {
                                             Ok(true) => trace!("APNs notification sent"),
                                             Ok(false) => {
                                                 trace!("APNs notification failed (invalid token)")
@@ -145,7 +161,7 @@ impl PushDispatcher {
                                 }
                                 Platform::Fcm => {
                                     if let Some(ref client) = fcm_client {
-                                        match client.send(&token).await {
+                                        match client.send(token.as_str()).await {
                                             Ok(true) => trace!("FCM notification sent"),
                                             Ok(false) => {
                                                 trace!("FCM notification failed (invalid token)")
@@ -155,6 +171,7 @@ impl PushDispatcher {
                                     }
                                 }
                             }
+                            // Token is automatically zeroed when dropped here
 
                             drop(permit);
                         }
@@ -185,13 +202,14 @@ impl PushDispatcher {
         }
 
         for payload in payloads {
-            let (platform, token) = match payload.platform {
+            // Extract token as Zeroizing<String> for automatic cleanup
+            let (platform, token): (Platform, Zeroizing<String>) = match payload.platform {
                 Platform::Apns => {
                     if self.apns_client.is_none() {
                         trace!("APNs not configured, skipping notification");
                         continue;
                     }
-                    (Platform::Apns, payload.device_token_hex())
+                    (Platform::Apns, Zeroizing::new(payload.device_token_hex()))
                 }
                 Platform::Fcm => {
                     if self.fcm_client.is_none() {
@@ -199,7 +217,7 @@ impl PushDispatcher {
                         continue;
                     }
                     match payload.device_token_string() {
-                        Some(t) => (Platform::Fcm, t),
+                        Some(t) => (Platform::Fcm, Zeroizing::new(t)),
                         None => {
                             trace!("Invalid FCM token (not UTF-8)");
                             continue;
@@ -207,6 +225,8 @@ impl PushDispatcher {
                     }
                 }
             };
+            // Note: payload (TokenPayload) is automatically zeroed when dropped here
+            // due to its ZeroizeOnDrop implementation
 
             // Try to send to the bounded queue
             match self.sender.try_send(PushMessage::Send { platform, token }) {
@@ -214,9 +234,11 @@ impl PushDispatcher {
                     // Successfully queued
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Token is automatically zeroed when dropped here
                     warn!("Push queue full, dropping notification (DoS protection)");
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Token is automatically zeroed when dropped here
                     warn!("Push queue closed, dropping notification");
                     break;
                 }
