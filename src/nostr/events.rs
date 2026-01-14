@@ -2,10 +2,11 @@
 //!
 //! Handles deduplication and processing of gift-wrapped notification requests.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lru::LruCache;
 use nostr_sdk::prelude::*;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
@@ -18,26 +19,52 @@ use crate::push::PushDispatcher;
 /// Duration to keep event IDs for deduplication (5 minutes).
 const DEDUP_WINDOW: Duration = Duration::from_secs(300);
 
+/// Default maximum size for the deduplication cache.
+pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
+
 /// Event processor for handling incoming gift-wrapped notifications.
 pub struct EventProcessor {
     nip59_handler: Nip59Handler,
     token_decryptor: TokenDecryptor,
     push_dispatcher: Arc<PushDispatcher>,
-    seen_events: Arc<RwLock<HashMap<EventId, Instant>>>,
+    seen_events: Arc<RwLock<LruCache<EventId, Instant>>>,
 }
 
 impl EventProcessor {
-    /// Create a new event processor.
+    /// Create a new event processor with default cache size.
+    #[allow(dead_code)]
     pub fn new(
         nip59_handler: Nip59Handler,
         token_decryptor: TokenDecryptor,
         push_dispatcher: Arc<PushDispatcher>,
     ) -> Self {
+        Self::with_cache_size(
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+            DEFAULT_MAX_DEDUP_CACHE_SIZE,
+        )
+    }
+
+    /// Create a new event processor with a custom cache size limit.
+    ///
+    /// The cache will automatically evict the least recently used entries
+    /// when the size limit is reached, preventing unbounded memory growth.
+    pub fn with_cache_size(
+        nip59_handler: Nip59Handler,
+        token_decryptor: TokenDecryptor,
+        push_dispatcher: Arc<PushDispatcher>,
+        max_cache_size: usize,
+    ) -> Self {
+        let cache_size = NonZeroUsize::new(max_cache_size).unwrap_or(
+            NonZeroUsize::new(DEFAULT_MAX_DEDUP_CACHE_SIZE)
+                .expect("DEFAULT_MAX_DEDUP_CACHE_SIZE is non-zero"),
+        );
         Self {
             nip59_handler,
             token_decryptor,
             push_dispatcher,
-            seen_events: Arc::new(RwLock::new(HashMap::new())),
+            seen_events: Arc::new(RwLock::new(LruCache::new(cache_size))),
         }
     }
 
@@ -125,26 +152,38 @@ impl EventProcessor {
     /// Check if an event has been seen recently.
     async fn is_duplicate(&self, event_id: &EventId) -> bool {
         let seen = self.seen_events.read().await;
-        seen.contains_key(event_id)
+        seen.contains(event_id)
     }
 
     /// Mark an event as seen.
+    ///
+    /// The LRU cache automatically evicts the oldest entries when the
+    /// configured size limit is reached, preventing unbounded memory growth.
     async fn mark_seen(&self, event_id: EventId) {
         let mut seen = self.seen_events.write().await;
-
-        // Clean up old entries occasionally if we wanted,
-        // but main cleanup task handles it.
-        // We could do lazy cleanup here but let's stick to the dedicated task.
-
-        seen.insert(event_id, Instant::now());
+        seen.put(event_id, Instant::now());
     }
 
-    /// Clean up the deduplication cache.
+    /// Clean up the deduplication cache by removing entries older than `DEDUP_WINDOW`.
+    ///
+    /// Note: The LRU cache also provides automatic eviction based on size,
+    /// so this cleanup is for time-based expiration of stale entries.
     pub async fn cleanup(&self) {
         let mut seen = self.seen_events.write().await;
         let now = Instant::now();
         let before = seen.len();
-        seen.retain(|_, seen_at| now.duration_since(*seen_at) < DEDUP_WINDOW);
+
+        // LruCache doesn't have retain(), so we collect keys to remove first
+        let expired_keys: Vec<_> = seen
+            .iter()
+            .filter(|(_, seen_at)| now.duration_since(**seen_at) >= DEDUP_WINDOW)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for key in &expired_keys {
+            seen.pop(key);
+        }
+
         let after = seen.len();
 
         if before != after {
@@ -154,6 +193,16 @@ impl EventProcessor {
                 "Cleaned up deduplication cache"
             );
         }
+    }
+
+    /// Returns the current number of entries in the deduplication cache.
+    #[cfg(test)]
+    pub fn cache_len(&self) -> usize {
+        // Use try_read to avoid blocking in tests
+        self.seen_events
+            .try_read()
+            .map(|guard| guard.len())
+            .unwrap_or(0)
     }
 }
 
@@ -322,7 +371,7 @@ mod tests {
         // Manually add an event ID to the seen list
         {
             let mut seen = processor.seen_events.write().await;
-            seen.insert(EventId::all_zeros(), Instant::now());
+            seen.put(EventId::all_zeros(), Instant::now());
         }
 
         // Verify it's there
@@ -354,5 +403,91 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap());
+    }
+
+    /// Create an EventProcessor with a custom cache size for testing.
+    fn create_processor_with_cache_size(server_keys: &Keys, cache_size: usize) -> EventProcessor {
+        let nip59_handler = Nip59Handler::new(server_keys.clone());
+        let token_decryptor = TokenDecryptor::new(server_keys.clone());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        EventProcessor::with_cache_size(nip59_handler, token_decryptor, push_dispatcher, cache_size)
+    }
+
+    #[tokio::test]
+    async fn test_cache_size_limit_evicts_oldest_entries() {
+        let server_keys = Keys::generate();
+        // Create processor with small cache size
+        let processor = create_processor_with_cache_size(&server_keys, 3);
+
+        // Generate 5 event IDs
+        let event_ids: Vec<EventId> = (0..5)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = i;
+                EventId::from_byte_array(bytes)
+            })
+            .collect();
+
+        // Add all 5 events - should evict oldest ones
+        for event_id in &event_ids {
+            processor.mark_seen(*event_id).await;
+        }
+
+        // Cache should only contain the last 3 entries
+        assert_eq!(processor.cache_len(), 3);
+
+        // First two entries should have been evicted (LRU)
+        assert!(!processor.is_duplicate(&event_ids[0]).await);
+        assert!(!processor.is_duplicate(&event_ids[1]).await);
+
+        // Last three entries should still be present
+        assert!(processor.is_duplicate(&event_ids[2]).await);
+        assert!(processor.is_duplicate(&event_ids[3]).await);
+        assert!(processor.is_duplicate(&event_ids[4]).await);
+    }
+
+    #[tokio::test]
+    async fn test_cache_size_zero_uses_default() {
+        let server_keys = Keys::generate();
+        // Creating with cache size 0 should fall back to default
+        let processor = create_processor_with_cache_size(&server_keys, 0);
+
+        // Add an event - should work without panic
+        let event_id = EventId::all_zeros();
+        processor.mark_seen(event_id).await;
+        assert!(processor.is_duplicate(&event_id).await);
+    }
+
+    #[tokio::test]
+    async fn test_cache_lru_access_updates_order() {
+        let server_keys = Keys::generate();
+        let processor = create_processor_with_cache_size(&server_keys, 3);
+
+        let event_ids: Vec<EventId> = (0..4)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = i;
+                EventId::from_byte_array(bytes)
+            })
+            .collect();
+
+        // Add first 3 events
+        processor.mark_seen(event_ids[0]).await;
+        processor.mark_seen(event_ids[1]).await;
+        processor.mark_seen(event_ids[2]).await;
+
+        // Access the first event again (makes it most recently used)
+        processor.mark_seen(event_ids[0]).await;
+
+        // Add a 4th event - should evict event_ids[1] (now the LRU)
+        processor.mark_seen(event_ids[3]).await;
+
+        // event_ids[1] should be evicted
+        assert!(!processor.is_duplicate(&event_ids[1]).await);
+
+        // event_ids[0], [2], and [3] should still be present
+        assert!(processor.is_duplicate(&event_ids[0]).await);
+        assert!(processor.is_duplicate(&event_ids[2]).await);
+        assert!(processor.is_duplicate(&event_ids[3]).await);
     }
 }
