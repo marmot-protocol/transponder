@@ -78,7 +78,17 @@ impl HealthServer {
             .route("/ready", get(ready_handler))
             .with_state(state);
 
-        let listener = TcpListener::bind(&self.config.bind_address).await?;
+        let listener = TcpListener::bind(&self.config.bind_address)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to bind health server to '{}': {}",
+                        self.config.bind_address, e
+                    ),
+                )
+            })?;
         info!(address = %self.config.bind_address, "Health server listening");
 
         axum::serve(listener, app)
@@ -303,5 +313,51 @@ mod tests {
             .expect("Server task should not panic");
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_bind_error_contains_address() {
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![relay_url.to_string()],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+        };
+
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+
+        // Use an invalid bind address to trigger an error
+        let invalid_address = "999.999.999.999:9999";
+        let config = HealthConfig {
+            enabled: true,
+            bind_address: invalid_address.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher);
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let result = server.run(shutdown_rx).await;
+
+        assert!(result.is_err());
+        let error_message = result.unwrap_err().to_string();
+        assert!(
+            error_message.contains(invalid_address),
+            "Error message '{}' should contain the bind address '{}'",
+            error_message,
+            invalid_address
+        );
+        assert!(
+            error_message.contains("Failed to bind health server"),
+            "Error message '{}' should contain context about the health server",
+            error_message
+        );
     }
 }
