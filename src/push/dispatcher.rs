@@ -66,6 +66,7 @@ impl PushDispatcher {
             apns_client.clone(),
             fcm_client.clone(),
             semaphore.clone(),
+            shutting_down.clone(),
         );
 
         Self {
@@ -83,6 +84,7 @@ impl PushDispatcher {
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
         semaphore: Arc<Semaphore>,
+        shutting_down: Arc<AtomicBool>,
     ) {
         // Wrap receiver in Arc<Mutex> so workers can share it
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
@@ -92,9 +94,16 @@ impl PushDispatcher {
             let apns_client = apns_client.clone();
             let fcm_client = fcm_client.clone();
             let semaphore = semaphore.clone();
+            let shutting_down = shutting_down.clone();
 
             tokio::spawn(async move {
                 loop {
+                    // Check shutdown flag before waiting for next message
+                    if shutting_down.load(Ordering::SeqCst) {
+                        debug!(worker_id, "Worker detected shutdown flag, exiting");
+                        break;
+                    }
+
                     // Get next message from the shared queue
                     let msg = {
                         let mut rx = receiver.lock().await;
@@ -103,6 +112,16 @@ impl PushDispatcher {
 
                     match msg {
                         Some(PushMessage::Send { platform, token }) => {
+                            // Check shutdown flag again before processing
+                            // This handles the case where shutdown was triggered while waiting
+                            if shutting_down.load(Ordering::SeqCst) {
+                                debug!(
+                                    worker_id,
+                                    "Worker detected shutdown during processing, exiting"
+                                );
+                                break;
+                            }
+
                             // Acquire semaphore permit before sending
                             let permit = match semaphore.acquire().await {
                                 Ok(p) => p,
@@ -231,15 +250,20 @@ impl PushDispatcher {
 
     /// Wait for all in-flight push notifications to complete.
     ///
-    /// This is used during graceful shutdown. It signals workers to stop,
-    /// then waits for all permits to be available (indicating all pushes complete).
+    /// This is used during graceful shutdown. It sets the shutdown flag,
+    /// attempts to send shutdown signals, then waits for all permits to be
+    /// available (indicating all pushes complete).
+    ///
+    /// Workers check the `shutting_down` flag in their loop, so they will
+    /// exit even if shutdown messages are dropped due to a full queue.
     pub async fn wait_for_completion(&self) {
-        // Mark as shutting down to prevent new dispatches
+        // Mark as shutting down to prevent new dispatches and signal workers
         self.shutting_down.store(true, Ordering::SeqCst);
 
-        // Send shutdown signals to all workers
+        // Send shutdown signals to all workers (best effort - workers also check the flag)
         for _ in 0..NUM_WORKERS {
-            // Use try_send since we don't want to block if queue is full
+            // Use try_send since we don't want to block if queue is full.
+            // Workers will exit via the shutting_down flag check even if this fails.
             let _ = self.sender.try_send(PushMessage::Shutdown);
         }
 
