@@ -65,6 +65,15 @@ impl Platform {
             ))),
         }
     }
+
+    /// Convert platform to byte identifier.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Platform::Apns => PLATFORM_APNS,
+            Platform::Fcm => PLATFORM_FCM,
+        }
+    }
 }
 
 /// Parsed encrypted token structure.
@@ -538,5 +547,17 @@ mod tests {
 
         let err = Platform::from_byte(0x00).unwrap_err();
         assert!(err.to_string().contains("0x00"));
+    }
+
+    #[test]
+    fn test_platform_byte_roundtrip() {
+        assert_eq!(
+            Platform::from_byte(Platform::Apns.as_byte()).unwrap(),
+            Platform::Apns
+        );
+        assert_eq!(
+            Platform::from_byte(Platform::Fcm.as_byte()).unwrap(),
+            Platform::Fcm
+        );
     }
 }

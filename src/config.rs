@@ -8,6 +8,10 @@ use serde::Deserialize;
 use std::path::Path;
 
 use crate::error::Result;
+use crate::rate_limiter::{
+    DEFAULT_MAX_SIZE as DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE, DEFAULT_RATE_LIMIT_PER_HOUR,
+    DEFAULT_RATE_LIMIT_PER_MINUTE,
+};
 
 /// Root configuration structure.
 #[derive(Debug, Clone, Deserialize)]
@@ -41,6 +45,18 @@ fn default_max_dedup_cache_size() -> usize {
     DEFAULT_MAX_DEDUP_CACHE_SIZE
 }
 
+fn default_max_rate_limit_cache_size() -> usize {
+    DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE
+}
+
+fn default_rate_limit_per_minute() -> u32 {
+    DEFAULT_RATE_LIMIT_PER_MINUTE
+}
+
+fn default_rate_limit_per_hour() -> u32 {
+    DEFAULT_RATE_LIMIT_PER_HOUR
+}
+
 /// Server-specific configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
@@ -57,6 +73,39 @@ pub struct ServerConfig {
     /// Default: 100,000 entries.
     #[serde(default = "default_max_dedup_cache_size")]
     pub max_dedup_cache_size: usize,
+
+    /// Maximum size for rate limit caches (encrypted token and device token).
+    ///
+    /// Each cache uses LRU eviction to prevent unbounded memory growth.
+    /// Default: 100,000 entries per cache.
+    #[serde(default = "default_max_rate_limit_cache_size")]
+    pub max_rate_limit_cache_size: usize,
+
+    /// Maximum notifications per encrypted token per minute.
+    ///
+    /// Rate limits identical encrypted blobs to prevent replay attacks.
+    /// Default: 240 (4 per second).
+    #[serde(default = "default_rate_limit_per_minute")]
+    pub encrypted_token_rate_limit_per_minute: u32,
+
+    /// Maximum notifications per encrypted token per hour.
+    ///
+    /// Default: 5,000.
+    #[serde(default = "default_rate_limit_per_hour")]
+    pub encrypted_token_rate_limit_per_hour: u32,
+
+    /// Maximum notifications per device token per minute.
+    ///
+    /// Rate limits notifications to the same device to prevent spam.
+    /// Default: 240 (4 per second).
+    #[serde(default = "default_rate_limit_per_minute")]
+    pub device_token_rate_limit_per_minute: u32,
+
+    /// Maximum notifications per device token per hour.
+    ///
+    /// Default: 5,000.
+    #[serde(default = "default_rate_limit_per_hour")]
+    pub device_token_rate_limit_per_hour: u32,
 }
 
 fn default_shutdown_timeout() -> u64 {
@@ -216,6 +265,26 @@ impl AppConfig {
                 "server.max_dedup_cache_size",
                 DEFAULT_MAX_DEDUP_CACHE_SIZE as i64,
             )?
+            .set_default(
+                "server.max_rate_limit_cache_size",
+                DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE as i64,
+            )?
+            .set_default(
+                "server.encrypted_token_rate_limit_per_minute",
+                DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
+            )?
+            .set_default(
+                "server.encrypted_token_rate_limit_per_hour",
+                DEFAULT_RATE_LIMIT_PER_HOUR as i64,
+            )?
+            .set_default(
+                "server.device_token_rate_limit_per_minute",
+                DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
+            )?
+            .set_default(
+                "server.device_token_rate_limit_per_hour",
+                DEFAULT_RATE_LIMIT_PER_HOUR as i64,
+            )?
             .set_default("relays.clearnet", Vec::<String>::new())?
             .set_default("relays.onion", Vec::<String>::new())?
             .set_default("relays.reconnect_interval_secs", 5)?
@@ -258,6 +327,26 @@ impl AppConfig {
             .set_default(
                 "server.max_dedup_cache_size",
                 DEFAULT_MAX_DEDUP_CACHE_SIZE as i64,
+            )?
+            .set_default(
+                "server.max_rate_limit_cache_size",
+                DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE as i64,
+            )?
+            .set_default(
+                "server.encrypted_token_rate_limit_per_minute",
+                DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
+            )?
+            .set_default(
+                "server.encrypted_token_rate_limit_per_hour",
+                DEFAULT_RATE_LIMIT_PER_HOUR as i64,
+            )?
+            .set_default(
+                "server.device_token_rate_limit_per_minute",
+                DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
+            )?
+            .set_default(
+                "server.device_token_rate_limit_per_hour",
+                DEFAULT_RATE_LIMIT_PER_HOUR as i64,
             )?
             .set_default("relays.clearnet", Vec::<String>::new())?
             .set_default("relays.onion", Vec::<String>::new())?
@@ -548,6 +637,9 @@ mod tests {
     fn test_server_config_defaults() {
         assert_eq!(default_shutdown_timeout(), 10);
         assert_eq!(default_max_dedup_cache_size(), 100_000);
+        assert_eq!(default_max_rate_limit_cache_size(), 100_000);
+        assert_eq!(default_rate_limit_per_minute(), 240);
+        assert_eq!(default_rate_limit_per_hour(), 5000);
     }
 
     #[test]
@@ -627,5 +719,68 @@ mod tests {
         let config = AppConfig::load(file.path()).unwrap();
 
         assert_eq!(config.server.max_dedup_cache_size, 50_000);
+    }
+
+    #[test]
+    fn test_rate_limit_cache_size_default() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = AppConfig::load(file.path()).unwrap();
+
+        assert_eq!(config.server.max_rate_limit_cache_size, 100_000);
+    }
+
+    #[test]
+    fn test_rate_limit_cache_size_custom() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+            max_rate_limit_cache_size = 50000
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = AppConfig::load(file.path()).unwrap();
+
+        assert_eq!(config.server.max_rate_limit_cache_size, 50_000);
+    }
+
+    #[test]
+    fn test_rate_limit_defaults() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = AppConfig::load(file.path()).unwrap();
+
+        assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 240);
+        assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 5000);
+        assert_eq!(config.server.device_token_rate_limit_per_minute, 240);
+        assert_eq!(config.server.device_token_rate_limit_per_hour, 5000);
+    }
+
+    #[test]
+    fn test_rate_limit_custom() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+            encrypted_token_rate_limit_per_minute = 100
+            encrypted_token_rate_limit_per_hour = 2000
+            device_token_rate_limit_per_minute = 50
+            device_token_rate_limit_per_hour = 1000
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = AppConfig::load(file.path()).unwrap();
+
+        assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 100);
+        assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 2000);
+        assert_eq!(config.server.device_token_rate_limit_per_minute, 50);
+        assert_eq!(config.server.device_token_rate_limit_per_hour, 1000);
     }
 }

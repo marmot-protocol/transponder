@@ -51,6 +51,19 @@ Transponder uses TOML configuration files with environment variable overrides. T
 # SECURITY: Store in environment variable for production
 private_key = ""
 
+# Graceful shutdown timeout in seconds
+shutdown_timeout_secs = 10
+
+# Event deduplication cache size (default: 100000)
+# max_dedup_cache_size = 100000
+
+# Rate limiting to prevent spam and replay attacks
+# max_rate_limit_cache_size = 100000           # LRU cache size per limiter
+# encrypted_token_rate_limit_per_minute = 240  # Per encrypted token (replay protection)
+# encrypted_token_rate_limit_per_hour = 5000
+# device_token_rate_limit_per_minute = 240     # Per device (spam protection)
+# device_token_rate_limit_per_hour = 5000
+
 [relays]
 # ClearNet relays to subscribe to
 clearnet = [
@@ -250,6 +263,16 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 | `transponder_dedup_cache_evictions_total` | Counter | Total dedup cache evictions |
 | `transponder_tokens_decrypted_total` | Counter | Total tokens successfully decrypted |
 | `transponder_tokens_decryption_failed_total` | Counter | Total token decryption failures |
+
+#### Token Rate Limiting
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `transponder_tokens_rate_limited_total` | Counter | `type`, `reason` | Tokens skipped due to rate limiting |
+| `transponder_rate_limit_cache_size` | Gauge | `type` | Current rate limit cache size |
+| `transponder_rate_limit_evictions_total` | Counter | `type` | Rate limit cache evictions |
+
+Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` or `hour`
 
 #### Push Notifications
 
