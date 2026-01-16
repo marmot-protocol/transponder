@@ -15,6 +15,29 @@ shutdown_timeout_secs = 10
 # Default: 100000
 # max_dedup_cache_size = 100000
 
+# Maximum size for rate limit caches (encrypted_token and device_token).
+# Each cache uses LRU eviction to prevent unbounded memory growth.
+# Default: 100000 entries per cache
+# max_rate_limit_cache_size = 100000
+
+# Rate limit: max notifications per encrypted token per minute.
+# Limits identical encrypted blobs to prevent replay attacks.
+# Default: 240 (4 per second)
+# encrypted_token_rate_limit_per_minute = 240
+
+# Rate limit: max notifications per encrypted token per hour.
+# Default: 5000
+# encrypted_token_rate_limit_per_hour = 5000
+
+# Rate limit: max notifications per device token per minute.
+# Limits notifications to the same device to prevent spam.
+# Default: 240 (4 per second)
+# device_token_rate_limit_per_minute = 240
+
+# Rate limit: max notifications per device token per hour.
+# Default: 5000
+# device_token_rate_limit_per_hour = 5000
+
 [relays]
 # ClearNet relays to subscribe to
 clearnet = [

@@ -19,6 +19,7 @@ mod error;
 mod metrics;
 mod nostr;
 mod push;
+mod rate_limiter;
 mod server;
 mod shutdown;
 
@@ -195,12 +196,20 @@ async fn main() -> Result<()> {
         warn!(error = %e, "Failed to publish inbox relay list");
     }
 
-    // Create event processor with configured cache size
-    let event_processor = Arc::new(EventProcessor::with_cache_size_and_metrics(
+    // Create event processor with configured cache sizes and rate limiting
+    let rate_limit_config = nostr::events::TokenRateLimitConfig {
+        max_cache_size: config.server.max_rate_limit_cache_size,
+        encrypted_token_per_minute: config.server.encrypted_token_rate_limit_per_minute,
+        encrypted_token_per_hour: config.server.encrypted_token_rate_limit_per_hour,
+        device_token_per_minute: config.server.device_token_rate_limit_per_minute,
+        device_token_per_hour: config.server.device_token_rate_limit_per_hour,
+    };
+    let event_processor = Arc::new(EventProcessor::with_full_config(
         nip59_handler,
         token_decryptor,
         push_dispatcher.clone(),
         config.server.max_dedup_cache_size,
+        rate_limit_config,
         metrics.clone(),
     ));
 

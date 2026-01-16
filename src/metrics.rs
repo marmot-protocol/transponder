@@ -41,6 +41,16 @@ pub struct Metrics {
     /// Total number of entries evicted from dedup cache during cleanup.
     pub dedup_cache_evictions_total: IntCounter,
 
+    // === Token Rate Limiting Metrics ===
+    /// Total number of tokens rate limited (by cache type and reason).
+    pub tokens_rate_limited_total: IntCounterVec,
+
+    /// Current size of rate limit caches (by type).
+    pub rate_limit_cache_size: IntGaugeVec,
+
+    /// Total number of entries evicted from rate limit caches (by type).
+    pub rate_limit_evictions_total: IntCounterVec,
+
     /// Total number of tokens successfully decrypted.
     pub tokens_decrypted_total: IntCounter,
 
@@ -135,6 +145,34 @@ impl Metrics {
             "Total number of entries evicted from deduplication cache",
         ))?;
         registry.register(Box::new(dedup_cache_evictions_total.clone()))?;
+
+        // === Token Rate Limiting Metrics ===
+        let tokens_rate_limited_total = IntCounterVec::new(
+            Opts::new(
+                "transponder_tokens_rate_limited_total",
+                "Total number of tokens skipped due to rate limiting",
+            ),
+            &["type", "reason"],
+        )?;
+        registry.register(Box::new(tokens_rate_limited_total.clone()))?;
+
+        let rate_limit_cache_size = IntGaugeVec::new(
+            Opts::new(
+                "transponder_rate_limit_cache_size",
+                "Current number of entries in rate limit caches",
+            ),
+            &["type"],
+        )?;
+        registry.register(Box::new(rate_limit_cache_size.clone()))?;
+
+        let rate_limit_evictions_total = IntCounterVec::new(
+            Opts::new(
+                "transponder_rate_limit_evictions_total",
+                "Total number of entries evicted from rate limit caches",
+            ),
+            &["type"],
+        )?;
+        registry.register(Box::new(rate_limit_evictions_total.clone()))?;
 
         let tokens_decrypted_total = IntCounter::with_opts(Opts::new(
             "transponder_tokens_decrypted_total",
@@ -275,6 +313,9 @@ impl Metrics {
             events_failed_total,
             dedup_cache_size,
             dedup_cache_evictions_total,
+            tokens_rate_limited_total,
+            rate_limit_cache_size,
+            rate_limit_evictions_total,
             tokens_decrypted_total,
             tokens_decryption_failed_total,
             push_dispatched_total,
@@ -343,6 +384,34 @@ impl Metrics {
     /// Record dedup cache evictions.
     pub fn record_dedup_evictions(&self, count: usize) {
         self.dedup_cache_evictions_total.inc_by(count as u64);
+    }
+
+    /// Record a rate limited token.
+    ///
+    /// `cache_type` should be "encrypted_token" or "device_token".
+    /// `reason` should be "minute" or "hour".
+    pub fn record_rate_limited(&self, cache_type: &str, reason: Option<&str>) {
+        self.tokens_rate_limited_total
+            .with_label_values(&[cache_type, reason.unwrap_or("unknown")])
+            .inc();
+    }
+
+    /// Update rate limit cache size.
+    ///
+    /// `cache_type` should be "encrypted_token" or "device_token".
+    pub fn set_rate_limit_cache_size(&self, cache_type: &str, size: usize) {
+        self.rate_limit_cache_size
+            .with_label_values(&[cache_type])
+            .set(size as i64);
+    }
+
+    /// Record rate limit cache evictions.
+    ///
+    /// `cache_type` should be "encrypted_token" or "device_token".
+    pub fn record_rate_limit_evictions(&self, cache_type: &str, count: usize) {
+        self.rate_limit_evictions_total
+            .with_label_values(&[cache_type])
+            .inc_by(count as u64);
     }
 
     /// Record a successful token decryption.
@@ -529,5 +598,95 @@ mod tests {
 
         let families = metrics.registry.gather();
         assert!(!families.is_empty());
+    }
+
+    #[test]
+    fn test_rate_limit_metrics_creation() {
+        let metrics = Metrics::new().unwrap();
+
+        // Verify rate limit metrics exist by exercising them
+        metrics.record_rate_limited("encrypted_token", Some("minute"));
+        metrics.record_rate_limited("device_token", Some("hour"));
+
+        let families = metrics.registry.gather();
+        let rate_limit_metric = families
+            .iter()
+            .find(|f| f.name() == "transponder_tokens_rate_limited_total");
+        assert!(rate_limit_metric.is_some());
+    }
+
+    #[test]
+    fn test_record_rate_limited() {
+        let metrics = Metrics::new().unwrap();
+
+        metrics.record_rate_limited("encrypted_token", Some("minute"));
+        metrics.record_rate_limited("encrypted_token", Some("minute"));
+        metrics.record_rate_limited("encrypted_token", Some("hour"));
+        metrics.record_rate_limited("device_token", Some("minute"));
+        metrics.record_rate_limited("device_token", None);
+
+        // Verify counters incremented correctly
+        let encrypted_minute = metrics
+            .tokens_rate_limited_total
+            .with_label_values(&["encrypted_token", "minute"])
+            .get();
+        let encrypted_hour = metrics
+            .tokens_rate_limited_total
+            .with_label_values(&["encrypted_token", "hour"])
+            .get();
+        let device_minute = metrics
+            .tokens_rate_limited_total
+            .with_label_values(&["device_token", "minute"])
+            .get();
+        let device_unknown = metrics
+            .tokens_rate_limited_total
+            .with_label_values(&["device_token", "unknown"])
+            .get();
+
+        assert_eq!(encrypted_minute, 2);
+        assert_eq!(encrypted_hour, 1);
+        assert_eq!(device_minute, 1);
+        assert_eq!(device_unknown, 1);
+    }
+
+    #[test]
+    fn test_set_rate_limit_cache_size() {
+        let metrics = Metrics::new().unwrap();
+
+        metrics.set_rate_limit_cache_size("encrypted_token", 5000);
+        metrics.set_rate_limit_cache_size("device_token", 3000);
+
+        let encrypted_size = metrics
+            .rate_limit_cache_size
+            .with_label_values(&["encrypted_token"])
+            .get();
+        let device_size = metrics
+            .rate_limit_cache_size
+            .with_label_values(&["device_token"])
+            .get();
+
+        assert_eq!(encrypted_size, 5000);
+        assert_eq!(device_size, 3000);
+    }
+
+    #[test]
+    fn test_record_rate_limit_evictions() {
+        let metrics = Metrics::new().unwrap();
+
+        metrics.record_rate_limit_evictions("encrypted_token", 100);
+        metrics.record_rate_limit_evictions("device_token", 50);
+        metrics.record_rate_limit_evictions("encrypted_token", 25);
+
+        let encrypted_evictions = metrics
+            .rate_limit_evictions_total
+            .with_label_values(&["encrypted_token"])
+            .get();
+        let device_evictions = metrics
+            .rate_limit_evictions_total
+            .with_label_values(&["device_token"])
+            .get();
+
+        assert_eq!(encrypted_evictions, 125);
+        assert_eq!(device_evictions, 50);
     }
 }
