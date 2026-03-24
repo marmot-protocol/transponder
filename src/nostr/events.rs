@@ -282,10 +282,7 @@ impl EventProcessor {
         }
 
         // Dispatch notifications
-        let count = payloads.len();
-        self.push_dispatcher.dispatch(payloads).await;
-
-        Ok(count)
+        self.push_dispatcher.dispatch(payloads).await
     }
 
     /// Hash arbitrary bytes to a fixed-size key for rate limiting.

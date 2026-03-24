@@ -24,6 +24,7 @@ use tracing::{debug, trace, warn};
 use zeroize::Zeroizing;
 
 use crate::crypto::{Platform, TokenPayload};
+use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 use crate::push::{ApnsClient, FcmClient};
 
@@ -53,6 +54,11 @@ enum PushMessage {
     },
     /// Shutdown signal for workers.
     Shutdown,
+}
+
+struct QueuedPushMessage {
+    platform: Platform,
+    token: Zeroizing<String>,
 }
 
 /// Push notification dispatcher.
@@ -262,14 +268,17 @@ impl PushDispatcher {
 
     /// Dispatch push notifications for all payloads.
     ///
-    /// This queues notifications for processing by worker tasks. If the queue
-    /// is full, notifications are dropped to prevent unbounded memory growth.
-    /// Invalid tokens are silently ignored per MIP-05 spec.
-    pub async fn dispatch(&self, payloads: Vec<TokenPayload>) {
+    /// This queues notifications for processing by worker tasks. The batch is
+    /// only accepted if enough queue capacity exists for all notifications, so
+    /// callers can safely treat a successful return as "all notifications were
+    /// admitted locally". Invalid tokens are silently ignored per MIP-05 spec.
+    pub async fn dispatch(&self, payloads: Vec<TokenPayload>) -> Result<usize> {
         if self.shutting_down.load(Ordering::SeqCst) {
             debug!("Dispatcher shutting down, ignoring dispatch request");
-            return;
+            return Err(Error::Dispatch("Dispatcher is shutting down".to_string()));
         }
+
+        let mut messages = Vec::with_capacity(payloads.len());
 
         for payload in payloads {
             // Extract token as Zeroizing<String> for automatic cleanup
@@ -298,36 +307,59 @@ impl PushDispatcher {
             // Note: payload (TokenPayload) is automatically zeroed when dropped here
             // due to its ZeroizeOnDrop implementation
 
-            let platform_str = match platform {
+            messages.push(QueuedPushMessage { platform, token });
+        }
+
+        if messages.is_empty() {
+            return Ok(0);
+        }
+
+        let message_count = messages.len();
+        let mut permits =
+            self.sender
+                .try_reserve_many(message_count)
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => {
+                        warn!(
+                            requested = message_count,
+                            available = self.sender.capacity(),
+                            "Push queue full, rejecting notification batch"
+                        );
+                        Error::Dispatch(format!(
+                            "Push queue full: unable to queue {message_count} notifications"
+                        ))
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        warn!("Push queue closed, rejecting notification batch");
+                        Error::Dispatch("Push queue closed".to_string())
+                    }
+                })?;
+
+        for message in messages {
+            let platform_str = match message.platform {
                 Platform::Apns => "apns",
                 Platform::Fcm => "fcm",
             };
 
-            // Try to send to the bounded queue
-            match self.sender.try_send(PushMessage::Send { platform, token }) {
-                Ok(()) => {
-                    // Successfully queued - record metric
-                    if let Some(ref m) = self.metrics {
-                        m.record_push_dispatched(platform_str);
-                        // Update queue size (approximate - capacity minus available)
-                        // tokio::mpsc::Sender::capacity() returns available permits
-                        m.set_push_queue_size(MAX_PENDING_QUEUE_SIZE - self.sender.capacity());
-                    }
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Token is automatically zeroed when dropped here
-                    warn!("Push queue full, dropping notification (DoS protection)");
-                    if let Some(ref m) = self.metrics {
-                        m.record_push_queue_dropped();
-                    }
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // Token is automatically zeroed when dropped here
-                    warn!("Push queue closed, dropping notification");
-                    break;
-                }
+            let permit = permits
+                .next()
+                .expect("reserved permits should match queued message count");
+            permit.send(PushMessage::Send {
+                platform: message.platform,
+                token: message.token,
+            });
+
+            if let Some(ref m) = self.metrics {
+                m.record_push_dispatched(platform_str);
             }
         }
+
+        if let Some(ref m) = self.metrics {
+            // Update queue size after the full batch is admitted.
+            m.set_push_queue_size(MAX_PENDING_QUEUE_SIZE - self.sender.capacity());
+        }
+
+        Ok(message_count)
     }
 
     /// Check if APNs is configured and ready.
@@ -418,7 +450,7 @@ mod tests {
         let dispatcher = PushDispatcher::new(None, None);
 
         // Should not panic with empty payloads
-        dispatcher.dispatch(vec![]).await;
+        assert_eq!(dispatcher.dispatch(vec![]).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -437,7 +469,7 @@ mod tests {
         ];
 
         // Should not panic - just skips notifications
-        dispatcher.dispatch(payloads).await;
+        assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -512,7 +544,7 @@ mod tests {
             device_token: vec![0xaa, 0xbb, 0xcc],
         }];
 
-        dispatcher.dispatch(payloads).await;
+        assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 0);
         // Should not panic, just skip the notification
     }
 
@@ -539,7 +571,7 @@ mod tests {
             device_token: b"fcm-token-123".to_vec(),
         }];
 
-        dispatcher.dispatch(payloads).await;
+        assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 0);
         // Should not panic, just skip the notification
     }
 
@@ -562,7 +594,7 @@ mod tests {
             device_token: vec![0xff, 0xfe, 0x00, 0x01], // Invalid UTF-8
         }];
 
-        dispatcher.dispatch(payloads).await;
+        assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 0);
         // Should not panic, just skip the notification
     }
 
@@ -608,7 +640,7 @@ mod tests {
             },
         ];
 
-        dispatcher.dispatch(payloads).await;
+        assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 2);
         // Tasks are spawned - give them time to start
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -729,8 +761,8 @@ mod tests {
             device_token: vec![0xaa, 0xbb, 0xcc],
         }];
 
-        dispatcher.dispatch(payloads).await;
-        // Should not panic, just ignore
+        let error = dispatcher.dispatch(payloads).await.unwrap_err();
+        assert!(matches!(error, Error::Dispatch(_)));
     }
 
     #[tokio::test]
@@ -753,5 +785,34 @@ mod tests {
         // The queue should be bounded
         assert!(dispatcher.queue_capacity() <= MAX_PENDING_QUEUE_SIZE);
         assert_eq!(dispatcher.max_queue_size(), MAX_PENDING_QUEUE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_rejects_batch_larger_than_queue() {
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+        let apns_client = ApnsClient::mock(apns_config, true);
+        let dispatcher = PushDispatcher::new(Some(apns_client), None);
+
+        let payloads = vec![
+            TokenPayload {
+                platform: Platform::Apns,
+                device_token: vec![0xaa, 0xbb, 0xcc],
+            };
+            MAX_PENDING_QUEUE_SIZE + 1
+        ];
+
+        let error = dispatcher.dispatch(payloads).await.unwrap_err();
+
+        assert!(matches!(error, Error::Dispatch(message) if message.contains("Push queue full")));
     }
 }
