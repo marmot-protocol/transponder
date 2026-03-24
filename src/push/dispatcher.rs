@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 use zeroize::Zeroizing;
 
@@ -68,6 +69,7 @@ pub struct PushDispatcher {
     semaphore: Arc<Semaphore>,
     sender: mpsc::Sender<PushMessage>,
     shutting_down: Arc<AtomicBool>,
+    worker_handles: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
     metrics: Option<Metrics>,
 }
 
@@ -100,12 +102,11 @@ impl PushDispatcher {
         }
 
         // Spawn worker tasks
-        Self::spawn_workers(
+        let worker_handles = Self::spawn_workers(
             receiver,
             apns_client.clone(),
             fcm_client.clone(),
             semaphore.clone(),
-            shutting_down.clone(),
             metrics.clone(),
         );
 
@@ -115,6 +116,7 @@ impl PushDispatcher {
             semaphore,
             sender,
             shutting_down,
+            worker_handles: tokio::sync::Mutex::new(worker_handles),
             metrics,
         }
     }
@@ -125,28 +127,21 @@ impl PushDispatcher {
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
         semaphore: Arc<Semaphore>,
-        shutting_down: Arc<AtomicBool>,
         metrics: Option<Metrics>,
-    ) {
+    ) -> Vec<JoinHandle<()>> {
         // Wrap receiver in Arc<Mutex> so workers can share it
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        let mut worker_handles = Vec::with_capacity(NUM_WORKERS);
 
         for worker_id in 0..NUM_WORKERS {
             let receiver = receiver.clone();
             let apns_client = apns_client.clone();
             let fcm_client = fcm_client.clone();
             let semaphore = semaphore.clone();
-            let shutting_down = shutting_down.clone();
             let metrics = metrics.clone();
 
-            tokio::spawn(async move {
+            worker_handles.push(tokio::spawn(async move {
                 loop {
-                    // Check shutdown flag before waiting for next message
-                    if shutting_down.load(Ordering::SeqCst) {
-                        debug!(worker_id, "Worker detected shutdown flag, exiting");
-                        break;
-                    }
-
                     // Get next message from the shared queue
                     let msg = {
                         let mut rx = receiver.lock().await;
@@ -155,17 +150,6 @@ impl PushDispatcher {
 
                     match msg {
                         Some(PushMessage::Send { platform, token }) => {
-                            // Check shutdown flag again before processing
-                            // This handles the case where shutdown was triggered while waiting
-                            if shutting_down.load(Ordering::SeqCst) {
-                                debug!(
-                                    worker_id,
-                                    "Worker detected shutdown during processing, exiting"
-                                );
-                                // Token is automatically zeroed when dropped here
-                                break;
-                            }
-
                             // Acquire semaphore permit before sending
                             let permit = match semaphore.acquire().await {
                                 Ok(p) => p,
@@ -262,8 +246,10 @@ impl PushDispatcher {
                         }
                     }
                 }
-            });
+            }));
         }
+
+        worker_handles
     }
 
     /// Dispatch push notifications for all payloads.
@@ -388,31 +374,38 @@ impl PushDispatcher {
 
     /// Wait for all in-flight push notifications to complete.
     ///
-    /// This is used during graceful shutdown. It sets the shutdown flag,
-    /// attempts to send shutdown signals, then waits for all permits to be
-    /// available (indicating all pushes complete).
-    ///
-    /// Workers check the `shutting_down` flag in their loop, so they will
-    /// exit even if shutdown messages are dropped due to a full queue.
+    /// This is used during graceful shutdown. It stops accepting new dispatches,
+    /// enqueues one shutdown message per worker behind any queued notifications,
+    /// and then waits for all worker tasks to exit. This guarantees queued work
+    /// is drained before shutdown completes.
     pub async fn wait_for_completion(&self) {
-        // Mark as shutting down to prevent new dispatches and signal workers
+        // Mark as shutting down to prevent new dispatches.
         self.shutting_down.store(true, Ordering::SeqCst);
 
-        // Send shutdown signals to all workers (best effort - workers also check the flag)
+        // Enqueue shutdown signals after any already-queued notifications.
         for _ in 0..NUM_WORKERS {
-            // Use try_send since we don't want to block if queue is full.
-            // Workers will exit via the shutting_down flag check even if this fails.
-            let _ = self.sender.try_send(PushMessage::Shutdown);
-        }
-
-        // Wait for all permits to be available (all in-flight pushes complete)
-        let mut permits = Vec::with_capacity(MAX_CONCURRENT_PUSHES);
-        for _ in 0..MAX_CONCURRENT_PUSHES {
-            if let Ok(permit) = self.semaphore.acquire().await {
-                permits.push(permit);
+            if self.sender.send(PushMessage::Shutdown).await.is_err() {
+                break;
             }
         }
-        debug!("All in-flight push notifications completed");
+
+        let worker_handles = {
+            let mut handles = self.worker_handles.lock().await;
+            std::mem::take(&mut *handles)
+        };
+
+        for handle in worker_handles {
+            if let Err(error) = handle.await {
+                warn!(error = %error, "Push worker exited unexpectedly during shutdown");
+            }
+        }
+
+        if let Some(ref m) = self.metrics {
+            m.set_push_queue_size(0);
+            m.set_push_semaphore_available(self.semaphore.available_permits());
+        }
+
+        debug!("All queued push notifications drained");
     }
 
     /// Returns the current queue capacity available.
@@ -785,6 +778,58 @@ mod tests {
         // The queue should be bounded
         assert!(dispatcher.queue_capacity() <= MAX_PENDING_QUEUE_SIZE);
         assert_eq!(dispatcher.max_queue_size(), MAX_PENDING_QUEUE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_completion_drains_backlog_before_returning() {
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+        let dispatcher = Arc::new(PushDispatcher::new(
+            Some(ApnsClient::mock(apns_config, true)),
+            None,
+        ));
+
+        let permits = dispatcher
+            .semaphore
+            .acquire_many(MAX_CONCURRENT_PUSHES as u32)
+            .await
+            .unwrap();
+
+        let payloads = vec![
+            TokenPayload {
+                platform: Platform::Apns,
+                device_token: vec![0xaa, 0xbb, 0xcc],
+            };
+            NUM_WORKERS + 2
+        ];
+        assert_eq!(
+            dispatcher.dispatch(payloads).await.unwrap(),
+            NUM_WORKERS + 2
+        );
+
+        let shutdown_dispatcher = dispatcher.clone();
+        let shutdown_handle = tokio::spawn(async move {
+            shutdown_dispatcher.wait_for_completion().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(permits);
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown_handle)
+            .await
+            .expect("shutdown should complete")
+            .expect("shutdown task should not panic");
+
+        assert_eq!(dispatcher.queue_capacity(), MAX_PENDING_QUEUE_SIZE);
     }
 
     #[tokio::test]
