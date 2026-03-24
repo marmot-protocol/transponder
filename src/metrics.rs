@@ -70,9 +70,6 @@ pub struct Metrics {
     /// Current number of items in the push queue.
     pub push_queue_size: IntGauge,
 
-    /// Total number of notifications dropped due to full queue.
-    pub push_queue_dropped_total: IntCounter,
-
     /// Number of available semaphore permits for concurrent pushes.
     pub push_semaphore_available: IntGauge,
 
@@ -220,12 +217,6 @@ impl Metrics {
         ))?;
         registry.register(Box::new(push_queue_size.clone()))?;
 
-        let push_queue_dropped_total = IntCounter::with_opts(Opts::new(
-            "transponder_push_queue_dropped_total",
-            "Total number of notifications dropped due to full queue",
-        ))?;
-        registry.register(Box::new(push_queue_dropped_total.clone()))?;
-
         let push_semaphore_available = IntGauge::with_opts(Opts::new(
             "transponder_push_semaphore_available",
             "Number of available permits for concurrent push requests",
@@ -322,7 +313,6 @@ impl Metrics {
             push_success_total,
             push_failed_total,
             push_queue_size,
-            push_queue_dropped_total,
             push_semaphore_available,
             push_retries_total,
             push_request_duration_seconds,
@@ -448,11 +438,6 @@ impl Metrics {
         self.push_queue_size.set(size as i64);
     }
 
-    /// Record a dropped notification due to full queue.
-    pub fn record_push_queue_dropped(&self) {
-        self.push_queue_dropped_total.inc();
-    }
-
     /// Update available semaphore permits.
     pub fn set_push_semaphore_available(&self, available: usize) {
         self.push_semaphore_available.set(available as i64);
@@ -536,7 +521,6 @@ mod tests {
         metrics.record_push_success("apns");
         metrics.record_push_failed("fcm", "invalid_token");
         metrics.set_push_queue_size(100);
-        metrics.record_push_queue_dropped();
         metrics.set_push_semaphore_available(95);
 
         let families = metrics.registry.gather();
