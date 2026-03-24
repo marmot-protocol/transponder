@@ -6,9 +6,9 @@
 //! # Bounded Queue Pattern
 //!
 //! To prevent unbounded task spawning (a potential DoS vector), the dispatcher
-//! uses a bounded channel. When the queue is full, new notifications are dropped
-//! and logged as warnings. This provides backpressure and protects against OOM
-//! conditions during traffic spikes.
+//! uses a bounded channel. When the queue is full, new notification batches are
+//! rejected before admission. This provides backpressure and protects against
+//! OOM conditions during traffic spikes.
 //!
 //! # Security
 //!
@@ -35,7 +35,7 @@ const MAX_CONCURRENT_PUSHES: usize = 100;
 /// Maximum number of pending notifications in the queue.
 ///
 /// This bounds the memory used by waiting tasks. When this limit is reached,
-/// new notifications will be dropped to protect against DoS attacks.
+/// new notification batches are rejected to protect against DoS attacks.
 const MAX_PENDING_QUEUE_SIZE: usize = 10_000;
 
 /// Number of worker tasks processing the queue.
@@ -72,6 +72,7 @@ pub struct PushDispatcher {
     semaphore: Arc<Semaphore>,
     sender: mpsc::Sender<PushMessage>,
     shutting_down: Arc<AtomicBool>,
+    admission_lock: tokio::sync::Mutex<()>,
     worker_handles: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
     metrics: Option<Metrics>,
 }
@@ -107,6 +108,7 @@ impl PushDispatcher {
         // Spawn worker tasks
         let worker_handles = Self::spawn_workers(
             receiver,
+            sender.clone(),
             apns_client.clone(),
             fcm_client.clone(),
             semaphore.clone(),
@@ -119,14 +121,22 @@ impl PushDispatcher {
             semaphore,
             sender,
             shutting_down,
+            admission_lock: tokio::sync::Mutex::new(()),
             worker_handles: tokio::sync::Mutex::new(worker_handles),
             metrics,
+        }
+    }
+
+    fn update_queue_size_metric(metrics: &Option<Metrics>, sender: &mpsc::Sender<PushMessage>) {
+        if let Some(metrics) = metrics {
+            metrics.set_push_queue_size(MAX_PENDING_QUEUE_SIZE - sender.capacity());
         }
     }
 
     /// Spawn worker tasks that process the push queue.
     fn spawn_workers(
         receiver: mpsc::Receiver<PushMessage>,
+        sender: mpsc::Sender<PushMessage>,
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
         semaphore: Arc<Semaphore>,
@@ -138,6 +148,7 @@ impl PushDispatcher {
 
         for worker_id in 0..NUM_WORKERS {
             let receiver = receiver.clone();
+            let sender = sender.clone();
             let apns_client = apns_client.clone();
             let fcm_client = fcm_client.clone();
             let semaphore = semaphore.clone();
@@ -151,10 +162,14 @@ impl PushDispatcher {
                         rx.recv().await
                     };
 
+                    if msg.is_some() {
+                        Self::update_queue_size_metric(&metrics, &sender);
+                    }
+
                     match msg {
                         Some(PushMessage::Send { platform, token }) => {
-                            // Acquire semaphore permit before sending
-                            let permit = match semaphore.acquire().await {
+                            // Acquire semaphore permit before spawning the send task.
+                            let permit = match semaphore.clone().acquire_owned().await {
                                 Ok(p) => p,
                                 Err(_) => {
                                     debug!(worker_id, "Semaphore closed, worker exiting");
@@ -168,75 +183,85 @@ impl PushDispatcher {
                                 m.set_push_semaphore_available(semaphore.available_permits());
                             }
 
-                            let platform_str = match platform {
-                                Platform::Apns => "apns",
-                                Platform::Fcm => "fcm",
-                            };
+                            let apns_client = apns_client.clone();
+                            let fcm_client = fcm_client.clone();
+                            let metrics = metrics.clone();
+                            let semaphore = semaphore.clone();
 
-                            match platform {
-                                Platform::Apns => {
-                                    if let Some(ref client) = apns_client {
-                                        match client.send(token.as_str()).await {
-                                            Ok(true) => {
-                                                trace!("APNs notification sent");
-                                                if let Some(ref m) = metrics {
-                                                    m.record_push_success(platform_str);
+                            tokio::spawn(async move {
+                                let platform_str = match platform {
+                                    Platform::Apns => "apns",
+                                    Platform::Fcm => "fcm",
+                                };
+
+                                match platform {
+                                    Platform::Apns => {
+                                        if let Some(client) = apns_client {
+                                            match client.send(token.as_str()).await {
+                                                Ok(true) => {
+                                                    trace!("APNs notification sent");
+                                                    if let Some(ref m) = metrics {
+                                                        m.record_push_success(platform_str);
+                                                    }
                                                 }
-                                            }
-                                            Ok(false) => {
-                                                trace!("APNs notification failed (invalid token)");
-                                                if let Some(ref m) = metrics {
-                                                    m.record_push_failed(
-                                                        platform_str,
-                                                        "invalid_token",
+                                                Ok(false) => {
+                                                    trace!(
+                                                        "APNs notification failed (invalid token)"
                                                     );
+                                                    if let Some(ref m) = metrics {
+                                                        m.record_push_failed(
+                                                            platform_str,
+                                                            "invalid_token",
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    debug!(error = %e, "APNs send error");
+                                                    if let Some(ref m) = metrics {
+                                                        m.record_push_failed(platform_str, "error");
+                                                    }
                                                 }
                                             }
-                                            Err(e) => {
-                                                debug!(error = %e, "APNs send error");
-                                                if let Some(ref m) = metrics {
-                                                    m.record_push_failed(platform_str, "error");
+                                        }
+                                    }
+                                    Platform::Fcm => {
+                                        if let Some(client) = fcm_client {
+                                            match client.send(token.as_str()).await {
+                                                Ok(true) => {
+                                                    trace!("FCM notification sent");
+                                                    if let Some(ref m) = metrics {
+                                                        m.record_push_success(platform_str);
+                                                    }
+                                                }
+                                                Ok(false) => {
+                                                    trace!(
+                                                        "FCM notification failed (invalid token)"
+                                                    );
+                                                    if let Some(ref m) = metrics {
+                                                        m.record_push_failed(
+                                                            platform_str,
+                                                            "invalid_token",
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    debug!(error = %e, "FCM send error");
+                                                    if let Some(ref m) = metrics {
+                                                        m.record_push_failed(platform_str, "error");
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                Platform::Fcm => {
-                                    if let Some(ref client) = fcm_client {
-                                        match client.send(token.as_str()).await {
-                                            Ok(true) => {
-                                                trace!("FCM notification sent");
-                                                if let Some(ref m) = metrics {
-                                                    m.record_push_success(platform_str);
-                                                }
-                                            }
-                                            Ok(false) => {
-                                                trace!("FCM notification failed (invalid token)");
-                                                if let Some(ref m) = metrics {
-                                                    m.record_push_failed(
-                                                        platform_str,
-                                                        "invalid_token",
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                debug!(error = %e, "FCM send error");
-                                                if let Some(ref m) = metrics {
-                                                    m.record_push_failed(platform_str, "error");
-                                                }
-                                            }
-                                        }
-                                    }
+                                // Token is automatically zeroed when dropped here.
+
+                                drop(permit);
+
+                                if let Some(ref m) = metrics {
+                                    m.set_push_semaphore_available(semaphore.available_permits());
                                 }
-                            }
-                            // Token is automatically zeroed when dropped here
-
-                            drop(permit);
-
-                            // Update semaphore metric after releasing permit
-                            if let Some(ref m) = metrics {
-                                m.set_push_semaphore_available(semaphore.available_permits());
-                            }
+                            });
                         }
                         Some(PushMessage::Shutdown) => {
                             debug!(worker_id, "Worker received shutdown signal");
@@ -262,6 +287,8 @@ impl PushDispatcher {
     /// callers can safely treat a successful return as "all notifications were
     /// admitted locally". Invalid tokens are silently ignored per MIP-05 spec.
     pub async fn dispatch(&self, payloads: Vec<TokenPayload>) -> Result<usize> {
+        let _admission_guard = self.admission_lock.lock().await;
+
         if self.shutting_down.load(Ordering::SeqCst) {
             debug!("Dispatcher shutting down, ignoring dispatch request");
             return Err(Error::Dispatch("Dispatcher is shutting down".to_string()));
@@ -343,10 +370,8 @@ impl PushDispatcher {
             }
         }
 
-        if let Some(ref m) = self.metrics {
-            // Update queue size after the full batch is admitted.
-            m.set_push_queue_size(MAX_PENDING_QUEUE_SIZE - self.sender.capacity());
-        }
+        // Update queue size after the full batch is admitted.
+        Self::update_queue_size_metric(&self.metrics, &self.sender);
 
         Ok(message_count)
     }
@@ -382,13 +407,17 @@ impl PushDispatcher {
     /// and then waits for all worker tasks to exit. This guarantees queued work
     /// is drained before shutdown completes.
     pub async fn wait_for_completion(&self) {
-        // Mark as shutting down to prevent new dispatches.
-        self.shutting_down.store(true, Ordering::SeqCst);
+        {
+            let _admission_guard = self.admission_lock.lock().await;
 
-        // Enqueue shutdown signals after any already-queued notifications.
-        for _ in 0..NUM_WORKERS {
-            if self.sender.send(PushMessage::Shutdown).await.is_err() {
-                break;
+            // Mark as shutting down to prevent new dispatches.
+            self.shutting_down.store(true, Ordering::SeqCst);
+
+            // Enqueue shutdown signals after any already-queued notifications.
+            for _ in 0..NUM_WORKERS {
+                if self.sender.send(PushMessage::Shutdown).await.is_err() {
+                    break;
+                }
             }
         }
 
@@ -402,6 +431,16 @@ impl PushDispatcher {
                 warn!(error = %error, "Push worker exited unexpectedly during shutdown");
             }
         }
+
+        // Wait for all spawned send tasks to finish and release their permits.
+        let mut permits = Vec::with_capacity(MAX_CONCURRENT_PUSHES);
+        for _ in 0..MAX_CONCURRENT_PUSHES {
+            match self.semaphore.acquire().await {
+                Ok(permit) => permits.push(permit),
+                Err(_) => break,
+            }
+        }
+        drop(permits);
 
         if let Some(ref m) = self.metrics {
             m.set_push_queue_size(0);
@@ -432,6 +471,21 @@ impl PushDispatcher {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn queue_size_metric_value(metrics: &crate::metrics::Metrics) -> i64 {
+        metrics
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "transponder_push_queue_size")
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .first()
+                    .and_then(|metric| metric.get_gauge().value)
+            })
+            .map(|value| value as i64)
+            .unwrap_or_default()
+    }
 
     #[tokio::test]
     async fn test_dispatcher_no_clients() {
@@ -665,6 +719,51 @@ mod tests {
 
         assert!(apns_dispatched, "APNs dispatch metric missing");
         assert!(fcm_dispatched, "FCM dispatch metric missing");
+    }
+
+    #[tokio::test]
+    async fn test_queue_metric_updates_after_worker_dequeue() {
+        use crate::config::ApnsConfig;
+        use crate::metrics::Metrics;
+        use crate::push::ApnsClient;
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+
+        let metrics = Metrics::default();
+        let dispatcher = PushDispatcher::with_metrics(
+            Some(ApnsClient::mock(apns_config, true)),
+            None,
+            Some(metrics.clone()),
+        );
+
+        let permits = dispatcher
+            .semaphore
+            .acquire_many(MAX_CONCURRENT_PUSHES as u32)
+            .await
+            .unwrap();
+
+        let payloads = vec![
+            TokenPayload {
+                platform: Platform::Apns,
+                device_token: vec![0xaa, 0xbb, 0xcc],
+            };
+            2
+        ];
+
+        assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 2);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(queue_size_metric_value(&metrics), 0);
+
+        drop(permits);
+        dispatcher.wait_for_completion().await;
     }
 
     #[tokio::test]
