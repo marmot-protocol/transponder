@@ -15,7 +15,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use hkdf::Hkdf;
-use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -28,16 +28,25 @@ const HKDF_SALT: &[u8] = b"mip05-v1";
 const HKDF_INFO: &[u8] = b"mip05-token-encryption";
 
 /// Expected size of the encrypted token (280 bytes total).
-/// - 33 bytes: compressed ephemeral public key
+/// - 32 bytes: x-only ephemeral public key
 /// - 12 bytes: nonce
-/// - 235 bytes: ciphertext (219 payload + 16 auth tag)
+/// - 236 bytes: ciphertext (220-byte plaintext + 16-byte auth tag)
 pub const ENCRYPTED_TOKEN_SIZE: usize = 280;
 
-/// Size of compressed secp256k1 public key.
-const PUBKEY_SIZE: usize = 33;
+/// Size of x-only secp256k1 public key.
+const PUBKEY_SIZE: usize = 32;
 
 /// Size of ChaCha20-Poly1305 nonce.
 const NONCE_SIZE: usize = 12;
+
+/// Size of decrypted token plaintext.
+const TOKEN_PLAINTEXT_SIZE: usize = 220;
+
+/// Required APNs device token length in bytes.
+const APNS_DEVICE_TOKEN_SIZE: usize = 32;
+
+/// Maximum allowed FCM device token length in bytes.
+const MAX_FCM_DEVICE_TOKEN_SIZE: usize = 200;
 
 /// Platform identifier for APNs (iOS).
 pub const PLATFORM_APNS: u8 = 0x01;
@@ -85,7 +94,7 @@ impl Platform {
 /// in memory.
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptedToken {
-    /// Compressed ephemeral public key (33 bytes).
+    /// X-only ephemeral public key (32 bytes).
     pub ephemeral_pubkey: [u8; PUBKEY_SIZE],
     /// ChaCha20-Poly1305 nonce (12 bytes).
     pub nonce: [u8; NONCE_SIZE],
@@ -97,9 +106,9 @@ impl EncryptedToken {
     /// Parse an encrypted token from raw bytes.
     ///
     /// Expected format:
-    /// - Bytes 0-32: Compressed ephemeral public key
-    /// - Bytes 33-44: Nonce
-    /// - Bytes 45-279: Ciphertext with auth tag
+    /// - Bytes 0-31: X-only ephemeral public key
+    /// - Bytes 32-43: Nonce
+    /// - Bytes 44-279: Ciphertext with auth tag
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() != ENCRYPTED_TOKEN_SIZE {
             return Err(Error::InvalidToken(format!(
@@ -141,43 +150,47 @@ pub struct TokenPayload {
 }
 
 impl TokenPayload {
-    /// Parse a decrypted payload, removing PKCS#7 padding.
+    /// Parse a decrypted token plaintext.
     ///
-    /// Payload format:
+    /// Token plaintext format:
     /// - Byte 0: Platform identifier (0x01 = APNs, 0x02 = FCM)
-    /// - Bytes 1-N: Device token
-    /// - Remaining: PKCS#7 padding
+    /// - Bytes 1-2: Device token length (big-endian)
+    /// - Bytes 3..(3+token_length): Device token
+    /// - Remaining: Random padding
     pub fn from_decrypted(data: &[u8]) -> Result<Self> {
-        if data.is_empty() {
-            return Err(Error::InvalidToken("Empty decrypted payload".to_string()));
+        if data.len() != TOKEN_PLAINTEXT_SIZE {
+            return Err(Error::InvalidToken(format!(
+                "Invalid token plaintext size: expected {TOKEN_PLAINTEXT_SIZE}, got {}",
+                data.len()
+            )));
         }
 
-        // Remove PKCS#7 padding
-        let padding_len = *data.last().unwrap() as usize;
-        if padding_len == 0 || padding_len > data.len() {
-            return Err(Error::InvalidToken("Invalid PKCS#7 padding".to_string()));
-        }
+        let platform = Platform::from_byte(data[0])?;
+        let token_length = u16::from_be_bytes([data[1], data[2]]) as usize;
 
-        // Verify padding bytes
-        for &byte in &data[data.len() - padding_len..] {
-            if byte as usize != padding_len {
-                return Err(Error::InvalidToken("Invalid PKCS#7 padding".to_string()));
+        match platform {
+            Platform::Apns if token_length != APNS_DEVICE_TOKEN_SIZE => {
+                return Err(Error::InvalidToken(format!(
+                    "Invalid APNs token length: expected {APNS_DEVICE_TOKEN_SIZE}, got {token_length}"
+                )));
             }
+            Platform::Fcm if !(1..=MAX_FCM_DEVICE_TOKEN_SIZE).contains(&token_length) => {
+                return Err(Error::InvalidToken(format!(
+                    "Invalid FCM token length: expected 1..={MAX_FCM_DEVICE_TOKEN_SIZE}, got {token_length}"
+                )));
+            }
+            _ => {}
         }
 
-        let unpadded = &data[..data.len() - padding_len];
-        if unpadded.is_empty() {
-            return Err(Error::InvalidToken(
-                "Payload empty after removing padding".to_string(),
-            ));
+        let payload_end = 3 + token_length;
+        if payload_end > data.len() {
+            return Err(Error::InvalidToken(format!(
+                "Token length {token_length} exceeds plaintext size {}",
+                data.len()
+            )));
         }
 
-        let platform = Platform::from_byte(unpadded[0])?;
-        let device_token = unpadded[1..].to_vec();
-
-        if device_token.is_empty() {
-            return Err(Error::InvalidToken("Empty device token".to_string()));
-        }
+        let device_token = data[3..payload_end].to_vec();
 
         Ok(Self {
             platform,
@@ -233,9 +246,10 @@ impl TokenDecryptor {
     /// All intermediate cryptographic material (shared secrets, derived keys,
     /// plaintext buffers) is automatically zeroed when this function returns.
     pub fn decrypt(&self, token: &EncryptedToken) -> Result<TokenPayload> {
-        // Parse ephemeral public key
-        let ephemeral_pubkey = PublicKey::from_slice(&token.ephemeral_pubkey)
+        // Parse x-only ephemeral public key and normalize it to even-Y for ECDH.
+        let ephemeral_xonly = XOnlyPublicKey::from_slice(&token.ephemeral_pubkey)
             .map_err(|e| Error::Crypto(format!("Invalid ephemeral public key: {e}")))?;
+        let ephemeral_pubkey = PublicKey::from_x_only_public_key(ephemeral_xonly, Parity::Even);
 
         // Perform ECDH to get shared point (wrapped for zeroization)
         let shared_point: Zeroizing<[u8; 64]> = Zeroizing::new(
@@ -300,6 +314,15 @@ impl TokenDecryptor {
 mod tests {
     use super::*;
 
+    fn build_plaintext(platform: u8, token_length: u16, token_bytes: &[u8]) -> Vec<u8> {
+        let mut plaintext = vec![0u8; TOKEN_PLAINTEXT_SIZE];
+        plaintext[0] = platform;
+        plaintext[1..3].copy_from_slice(&token_length.to_be_bytes());
+        let end = 3 + token_bytes.len();
+        plaintext[3..end].copy_from_slice(token_bytes);
+        plaintext
+    }
+
     #[test]
     fn test_platform_from_byte() {
         assert_eq!(Platform::from_byte(0x01).unwrap(), Platform::Apns);
@@ -330,18 +353,24 @@ mod tests {
 
     #[test]
     fn test_token_payload_parsing() {
-        // Platform byte + device token + PKCS#7 padding (3 bytes of 0x03)
-        let data = vec![0x01, 0xaa, 0xbb, 0xcc, 0x03, 0x03, 0x03];
+        let device_token = [0xAA; APNS_DEVICE_TOKEN_SIZE];
+        let data = build_plaintext(PLATFORM_APNS, APNS_DEVICE_TOKEN_SIZE as u16, &device_token);
         let payload = TokenPayload::from_decrypted(&data).unwrap();
         assert_eq!(payload.platform, Platform::Apns);
-        assert_eq!(payload.device_token, vec![0xaa, 0xbb, 0xcc]);
+        assert_eq!(payload.device_token, device_token);
     }
 
     #[test]
-    fn test_token_payload_invalid_padding() {
-        // Invalid padding (mismatched bytes)
-        let data = vec![0x01, 0xaa, 0xbb, 0x02, 0x03];
-        assert!(TokenPayload::from_decrypted(&data).is_err());
+    fn test_token_payload_invalid_apns_length() {
+        let data = build_plaintext(PLATFORM_APNS, 31, &[0xAA; 31]);
+        let result = TokenPayload::from_decrypted(&data);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid APNs token length")
+        );
     }
 
     #[test]
@@ -391,74 +420,67 @@ mod tests {
         let result = TokenPayload::from_decrypted(&data);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("Empty decrypted payload"));
+        assert!(err.to_string().contains("Invalid token plaintext size"));
     }
 
     #[test]
     fn test_token_payload_fcm_platform() {
-        // FCM platform byte (0x02) + device token + PKCS#7 padding (2 bytes of 0x02)
-        let data = vec![0x02, 0x64, 0x65, 0x76, 0x69, 0x63, 0x65, 0x02, 0x02];
+        let device_token = b"device";
+        let data = build_plaintext(PLATFORM_FCM, device_token.len() as u16, device_token);
         let payload = TokenPayload::from_decrypted(&data).unwrap();
         assert_eq!(payload.platform, Platform::Fcm);
-        assert_eq!(
-            payload.device_token,
-            vec![0x64, 0x65, 0x76, 0x69, 0x63, 0x65]
-        ); // "device"
+        assert_eq!(payload.device_token, device_token);
     }
 
     #[test]
-    fn test_token_payload_padding_zero() {
-        // Padding of 0 is invalid
-        let data = vec![0x01, 0xaa, 0x00];
+    fn test_token_payload_fcm_length_zero() {
+        let data = build_plaintext(PLATFORM_FCM, 0, &[]);
         let result = TokenPayload::from_decrypted(&data);
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Invalid PKCS#7 padding")
+                .contains("Invalid FCM token length")
         );
     }
 
     #[test]
-    fn test_token_payload_padding_too_large() {
-        // Padding larger than data length is invalid
-        let data = vec![0x01, 0xaa, 0x10]; // 0x10 = 16, but data is only 3 bytes
+    fn test_token_payload_fcm_length_too_large() {
+        let data = build_plaintext(PLATFORM_FCM, 201, &[0x11; 200]);
         let result = TokenPayload::from_decrypted(&data);
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Invalid PKCS#7 padding")
+                .contains("Invalid FCM token length")
         );
     }
 
     #[test]
-    fn test_token_payload_empty_after_padding() {
-        // After removing padding, only the data would be empty (all padding)
-        let data = vec![0x03, 0x03, 0x03]; // 3 bytes of 0x03 padding = empty payload
+    fn test_token_payload_wrong_size() {
+        let data = vec![0u8; TOKEN_PLAINTEXT_SIZE - 1];
         let result = TokenPayload::from_decrypted(&data);
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Payload empty after removing padding")
+                .contains("Invalid token plaintext size")
         );
     }
 
     #[test]
     fn test_token_payload_empty_device_token() {
-        // Platform byte + 1 byte of padding (no device token)
-        let data = vec![0x01, 0x01]; // Platform byte 0x01, then 1 byte of 0x01 padding
+        let data = build_plaintext(PLATFORM_FCM, 0, &[]);
         let result = TokenPayload::from_decrypted(&data);
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Empty device token")
+                .contains("Invalid FCM token length")
         );
     }
 

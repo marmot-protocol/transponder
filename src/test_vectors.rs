@@ -9,7 +9,7 @@
 //! event processing pipeline from relay receipt to push dispatch.
 
 use ::hkdf::Hkdf;
-use ::secp256k1::{PublicKey, Secp256k1, SecretKey};
+use ::secp256k1::{Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
 use base64::prelude::*;
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
@@ -28,6 +28,14 @@ const HKDF_INFO: &[u8] = b"mip05-token-encryption";
 
 /// Kind for MIP-05 notification requests.
 pub const KIND_NOTIFICATION_REQUEST: u16 = 446;
+
+const TOKEN_PLAINTEXT_SIZE: usize = 220;
+const APNS_DEVICE_TOKEN_SIZE: usize = 32;
+const MAX_FCM_DEVICE_TOKEN_SIZE: usize = 200;
+const TAG_VERSION: &str = "v";
+const TAG_ENCODING: &str = "encoding";
+const VERSION_MIP05_V1: &str = "mip05-v1";
+const ENCODING_BASE64: &str = "base64";
 
 /// A test token that can be encrypted for the server.
 #[derive(Debug, Clone)]
@@ -81,26 +89,30 @@ impl TestToken {
         }
     }
 
-    /// Get the plaintext payload with PKCS#7 padding.
+    /// Get the fixed-size token plaintext used by MIP-05.
     ///
-    /// Format: platform_byte || device_token || pkcs7_padding
-    /// Padded to 219 bytes (the expected plaintext size for MIP-05).
-    fn to_padded_payload(&self) -> Vec<u8> {
-        const PAYLOAD_SIZE: usize = 219; // Expected plaintext size
+    /// Format: platform || token_length || device_token || random_padding
+    fn to_plaintext(&self) -> Vec<u8> {
+        match self.platform {
+            PLATFORM_APNS => assert_eq!(
+                self.device_token.len(),
+                APNS_DEVICE_TOKEN_SIZE,
+                "APNs token must be 32 bytes"
+            ),
+            PLATFORM_FCM => assert!(
+                (1..=MAX_FCM_DEVICE_TOKEN_SIZE).contains(&self.device_token.len()),
+                "FCM token must be 1..=200 bytes"
+            ),
+            _ => panic!("unsupported test platform"),
+        }
 
-        let mut payload = Vec::with_capacity(PAYLOAD_SIZE);
-        payload.push(self.platform);
-        payload.extend_from_slice(&self.device_token);
-
-        // Add PKCS#7 padding
-        let padding_len = PAYLOAD_SIZE - payload.len();
-        assert!(
-            padding_len > 0 && padding_len <= 255,
-            "Token too large for payload"
-        );
-        payload.resize(PAYLOAD_SIZE, padding_len as u8);
-
-        payload
+        let token_length = self.device_token.len();
+        let mut plaintext = vec![0u8; TOKEN_PLAINTEXT_SIZE];
+        plaintext[0] = self.platform;
+        plaintext[1..3].copy_from_slice(&(token_length as u16).to_be_bytes());
+        plaintext[3..(3 + token_length)].copy_from_slice(&self.device_token);
+        getrandom::fill(&mut plaintext[(3 + token_length)..]).expect("random bytes");
+        plaintext
     }
 }
 
@@ -127,12 +139,9 @@ impl TokenEncryptor {
     /// Create from a server's nostr Keys.
     #[must_use]
     pub fn from_keys(keys: &Keys) -> Self {
-        let pubkey_bytes = keys.public_key().to_bytes();
-        // Convert x-only pubkey to compressed pubkey (assume even y)
-        let mut compressed = [0u8; 33];
-        compressed[0] = 0x02; // Even y-coordinate prefix
-        compressed[1..].copy_from_slice(&pubkey_bytes);
-        let server_pubkey = PublicKey::from_slice(&compressed).expect("valid pubkey");
+        let xonly =
+            XOnlyPublicKey::from_slice(&keys.public_key().to_bytes()).expect("valid pubkey");
+        let server_pubkey = PublicKey::from_x_only_public_key(xonly, Parity::Even);
         Self::new(server_pubkey)
     }
 
@@ -146,6 +155,7 @@ impl TokenEncryptor {
         let ephemeral_secret =
             SecretKey::from_slice(&ephemeral_secret_bytes).expect("valid secret key");
         let ephemeral_pubkey = PublicKey::from_secret_key(&self.secp, &ephemeral_secret);
+        let ephemeral_xonly = XOnlyPublicKey::from(ephemeral_pubkey);
 
         // Perform ECDH to get shared secret
         let shared_point =
@@ -165,16 +175,16 @@ impl TokenEncryptor {
 
         // Encrypt using ChaCha20-Poly1305
         let cipher = ChaCha20Poly1305::new_from_slice(&encryption_key).expect("valid key size");
-        let plaintext = token.to_padded_payload();
+        let plaintext = token.to_plaintext();
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_ref())
             .expect("encryption should not fail");
 
         // Assemble encrypted token: ephemeral_pubkey || nonce || ciphertext
         let mut encrypted = Vec::with_capacity(ENCRYPTED_TOKEN_SIZE);
-        encrypted.extend_from_slice(&ephemeral_pubkey.serialize()); // 33 bytes
+        encrypted.extend_from_slice(&ephemeral_xonly.serialize()); // 32 bytes
         encrypted.extend_from_slice(&nonce_bytes); // 12 bytes
-        encrypted.extend_from_slice(&ciphertext); // 235 bytes (219 + 16 tag)
+        encrypted.extend_from_slice(&ciphertext); // 236 bytes (220 + 16 tag)
 
         assert_eq!(encrypted.len(), ENCRYPTED_TOKEN_SIZE);
         encrypted
@@ -188,10 +198,10 @@ impl TokenEncryptor {
 
 /// Builder for creating kind 446 notification request content.
 ///
-/// The content is a JSON array of base64-encoded encrypted tokens.
+/// The content is one base64 string of concatenated encrypted tokens.
 pub struct NotificationContentBuilder {
     encryptor: TokenEncryptor,
-    tokens: Vec<String>,
+    tokens: Vec<Vec<u8>>,
 }
 
 #[allow(dead_code)]
@@ -209,7 +219,7 @@ impl NotificationContentBuilder {
     #[must_use]
     pub fn with_apns_token(mut self, device_token_hex: &str) -> Self {
         let token = TestToken::apns(device_token_hex);
-        self.tokens.push(self.encryptor.encrypt_base64(&token));
+        self.tokens.push(self.encryptor.encrypt(&token));
         self
     }
 
@@ -217,7 +227,7 @@ impl NotificationContentBuilder {
     #[must_use]
     pub fn with_random_apns_token(mut self) -> Self {
         let token = TestToken::apns_random();
-        self.tokens.push(self.encryptor.encrypt_base64(&token));
+        self.tokens.push(self.encryptor.encrypt(&token));
         self
     }
 
@@ -225,7 +235,7 @@ impl NotificationContentBuilder {
     #[must_use]
     pub fn with_fcm_token(mut self, device_token: &str) -> Self {
         let token = TestToken::fcm(device_token);
-        self.tokens.push(self.encryptor.encrypt_base64(&token));
+        self.tokens.push(self.encryptor.encrypt(&token));
         self
     }
 
@@ -233,21 +243,30 @@ impl NotificationContentBuilder {
     #[must_use]
     pub fn with_random_fcm_token(mut self) -> Self {
         let token = TestToken::fcm_random();
-        self.tokens.push(self.encryptor.encrypt_base64(&token));
+        self.tokens.push(self.encryptor.encrypt(&token));
         self
     }
 
     /// Add a pre-encrypted token (base64 encoded).
     #[must_use]
     pub fn with_raw_token(mut self, base64_token: String) -> Self {
-        self.tokens.push(base64_token);
+        let token = BASE64_STANDARD
+            .decode(base64_token)
+            .expect("pre-encrypted token should be valid base64");
+        assert_eq!(
+            token.len(),
+            ENCRYPTED_TOKEN_SIZE,
+            "token should be 280 bytes"
+        );
+        self.tokens.push(token);
         self
     }
 
-    /// Build the JSON content string.
+    /// Build the base64 content string.
     #[must_use]
     pub fn build(self) -> String {
-        serde_json::to_string(&self.tokens).expect("serialization should not fail")
+        let concatenated: Vec<u8> = self.tokens.into_iter().flatten().collect();
+        BASE64_STANDARD.encode(concatenated)
     }
 }
 
@@ -280,10 +299,14 @@ impl GiftWrapBuilder {
     /// Build a gift-wrapped notification request event.
     ///
     /// # Arguments
-    /// * `content` - The JSON content (array of base64-encoded encrypted tokens)
+    /// * `content` - The base64 content (concatenated encrypted tokens)
     pub async fn build(&self, content: &str) -> Event {
         // Create the kind 446 rumor (unsigned event)
-        let rumor_builder = EventBuilder::new(Kind::Custom(KIND_NOTIFICATION_REQUEST), content);
+        let rumor_builder = EventBuilder::new(Kind::Custom(KIND_NOTIFICATION_REQUEST), content)
+            .tags([
+                Tag::parse([TAG_VERSION, VERSION_MIP05_V1]).expect("valid version tag"),
+                Tag::parse([TAG_ENCODING, ENCODING_BASE64]).expect("valid encoding tag"),
+            ]);
 
         // Build the unsigned event (rumor)
         let rumor = rumor_builder.build(self.sender_keys.public_key());
@@ -303,9 +326,13 @@ impl GiftWrapBuilder {
     /// Build a gift-wrapped notification request with the given tokens.
     pub async fn build_with_tokens(&self, tokens: Vec<TestToken>) -> Event {
         let encryptor = TokenEncryptor::from_keys(&self.server_keys);
-        let token_strings: Vec<String> =
-            tokens.iter().map(|t| encryptor.encrypt_base64(t)).collect();
-        let content = serde_json::to_string(&token_strings).expect("serialization");
+        let content = tokens
+            .into_iter()
+            .fold(
+                NotificationContentBuilder::new(&self.server_keys),
+                |builder, token| builder.with_raw_token(encryptor.encrypt_base64(&token)),
+            )
+            .build();
         self.build(&content).await
     }
 }
@@ -358,9 +385,9 @@ pub mod scenarios {
             .await
     }
 
-    /// Create a notification with an empty token array.
+    /// Create a notification with an empty token blob.
     pub async fn empty_notification(server_keys: &Keys, sender_keys: &Keys) -> Event {
-        let content = "[]";
+        let content = "";
 
         GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
             .build(content)
@@ -383,7 +410,8 @@ mod tests {
         let encryptor = TokenEncryptor::from_keys(&server_keys);
 
         // Create and encrypt a test token
-        let test_token = TestToken::apns("deadbeef1234567890abcdef");
+        let test_token =
+            TestToken::apns("deadbeef1234567890abcdefdeadbeef1234567890abcdefdeadbeef12345678");
         let encrypted = encryptor.encrypt(&test_token);
 
         // Verify size
@@ -419,19 +447,12 @@ mod tests {
         let server_keys = Keys::generate();
 
         let content = NotificationContentBuilder::new(&server_keys)
-            .with_apns_token("aabbccdd")
+            .with_apns_token("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
             .with_fcm_token("fcm-token")
             .build();
 
-        // Should be valid JSON array
-        let parsed: Vec<String> = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed.len(), 2);
-
-        // Each token should be valid base64
-        for token_b64 in &parsed {
-            let decoded = BASE64_STANDARD.decode(token_b64).unwrap();
-            assert_eq!(decoded.len(), ENCRYPTED_TOKEN_SIZE);
-        }
+        let decoded = BASE64_STANDARD.decode(&content).unwrap();
+        assert_eq!(decoded.len(), ENCRYPTED_TOKEN_SIZE * 2);
     }
 
     #[tokio::test]
@@ -464,7 +485,7 @@ mod tests {
 
         // Create notification content
         let content = NotificationContentBuilder::new(&server_keys)
-            .with_apns_token("deadbeef")
+            .with_apns_token("deadbeef1234567890abcdefdeadbeef1234567890abcdefdeadbeef12345678")
             .build();
 
         // Create gift wrap
@@ -491,7 +512,7 @@ mod tests {
 
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
-        let device_token_hex = "0123456789abcdef0123456789abcdef";
+        let device_token_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         // Create gift-wrapped notification
         let gift_wrap =
