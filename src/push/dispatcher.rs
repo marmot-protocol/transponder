@@ -16,7 +16,7 @@
 //! from memory when no longer needed, preventing sensitive data from lingering.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
@@ -71,6 +71,7 @@ pub struct PushDispatcher {
     fcm_client: Option<Arc<FcmClient>>,
     semaphore: Arc<Semaphore>,
     sender: mpsc::Sender<PushMessage>,
+    queue_depth: Arc<AtomicUsize>,
     shutting_down: Arc<AtomicBool>,
     admission_lock: tokio::sync::Mutex<()>,
     worker_handles: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
@@ -98,6 +99,7 @@ impl PushDispatcher {
         let fcm_client = fcm_client.map(Arc::new);
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSHES));
         let (sender, receiver) = mpsc::channel(MAX_PENDING_QUEUE_SIZE);
+        let queue_depth = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
 
         // Initialize semaphore metric
@@ -108,7 +110,7 @@ impl PushDispatcher {
         // Spawn worker tasks
         let worker_handles = Self::spawn_workers(
             receiver,
-            sender.clone(),
+            queue_depth.clone(),
             apns_client.clone(),
             fcm_client.clone(),
             semaphore.clone(),
@@ -120,6 +122,7 @@ impl PushDispatcher {
             fcm_client,
             semaphore,
             sender,
+            queue_depth,
             shutting_down,
             admission_lock: tokio::sync::Mutex::new(()),
             worker_handles: tokio::sync::Mutex::new(worker_handles),
@@ -127,16 +130,26 @@ impl PushDispatcher {
         }
     }
 
-    fn update_queue_size_metric(metrics: &Option<Metrics>, sender: &mpsc::Sender<PushMessage>) {
+    fn update_queue_size_metric(metrics: &Option<Metrics>, queue_depth: &AtomicUsize) {
         if let Some(metrics) = metrics {
-            metrics.set_push_queue_size(MAX_PENDING_QUEUE_SIZE - sender.capacity());
+            metrics.set_push_queue_size(queue_depth.load(Ordering::SeqCst));
         }
+    }
+
+    fn increment_queue_depth(queue_depth: &AtomicUsize, count: usize) {
+        queue_depth.fetch_add(count, Ordering::SeqCst);
+    }
+
+    fn decrement_queue_depth(queue_depth: &AtomicUsize) {
+        let _ = queue_depth.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_sub(1)
+        });
     }
 
     /// Spawn worker tasks that process the push queue.
     fn spawn_workers(
         receiver: mpsc::Receiver<PushMessage>,
-        sender: mpsc::Sender<PushMessage>,
+        queue_depth: Arc<AtomicUsize>,
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
         semaphore: Arc<Semaphore>,
@@ -148,7 +161,7 @@ impl PushDispatcher {
 
         for worker_id in 0..NUM_WORKERS {
             let receiver = receiver.clone();
-            let sender = sender.clone();
+            let queue_depth = queue_depth.clone();
             let apns_client = apns_client.clone();
             let fcm_client = fcm_client.clone();
             let semaphore = semaphore.clone();
@@ -162,12 +175,11 @@ impl PushDispatcher {
                         rx.recv().await
                     };
 
-                    if msg.is_some() {
-                        Self::update_queue_size_metric(&metrics, &sender);
-                    }
-
                     match msg {
                         Some(PushMessage::Send { platform, token }) => {
+                            Self::decrement_queue_depth(&queue_depth);
+                            Self::update_queue_size_metric(&metrics, &queue_depth);
+
                             // Acquire semaphore permit before spawning the send task.
                             let permit = match semaphore.clone().acquire_owned().await {
                                 Ok(p) => p,
@@ -370,8 +382,9 @@ impl PushDispatcher {
             }
         }
 
+        Self::increment_queue_depth(&self.queue_depth, message_count);
         // Update queue size after the full batch is admitted.
-        Self::update_queue_size_metric(&self.metrics, &self.sender);
+        Self::update_queue_size_metric(&self.metrics, &self.queue_depth);
 
         Ok(message_count)
     }
@@ -442,6 +455,7 @@ impl PushDispatcher {
         }
         drop(permits);
 
+        self.queue_depth.store(0, Ordering::SeqCst);
         if let Some(ref m) = self.metrics {
             m.set_push_queue_size(0);
             m.set_push_semaphore_available(self.semaphore.available_permits());
