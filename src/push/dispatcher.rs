@@ -39,7 +39,10 @@ const MAX_CONCURRENT_PUSHES: usize = 100;
 const MAX_PENDING_QUEUE_SIZE: usize = 10_000;
 
 /// Number of worker tasks processing the queue.
-const NUM_WORKERS: usize = 4;
+///
+/// Match the worker pool to the semaphore limit so the dispatcher can actually
+/// reach the configured maximum outbound concurrency.
+const NUM_WORKERS: usize = MAX_CONCURRENT_PUSHES;
 
 /// Internal message for the push queue.
 ///
@@ -830,6 +833,11 @@ mod tests {
             .expect("shutdown task should not panic");
 
         assert_eq!(dispatcher.queue_capacity(), MAX_PENDING_QUEUE_SIZE);
+    }
+
+    #[test]
+    fn test_worker_count_matches_concurrency_limit() {
+        assert_eq!(NUM_WORKERS, MAX_CONCURRENT_PUSHES);
     }
 
     #[tokio::test]
