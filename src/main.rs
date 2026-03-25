@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use nostr_sdk::prelude::*;
+use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -51,6 +52,19 @@ struct Args {
 enum Command {
     /// Generate a new Nostr key pair for the server
     GenerateKeys,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationReceiveAction {
+    Continue,
+    Shutdown,
+}
+
+fn classify_notification_receive_error(error: &RecvError) -> NotificationReceiveAction {
+    match error {
+        RecvError::Lagged(_) => NotificationReceiveAction::Continue,
+        RecvError::Closed => NotificationReceiveAction::Shutdown,
+    }
 }
 
 #[tokio::main]
@@ -255,8 +269,15 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            error!(error = %e, "Notification channel error");
-                            break;
+                            match classify_notification_receive_error(&e) {
+                                NotificationReceiveAction::Continue => {
+                                    warn!(error = %e, "Lagged relay notifications, continuing");
+                                }
+                                NotificationReceiveAction::Shutdown => {
+                                    error!(error = %e, "Notification channel closed");
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -366,4 +387,23 @@ fn init_logging(config: &config::LoggingConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_receive_lag_is_recoverable() {
+        let action = classify_notification_receive_error(&RecvError::Lagged(3));
+
+        assert_eq!(action, NotificationReceiveAction::Continue);
+    }
+
+    #[test]
+    fn notification_receive_close_is_terminal() {
+        let action = classify_notification_receive_error(&RecvError::Closed);
+
+        assert_eq!(action, NotificationReceiveAction::Shutdown);
+    }
 }

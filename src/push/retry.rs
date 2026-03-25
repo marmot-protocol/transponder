@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::warn;
 
+use crate::error::Error;
 use crate::metrics::Metrics;
 
 /// Default maximum number of retry attempts.
@@ -115,6 +116,60 @@ where
     }
 }
 
+/// Execute an async transport operation with exponential backoff retry.
+///
+/// Only `Error::Http` failures are retried. The last transport error is
+/// returned once the retry budget is exhausted.
+#[must_use = "retry result indicates success/failure and should not be ignored"]
+pub async fn with_transport_retry<T, F, Fut>(
+    config: &RetryConfig,
+    service_name: &str,
+    mut operation: F,
+    metrics: Option<&Metrics>,
+) -> crate::error::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<T>>,
+{
+    let mut retries = 0;
+    let mut backoff = config.initial_backoff;
+
+    loop {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(Error::Http(error)) if retries < config.max_retries => {
+                retries += 1;
+
+                if let Some(metrics) = metrics {
+                    metrics.record_push_retry(service_name.to_lowercase().as_str());
+                }
+
+                warn!(
+                    service = service_name,
+                    error = %error,
+                    retry = retries,
+                    max_retries = config.max_retries,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "Retrying push transport error"
+                );
+
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+            Err(Error::Http(error)) => {
+                warn!(
+                    service = service_name,
+                    error = %error,
+                    retries = retries,
+                    "Max retries exceeded for push transport error"
+                );
+                return Err(Error::Http(error));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Parse a Retry-After header value into a Duration.
 ///
 /// Supports both delay-seconds format (e.g., "120") and HTTP-date format.
@@ -136,6 +191,7 @@ pub fn parse_retry_after(header_value: Option<&str>) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::Client;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -378,5 +434,70 @@ mod tests {
         // Verify metrics were recorded - gather metrics and check they're non-empty
         let families = metrics.registry.gather();
         assert!(!families.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_with_transport_retry_success_after_retries() {
+        let config = RetryConfig {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(1),
+        };
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+        let client = Client::new();
+
+        let result: crate::error::Result<bool> = with_transport_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                let client = client.clone();
+                async move {
+                    let attempts = count.fetch_add(1, Ordering::SeqCst);
+                    if attempts < 2 {
+                        let error = client.get("http://127.0.0.1:9").send().await.unwrap_err();
+                        Err(Error::from(error))
+                    } else {
+                        Ok(true)
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_with_transport_retry_exhausts_retries() {
+        let config = RetryConfig {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(1),
+        };
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+        let client = Client::new();
+
+        let result: crate::error::Result<bool> = with_transport_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                let client = client.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let error = client.get("http://127.0.0.1:9").send().await.unwrap_err();
+                    Err(Error::from(error))
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::Http(_))));
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
     }
 }

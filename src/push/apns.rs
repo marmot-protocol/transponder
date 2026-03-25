@@ -219,6 +219,16 @@ impl ApnsClient {
         .await
     }
 
+    fn build_request(&self, url: &str, auth_token: &str) -> reqwest::RequestBuilder {
+        self.http_client
+            .post(url)
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
+            .header("apns-topic", &self.config.bundle_id)
+            .header("authorization", format!("bearer {auth_token}"))
+            .json(&ApnsPayload::default())
+    }
+
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
@@ -226,26 +236,28 @@ impl ApnsClient {
         let start = Instant::now();
         let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
 
-        let payload = ApnsPayload::default();
-
-        let mut request = self
-            .http_client
-            .post(&url)
-            .header("apns-push-type", "background")
-            .header("apns-priority", "5")
-            .header("apns-topic", &self.config.bundle_id)
-            .json(&payload);
-
         // Add authorization header
         let token = match self.get_token().await {
             Ok(t) => t,
             Err(e) => return SendAttemptResult::Permanent(e),
         };
-        request = request.header("authorization", format!("bearer {token}"));
 
-        let response = match request.send().await {
+        let transport_retry = RetryConfig::default();
+        let response = match retry::with_transport_retry(
+            &transport_retry,
+            "APNs",
+            || async {
+                self.build_request(&url, &token)
+                    .send()
+                    .await
+                    .map_err(Error::from)
+            },
+            self.metrics.as_ref(),
+        )
+        .await
+        {
             Ok(r) => r,
-            Err(e) => return SendAttemptResult::Permanent(Error::from(e)),
+            Err(e) => return SendAttemptResult::Permanent(e),
         };
 
         let status = response.status();

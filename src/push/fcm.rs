@@ -279,6 +279,31 @@ impl FcmClient {
         .await
     }
 
+    fn build_request(
+        &self,
+        url: &str,
+        access_token: &str,
+        device_token: &str,
+    ) -> reqwest::RequestBuilder {
+        let mut data = std::collections::HashMap::new();
+        data.insert("content_available".to_string(), "true".to_string());
+
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: device_token.to_string(),
+                android: Some(AndroidConfig {
+                    priority: "high".to_string(),
+                }),
+                data: Some(data),
+            },
+        };
+
+        self.http_client
+            .post(url)
+            .header("authorization", format!("Bearer {access_token}"))
+            .json(&request)
+    }
+
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
@@ -295,29 +320,25 @@ impl FcmClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        let mut data = std::collections::HashMap::new();
-        data.insert("content_available".to_string(), "true".to_string());
-
-        let request = FcmRequest {
-            message: FcmMessage {
-                token: device_token.to_string(),
-                android: Some(AndroidConfig {
-                    priority: "high".to_string(),
-                }),
-                data: Some(data),
-            },
+        let transport_retry = RetryConfig {
+            max_retries: 1,
+            ..RetryConfig::default()
         };
-
-        let response = match self
-            .http_client
-            .post(&url)
-            .header("authorization", format!("Bearer {access_token}"))
-            .json(&request)
-            .send()
-            .await
+        let response = match retry::with_transport_retry(
+            &transport_retry,
+            "FCM",
+            || async {
+                self.build_request(&url, &access_token, device_token)
+                    .send()
+                    .await
+                    .map_err(Error::from)
+            },
+            self.metrics.as_ref(),
+        )
+        .await
         {
             Ok(r) => r,
-            Err(e) => return SendAttemptResult::Permanent(Error::from(e)),
+            Err(e) => return SendAttemptResult::Permanent(e),
         };
 
         let status = response.status();

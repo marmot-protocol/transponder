@@ -29,6 +29,10 @@ pub enum Error {
     #[error("Invalid token: {0}")]
     InvalidToken(String),
 
+    /// Push dispatch or queueing error.
+    #[error("Push dispatch error: {0}")]
+    Dispatch(String),
+
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -89,6 +93,12 @@ mod tests {
     fn test_error_display_invalid_token() {
         let err = Error::InvalidToken("malformed token data".to_string());
         assert_eq!(err.to_string(), "Invalid token: malformed token data");
+    }
+
+    #[test]
+    fn test_error_display_dispatch() {
+        let err = Error::Dispatch("queue full".to_string());
+        assert_eq!(err.to_string(), "Push dispatch error: queue full");
     }
 
     #[test]

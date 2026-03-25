@@ -282,10 +282,7 @@ impl EventProcessor {
         }
 
         // Dispatch notifications
-        let count = payloads.len();
-        self.push_dispatcher.dispatch(payloads).await;
-
-        Ok(count)
+        self.push_dispatcher.dispatch(payloads).await
     }
 
     /// Hash arbitrary bytes to a fixed-size key for rate limiting.
@@ -431,7 +428,7 @@ mod tests {
     async fn test_process_valid_gift_wrap_event() {
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
-        let device_token = "aabbccdd11223344aabbccdd11223344";
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
 
         let event =
             scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
@@ -451,7 +448,7 @@ mod tests {
         let event = scenarios::single_apns_notification(
             &server_keys,
             &sender_keys,
-            "deadbeef12345678deadbeef12345678",
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
         )
         .await;
 
@@ -476,14 +473,14 @@ mod tests {
         let event1 = scenarios::single_apns_notification(
             &server_keys,
             &sender_keys,
-            "aaaa111122223333aaaa111122223333",
+            "aaaa111122223333aaaa111122223333aaaa111122223333aaaa111122223333",
         )
         .await;
 
         let event2 = scenarios::single_apns_notification(
             &server_keys,
             &sender_keys,
-            "bbbb444455556666bbbb444455556666",
+            "bbbb444455556666bbbb444455556666bbbb444455556666bbbb444455556666",
         )
         .await;
 
@@ -505,7 +502,7 @@ mod tests {
         let event = scenarios::single_apns_notification(
             &wrong_server_keys,
             &sender_keys,
-            "deadbeef12345678deadbeef12345678",
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
         )
         .await;
 
@@ -517,7 +514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_empty_token_list() {
+    async fn test_process_empty_token_blob() {
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
 
@@ -527,7 +524,7 @@ mod tests {
         let result = processor.process(&event).await;
 
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]
@@ -796,7 +793,7 @@ mod tests {
         );
 
         // Same device token, but different encrypted blobs (re-encrypted each time)
-        let device_token = "aabbccdd11223344aabbccdd11223344";
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
 
         // First notification should succeed
         let event1 =
@@ -822,7 +819,7 @@ mod tests {
         assert!(result3.unwrap());
 
         // A different device should still work
-        let other_device = "11111111222222223333333344444444";
+        let other_device = "1111111122222222333333334444444411111111222222223333333344444444";
         let event4 =
             scenarios::single_apns_notification(&server_keys, &sender_keys, other_device).await;
         let result4 = processor.process(&event4).await;
@@ -835,7 +832,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_encrypted_token_rate_limiting() {
-        use crate::test_vectors::{GiftWrapBuilder, TestToken, TokenEncryptor};
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
 
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
@@ -854,11 +853,14 @@ mod tests {
 
         // Encrypt a token once and reuse the same encrypted blob
         let encryptor = TokenEncryptor::from_keys(&server_keys);
-        let test_token = TestToken::apns("deadbeef12345678deadbeef12345678");
+        let test_token =
+            TestToken::apns("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678");
         let encrypted_b64 = encryptor.encrypt_base64(&test_token);
 
         // Create events with the exact same encrypted token
-        let content = serde_json::to_string(&vec![&encrypted_b64]).unwrap();
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(encrypted_b64.clone())
+            .build();
 
         let event1 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
             .build(&content)
@@ -892,7 +894,9 @@ mod tests {
         // A different encrypted token (same device) should work since we rate limit
         // encrypted tokens first
         let encrypted_b64_2 = encryptor.encrypt_base64(&test_token);
-        let content2 = serde_json::to_string(&vec![&encrypted_b64_2]).unwrap();
+        let content2 = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(encrypted_b64_2)
+            .build();
         let event4 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
             .build(&content2)
             .await;
@@ -903,7 +907,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_window_reset() {
-        use crate::test_vectors::{GiftWrapBuilder, TestToken, TokenEncryptor};
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
 
         tokio::time::pause();
 
@@ -922,9 +928,12 @@ mod tests {
         );
 
         let encryptor = TokenEncryptor::from_keys(&server_keys);
-        let test_token = TestToken::apns("aabbccdd11223344aabbccdd11223344");
+        let test_token =
+            TestToken::apns("aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344");
         let encrypted_b64 = encryptor.encrypt_base64(&test_token);
-        let content = serde_json::to_string(&vec![&encrypted_b64]).unwrap();
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(encrypted_b64)
+            .build();
 
         // First request succeeds
         let event1 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
