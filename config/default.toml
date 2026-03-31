@@ -6,6 +6,10 @@
 # REQUIRED: Set via TRANSPONDER_SERVER_PRIVATE_KEY environment variable
 private_key = ""
 
+# Alternative: path to a file containing the private key.
+# Useful with Docker secrets or other mounted secret files.
+# private_key_file = "/run/secrets/transponder_private_key"
+
 # Graceful shutdown timeout in seconds
 # Increase this for environments with slow networks or high in-flight notification counts
 shutdown_timeout_secs = 10
@@ -45,7 +49,8 @@ clearnet = [
     "wss://nos.lol"
 ]
 
-# Tor/onion relays (optional, requires tor feature)
+# Tor/onion relays (optional)
+# Requires a binary built with: cargo build --features tor
 onion = []
 
 # Reconnection settings

@@ -6,6 +6,8 @@
 //! to APNs and FCM.
 
 use std::sync::Arc;
+use std::time::Duration;
+use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -52,6 +54,12 @@ struct Args {
 enum Command {
     /// Generate a new Nostr key pair for the server
     GenerateKeys,
+    /// Probe a running Transponder instance for container health checks
+    Healthcheck {
+        /// Health endpoint URL to probe
+        #[arg(long, default_value = "http://127.0.0.1:8080/health")]
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,8 +80,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Handle subcommands
-    if let Some(Command::GenerateKeys) = args.command {
-        return generate_keys();
+    if let Some(command) = args.command {
+        return match command {
+            Command::GenerateKeys => generate_keys(),
+            Command::Healthcheck { url } => run_healthcheck(&url).await,
+        };
     }
 
     // Load configuration
@@ -106,8 +117,10 @@ async fn main() -> Result<()> {
         "Starting Transponder"
     );
 
+    let server_private_key = resolve_server_private_key(&config.server)?;
+
     // Validate configuration
-    if config.server.private_key.is_empty() {
+    if server_private_key.is_empty() {
         anyhow::bail!("Server private key is required");
     }
 
@@ -117,7 +130,7 @@ async fn main() -> Result<()> {
 
     // Create server keys
     let secret_key =
-        SecretKey::from_hex(&config.server.private_key).context("Invalid server private key")?;
+        SecretKey::from_hex(&server_private_key).context("Invalid server private key")?;
     let keys = Keys::new(secret_key);
 
     info!(
@@ -357,6 +370,47 @@ fn generate_keys() -> Result<()> {
     Ok(())
 }
 
+/// Resolve the server private key from config or a mounted secret file.
+fn resolve_server_private_key(config: &config::ServerConfig) -> Result<String> {
+    if !config.private_key.is_empty() {
+        return Ok(config.private_key.trim().to_string());
+    }
+
+    if config.private_key_file.is_empty() {
+        return Ok(String::new());
+    }
+
+    let key_path = Path::new(&config.private_key_file);
+    let key = fs::read_to_string(key_path).with_context(|| {
+        format!(
+            "Failed to read server private key file {}",
+            key_path.display()
+        )
+    })?;
+
+    Ok(key.trim().to_string())
+}
+
+/// Probe a Transponder health endpoint and return a non-zero exit on failure.
+async fn run_healthcheck(url: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("Failed to create healthcheck client")?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to reach health endpoint at {url}"))?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    anyhow::bail!("Healthcheck failed with status {}", response.status())
+}
+
 /// Initialize the tracing subscriber based on configuration.
 fn init_logging(config: &config::LoggingConfig) -> Result<()> {
     let filter =
@@ -392,6 +446,10 @@ fn init_logging(config: &config::LoggingConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, http::StatusCode, routing::get};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use tokio::net::TcpListener;
 
     #[test]
     fn notification_receive_lag_is_recoverable() {
@@ -405,5 +463,77 @@ mod tests {
         let action = classify_notification_receive_error(&RecvError::Closed);
 
         assert_eq!(action, NotificationReceiveAction::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn healthcheck_command_accepts_success_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/health", get(|| async { StatusCode::OK }));
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let result = run_healthcheck(&format!("http://{addr}/health")).await;
+
+        server.abort();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn healthcheck_command_rejects_error_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/health",
+            get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "not ready") }),
+        );
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let result = run_healthcheck(&format!("http://{addr}/health")).await;
+
+        server.abort();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_server_private_key_prefers_inline_value() {
+        let config = config::ServerConfig {
+            private_key: "abc123".to_string(),
+            private_key_file: "/tmp/ignored".to_string(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 100_000,
+            max_rate_limit_cache_size: 100_000,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+        };
+
+        assert_eq!(resolve_server_private_key(&config).unwrap(), "abc123");
+    }
+
+    #[test]
+    fn resolve_server_private_key_reads_secret_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "abc123").unwrap();
+
+        let config = config::ServerConfig {
+            private_key: String::new(),
+            private_key_file: file.path().display().to_string(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 100_000,
+            max_rate_limit_cache_size: 100_000,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+        };
+
+        assert_eq!(resolve_server_private_key(&config).unwrap(), "abc123");
     }
 }

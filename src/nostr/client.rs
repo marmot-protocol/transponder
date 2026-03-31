@@ -1,7 +1,7 @@
 //! Nostr relay client implementation.
 //!
-//! Handles connections to ClearNet and Tor relays, subscription management,
-//! and automatic reconnection.
+//! Handles connections to ClearNet relays, optional Tor relays, subscription
+//! management, and automatic reconnection.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +17,11 @@ use crate::metrics::Metrics;
 // Type alias to avoid confusion with our RelayStatus
 use nostr_sdk::RelayStatus as NostrRelayStatus;
 
+#[cfg(feature = "tor")]
+const TOR_FEATURE_ENABLED: bool = true;
+#[cfg(not(feature = "tor"))]
+const TOR_FEATURE_ENABLED: bool = false;
+
 /// Status of relay connections.
 #[derive(Debug, Clone, Default)]
 pub struct RelayStatus {
@@ -28,7 +33,7 @@ pub struct RelayStatus {
     pub total_configured: usize,
 }
 
-/// Nostr relay client with support for ClearNet and Tor relays.
+/// Nostr relay client with support for ClearNet and optional Tor relays.
 pub struct RelayClient {
     client: Client,
     config: RelayConfig,
@@ -49,6 +54,8 @@ impl RelayClient {
         config: RelayConfig,
         metrics: Option<Metrics>,
     ) -> Result<Self> {
+        validate_relay_config(&config)?;
+
         let client = Client::builder().signer(keys).build();
 
         let total = config.clearnet.len() + config.onion.len();
@@ -249,6 +256,16 @@ impl RelayClient {
 
         Ok(())
     }
+}
+
+fn validate_relay_config(config: &RelayConfig) -> Result<()> {
+    if !TOR_FEATURE_ENABLED && !config.onion.is_empty() {
+        return Err(Error::Nostr(
+            "Onion relays are configured, but this build does not include Tor support. Rebuild with `--features tor`.".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -515,6 +532,7 @@ mod tests {
         client.disconnect().await.unwrap();
     }
 
+    #[cfg(feature = "tor")]
     #[tokio::test]
     async fn test_publish_inbox_relays_with_onion_relays() {
         let keys = Keys::generate();
@@ -531,6 +549,40 @@ mod tests {
         // Should attempt to publish (will fail since no real connection, but tests the path)
         let result = client.publish_inbox_relays().await;
         // The function always returns Ok, even if publishing fails
+        assert!(result.is_ok());
+    }
+
+    #[cfg(not(feature = "tor"))]
+    #[tokio::test]
+    async fn test_relay_client_rejects_onion_relays_without_tor_feature() {
+        let keys = Keys::generate();
+        let config = RelayConfig {
+            clearnet: vec![],
+            onion: vec!["wss://example.onion".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        let result = RelayClient::new(keys, config).await;
+        assert!(result.is_err());
+        let err = result.err().expect("onion relays should be rejected");
+        assert!(err.to_string().contains("does not include Tor support"));
+    }
+
+    #[cfg(feature = "tor")]
+    #[tokio::test]
+    async fn test_relay_client_allows_onion_relays_with_tor_feature() {
+        let keys = Keys::generate();
+        let config = RelayConfig {
+            clearnet: vec![],
+            onion: vec!["wss://example.onion".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        let result = RelayClient::new(keys, config).await;
         assert!(result.is_ok());
     }
 

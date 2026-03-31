@@ -6,12 +6,16 @@ rust-version = "1.90"
 description = "Privacy-preserving push notification server implementing the MIP-05 specification"
 license = "MIT"
 
+[features]
+default = []
+tor = ["nostr-sdk/tor"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.49", features = ["full", "signal"] }
 
 # Nostr
-nostr-sdk = { version = "0.44", default-features = false, features = ["tor", "nip59"] }
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip59"] }
 
 # Cryptography
 chacha20poly1305 = "0.10.1"
@@ -20,7 +24,7 @@ sha2 = "0.10.9"
 secp256k1 = { version = "0.29", features = ["rand", "std"] }
 
 # Push notifications
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
 jsonwebtoken = "9"
 
 # Configuration

@@ -17,6 +17,7 @@ Transponder enables push notifications for Marmot-compatible messaging apps whil
 - Rust 1.90+
 - APNs credentials (for iOS notifications)
 - FCM service account (for Android notifications)
+- Optional: build with `--features tor` only if you need onion relay support
 
 ## Quick Start
 
@@ -33,6 +34,8 @@ cp config/default.toml config/local.toml
 # Run
 ./target/release/transponder --config config/local.toml
 ```
+
+Tor relay support is disabled in the default build. If you need `.onion` relays, build and run with `--features tor`.
 
 ## Configuration
 
@@ -71,8 +74,8 @@ clearnet = [
     "wss://nos.lol"
 ]
 
-# Tor/onion relays (optional, enables enhanced privacy)
-# Requires the server to have Tor connectivity
+# Tor/onion relays (optional)
+# Requires a build with `--features tor` and a host that can support Tor traffic
 onion = []
 
 # Reconnection settings (reserved for future use)
@@ -150,6 +153,7 @@ export TRANSPONDER_FCM_SERVICE_ACCOUNT_PATH="/path/to/service-account.json"
 
 # Relays (JSON array format)
 export TRANSPONDER_RELAYS_CLEARNET='["wss://relay.example.com","wss://relay2.example.com"]'
+export TRANSPONDER_RELAYS_ONION='["wss://exampleonionrelay.onion"]' # requires `--features tor`
 
 # Logging
 export TRANSPONDER_LOGGING_LEVEL="debug"
@@ -187,7 +191,15 @@ Share the public key with clients so they can encrypt notification tokens for yo
 ### Building
 
 ```bash
+docker login dhi.io
 docker build -t transponder .
+```
+
+To build an image with onion relay support enabled:
+
+```bash
+docker login dhi.io
+docker build --build-arg CARGO_FEATURES='--features tor' -t transponder:tor .
 ```
 
 ### Running
@@ -195,7 +207,11 @@ docker build -t transponder .
 ```bash
 docker run -d \
   --name transponder \
-  -p 8080:8080 \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  -p 127.0.0.1:8080:8080 \
   -v /path/to/config.toml:/etc/transponder/config.toml:ro \
   -v /path/to/credentials:/credentials:ro \
   -e TRANSPONDER_SERVER_PRIVATE_KEY="your-hex-key" \
@@ -204,14 +220,17 @@ docker run -d \
 
 ### Docker Compose
 
-A `docker-compose.yml` is included with Transponder, Prometheus, and Grafana services:
+A hardened `docker-compose.yml` is included. By default it starts only Transponder; Prometheus and
+Grafana are behind the `monitoring` profile and bind to localhost only.
 
 ```bash
-# Start all services (Transponder + monitoring stack)
+# Start only Transponder
 docker compose up -d
 
-# Start only Transponder
-docker compose up -d transponder
+# Start Transponder plus the monitoring stack
+export GF_SECURITY_ADMIN_USER=admin
+export GF_SECURITY_ADMIN_PASSWORD='choose-a-long-random-password'
+docker compose --profile monitoring up -d
 
 # View logs
 docker compose logs -f transponder
@@ -219,10 +238,89 @@ docker compose logs -f transponder
 
 Services and ports:
 - **Transponder**: `http://localhost:8080` (health, readiness, metrics)
-- **Prometheus**: `http://localhost:9090` (metrics storage and queries)
-- **Grafana**: `http://localhost:3000` (dashboards, default login: admin/admin)
+- **Prometheus**: `http://localhost:9090` when the `monitoring` profile is enabled
+- **Grafana**: `http://localhost:3000` when the `monitoring` profile is enabled
 
 See [Monitoring with Prometheus & Grafana](#monitoring-with-prometheus--grafana) for more details.
+
+### Runtime Notes
+
+- The production image now uses Docker Hardened Images for both build and runtime stages.
+- Base images and the production monitoring/proxy images are pinned by digest for reproducible deploys.
+- Docker health checks use `transponder healthcheck`, so the container does not need `wget` or `curl`.
+- The build context intentionally excludes local configs and credentials via `.dockerignore`.
+- Tor relay support is disabled in the default build and must be enabled explicitly with `--features tor`.
+
+## Production Deployment
+
+The repository now includes a production deployment bundle:
+
+- [compose.prod.yml](/Users/jeff/.codex/worktrees/c05d/transponder/compose.prod.yml)
+- [config/production.toml.example](/Users/jeff/.codex/worktrees/c05d/transponder/config/production.toml.example)
+- [deploy/production.env.example](/Users/jeff/.codex/worktrees/c05d/transponder/deploy/production.env.example)
+- [docs/deployment.md](/Users/jeff/.codex/worktrees/c05d/transponder/docs/deployment.md)
+
+Recommended deployment flow:
+
+```bash
+cp config/production.toml.example config/production.toml
+cp deploy/production.env.example deploy/production.env
+mkdir -p credentials secrets
+chmod 700 credentials secrets
+
+printf '%s\n' 'YOUR_64_CHAR_HEX_PRIVATE_KEY' > secrets/server_private_key
+chmod 600 secrets/server_private_key
+
+docker login dhi.io
+docker build -t transponder:local .
+docker compose -f compose.prod.yml --env-file deploy/production.env up -d
+```
+
+The production bundle uses `TRANSPONDER_SERVER_PRIVATE_KEY_FILE` so the server private key can be mounted as a file instead of injected directly as an environment variable.
+
+If you plan to configure onion relays, build the image with `--build-arg CARGO_FEATURES='--features tor'` first and point `TRANSPONDER_IMAGE` at that Tor-enabled image tag.
+
+If you want Grafana reachable at a public URL, the production bundle also includes an optional Caddy profile. Set `GRAFANA_PUBLIC_HOST`, `GRAFANA_ROOT_URL`, and `CADDY_EMAIL` in [deploy/production.env.example](/Users/jeff/.codex/worktrees/c05d/transponder/deploy/production.env.example), then start with:
+
+```bash
+docker compose -f compose.prod.yml --env-file deploy/production.env --profile monitoring --profile proxy up -d
+```
+
+That serves Grafana through Caddy at `https://$GRAFANA_PUBLIC_HOST` while keeping the Grafana container itself on an internal Docker network.
+
+### Machine Sizing
+
+Transponder is lightweight compared with a database-backed service, but it does have real memory and network needs from relay connections, decryption work, push fan-out, and optional Tor support.
+
+Starting guidance:
+
+- Test or evaluation node: `1 vCPU`, `1 GB RAM`
+- Small production node, clearnet only, no local monitoring: `2 vCPU`, `2 GB RAM`
+- Recommended production node, especially with Prometheus/Grafana or onion relays: `2 vCPU`, `4 GB RAM`
+- Higher-traffic or Tor-heavy deployment: `4 vCPU`, `8 GB RAM`
+
+Disk guidance:
+
+- `20 GB` is enough for Transponder alone
+- `40 GB` is a safer floor if you keep Prometheus and Grafana on the same VM
+
+For the full host-prep and upgrade flow, see [docs/deployment.md](/Users/jeff/.codex/worktrees/c05d/transponder/docs/deployment.md).
+
+### Dependency Audit
+
+Run a local vulnerability audit with:
+
+```bash
+just audit
+```
+
+or directly:
+
+```bash
+cargo audit
+```
+
+`just audit` uses the repository audit policy for the optional Tor dependency tree. The default build does not enable Tor, and the remaining ignored advisories are upstream in that optional graph. Use `just audit-strict` if you want the raw unfiltered report.
 
 ## Health Checks
 
@@ -315,13 +413,15 @@ The repository includes a ready-to-use monitoring stack with Prometheus and Graf
 
 ```bash
 # Start Transponder with the full monitoring stack
-docker compose up -d
+export GF_SECURITY_ADMIN_USER=admin
+export GF_SECURITY_ADMIN_PASSWORD='choose-a-long-random-password'
+docker compose --profile monitoring up -d
 
 # Access the services:
 # - Transponder health: http://localhost:8080/health
 # - Transponder metrics: http://localhost:8080/metrics
 # - Prometheus: http://localhost:9090
-# - Grafana: http://localhost:3000 (admin/admin)
+# - Grafana: http://localhost:3000
 ```
 
 ### Architecture
@@ -419,6 +519,7 @@ Nostr Relays (ClearNet/Tor)
 
 - **Never commit credentials** to version control
 - **Use environment variables** for sensitive values in production
+- **Prefer mounted secret files** for the server private key in Docker/Compose
 - **Restrict file permissions** on config files: `chmod 600 config/local.toml`
 - **Mount credentials read-only** in Docker: `-v /path:/credentials:ro`
 
@@ -435,6 +536,11 @@ The server private key is critical:
 - **TLS everywhere**: All connections to relays, APNs, and FCM use TLS
 - **Health endpoint exposure**: Consider binding to localhost (`127.0.0.1:8080`) and using a reverse proxy
 - **Firewall rules**: Only expose port 8080 if health checks are needed externally
+- **Prefer localhost binds** in Compose and publish through a reverse proxy only when needed
+- **Default inbound policy**: SSH only, plus `80/443` if you are exposing Grafana through Caddy
+- **Do not publish** Transponder, Prometheus, or Grafana admin ports directly to the public internet
+- **Outbound policy**: Allow HTTPS egress to relays, APNs, and FCM; onion relay support may require broader Tor-compatible egress
+- **Tor is opt-in**: The default build rejects onion relay configuration unless you compile with `--features tor`
 
 ### Logging Security
 
@@ -446,6 +552,7 @@ The server private key is critical:
 ### Operational Security
 
 - Run as a **non-root user** (the Docker image does this automatically)
+- Prefer **rootless Docker** on the host when feasible
 - Use **read-only filesystems** where possible
 - Enable **health checks** for orchestration systems
 - Monitor for **unusual error rates** which may indicate attacks
@@ -455,6 +562,9 @@ The server private key is critical:
 ```bash
 # Run tests
 cargo test
+
+# Run the optional Tor relay build
+cargo test --features tor
 
 # Run with verbose logging
 RUST_LOG=debug cargo run -- --config config/local.toml
@@ -473,6 +583,7 @@ cargo build --release
 
 ### "Failed to connect to any relay"
 - Check relay URLs are correct and accessible
+- If you configured onion relays, confirm the binary was built with `--features tor`
 - For onion relays, ensure Tor connectivity
 - Verify firewall allows outbound WebSocket connections
 

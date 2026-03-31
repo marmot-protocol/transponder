@@ -1,0 +1,16 @@
+{
+	email {$CADDY_EMAIL}
+	admin off
+}
+
+{$GRAFANA_PUBLIC_HOST} {
+	encode zstd gzip
+
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+	}
+
+	reverse_proxy grafana:3000
+}

@@ -63,6 +63,10 @@ pub struct ServerConfig {
     /// Server's Nostr private key (hex or nsec format).
     pub private_key: String,
 
+    /// Path to a file containing the server's Nostr private key.
+    #[serde(default)]
+    pub private_key_file: String,
+
     /// Graceful shutdown timeout in seconds.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
@@ -260,6 +264,7 @@ impl AppConfig {
         let config = Config::builder()
             // Start with default values
             .set_default("server.private_key", "")?
+            .set_default("server.private_key_file", "")?
             .set_default("server.shutdown_timeout_secs", 10)?
             .set_default(
                 "server.max_dedup_cache_size",
@@ -323,6 +328,7 @@ impl AppConfig {
         let config = Config::builder()
             // Set defaults
             .set_default("server.private_key", "")?
+            .set_default("server.private_key_file", "")?
             .set_default("server.shutdown_timeout_secs", 10)?
             .set_default(
                 "server.max_dedup_cache_size",

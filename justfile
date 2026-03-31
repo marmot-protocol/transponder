@@ -9,13 +9,25 @@ default:
 build:
     cargo build
 
+# Build with optional Tor relay support
+build-tor:
+    cargo build --features tor
+
 # Build release binary
 build-release:
     cargo build --release
 
+# Build release binary with optional Tor relay support
+build-release-tor:
+    cargo build --release --features tor
+
 # Run the server with default config
 run:
     cargo run -- --config config/default.toml
+
+# Run the server with Tor relay support enabled
+run-tor:
+    cargo run --features tor -- --config config/default.toml
 
 # Run the server with local config (for development)
 run-local:
@@ -29,6 +41,10 @@ run-debug:
 test:
     cargo test
 
+# Run all tests with Tor relay support enabled
+test-tor:
+    cargo test --features tor
+
 # Run tests with output
 test-verbose:
     cargo test -- --nocapture
@@ -41,9 +57,21 @@ test-module module:
 check:
     cargo check
 
+# Check code with Tor relay support enabled
+check-tor:
+    cargo check --features tor
+
 # Run clippy lints
 lint:
     cargo clippy -- -D warnings
+
+# Run dependency vulnerability audit
+audit:
+    ./scripts/cargo-audit.sh
+
+# Run the raw dependency vulnerability audit without policy ignores
+audit-strict:
+    cargo audit
 
 # Format code
 fmt:
@@ -53,8 +81,8 @@ fmt:
 fmt-check:
     cargo fmt -- --check
 
-# Run all checks (format, lint, test)
-ci: fmt-check lint test
+# Run all checks (format, lint, test, audit)
+ci: fmt-check lint test audit
 
 # Clean build artifacts
 clean:
@@ -78,6 +106,7 @@ coverage-report:
 
 # Install development dependencies
 install-dev-deps:
+    cargo install cargo-audit
     cargo install cargo-llvm-cov
     rustup component add llvm-tools-preview
 

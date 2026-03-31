@@ -1,0 +1,16 @@
+.git
+.github
+target
+trees
+credentials
+.env
+.env.*
+config/local.toml
+config/production.toml
+config/*.local.toml
+*.p8
+*.p12
+*.pem
+*.key
+service-account*.json
+security_best_practices_report.md
