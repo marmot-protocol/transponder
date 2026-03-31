@@ -75,6 +75,28 @@ fn classify_notification_receive_error(error: &RecvError) -> NotificationReceive
     }
 }
 
+fn validate_startup_config(server_private_key: &str, relays: &config::RelayConfig) -> Result<()> {
+    if server_private_key.is_empty() {
+        anyhow::bail!("Server private key is required");
+    }
+
+    if relays.clearnet.is_empty() && relays.onion.is_empty() {
+        anyhow::bail!("At least one relay must be configured");
+    }
+
+    Ok(())
+}
+
+fn build_rate_limit_config(server: &config::ServerConfig) -> nostr::events::TokenRateLimitConfig {
+    nostr::events::TokenRateLimitConfig {
+        max_cache_size: server.max_rate_limit_cache_size,
+        encrypted_token_per_minute: server.encrypted_token_rate_limit_per_minute,
+        encrypted_token_per_hour: server.encrypted_token_rate_limit_per_hour,
+        device_token_per_minute: server.device_token_rate_limit_per_minute,
+        device_token_per_hour: server.device_token_rate_limit_per_hour,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -120,13 +142,7 @@ async fn main() -> Result<()> {
     let server_private_key = resolve_server_private_key(&config.server)?;
 
     // Validate configuration
-    if server_private_key.is_empty() {
-        anyhow::bail!("Server private key is required");
-    }
-
-    if config.relays.clearnet.is_empty() && config.relays.onion.is_empty() {
-        anyhow::bail!("At least one relay must be configured");
-    }
+    validate_startup_config(&server_private_key, &config.relays)?;
 
     // Create server keys
     let secret_key =
@@ -224,13 +240,7 @@ async fn main() -> Result<()> {
     }
 
     // Create event processor with configured cache sizes and rate limiting
-    let rate_limit_config = nostr::events::TokenRateLimitConfig {
-        max_cache_size: config.server.max_rate_limit_cache_size,
-        encrypted_token_per_minute: config.server.encrypted_token_rate_limit_per_minute,
-        encrypted_token_per_hour: config.server.encrypted_token_rate_limit_per_hour,
-        device_token_per_minute: config.server.device_token_rate_limit_per_minute,
-        device_token_per_hour: config.server.device_token_rate_limit_per_hour,
-    };
+    let rate_limit_config = build_rate_limit_config(&config.server);
     let event_processor = Arc::new(EventProcessor::with_full_config(
         nip59_handler,
         token_decryptor,
@@ -500,6 +510,18 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn healthcheck_command_reports_unreachable_endpoint() {
+        let result = run_healthcheck("http://127.0.0.1:1/health").await;
+
+        let error = result.expect_err("healthcheck should fail for unreachable endpoints");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to reach health endpoint at http://127.0.0.1:1/health")
+        );
+    }
+
     #[test]
     fn resolve_server_private_key_prefers_inline_value() {
         let config = config::ServerConfig {
@@ -535,5 +557,107 @@ mod tests {
         };
 
         assert_eq!(resolve_server_private_key(&config).unwrap(), "abc123");
+    }
+
+    #[test]
+    fn resolve_server_private_key_returns_empty_when_unset() {
+        let config = config::ServerConfig {
+            private_key: String::new(),
+            private_key_file: String::new(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 100_000,
+            max_rate_limit_cache_size: 100_000,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+        };
+
+        assert_eq!(resolve_server_private_key(&config).unwrap(), "");
+    }
+
+    #[test]
+    fn resolve_server_private_key_reports_missing_secret_file() {
+        let config = config::ServerConfig {
+            private_key: String::new(),
+            private_key_file: "/tmp/definitely-missing-transponder-key".to_string(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 100_000,
+            max_rate_limit_cache_size: 100_000,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+        };
+
+        let error = resolve_server_private_key(&config)
+            .expect_err("missing secret file should return an error");
+        assert!(error.to_string().contains("Failed to read server private key file"));
+    }
+
+    #[test]
+    fn validate_startup_config_rejects_missing_private_key() {
+        let relays = config::RelayConfig {
+            clearnet: vec!["wss://relay.example.com".to_string()],
+            onion: Vec::new(),
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 30,
+        };
+
+        let error = validate_startup_config("", &relays)
+            .expect_err("missing private key should be rejected");
+        assert_eq!(error.to_string(), "Server private key is required");
+    }
+
+    #[test]
+    fn validate_startup_config_rejects_missing_relays() {
+        let relays = config::RelayConfig {
+            clearnet: Vec::new(),
+            onion: Vec::new(),
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 30,
+        };
+
+        let error = validate_startup_config("abc123", &relays)
+            .expect_err("missing relays should be rejected");
+        assert_eq!(error.to_string(), "At least one relay must be configured");
+    }
+
+    #[test]
+    fn validate_startup_config_accepts_onion_only_relays() {
+        let relays = config::RelayConfig {
+            clearnet: Vec::new(),
+            onion: vec!["wss://example.onion".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 30,
+        };
+
+        assert!(validate_startup_config("abc123", &relays).is_ok());
+    }
+
+    #[test]
+    fn build_rate_limit_config_matches_server_settings() {
+        let server = config::ServerConfig {
+            private_key: String::new(),
+            private_key_file: String::new(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 100_000,
+            max_rate_limit_cache_size: 1234,
+            encrypted_token_rate_limit_per_minute: 111,
+            encrypted_token_rate_limit_per_hour: 2222,
+            device_token_rate_limit_per_minute: 333,
+            device_token_rate_limit_per_hour: 4444,
+        };
+
+        let rate_limit_config = build_rate_limit_config(&server);
+
+        assert_eq!(rate_limit_config.max_cache_size, 1234);
+        assert_eq!(rate_limit_config.encrypted_token_per_minute, 111);
+        assert_eq!(rate_limit_config.encrypted_token_per_hour, 2222);
+        assert_eq!(rate_limit_config.device_token_per_minute, 333);
+        assert_eq!(rate_limit_config.device_token_per_hour, 4444);
     }
 }
