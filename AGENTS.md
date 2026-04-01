@@ -61,7 +61,7 @@ cargo llvm-cov --html
 
 ## Code Style
 
-- Use `rustfmt` for formatting (run `cargo fmt` before committing)
+- Use `rustfmt` for formatting (run `cargo fmt` before committing when working outside the `just ci` flow)
 - Follow Rust API guidelines: https://rust-lang.github.io/api-guidelines/
 - Use `thiserror` for error types in library code
 - Use `anyhow` for error propagation in main/tests

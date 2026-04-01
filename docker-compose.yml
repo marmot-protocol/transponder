@@ -25,7 +25,8 @@ services:
       # TRANSPONDER_FCM_ENABLED: "true"
       TRANSPONDER_LOGGING_LEVEL: "info"
     healthcheck:
-      test: ["CMD", "/bin/transponder", "healthcheck"]
+      # If you override health.bind_address, update this URL to match.
+      test: ["CMD", "/bin/transponder", "healthcheck", "--url", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3

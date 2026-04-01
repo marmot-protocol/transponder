@@ -179,9 +179,9 @@ Docker:
 ```bash
 docker compose -f compose.prod.yml --env-file deploy/production.env ps
 docker compose -f compose.prod.yml --env-file deploy/production.env logs -f transponder
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/ready
-curl http://127.0.0.1:8080/metrics
+curl http://127.0.0.1:${TRANSPONDER_PUBLISHED_PORT:-8080}/health
+curl http://127.0.0.1:${TRANSPONDER_PUBLISHED_PORT:-8080}/ready
+curl http://127.0.0.1:${TRANSPONDER_PUBLISHED_PORT:-8080}/metrics
 ```
 
 systemd:
@@ -189,10 +189,12 @@ systemd:
 ```bash
 systemctl status transponder
 journalctl -u transponder -f
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/ready
-curl http://127.0.0.1:8080/metrics
+curl http://127.0.0.1:<HEALTH_PORT>/health
+curl http://127.0.0.1:<HEALTH_PORT>/ready
+curl http://127.0.0.1:<HEALTH_PORT>/metrics
 ```
+
+For Docker, `TRANSPONDER_PUBLISHED_PORT` defaults to `8080` if unset. For native deployments, `<HEALTH_PORT>` is whatever you configure in `health.bind_address`; the production example defaults to `8080`.
 
 `/ready` should return HTTP 200 only when at least one relay is connected and at least one push provider is configured.
 
@@ -202,9 +204,17 @@ Docker:
 
 ```bash
 docker login dhi.io
+
+# Default deployment
 docker build -t transponder:local .
+
+# Tor-enabled deployment for onion relays
+docker build --build-arg CARGO_FEATURES='--features tor' -t transponder:tor .
+
 docker compose -f compose.prod.yml --env-file deploy/production.env up -d
 ```
+
+Build `transponder:local` for the default deployment path, or `transponder:tor` when `TRANSPONDER_IMAGE` points at a Tor-enabled image for onion relays.
 
 systemd:
 
