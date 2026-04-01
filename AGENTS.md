@@ -97,18 +97,6 @@ src/
 └── metrics.rs        # Prometheus metrics collection
 ```
 
-### Monitoring Stack
-
-```
-monitoring/
-├── prometheus/
-│   └── prometheus.yml    # Prometheus scrape config (targets transponder:8080)
-└── grafana/
-    └── provisioning/
-        └── datasources/
-            └── datasource.yml  # Auto-provisions Prometheus datasource
-```
-
 ## Key Implementation Details
 
 ### Token Decryption (crypto/token.rs)

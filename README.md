@@ -220,17 +220,10 @@ docker run -d \
 
 ### Docker Compose
 
-A hardened `docker-compose.yml` is included. By default it starts only Transponder; Prometheus and
-Grafana are behind the `monitoring` profile and bind to localhost only.
+A hardened `docker-compose.yml` is included. It starts only Transponder.
 
 ```bash
-# Start only Transponder
 docker compose up -d
-
-# Start Transponder plus the monitoring stack
-export GF_SECURITY_ADMIN_USER=admin
-export GF_SECURITY_ADMIN_PASSWORD='choose-a-long-random-password'
-docker compose --profile monitoring up -d
 
 # View logs
 docker compose logs -f transponder
@@ -238,15 +231,11 @@ docker compose logs -f transponder
 
 Services and ports:
 - **Transponder**: `http://localhost:8080` (health, readiness, metrics)
-- **Prometheus**: `http://localhost:9090` when the `monitoring` profile is enabled
-- **Grafana**: `http://localhost:3000` when the `monitoring` profile is enabled
-
-See [Monitoring with Prometheus & Grafana](#monitoring-with-prometheus--grafana) for more details.
 
 ### Runtime Notes
 
 - The production image now uses Docker Hardened Images for both build and runtime stages.
-- Base images and the production monitoring/proxy images are pinned by digest for reproducible deploys.
+- Base images are pinned by digest for reproducible deploys.
 - Docker health checks use `transponder healthcheck`, so the container does not need `wget` or `curl`.
 - The build context intentionally excludes local configs and credentials via `.dockerignore`.
 - Tor relay support is disabled in the default build and must be enabled explicitly with `--features tor`.
@@ -255,10 +244,11 @@ See [Monitoring with Prometheus & Grafana](#monitoring-with-prometheus--grafana)
 
 The repository now includes a production deployment bundle:
 
-- [compose.prod.yml](/Users/jeff/.codex/worktrees/c05d/transponder/compose.prod.yml)
-- [config/production.toml.example](/Users/jeff/.codex/worktrees/c05d/transponder/config/production.toml.example)
-- [deploy/production.env.example](/Users/jeff/.codex/worktrees/c05d/transponder/deploy/production.env.example)
-- [docs/deployment.md](/Users/jeff/.codex/worktrees/c05d/transponder/docs/deployment.md)
+- [compose.prod.yml](compose.prod.yml)
+- [config/production.toml.example](config/production.toml.example)
+- [deploy/production.env.example](deploy/production.env.example)
+- [docs/deployment.md](docs/deployment.md)
+- [deploy/transponder.service.example](deploy/transponder.service.example)
 
 Recommended deployment flow:
 
@@ -280,14 +270,6 @@ The production bundle uses `TRANSPONDER_SERVER_PRIVATE_KEY_FILE` so the server p
 
 If you plan to configure onion relays, build the image with `--build-arg CARGO_FEATURES='--features tor'` first and point `TRANSPONDER_IMAGE` at that Tor-enabled image tag.
 
-If you want Grafana reachable at a public URL, the production bundle also includes an optional Caddy profile. Set `GRAFANA_PUBLIC_HOST`, `GRAFANA_ROOT_URL`, and `CADDY_EMAIL` in [deploy/production.env.example](/Users/jeff/.codex/worktrees/c05d/transponder/deploy/production.env.example), then start with:
-
-```bash
-docker compose -f compose.prod.yml --env-file deploy/production.env --profile monitoring --profile proxy up -d
-```
-
-That serves Grafana through Caddy at `https://$GRAFANA_PUBLIC_HOST` while keeping the Grafana container itself on an internal Docker network.
-
 ### Machine Sizing
 
 Transponder is lightweight compared with a database-backed service, but it does have real memory and network needs from relay connections, decryption work, push fan-out, and optional Tor support.
@@ -295,16 +277,16 @@ Transponder is lightweight compared with a database-backed service, but it does 
 Starting guidance:
 
 - Test or evaluation node: `1 vCPU`, `1 GB RAM`
-- Small production node, clearnet only, no local monitoring: `2 vCPU`, `2 GB RAM`
-- Recommended production node, especially with Prometheus/Grafana or onion relays: `2 vCPU`, `4 GB RAM`
+- Small production node, clearnet only: `2 vCPU`, `2 GB RAM`
+- Recommended production node, especially with onion relays: `2 vCPU`, `4 GB RAM`
 - Higher-traffic or Tor-heavy deployment: `4 vCPU`, `8 GB RAM`
 
 Disk guidance:
 
 - `20 GB` is enough for Transponder alone
-- `40 GB` is a safer floor if you keep Prometheus and Grafana on the same VM
+- `40 GB` gives you comfortable headroom for logs, credential rotation, and general host overhead
 
-For the full host-prep and upgrade flow, see [docs/deployment.md](/Users/jeff/.codex/worktrees/c05d/transponder/docs/deployment.md).
+For the full host-prep, `systemd` example, and upgrade flow, see [docs/deployment.md](docs/deployment.md).
 
 ### Dependency Audit
 
@@ -405,83 +387,15 @@ Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` 
 
 All metrics are designed to be safe for exposure. They do not include device tokens, user identifiers, message content, or relay URLs.
 
-## Monitoring with Prometheus & Grafana
+## Monitoring Integration
 
-The repository includes a ready-to-use monitoring stack with Prometheus and Grafana via Docker Compose.
+Transponder exposes Prometheus-format metrics at `/metrics`, but the repository no longer bundles Prometheus, Grafana, or a reverse proxy. That is intentional: operators can scrape and visualize Transponder using whatever monitoring stack they already trust.
 
-### Quick Start
+Typical patterns:
 
-```bash
-# Start Transponder with the full monitoring stack
-export GF_SECURITY_ADMIN_USER=admin
-export GF_SECURITY_ADMIN_PASSWORD='choose-a-long-random-password'
-docker compose --profile monitoring up -d
-
-# Access the services:
-# - Transponder health: http://localhost:8080/health
-# - Transponder metrics: http://localhost:8080/metrics
-# - Prometheus: http://localhost:9090
-# - Grafana: http://localhost:3000
-```
-
-### Architecture
-
-```
-┌─────────────┐     scrape      ┌────────────┐     query     ┌─────────┐
-│ Transponder │◄────────────────│ Prometheus │◄──────────────│ Grafana │
-│  :8080      │    /metrics     │  :9090     │               │  :3000  │
-└─────────────┘                 └────────────┘               └─────────┘
-```
-
-### Configuration Files
-
-| File | Description |
-|------|-------------|
-| `docker-compose.yml` | Service definitions for all containers |
-| `monitoring/prometheus/prometheus.yml` | Prometheus scrape configuration |
-| `monitoring/grafana/provisioning/datasources/datasource.yml` | Grafana datasource setup |
-
-### Prometheus Configuration
-
-The default Prometheus configuration scrapes Transponder metrics every 15 seconds:
-
-```yaml
-# monitoring/prometheus/prometheus.yml
-global:
-  scrape_interval: 15s
-
-scrape_configs:
-  - job_name: 'transponder'
-    static_configs:
-      - targets: ['transponder:8080']
-```
-
-### Example PromQL Queries
-
-```promql
-# Push notification success rate (last 5 minutes)
-sum(rate(transponder_push_success_total[5m])) / sum(rate(transponder_push_dispatched_total[5m]))
-
-# Events processed per second
-rate(transponder_events_processed_total[1m])
-
-# Push request latency (p99)
-histogram_quantile(0.99, rate(transponder_push_request_duration_seconds_bucket[5m]))
-
-# Current relay connections by type
-transponder_relays_connected
-
-# Token decryption failure rate
-rate(transponder_tokens_decryption_failed_total[5m]) / rate(transponder_tokens_decrypted_total[5m])
-```
-
-### Running Without Monitoring
-
-To run only Transponder without Prometheus and Grafana:
-
-```bash
-docker compose up -d transponder
-```
+- scrape `http://127.0.0.1:8080/metrics` from a local Prometheus, VictoriaMetrics, or similar agent
+- forward metrics through an existing reverse proxy or VPN if you need remote scraping
+- keep `/metrics` internal-only unless you have a deliberate access-control story
 
 ## How It Works
 
@@ -537,8 +451,8 @@ The server private key is critical:
 - **Health endpoint exposure**: Consider binding to localhost (`127.0.0.1:8080`) and using a reverse proxy
 - **Firewall rules**: Only expose port 8080 if health checks are needed externally
 - **Prefer localhost binds** in Compose and publish through a reverse proxy only when needed
-- **Default inbound policy**: SSH only, plus `80/443` if you are exposing Grafana through Caddy
-- **Do not publish** Transponder, Prometheus, or Grafana admin ports directly to the public internet
+- **Default inbound policy**: SSH only
+- **Do not publish** the health or metrics port directly to the public internet unless you have a clear access-control plan
 - **Outbound policy**: Allow HTTPS egress to relays, APNs, and FCM; onion relay support may require broader Tor-compatible egress
 - **Tor is opt-in**: The default build rejects onion relay configuration unless you compile with `--features tor`
 
