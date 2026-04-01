@@ -1,0 +1,40 @@
+services:
+  transponder:
+    image: ${TRANSPONDER_IMAGE:-transponder:local}
+    container_name: transponder
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    ports:
+      - "127.0.0.1:${TRANSPONDER_PUBLISHED_PORT:-8080}:8080"
+    volumes:
+      - ${TRANSPONDER_CONFIG_FILE:-./config/production.toml}:/etc/transponder/config.toml:ro
+      - ${TRANSPONDER_CREDENTIALS_DIR:-./credentials}:/credentials:ro
+    environment:
+      TRANSPONDER_SERVER_PRIVATE_KEY_FILE: /run/secrets/transponder_private_key
+      TRANSPONDER_LOGGING_LEVEL: ${TRANSPONDER_LOGGING_LEVEL:-info}
+      TRANSPONDER_LOGGING_FORMAT: json
+    secrets:
+      - transponder_private_key
+    healthcheck:
+      test: ["CMD", "/bin/transponder", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+secrets:
+  transponder_private_key:
+    file: ${TRANSPONDER_SERVER_PRIVATE_KEY_SECRET_FILE:-./secrets/server_private_key}

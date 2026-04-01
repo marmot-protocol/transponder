@@ -1,0 +1,31 @@
+[Unit]
+Description=Transponder push notification server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=transponder
+Group=transponder
+WorkingDirectory=/var/lib/transponder
+ExecStart=/usr/local/bin/transponder --config /etc/transponder/config.toml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/etc/transponder/config.toml /etc/transponder/secrets /etc/transponder/credentials
+ReadWritePaths=/var/lib/transponder
+Environment=TRANSPONDER_SERVER_PRIVATE_KEY_FILE=/etc/transponder/secrets/server_private_key
+Environment=TRANSPONDER_LOGGING_LEVEL=info
+
+[Install]
+WantedBy=multi-user.target

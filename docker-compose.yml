@@ -3,8 +3,16 @@ services:
     build: .
     container_name: transponder
     restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       # Mount custom config (create this from config/default.toml)
       - ./config/local.toml:/etc/transponder/config.toml:ro
@@ -15,9 +23,10 @@ services:
       # TRANSPONDER_SERVER_PRIVATE_KEY: "your-hex-private-key"
       # TRANSPONDER_APNS_ENABLED: "true"
       # TRANSPONDER_FCM_ENABLED: "true"
-      RUST_LOG: "info"
+      TRANSPONDER_LOGGING_LEVEL: "info"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      # If you override health.bind_address, update this URL to match.
+      test: ["CMD", "/bin/transponder", "healthcheck", "--url", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -27,56 +36,3 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-
-  # Optional: Local development with hot reload
-  transponder-dev:
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    container_name: transponder-dev
-    profiles:
-      - dev
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./src:/app/src:ro
-      - ./config:/app/config:ro
-      - ./credentials:/credentials:ro
-    environment:
-      RUST_LOG: "debug"
-      TRANSPONDER_LOGGING_FORMAT: "pretty"
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - grafana_data:/var/lib/grafana
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    depends_on:
-      - prometheus
-
-volumes:
-  prometheus_data:
-  grafana_data:

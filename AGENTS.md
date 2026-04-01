@@ -61,7 +61,7 @@ cargo llvm-cov --html
 
 ## Code Style
 
-- Use `rustfmt` for formatting (run `cargo fmt` before committing)
+- Use `rustfmt` for formatting (run `cargo fmt` before committing when working outside the `just ci` flow)
 - Follow Rust API guidelines: https://rust-lang.github.io/api-guidelines/
 - Use `thiserror` for error types in library code
 - Use `anyhow` for error propagation in main/tests
@@ -95,18 +95,6 @@ src/
 │   ├── mod.rs        # Module exports
 │   └── health.rs     # Health check HTTP endpoints (/health, /ready, /metrics)
 └── metrics.rs        # Prometheus metrics collection
-```
-
-### Monitoring Stack
-
-```
-monitoring/
-├── prometheus/
-│   └── prometheus.yml    # Prometheus scrape config (targets transponder:8080)
-└── grafana/
-    └── provisioning/
-        └── datasources/
-            └── datasource.yml  # Auto-provisions Prometheus datasource
 ```
 
 ## Key Implementation Details
@@ -186,7 +174,9 @@ TRANSPONDER_RELAYS_CLEARNET='["wss://relay.example.com"]'
 
 ## PR Guidelines
 
-- Run `cargo fmt` before committing
+- Run `just ci` before every commit; this is the standard pre-commit gate for formatting, linting, tests, and audit checks
+- If `just ci` fails, fix the issues before committing
+- Run `cargo fmt` before committing when working outside the `just ci` flow
 - Run `cargo clippy -- -D warnings` and fix all warnings
 - All tests must pass (`cargo test`)
 - Include tests for new functionality
