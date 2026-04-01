@@ -1,11 +1,13 @@
 //! Configuration loading and management.
 //!
 //! Supports TOML configuration files with environment variable overrides.
-//! Environment variables follow the pattern: `TRANSPONDER_<SECTION>_<KEY>`
+//! Environment variables follow the pattern: `TRANSPONDER_<SECTION>_<KEY>`.
+//! Everything after the first underscore becomes the key name, so
+//! `TRANSPONDER_SERVER_PRIVATE_KEY` maps to `server.private_key`.
 
-use config::{Config, Environment, File};
+use config::{Config, ConfigBuilder, File, builder::DefaultState};
 use serde::Deserialize;
-use std::path::Path;
+use std::{env, ffi::OsString, path::Path};
 
 use crate::error::Result;
 use crate::rate_limiter::{
@@ -40,6 +42,7 @@ pub struct AppConfig {
 
 /// Default maximum size for the deduplication cache.
 const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
+const ENV_PREFIX: &str = "TRANSPONDER_";
 
 fn default_max_dedup_cache_size() -> usize {
     DEFAULT_MAX_DEDUP_CACHE_SIZE
@@ -255,69 +258,145 @@ fn default_log_format() -> String {
     "json".to_string()
 }
 
+fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
+    Ok(Config::builder()
+        // Start with default values
+        .set_default("server.private_key", "")?
+        .set_default("server.private_key_file", "")?
+        .set_default("server.shutdown_timeout_secs", 10)?
+        .set_default(
+            "server.max_dedup_cache_size",
+            DEFAULT_MAX_DEDUP_CACHE_SIZE as i64,
+        )?
+        .set_default(
+            "server.max_rate_limit_cache_size",
+            DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE as i64,
+        )?
+        .set_default(
+            "server.encrypted_token_rate_limit_per_minute",
+            DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
+        )?
+        .set_default(
+            "server.encrypted_token_rate_limit_per_hour",
+            DEFAULT_RATE_LIMIT_PER_HOUR as i64,
+        )?
+        .set_default(
+            "server.device_token_rate_limit_per_minute",
+            DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
+        )?
+        .set_default(
+            "server.device_token_rate_limit_per_hour",
+            DEFAULT_RATE_LIMIT_PER_HOUR as i64,
+        )?
+        .set_default("relays.clearnet", Vec::<String>::new())?
+        .set_default("relays.onion", Vec::<String>::new())?
+        .set_default("relays.reconnect_interval_secs", 5)?
+        .set_default("relays.max_reconnect_attempts", 10)?
+        .set_default("relays.connection_timeout_secs", 30)?
+        .set_default("apns.enabled", false)?
+        .set_default("apns.key_id", "")?
+        .set_default("apns.team_id", "")?
+        .set_default("apns.private_key_path", "")?
+        .set_default("apns.environment", "production")?
+        .set_default("apns.bundle_id", "")?
+        .set_default("fcm.enabled", false)?
+        .set_default("fcm.service_account_path", "")?
+        .set_default("fcm.project_id", "")?
+        .set_default("health.enabled", true)?
+        .set_default("health.bind_address", "0.0.0.0:8080")?
+        .set_default("metrics.enabled", true)?
+        .set_default("logging.level", "info")?
+        .set_default("logging.format", "json")?)
+}
+
+fn apply_env_overrides(
+    mut builder: ConfigBuilder<DefaultState>,
+) -> Result<ConfigBuilder<DefaultState>> {
+    for (key, value) in env::vars_os() {
+        let Some((env_key, config_key)) = env_var_to_config_key(key)? else {
+            continue;
+        };
+
+        let value = value.into_string().map_err(|os_string| {
+            config::ConfigError::Message(format!(
+                "env variable {env_key:?} contains non-Unicode data: {os_string:?}"
+            ))
+        })?;
+
+        builder = if is_string_list_key(&config_key) {
+            builder.set_override(&config_key, parse_string_list_env(&env_key, &value)?)?
+        } else {
+            builder.set_override(&config_key, value)?
+        };
+    }
+
+    Ok(builder)
+}
+
+// Preserve underscores in field names by splitting only once after the section.
+fn env_var_to_config_key(
+    key: OsString,
+) -> std::result::Result<Option<(String, String)>, config::ConfigError> {
+    let key = match key.into_string() {
+        Ok(key) => key,
+        Err(_) => return Ok(None),
+    };
+
+    let Some(remainder) = key.strip_prefix(ENV_PREFIX) else {
+        return Ok(None);
+    };
+    let Some((section, field)) = remainder.split_once('_') else {
+        return Ok(None);
+    };
+    if section.is_empty() || field.is_empty() {
+        return Ok(None);
+    }
+
+    let config_key = format!(
+        "{}.{}",
+        section.to_ascii_lowercase(),
+        field.to_ascii_lowercase()
+    );
+
+    Ok(Some((key, config_key)))
+}
+
+fn is_string_list_key(config_key: &str) -> bool {
+    matches!(config_key, "relays.clearnet" | "relays.onion")
+}
+
+fn parse_string_list_env(
+    env_key: &str,
+    value: &str,
+) -> std::result::Result<Vec<String>, config::ConfigError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if trimmed.starts_with('[') {
+        return Err(config::ConfigError::Message(format!(
+            "env variable {env_key} must use a comma-separated list, not JSON"
+        )));
+    }
+
+    Ok(trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 impl AppConfig {
     /// Load configuration from a file path with environment variable overrides.
     ///
-    /// Environment variables follow the pattern: `TRANSPONDER_<SECTION>_<KEY>`
-    /// For example: `TRANSPONDER_SERVER_PRIVATE_KEY`
+    /// Environment variables follow the pattern: `TRANSPONDER_<SECTION>_<KEY>`.
+    /// Everything after the first underscore becomes the key name, so
+    /// `TRANSPONDER_SERVER_PRIVATE_KEY` maps to `server.private_key`.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let config = Config::builder()
-            // Start with default values
-            .set_default("server.private_key", "")?
-            .set_default("server.private_key_file", "")?
-            .set_default("server.shutdown_timeout_secs", 10)?
-            .set_default(
-                "server.max_dedup_cache_size",
-                DEFAULT_MAX_DEDUP_CACHE_SIZE as i64,
-            )?
-            .set_default(
-                "server.max_rate_limit_cache_size",
-                DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE as i64,
-            )?
-            .set_default(
-                "server.encrypted_token_rate_limit_per_minute",
-                DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
-            )?
-            .set_default(
-                "server.encrypted_token_rate_limit_per_hour",
-                DEFAULT_RATE_LIMIT_PER_HOUR as i64,
-            )?
-            .set_default(
-                "server.device_token_rate_limit_per_minute",
-                DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
-            )?
-            .set_default(
-                "server.device_token_rate_limit_per_hour",
-                DEFAULT_RATE_LIMIT_PER_HOUR as i64,
-            )?
-            .set_default("relays.clearnet", Vec::<String>::new())?
-            .set_default("relays.onion", Vec::<String>::new())?
-            .set_default("relays.reconnect_interval_secs", 5)?
-            .set_default("relays.max_reconnect_attempts", 10)?
-            .set_default("relays.connection_timeout_secs", 30)?
-            .set_default("apns.enabled", false)?
-            .set_default("apns.key_id", "")?
-            .set_default("apns.team_id", "")?
-            .set_default("apns.private_key_path", "")?
-            .set_default("apns.environment", "production")?
-            .set_default("apns.bundle_id", "")?
-            .set_default("fcm.enabled", false)?
-            .set_default("fcm.service_account_path", "")?
-            .set_default("fcm.project_id", "")?
-            .set_default("health.enabled", true)?
-            .set_default("health.bind_address", "0.0.0.0:8080")?
-            .set_default("metrics.enabled", true)?
-            .set_default("logging.level", "info")?
-            .set_default("logging.format", "json")?
-            // Load from config file
-            .add_source(File::from(path.as_ref()))
-            // Override with environment variables
-            .add_source(
-                Environment::with_prefix("TRANSPONDER")
-                    .separator("_")
-                    .try_parsing(true),
-            )
-            .build()?;
+        let builder = base_config_builder()?.add_source(File::from(path.as_ref()));
+        let config = apply_env_overrides(builder)?.build()?;
 
         Ok(config.try_deserialize()?)
     }
@@ -325,61 +404,7 @@ impl AppConfig {
     /// Load configuration from environment variables only (no config file).
     #[allow(dead_code)]
     pub fn from_env() -> Result<Self> {
-        let config = Config::builder()
-            // Set defaults
-            .set_default("server.private_key", "")?
-            .set_default("server.private_key_file", "")?
-            .set_default("server.shutdown_timeout_secs", 10)?
-            .set_default(
-                "server.max_dedup_cache_size",
-                DEFAULT_MAX_DEDUP_CACHE_SIZE as i64,
-            )?
-            .set_default(
-                "server.max_rate_limit_cache_size",
-                DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE as i64,
-            )?
-            .set_default(
-                "server.encrypted_token_rate_limit_per_minute",
-                DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
-            )?
-            .set_default(
-                "server.encrypted_token_rate_limit_per_hour",
-                DEFAULT_RATE_LIMIT_PER_HOUR as i64,
-            )?
-            .set_default(
-                "server.device_token_rate_limit_per_minute",
-                DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
-            )?
-            .set_default(
-                "server.device_token_rate_limit_per_hour",
-                DEFAULT_RATE_LIMIT_PER_HOUR as i64,
-            )?
-            .set_default("relays.clearnet", Vec::<String>::new())?
-            .set_default("relays.onion", Vec::<String>::new())?
-            .set_default("relays.reconnect_interval_secs", 5)?
-            .set_default("relays.max_reconnect_attempts", 10)?
-            .set_default("relays.connection_timeout_secs", 30)?
-            .set_default("apns.enabled", false)?
-            .set_default("apns.key_id", "")?
-            .set_default("apns.team_id", "")?
-            .set_default("apns.private_key_path", "")?
-            .set_default("apns.environment", "production")?
-            .set_default("apns.bundle_id", "")?
-            .set_default("fcm.enabled", false)?
-            .set_default("fcm.service_account_path", "")?
-            .set_default("fcm.project_id", "")?
-            .set_default("health.enabled", true)?
-            .set_default("health.bind_address", "0.0.0.0:8080")?
-            .set_default("metrics.enabled", true)?
-            .set_default("logging.level", "info")?
-            .set_default("logging.format", "json")?
-            // Load from environment
-            .add_source(
-                Environment::with_prefix("TRANSPONDER")
-                    .separator("_")
-                    .try_parsing(true),
-            )
-            .build()?;
+        let config = apply_env_overrides(base_config_builder()?)?.build()?;
 
         Ok(config.try_deserialize()?)
     }
@@ -407,7 +432,62 @@ impl ApnsConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::Builder;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        original: Vec<(String, String)>,
+    }
+
+    impl EnvGuard {
+        fn new(vars: &[(&str, &str)]) -> Self {
+            let original = env::vars()
+                .filter(|(key, _)| key.starts_with(ENV_PREFIX))
+                .collect::<Vec<_>>();
+
+            clear_transponder_env();
+
+            for (key, value) in vars {
+                unsafe { env::set_var(key, value) };
+            }
+
+            Self { original }
+        }
+
+        fn clear() -> Self {
+            Self::new(&[])
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            clear_transponder_env();
+
+            for (key, value) in &self.original {
+                unsafe { env::set_var(key, value) };
+            }
+        }
+    }
+
+    fn clear_transponder_env() {
+        for (key, _) in env::vars().filter(|(key, _)| key.starts_with(ENV_PREFIX)) {
+            unsafe { env::remove_var(key) };
+        }
+    }
+
+    fn with_clean_env<T>(test: impl FnOnce() -> T) -> T {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::clear();
+        test()
+    }
+
+    fn with_env_vars<T>(vars: &[(&str, &str)], test: impl FnOnce() -> T) -> T {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::new(vars);
+        test()
+    }
 
     fn create_temp_config(content: &str) -> tempfile::NamedTempFile {
         let mut file = Builder::new().suffix(".toml").tempfile().unwrap();
@@ -417,7 +497,8 @@ mod tests {
 
     #[test]
     fn test_load_minimal_config() {
-        let config_content = r#"
+        with_clean_env(|| {
+            let config_content = r#"
             [server]
             private_key = "abc123"
 
@@ -440,15 +521,16 @@ mod tests {
             level = "info"
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        assert_eq!(config.server.private_key, "abc123");
-        assert_eq!(config.server.shutdown_timeout_secs, 10); // default
-        assert_eq!(config.relays.clearnet.len(), 1);
-        assert!(!config.apns.enabled);
-        assert!(!config.fcm.enabled);
-        assert!(config.metrics.enabled);
+            assert_eq!(config.server.private_key, "abc123");
+            assert_eq!(config.server.shutdown_timeout_secs, 10); // default
+            assert_eq!(config.relays.clearnet.len(), 1);
+            assert!(!config.apns.enabled);
+            assert!(!config.fcm.enabled);
+            assert!(config.metrics.enabled);
+        });
     }
 
     #[test]
@@ -483,7 +565,8 @@ mod tests {
 
     #[test]
     fn test_load_full_config() {
-        let config_content = r#"
+        with_clean_env(|| {
+            let config_content = r#"
             [server]
             private_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             shutdown_timeout_secs = 30
@@ -520,93 +603,173 @@ mod tests {
             format = "pretty"
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        assert_eq!(
-            config.server.private_key,
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        );
-        assert_eq!(config.server.shutdown_timeout_secs, 30);
-        assert_eq!(config.relays.clearnet.len(), 2);
-        assert_eq!(config.relays.onion.len(), 1);
-        assert_eq!(config.relays.reconnect_interval_secs, 10);
-        assert_eq!(config.relays.max_reconnect_attempts, 5);
-        assert!(config.apns.enabled);
-        assert_eq!(config.apns.key_id, "KEY123");
-        assert_eq!(config.apns.team_id, "TEAM456");
-        assert!(!config.apns.is_production());
-        assert!(config.fcm.enabled);
-        assert_eq!(config.fcm.project_id, "my-project");
-        assert_eq!(config.health.bind_address, "127.0.0.1:9090");
-        assert!(config.metrics.enabled);
-        assert_eq!(config.logging.level, "debug");
-        assert_eq!(config.logging.format, "pretty");
+            assert_eq!(
+                config.server.private_key,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            );
+            assert_eq!(config.server.shutdown_timeout_secs, 30);
+            assert_eq!(config.relays.clearnet.len(), 2);
+            assert_eq!(config.relays.onion.len(), 1);
+            assert_eq!(config.relays.reconnect_interval_secs, 10);
+            assert_eq!(config.relays.max_reconnect_attempts, 5);
+            assert!(config.apns.enabled);
+            assert_eq!(config.apns.key_id, "KEY123");
+            assert_eq!(config.apns.team_id, "TEAM456");
+            assert!(!config.apns.is_production());
+            assert!(config.fcm.enabled);
+            assert_eq!(config.fcm.project_id, "my-project");
+            assert_eq!(config.health.bind_address, "127.0.0.1:9090");
+            assert!(config.metrics.enabled);
+            assert_eq!(config.logging.level, "debug");
+            assert_eq!(config.logging.format, "pretty");
+        });
     }
 
     #[test]
     fn test_default_values() {
-        // Config with only required fields - should use defaults for others
-        let config_content = r#"
+        with_clean_env(|| {
+            // Config with only required fields - should use defaults for others
+            let config_content = r#"
             [server]
             private_key = "test"
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        // Check defaults
-        assert_eq!(config.server.shutdown_timeout_secs, 10);
-        assert!(config.relays.clearnet.is_empty());
-        assert!(config.relays.onion.is_empty());
-        assert_eq!(config.relays.reconnect_interval_secs, 5);
-        assert_eq!(config.relays.max_reconnect_attempts, 10);
-        assert_eq!(config.relays.connection_timeout_secs, 30);
-        assert!(!config.apns.enabled);
-        assert_eq!(config.apns.environment, "production");
-        assert!(!config.fcm.enabled);
-        assert!(config.health.enabled);
-        assert_eq!(config.health.bind_address, "0.0.0.0:8080");
-        assert!(config.metrics.enabled);
-        assert_eq!(config.logging.level, "info");
-        assert_eq!(config.logging.format, "json");
+            // Check defaults
+            assert_eq!(config.server.shutdown_timeout_secs, 10);
+            assert!(config.relays.clearnet.is_empty());
+            assert!(config.relays.onion.is_empty());
+            assert_eq!(config.relays.reconnect_interval_secs, 5);
+            assert_eq!(config.relays.max_reconnect_attempts, 10);
+            assert_eq!(config.relays.connection_timeout_secs, 30);
+            assert!(!config.apns.enabled);
+            assert_eq!(config.apns.environment, "production");
+            assert!(!config.fcm.enabled);
+            assert!(config.health.enabled);
+            assert_eq!(config.health.bind_address, "0.0.0.0:8080");
+            assert!(config.metrics.enabled);
+            assert_eq!(config.logging.level, "info");
+            assert_eq!(config.logging.format, "json");
+        });
     }
 
     #[test]
     fn test_config_invalid_toml() {
-        let config_content = "this is not valid toml {{{";
+        with_clean_env(|| {
+            let config_content = "this is not valid toml {{{";
 
-        let file = create_temp_config(config_content);
-        let result = AppConfig::load(file.path());
-        assert!(result.is_err());
+            let file = create_temp_config(config_content);
+            let result = AppConfig::load(file.path());
+            assert!(result.is_err());
+        });
     }
 
     #[test]
     fn test_from_env_with_defaults() {
-        // Clear any existing TRANSPONDER_ env vars that might interfere
-        // This test verifies from_env works with defaults
-        let config = AppConfig::from_env().unwrap();
+        with_clean_env(|| {
+            let config = AppConfig::from_env().unwrap();
 
-        // Should have default values
-        assert_eq!(config.server.shutdown_timeout_secs, 10);
-        assert!(config.relays.clearnet.is_empty());
-        assert!(config.relays.onion.is_empty());
-        assert_eq!(config.relays.reconnect_interval_secs, 5);
-        assert_eq!(config.relays.max_reconnect_attempts, 10);
-        assert_eq!(config.relays.connection_timeout_secs, 30);
-        assert!(!config.apns.enabled);
-        assert_eq!(config.apns.environment, "production");
-        assert!(!config.fcm.enabled);
-        assert!(config.health.enabled);
-        assert_eq!(config.health.bind_address, "0.0.0.0:8080");
-        assert_eq!(config.logging.level, "info");
-        assert_eq!(config.logging.format, "json");
+            // Should have default values
+            assert_eq!(config.server.shutdown_timeout_secs, 10);
+            assert!(config.relays.clearnet.is_empty());
+            assert!(config.relays.onion.is_empty());
+            assert_eq!(config.relays.reconnect_interval_secs, 5);
+            assert_eq!(config.relays.max_reconnect_attempts, 10);
+            assert_eq!(config.relays.connection_timeout_secs, 30);
+            assert!(!config.apns.enabled);
+            assert_eq!(config.apns.environment, "production");
+            assert!(!config.fcm.enabled);
+            assert!(config.health.enabled);
+            assert_eq!(config.health.bind_address, "0.0.0.0:8080");
+            assert_eq!(config.logging.level, "info");
+            assert_eq!(config.logging.format, "json");
+        });
+    }
+
+    #[test]
+    fn test_from_env_overrides_keys_with_underscores() {
+        with_env_vars(
+            &[
+                ("TRANSPONDER_SERVER_PRIVATE_KEY", "env-private-key"),
+                ("TRANSPONDER_SERVER_SHUTDOWN_TIMEOUT_SECS", "30"),
+                ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "50000"),
+                ("TRANSPONDER_APNS_KEY_ID", "KEY123"),
+                ("TRANSPONDER_HEALTH_BIND_ADDRESS", "127.0.0.1:9090"),
+            ],
+            || {
+                let config = AppConfig::from_env().unwrap();
+
+                assert_eq!(config.server.private_key, "env-private-key");
+                assert_eq!(config.server.shutdown_timeout_secs, 30);
+                assert_eq!(config.server.max_dedup_cache_size, 50_000);
+                assert_eq!(config.apns.key_id, "KEY123");
+                assert_eq!(config.health.bind_address, "127.0.0.1:9090");
+            },
+        );
+    }
+
+    #[test]
+    fn test_load_env_overrides_file_values() {
+        with_env_vars(
+            &[
+                ("TRANSPONDER_SERVER_PRIVATE_KEY", "env-private-key"),
+                ("TRANSPONDER_APNS_PRIVATE_KEY_PATH", "/env/key.p8"),
+            ],
+            || {
+                let file = create_temp_config(
+                    r#"
+            [server]
+            private_key = "file-private-key"
+
+            [apns]
+            private_key_path = "/file/key.p8"
+        "#,
+                );
+
+                let config = AppConfig::load(file.path()).unwrap();
+
+                assert_eq!(config.server.private_key, "env-private-key");
+                assert_eq!(config.apns.private_key_path, "/env/key.p8");
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_parses_comma_separated_relay_lists() {
+        with_env_vars(
+            &[
+                (
+                    "TRANSPONDER_RELAYS_CLEARNET",
+                    "wss://relay.example.com, wss://relay2.example.com",
+                ),
+                ("TRANSPONDER_RELAYS_ONION", "ws://relay.onion"),
+            ],
+            || {
+                let config = AppConfig::from_env().unwrap();
+
+                assert_eq!(
+                    config.relays.clearnet,
+                    vec![
+                        "wss://relay.example.com".to_string(),
+                        "wss://relay2.example.com".to_string(),
+                    ]
+                );
+                assert_eq!(config.relays.onion, vec!["ws://relay.onion".to_string()]);
+            },
+        );
     }
 
     #[test]
     fn test_config_nonexistent_file() {
-        let result = AppConfig::load("/nonexistent/path/to/config.toml");
-        assert!(result.is_err());
+        with_clean_env(|| {
+            let result = AppConfig::load("/nonexistent/path/to/config.toml");
+            assert!(result.is_err());
+        });
     }
 
     #[test]
@@ -676,8 +839,9 @@ mod tests {
 
     #[test]
     fn test_config_partial_sections() {
-        // Config that only specifies some sections - others should get defaults
-        let config_content = r#"
+        with_clean_env(|| {
+            // Config that only specifies some sections - others should get defaults
+            let config_content = r#"
             [server]
             private_key = "test-key"
 
@@ -690,89 +854,101 @@ mod tests {
             # Missing other fields - should get defaults
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        assert_eq!(config.server.private_key, "test-key");
-        assert!(config.apns.enabled);
-        assert_eq!(config.apns.key_id, "MYKEY");
-        assert_eq!(config.apns.environment, "production"); // default
-        assert!(!config.fcm.enabled); // default
+            assert_eq!(config.server.private_key, "test-key");
+            assert!(config.apns.enabled);
+            assert_eq!(config.apns.key_id, "MYKEY");
+            assert_eq!(config.apns.environment, "production"); // default
+            assert!(!config.fcm.enabled); // default
+        });
     }
 
     #[test]
     fn test_max_dedup_cache_size_default() {
-        let config_content = r#"
+        with_clean_env(|| {
+            let config_content = r#"
             [server]
             private_key = "test"
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        assert_eq!(config.server.max_dedup_cache_size, 100_000);
+            assert_eq!(config.server.max_dedup_cache_size, 100_000);
+        });
     }
 
     #[test]
     fn test_max_dedup_cache_size_custom() {
-        let config_content = r#"
+        with_clean_env(|| {
+            let config_content = r#"
             [server]
             private_key = "test"
             max_dedup_cache_size = 50000
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        assert_eq!(config.server.max_dedup_cache_size, 50_000);
+            assert_eq!(config.server.max_dedup_cache_size, 50_000);
+        });
     }
 
     #[test]
     fn test_rate_limit_cache_size_default() {
-        let config_content = r#"
+        with_clean_env(|| {
+            let config_content = r#"
             [server]
             private_key = "test"
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        assert_eq!(config.server.max_rate_limit_cache_size, 100_000);
+            assert_eq!(config.server.max_rate_limit_cache_size, 100_000);
+        });
     }
 
     #[test]
     fn test_rate_limit_cache_size_custom() {
-        let config_content = r#"
+        with_clean_env(|| {
+            let config_content = r#"
             [server]
             private_key = "test"
             max_rate_limit_cache_size = 50000
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        assert_eq!(config.server.max_rate_limit_cache_size, 50_000);
+            assert_eq!(config.server.max_rate_limit_cache_size, 50_000);
+        });
     }
 
     #[test]
     fn test_rate_limit_defaults() {
-        let config_content = r#"
+        with_clean_env(|| {
+            let config_content = r#"
             [server]
             private_key = "test"
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 240);
-        assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 5000);
-        assert_eq!(config.server.device_token_rate_limit_per_minute, 240);
-        assert_eq!(config.server.device_token_rate_limit_per_hour, 5000);
+            assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 240);
+            assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 5000);
+            assert_eq!(config.server.device_token_rate_limit_per_minute, 240);
+            assert_eq!(config.server.device_token_rate_limit_per_hour, 5000);
+        });
     }
 
     #[test]
     fn test_rate_limit_custom() {
-        let config_content = r#"
+        with_clean_env(|| {
+            let config_content = r#"
             [server]
             private_key = "test"
             encrypted_token_rate_limit_per_minute = 100
@@ -781,12 +957,13 @@ mod tests {
             device_token_rate_limit_per_hour = 1000
         "#;
 
-        let file = create_temp_config(config_content);
-        let config = AppConfig::load(file.path()).unwrap();
+            let file = create_temp_config(config_content);
+            let config = AppConfig::load(file.path()).unwrap();
 
-        assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 100);
-        assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 2000);
-        assert_eq!(config.server.device_token_rate_limit_per_minute, 50);
-        assert_eq!(config.server.device_token_rate_limit_per_hour, 1000);
+            assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 100);
+            assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 2000);
+            assert_eq!(config.server.device_token_rate_limit_per_minute, 50);
+            assert_eq!(config.server.device_token_rate_limit_per_hour, 1000);
+        });
     }
 }
