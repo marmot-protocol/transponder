@@ -592,7 +592,11 @@ mod tests {
 
         let error = resolve_server_private_key(&config)
             .expect_err("missing secret file should return an error");
-        assert!(error.to_string().contains("Failed to read server private key file"));
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to read server private key file")
+        );
     }
 
     #[test]

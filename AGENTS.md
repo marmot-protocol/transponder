@@ -186,7 +186,9 @@ TRANSPONDER_RELAYS_CLEARNET='["wss://relay.example.com"]'
 
 ## PR Guidelines
 
-- Run `cargo fmt` before committing
+- Run `just ci` before every commit; this is the standard pre-commit gate for formatting, linting, tests, and audit checks
+- If `just ci` fails, fix the issues before committing
+- Run `cargo fmt` before committing when working outside the `just ci` flow
 - Run `cargo clippy -- -D warnings` and fix all warnings
 - All tests must pass (`cargo test`)
 - Include tests for new functionality
