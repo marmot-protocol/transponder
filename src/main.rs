@@ -75,6 +75,11 @@ fn classify_notification_receive_error(error: &RecvError) -> NotificationReceive
     }
 }
 
+#[cfg(feature = "tor")]
+const TOR_FEATURE_ENABLED: bool = true;
+#[cfg(not(feature = "tor"))]
+const TOR_FEATURE_ENABLED: bool = false;
+
 fn validate_startup_config(server_private_key: &str, relays: &config::RelayConfig) -> Result<()> {
     if server_private_key.is_empty() {
         anyhow::bail!("Server private key is required");
@@ -82,6 +87,10 @@ fn validate_startup_config(server_private_key: &str, relays: &config::RelayConfi
 
     if relays.clearnet.is_empty() && relays.onion.is_empty() {
         anyhow::bail!("At least one relay must be configured");
+    }
+
+    if !TOR_FEATURE_ENABLED && !relays.onion.is_empty() {
+        anyhow::bail!("Onion relays require the 'tor' feature");
     }
 
     Ok(())
@@ -95,6 +104,10 @@ fn build_rate_limit_config(server: &config::ServerConfig) -> nostr::events::Toke
         device_token_per_minute: server.device_token_rate_limit_per_minute,
         device_token_per_hour: server.device_token_rate_limit_per_hour,
     }
+}
+
+fn parse_server_secret_key(server_private_key: &str) -> Result<SecretKey> {
+    SecretKey::parse(server_private_key).context("Invalid server private key")
 }
 
 #[tokio::main]
@@ -145,8 +158,7 @@ async fn main() -> Result<()> {
     validate_startup_config(&server_private_key, &config.relays)?;
 
     // Create server keys
-    let secret_key =
-        SecretKey::from_hex(&server_private_key).context("Invalid server private key")?;
+    let secret_key = parse_server_secret_key(&server_private_key)?;
     let keys = Keys::new(secret_key);
 
     info!(
@@ -382,15 +394,17 @@ fn generate_keys() -> Result<()> {
 
 /// Resolve the server private key from config or a mounted secret file.
 fn resolve_server_private_key(config: &config::ServerConfig) -> Result<String> {
-    if !config.private_key.is_empty() {
-        return Ok(config.private_key.trim().to_string());
+    let private_key = config.private_key.trim();
+    if !private_key.is_empty() {
+        return Ok(private_key.to_string());
     }
 
-    if config.private_key_file.is_empty() {
+    let private_key_file = config.private_key_file.trim();
+    if private_key_file.is_empty() {
         return Ok(String::new());
     }
 
-    let key_path = Path::new(&config.private_key_file);
+    let key_path = Path::new(private_key_file);
     let key = fs::read_to_string(key_path).with_context(|| {
         format!(
             "Failed to read server private key file {}",
@@ -560,6 +574,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_server_private_key_treats_whitespace_inline_value_as_empty() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "abc123").unwrap();
+
+        let config = config::ServerConfig {
+            private_key: "   \n\t  ".to_string(),
+            private_key_file: format!("  {}  ", file.path().display()),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 100_000,
+            max_rate_limit_cache_size: 100_000,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+        };
+
+        assert_eq!(resolve_server_private_key(&config).unwrap(), "abc123");
+    }
+
+    #[test]
     fn resolve_server_private_key_returns_empty_when_unset() {
         let config = config::ServerConfig {
             private_key: String::new(),
@@ -630,6 +664,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "tor"))]
+    fn validate_startup_config_rejects_onion_relays_without_tor_feature() {
+        let relays = config::RelayConfig {
+            clearnet: vec!["wss://relay.example.com".to_string()],
+            onion: vec!["wss://example.onion".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 30,
+        };
+
+        let error = validate_startup_config("abc123", &relays)
+            .expect_err("onion relays should require the tor feature");
+        assert_eq!(error.to_string(), "Onion relays require the 'tor' feature");
+    }
+
+    #[test]
+    #[cfg(feature = "tor")]
     fn validate_startup_config_accepts_onion_only_relays() {
         let relays = config::RelayConfig {
             clearnet: Vec::new(),
@@ -640,6 +691,39 @@ mod tests {
         };
 
         assert!(validate_startup_config("abc123", &relays).is_ok());
+    }
+
+    #[test]
+    fn parse_server_secret_key_accepts_nsec_format() {
+        let secret_key = Keys::generate().secret_key().to_bech32().unwrap();
+
+        let parsed_key = parse_server_secret_key(&secret_key).unwrap();
+
+        assert_eq!(parsed_key.to_bech32().unwrap(), secret_key);
+    }
+
+    #[test]
+    fn parse_server_secret_key_accepts_resolved_file_value() {
+        let secret_key = Keys::generate().secret_key().to_bech32().unwrap();
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "  {secret_key}  ").unwrap();
+
+        let config = config::ServerConfig {
+            private_key: String::new(),
+            private_key_file: file.path().display().to_string(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 100_000,
+            max_rate_limit_cache_size: 100_000,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+        };
+
+        let resolved_key = resolve_server_private_key(&config).unwrap();
+        let parsed_key = parse_server_secret_key(&resolved_key).unwrap();
+
+        assert_eq!(parsed_key.to_bech32().unwrap(), secret_key);
     }
 
     #[test]
