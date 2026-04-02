@@ -450,6 +450,11 @@ mod tests {
             clear_transponder_env();
 
             for (key, value) in vars {
+                // SAFETY: these test helpers only mutate process environment variables while
+                // holding `ENV_MUTEX`, which serializes all test callers that touch
+                // `env::set_var`/`env::remove_var` in this module. This is limited to test
+                // usage and assumes future callers keep using `with_clean_env`/`with_env_vars`
+                // so no concurrent environment access occurs while this unsafe call runs.
                 unsafe { env::set_var(key, value) };
             }
 
@@ -760,6 +765,20 @@ mod tests {
                     ]
                 );
                 assert_eq!(config.relays.onion, vec!["ws://relay.onion".to_string()]);
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_rejects_json_relay_lists() {
+        with_env_vars(
+            &[(
+                "TRANSPONDER_RELAYS_CLEARNET",
+                r#"["wss://relay.example.com"]"#,
+            )],
+            || {
+                let error = AppConfig::from_env().unwrap_err();
+                assert!(error.to_string().contains("comma-separated"));
             },
         );
     }
