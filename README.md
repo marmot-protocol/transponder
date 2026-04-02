@@ -135,7 +135,9 @@ format = "json"
 
 ### Environment Variables
 
-Override any config value using environment variables with the pattern `TRANSPONDER_<SECTION>_<KEY>`:
+Override any config value using environment variables with the pattern `TRANSPONDER_<SECTION>_<KEY>`.
+The first underscore after `TRANSPONDER` separates the section from the key, so
+`TRANSPONDER_SERVER_PRIVATE_KEY` maps to `server.private_key`:
 
 ```bash
 # Required: Server private key
@@ -151,9 +153,9 @@ export TRANSPONDER_APNS_BUNDLE_ID="com.example.app"
 export TRANSPONDER_FCM_ENABLED=true
 export TRANSPONDER_FCM_SERVICE_ACCOUNT_PATH="/path/to/service-account.json"
 
-# Relays (JSON array format)
-export TRANSPONDER_RELAYS_CLEARNET='["wss://relay.example.com","wss://relay2.example.com"]'
-export TRANSPONDER_RELAYS_ONION='["wss://exampleonionrelay.onion"]' # requires `--features tor`
+# Relays (comma-separated)
+export TRANSPONDER_RELAYS_CLEARNET="wss://relay.example.com,wss://relay2.example.com"
+export TRANSPONDER_RELAYS_ONION="wss://exampleonionrelay.onion" # requires `--features tor`
 
 # Logging
 export TRANSPONDER_LOGGING_LEVEL="debug"
