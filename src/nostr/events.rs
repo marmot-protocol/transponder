@@ -16,7 +16,7 @@ use tracing::{debug, trace, warn};
 
 use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
 use crate::error::Result;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, OutcomeLabel};
 use crate::push::PushDispatcher;
 use crate::rate_limiter::{
     DEFAULT_MAX_SIZE, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig,
@@ -32,13 +32,14 @@ const CLEANUP_BATCH_SIZE: usize = 1000;
 /// Default maximum size for the deduplication cache.
 pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
 
-struct InFlightEventGuard {
-    metrics: Option<Metrics>,
+#[must_use]
+struct InFlightEventGuard<'a> {
+    metrics: Option<&'a Metrics>,
 }
 
-impl InFlightEventGuard {
-    fn new(metrics: Option<Metrics>) -> Self {
-        if let Some(ref m) = metrics {
+impl<'a> InFlightEventGuard<'a> {
+    fn new(metrics: Option<&'a Metrics>) -> Self {
+        if let Some(m) = metrics {
             m.inc_events_in_flight();
         }
 
@@ -46,9 +47,9 @@ impl InFlightEventGuard {
     }
 }
 
-impl Drop for InFlightEventGuard {
+impl Drop for InFlightEventGuard<'_> {
     fn drop(&mut self) {
-        if let Some(ref m) = self.metrics {
+        if let Some(m) = self.metrics {
             m.dec_events_in_flight();
         }
     }
@@ -172,7 +173,7 @@ impl EventProcessor {
     /// Returns `Ok(true)` if the event was processed, `Ok(false)` if it was
     /// deduplicated (already seen), or an error if processing failed.
     pub async fn process(&self, event: &Event) -> Result<bool> {
-        let _in_flight = InFlightEventGuard::new(self.metrics.clone());
+        let _in_flight = InFlightEventGuard::new(self.metrics.as_ref());
         let started_at = StdInstant::now();
 
         // Record event received
@@ -186,7 +187,7 @@ impl EventProcessor {
             if let Some(ref m) = self.metrics {
                 m.record_event_deduplicated();
                 m.observe_event_processing_duration(
-                    "duplicate",
+                    OutcomeLabel::Duplicate,
                     started_at.elapsed().as_secs_f64(),
                 );
             }
@@ -209,7 +210,7 @@ impl EventProcessor {
                 if let Some(ref m) = self.metrics {
                     m.record_event_processed();
                     m.observe_event_processing_duration(
-                        "processed",
+                        OutcomeLabel::Processed,
                         started_at.elapsed().as_secs_f64(),
                     );
                 }
@@ -225,7 +226,7 @@ impl EventProcessor {
                 if let Some(ref m) = self.metrics {
                     m.record_event_failed();
                     m.observe_event_processing_duration(
-                        "failed",
+                        OutcomeLabel::Failed,
                         started_at.elapsed().as_secs_f64(),
                     );
                 }
@@ -242,7 +243,7 @@ impl EventProcessor {
             Ok(notification) => {
                 if let Some(ref m) = self.metrics {
                     m.observe_gift_wrap_unwrap_duration(
-                        "success",
+                        OutcomeLabel::Success,
                         unwrap_started_at.elapsed().as_secs_f64(),
                     );
                 }
@@ -251,7 +252,7 @@ impl EventProcessor {
             Err(e) => {
                 if let Some(ref m) = self.metrics {
                     m.observe_gift_wrap_unwrap_duration(
-                        "failed",
+                        OutcomeLabel::Failed,
                         unwrap_started_at.elapsed().as_secs_f64(),
                     );
                 }
@@ -274,7 +275,7 @@ impl EventProcessor {
             Ok(token_bytes) => {
                 if let Some(ref m) = self.metrics {
                     m.observe_notification_parse_duration(
-                        "success",
+                        OutcomeLabel::Success,
                         parse_started_at.elapsed().as_secs_f64(),
                     );
                     m.observe_tokens_per_event(token_bytes.len());
@@ -284,7 +285,7 @@ impl EventProcessor {
             Err(e) => {
                 if let Some(ref m) = self.metrics {
                     m.observe_notification_parse_duration(
-                        "failed",
+                        OutcomeLabel::Failed,
                         parse_started_at.elapsed().as_secs_f64(),
                     );
                 }
@@ -328,7 +329,7 @@ impl EventProcessor {
                     if let Some(ref m) = self.metrics {
                         m.record_token_decrypted();
                         m.observe_token_decrypt_duration(
-                            "success",
+                            OutcomeLabel::Success,
                             decrypt_started_at.elapsed().as_secs_f64(),
                         );
                     }
@@ -340,7 +341,7 @@ impl EventProcessor {
                     if let Some(ref m) = self.metrics {
                         m.record_token_decryption_failed();
                         m.observe_token_decrypt_duration(
-                            "failed",
+                            OutcomeLabel::Failed,
                             decrypt_started_at.elapsed().as_secs_f64(),
                         );
                     }
@@ -378,7 +379,7 @@ impl EventProcessor {
             Ok(count) => {
                 if let Some(ref m) = self.metrics {
                     m.observe_push_dispatch_admission_duration(
-                        "success",
+                        OutcomeLabel::Success,
                         dispatch_started_at.elapsed().as_secs_f64(),
                     );
                     m.observe_notifications_admitted_per_event(count);
@@ -388,7 +389,7 @@ impl EventProcessor {
             Err(e) => {
                 if let Some(ref m) = self.metrics {
                     m.observe_push_dispatch_admission_duration(
-                        "failed",
+                        OutcomeLabel::Failed,
                         dispatch_started_at.elapsed().as_secs_f64(),
                     );
                 }
@@ -513,8 +514,64 @@ impl EventProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::push::PushDispatcher;
+    use crate::config::ApnsConfig;
+    use crate::metrics::{Metrics, OutcomeLabel};
+    use crate::push::{ApnsClient, PushDispatcher};
     use crate::test_vectors::scenarios;
+    use prometheus::proto::Metric;
+
+    fn metric_matches_labels(metric: &Metric, labels: &[(&str, &str)]) -> bool {
+        labels.iter().all(|(name, value)| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == *name && label.value() == *value)
+        })
+    }
+
+    fn counter_value(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> f64 {
+        metrics
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| metric_matches_labels(metric, labels))
+                    .and_then(|metric| metric.get_counter().value)
+            })
+            .unwrap_or_default()
+    }
+
+    fn gauge_value(metrics: &Metrics, name: &str) -> f64 {
+        metrics
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .first()
+                    .and_then(|metric| metric.get_gauge().value)
+            })
+            .unwrap_or_default()
+    }
+
+    fn histogram_count(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> u64 {
+        metrics
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| metric_matches_labels(metric, labels))
+                    .and_then(|metric| metric.get_histogram().sample_count)
+            })
+            .unwrap_or_default()
+    }
 
     fn create_processor(server_keys: &Keys) -> EventProcessor {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
@@ -536,6 +593,39 @@ mod tests {
         EventProcessor::with_cache_size(nip59_handler, token_decryptor, push_dispatcher, cache_size)
     }
 
+    fn create_processor_with_metrics(server_keys: &Keys) -> (EventProcessor, Metrics) {
+        let nip59_handler = Nip59Handler::new(server_keys.clone());
+        let secp_secret_key =
+            secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+        let metrics = Metrics::new().expect("metrics");
+        let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
+            Some(ApnsClient::mock(apns_config, true)),
+            None,
+            Some(metrics.clone()),
+        ));
+        (
+            EventProcessor::with_full_config(
+                nip59_handler,
+                token_decryptor,
+                push_dispatcher,
+                DEFAULT_MAX_DEDUP_CACHE_SIZE,
+                TokenRateLimitConfig::default(),
+                Some(metrics.clone()),
+            ),
+            metrics,
+        )
+    }
+
     #[tokio::test]
     async fn test_process_valid_gift_wrap_event() {
         let server_keys = Keys::generate();
@@ -550,6 +640,83 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_process_valid_gift_wrap_event_records_metrics() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+        let result = processor.process(&event).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_received_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            1.0
+        );
+        assert_eq!(gauge_value(&metrics, "transponder_events_in_flight"), 0.0);
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_event_processing_duration_seconds",
+                &[("outcome", OutcomeLabel::Processed.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_gift_wrap_unwrap_duration_seconds",
+                &[("outcome", OutcomeLabel::Success.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_notification_parse_duration_seconds",
+                &[("outcome", OutcomeLabel::Success.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_token_decrypt_duration_seconds",
+                &[("outcome", OutcomeLabel::Success.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_push_dispatch_admission_duration_seconds",
+                &[("outcome", OutcomeLabel::Success.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_count(&metrics, "transponder_tokens_per_event", &[]),
+            1
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_notifications_admitted_per_event",
+                &[]
+            ),
+            1
+        );
     }
 
     #[tokio::test]
@@ -575,6 +742,42 @@ mod tests {
         let result2 = processor.process(&event).await;
         assert!(result2.is_ok());
         assert!(!result2.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_process_duplicate_event_records_metrics() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let event = scenarios::single_apns_notification(
+            &server_keys,
+            &sender_keys,
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        )
+        .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+
+        assert!(processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_received_total", &[]),
+            2.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            1.0
+        );
+        assert_eq!(gauge_value(&metrics, "transponder_events_in_flight"), 0.0);
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_event_processing_duration_seconds",
+                &[("outcome", OutcomeLabel::Duplicate.as_str())],
+            ),
+            1
+        );
     }
 
     #[tokio::test]
@@ -626,6 +829,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_failed_event_records_metrics() {
+        let server_keys = Keys::generate();
+        let wrong_server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let event = scenarios::single_apns_notification(
+            &wrong_server_keys,
+            &sender_keys,
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        )
+        .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+        let result = processor.process(&event).await;
+
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(gauge_value(&metrics, "transponder_events_in_flight"), 0.0);
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_event_processing_duration_seconds",
+                &[("outcome", OutcomeLabel::Failed.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_gift_wrap_unwrap_duration_seconds",
+                &[("outcome", OutcomeLabel::Failed.as_str())],
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn test_process_empty_token_blob() {
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
@@ -637,6 +881,32 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_process_empty_token_blob_records_parse_failure_metrics() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let event = scenarios::empty_notification(&server_keys, &sender_keys).await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+        let result = processor.process(&event).await;
+
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_notification_parse_duration_seconds",
+                &[("outcome", OutcomeLabel::Failed.as_str())],
+            ),
+            1
+        );
     }
 
     #[tokio::test]

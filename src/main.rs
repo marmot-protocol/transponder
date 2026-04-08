@@ -75,6 +75,15 @@ fn classify_notification_receive_error(error: &RecvError) -> NotificationReceive
     }
 }
 
+fn record_notification_receive_metrics(metrics: Option<&Metrics>, error: &RecvError) {
+    if let RecvError::Lagged(skipped) = error
+        && let Some(metrics) = metrics
+    {
+        metrics.record_relay_notifications_lagged();
+        metrics.record_relay_notifications_dropped(*skipped);
+    }
+}
+
 #[cfg(feature = "tor")]
 const TOR_FEATURE_ENABLED: bool = true;
 #[cfg(not(feature = "tor"))]
@@ -305,11 +314,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            if let RecvError::Lagged(skipped) = &e
-                                && let Some(ref m) = event_metrics {
-                                m.record_relay_notifications_lagged();
-                                m.record_relay_notifications_dropped(*skipped);
-                            }
+                            record_notification_receive_metrics(event_metrics.as_ref(), &e);
 
                             match classify_notification_receive_error(&e) {
                                 NotificationReceiveAction::Continue => {
@@ -494,6 +499,26 @@ mod tests {
         let action = classify_notification_receive_error(&RecvError::Closed);
 
         assert_eq!(action, NotificationReceiveAction::Shutdown);
+    }
+
+    #[test]
+    fn notification_receive_lag_records_metrics() {
+        let metrics = Metrics::new().unwrap();
+
+        record_notification_receive_metrics(Some(&metrics), &RecvError::Lagged(3));
+
+        assert_eq!(metrics.relay_notifications_lagged_total.get(), 1);
+        assert_eq!(metrics.relay_notifications_dropped_total.get(), 3);
+    }
+
+    #[test]
+    fn notification_receive_close_does_not_record_metrics() {
+        let metrics = Metrics::new().unwrap();
+
+        record_notification_receive_metrics(Some(&metrics), &RecvError::Closed);
+
+        assert_eq!(metrics.relay_notifications_lagged_total.get(), 0);
+        assert_eq!(metrics.relay_notifications_dropped_total.get(), 0);
     }
 
     #[tokio::test]
