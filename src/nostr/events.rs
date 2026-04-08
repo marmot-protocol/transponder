@@ -406,6 +406,7 @@ impl EventProcessor {
                         OperationOutcome::Failed,
                         dispatch_started_at.elapsed_secs(),
                     );
+                    m.observe_notifications_admitted_per_event(0);
                 }
                 Err(e)
             }
@@ -596,6 +597,43 @@ mod tests {
                 push_dispatcher,
                 DEFAULT_MAX_DEDUP_CACHE_SIZE,
                 rate_limit_config,
+                Some(metrics.clone()),
+            ),
+            metrics,
+        )
+    }
+
+    async fn create_processor_with_shutdown_dispatcher_metrics(
+        server_keys: &Keys,
+    ) -> (EventProcessor, Metrics) {
+        let nip59_handler = Nip59Handler::new(server_keys.clone());
+        let secp_secret_key =
+            secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+        };
+        let metrics = Metrics::new().expect("metrics");
+        let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
+            Some(ApnsClient::mock(apns_config, true)),
+            None,
+            Some(metrics.clone()),
+        ));
+        push_dispatcher.wait_for_completion().await;
+
+        (
+            EventProcessor::with_full_config(
+                nip59_handler,
+                token_decryptor,
+                push_dispatcher,
+                DEFAULT_MAX_DEDUP_CACHE_SIZE,
+                TokenRateLimitConfig::default(),
                 Some(metrics.clone()),
             ),
             metrics,
@@ -846,6 +884,51 @@ mod tests {
                 &[("outcome", OperationOutcome::Failed.as_str())],
             ),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_dispatch_failure_records_zero_admissions() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+
+        let (processor, metrics) =
+            create_processor_with_shutdown_dispatcher_metrics(&server_keys).await;
+        let result = processor.process(&event).await;
+
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_push_dispatch_admission_duration_seconds",
+                &[("outcome", OperationOutcome::Failed.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_notifications_admitted_per_event",
+                &[]
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_sum(
+                &metrics,
+                "transponder_notifications_admitted_per_event",
+                &[]
+            ),
+            0.0
         );
     }
 

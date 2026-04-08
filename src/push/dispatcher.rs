@@ -336,19 +336,19 @@ impl PushDispatcher {
             messages.push(QueuedPushMessage { platform, token });
         }
 
-        if messages.is_empty() {
-            return Ok(0);
-        }
-
         let message_count = messages.len();
-        // Check shutdown after platform/token filtering so the rejection metric only
-        // counts messages that would otherwise have been admissible.
+        // Check shutdown after platform/token filtering so post-shutdown requests
+        // always fail while the rejection metric only counts admissible messages.
         if self.shutting_down.load(Ordering::SeqCst) {
             if let Some(ref m) = self.metrics {
                 m.record_push_queue_rejected(message_count as u64);
             }
             debug!("Dispatcher shutting down, ignoring dispatch request");
             return Err(Error::Dispatch("Dispatcher is shutting down".to_string()));
+        }
+
+        if messages.is_empty() {
+            return Ok(0);
         }
 
         let mut permits =
@@ -1006,6 +1006,21 @@ mod tests {
             counter_metric_value(&metrics, "transponder_push_queue_rejected_total"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_after_shutdown_rejects_filtered_batch() {
+        let dispatcher = PushDispatcher::new(None, None);
+
+        dispatcher.wait_for_completion().await;
+
+        let payloads = vec![TokenPayload {
+            platform: Platform::Apns,
+            device_token: vec![0xaa, 0xbb, 0xcc],
+        }];
+
+        let error = dispatcher.dispatch(payloads).await.unwrap_err();
+        assert!(matches!(error, Error::Dispatch(_)));
     }
 
     #[tokio::test]

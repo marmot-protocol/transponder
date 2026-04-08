@@ -103,7 +103,8 @@ pub struct Metrics {
     /// Maximum number of concurrent outbound push requests.
     pub push_concurrency_limit: IntGauge,
 
-    /// Total number of notifications rejected due to push queue capacity or shutdown.
+    /// Total number of notifications rejected because the push queue was full,
+    /// the dispatcher was shutting down, or the queue channel was closed.
     pub push_queue_rejected_total: IntCounter,
 
     /// Duration of push dispatcher admission by outcome.
@@ -417,7 +418,7 @@ impl Metrics {
 
         let push_queue_rejected_total = IntCounter::with_opts(Opts::new(
             "transponder_push_queue_rejected_total",
-            "Total number of notifications rejected due to push queue capacity or shutdown",
+            "Total number of notifications rejected because the push queue was full, the dispatcher was shutting down, or the queue channel was closed",
         ))?;
         registry.register(Box::new(push_queue_rejected_total.clone()))?;
 

@@ -379,7 +379,7 @@ Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` 
 | `transponder_push_queue_capacity` | Gauge | - | Maximum number of notifications the push queue can hold |
 | `transponder_push_semaphore_available` | Gauge | - | Available concurrent push permits |
 | `transponder_push_concurrency_limit` | Gauge | - | Maximum number of concurrent outbound push requests |
-| `transponder_push_queue_rejected_total` | Counter | - | Notifications rejected before admission because the push queue was full, closed, or shutting down |
+| `transponder_push_queue_rejected_total` | Counter | - | Notifications rejected before admission because the push queue was full, the dispatcher was shutting down, or the queue channel was closed |
 | `transponder_push_dispatch_admission_duration_seconds` | Histogram | `outcome` | Time spent admitting notifications into the push dispatcher |
 | `transponder_push_retries_total` | Counter | `platform` | Push retry attempts |
 | `transponder_push_request_duration_seconds` | Histogram | `platform` | Push request duration |

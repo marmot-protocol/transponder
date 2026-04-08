@@ -27,18 +27,34 @@ fn metric<'a>(family: &'a MetricFamily, labels: &[(&str, &str)]) -> Option<&'a M
         .find(|metric| metric_matches_labels(metric, labels))
 }
 
+/// Return the counter value for a metric family selected by name and labels.
+///
+/// `metrics` is the registry wrapper to inspect, `name` is the Prometheus
+/// metric family name, and `labels` selects the labeled sample within that
+/// family. Returns the counter value, or `0.0` when no matching sample exists.
 pub(crate) fn counter_value(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> f64 {
     metric(&family(metrics, name), labels)
         .and_then(|metric| metric.get_counter().value)
         .unwrap_or_default()
 }
 
+/// Return the gauge value for a metric family selected by name and labels.
+///
+/// `metrics` is the registry wrapper to inspect, `name` is the Prometheus
+/// metric family name, and `labels` selects the labeled sample within that
+/// family. Returns the gauge value, or `0.0` when no matching sample exists.
 pub(crate) fn gauge_value(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> f64 {
     metric(&family(metrics, name), labels)
         .and_then(|metric| metric.get_gauge().value)
         .unwrap_or_default()
 }
 
+/// Return the histogram sample count for a metric family selected by name and
+/// labels.
+///
+/// `metrics` is the registry wrapper to inspect, `name` is the Prometheus
+/// metric family name, and `labels` selects the labeled sample within that
+/// family. Returns the histogram sample count, or `0` when no match exists.
 pub(crate) fn histogram_sample_count(
     metrics: &Metrics,
     name: &str,
@@ -49,6 +65,12 @@ pub(crate) fn histogram_sample_count(
         .unwrap_or_default()
 }
 
+/// Return the histogram sample sum for a metric family selected by name and
+/// labels.
+///
+/// `metrics` is the registry wrapper to inspect, `name` is the Prometheus
+/// metric family name, and `labels` selects the labeled sample within that
+/// family. Returns the histogram sample sum, or `0.0` when no match exists.
 pub(crate) fn histogram_sample_sum(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> f64 {
     metric(&family(metrics, name), labels)
         .and_then(|metric| metric.get_histogram().sample_sum)
