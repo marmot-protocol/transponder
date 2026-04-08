@@ -517,60 +517,13 @@ mod tests {
     use crate::config::ApnsConfig;
     use crate::metrics::{Metrics, OutcomeLabel};
     use crate::push::{ApnsClient, PushDispatcher};
+    use crate::test_metrics::{
+        counter_value, gauge_value as metric_gauge_value, histogram_sample_count as histogram_count,
+    };
     use crate::test_vectors::scenarios;
-    use prometheus::proto::Metric;
-
-    fn metric_matches_labels(metric: &Metric, labels: &[(&str, &str)]) -> bool {
-        labels.iter().all(|(name, value)| {
-            metric
-                .get_label()
-                .iter()
-                .any(|label| label.name() == *name && label.value() == *value)
-        })
-    }
-
-    fn counter_value(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> f64 {
-        metrics
-            .gather()
-            .into_iter()
-            .find(|family| family.name() == name)
-            .and_then(|family| {
-                family
-                    .get_metric()
-                    .iter()
-                    .find(|metric| metric_matches_labels(metric, labels))
-                    .and_then(|metric| metric.get_counter().value)
-            })
-            .unwrap_or_default()
-    }
 
     fn gauge_value(metrics: &Metrics, name: &str) -> f64 {
-        metrics
-            .gather()
-            .into_iter()
-            .find(|family| family.name() == name)
-            .and_then(|family| {
-                family
-                    .get_metric()
-                    .first()
-                    .and_then(|metric| metric.get_gauge().value)
-            })
-            .unwrap_or_default()
-    }
-
-    fn histogram_count(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> u64 {
-        metrics
-            .gather()
-            .into_iter()
-            .find(|family| family.name() == name)
-            .and_then(|family| {
-                family
-                    .get_metric()
-                    .iter()
-                    .find(|metric| metric_matches_labels(metric, labels))
-                    .and_then(|metric| metric.get_histogram().sample_count)
-            })
-            .unwrap_or_default()
+        metric_gauge_value(metrics, name, &[])
     }
 
     fn create_processor(server_keys: &Keys) -> EventProcessor {

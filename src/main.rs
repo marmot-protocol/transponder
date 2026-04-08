@@ -27,6 +27,8 @@ mod server;
 mod shutdown;
 
 #[cfg(test)]
+mod test_metrics;
+#[cfg(test)]
 mod test_vectors;
 
 use config::AppConfig;

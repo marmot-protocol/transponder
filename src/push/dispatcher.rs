@@ -505,36 +505,17 @@ impl PushDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_metrics::{
+        counter_value as metric_counter_value, gauge_value as metric_gauge_value,
+    };
     use std::time::Duration;
 
     fn gauge_metric_value(metrics: &crate::metrics::Metrics, name: &str) -> i64 {
-        metrics
-            .gather()
-            .into_iter()
-            .find(|family| family.name() == name)
-            .and_then(|family| {
-                family
-                    .get_metric()
-                    .first()
-                    .and_then(|metric| metric.get_gauge().value)
-            })
-            .map(|value| value as i64)
-            .unwrap_or_default()
+        metric_gauge_value(metrics, name, &[]) as i64
     }
 
     fn counter_metric_value(metrics: &crate::metrics::Metrics, name: &str) -> u64 {
-        metrics
-            .gather()
-            .into_iter()
-            .find(|family| family.name() == name)
-            .and_then(|family| {
-                family
-                    .get_metric()
-                    .first()
-                    .and_then(|metric| metric.get_counter().value)
-            })
-            .map(|value| value as u64)
-            .unwrap_or_default()
+        metric_counter_value(metrics, name, &[]) as u64
     }
 
     fn queue_size_metric_value(metrics: &crate::metrics::Metrics) -> i64 {

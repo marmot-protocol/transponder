@@ -168,32 +168,28 @@ impl OutcomeLabel {
     }
 }
 
-fn event_duration_buckets() -> Vec<f64> {
-    vec![
-        0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-    ]
+const EVENT_DURATION_BUCKETS: [f64; 12] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
+const PARSE_DURATION_BUCKETS: [f64; 10] = [
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+];
+const TOKEN_DECRYPT_DURATION_BUCKETS: [f64; 10] = [
+    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+];
+const PER_EVENT_COUNT_BUCKETS: [f64; 9] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+const NOTIFICATION_CONTENT_SIZE_BUCKETS: [f64; 9] = [
+    128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0,
+];
+
+fn observe_outcome(histogram: &HistogramVec, outcome: OutcomeLabel, value: f64) {
+    histogram
+        .with_label_values(&[outcome.as_str()])
+        .observe(value);
 }
 
-fn parse_duration_buckets() -> Vec<f64> {
-    vec![
-        0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
-    ]
-}
-
-fn token_decrypt_duration_buckets() -> Vec<f64> {
-    vec![
-        0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
-    ]
-}
-
-fn per_event_count_buckets() -> Vec<f64> {
-    vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
-}
-
-fn notification_content_size_buckets() -> Vec<f64> {
-    vec![
-        128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0,
-    ]
+fn set_usize_gauge(gauge: &IntGauge, value: usize) {
+    gauge.set(value as i64);
 }
 
 impl Metrics {
@@ -237,7 +233,7 @@ impl Metrics {
                 "transponder_event_processing_duration_seconds",
                 "End-to-end duration of event processing by outcome",
             )
-            .buckets(event_duration_buckets()),
+            .buckets(EVENT_DURATION_BUCKETS.to_vec()),
             &["outcome"],
         )?;
         registry.register(Box::new(event_processing_duration_seconds.clone()))?;
@@ -247,7 +243,7 @@ impl Metrics {
                 "transponder_gift_wrap_unwrap_duration_seconds",
                 "Duration of gift-wrap unwrap operations by outcome",
             )
-            .buckets(event_duration_buckets()),
+            .buckets(EVENT_DURATION_BUCKETS.to_vec()),
             &["outcome"],
         )?;
         registry.register(Box::new(gift_wrap_unwrap_duration_seconds.clone()))?;
@@ -257,7 +253,7 @@ impl Metrics {
                 "transponder_notification_parse_duration_seconds",
                 "Duration of notification parsing operations by outcome",
             )
-            .buckets(parse_duration_buckets()),
+            .buckets(PARSE_DURATION_BUCKETS.to_vec()),
             &["outcome"],
         )?;
         registry.register(Box::new(notification_parse_duration_seconds.clone()))?;
@@ -267,7 +263,7 @@ impl Metrics {
                 "transponder_tokens_per_event",
                 "Number of encrypted tokens carried by each parsed event",
             )
-            .buckets(per_event_count_buckets()),
+            .buckets(PER_EVENT_COUNT_BUCKETS.to_vec()),
         )?;
         registry.register(Box::new(tokens_per_event.clone()))?;
 
@@ -276,7 +272,7 @@ impl Metrics {
                 "transponder_notification_content_size_bytes",
                 "Size of kind 446 notification content before base64 decoding",
             )
-            .buckets(notification_content_size_buckets()),
+            .buckets(NOTIFICATION_CONTENT_SIZE_BUCKETS.to_vec()),
         )?;
         registry.register(Box::new(notification_content_size_bytes.clone()))?;
 
@@ -337,7 +333,7 @@ impl Metrics {
                 "transponder_token_decrypt_duration_seconds",
                 "Duration of individual token decrypt operations by outcome",
             )
-            .buckets(token_decrypt_duration_buckets()),
+            .buckets(TOKEN_DECRYPT_DURATION_BUCKETS.to_vec()),
             &["outcome"],
         )?;
         registry.register(Box::new(token_decrypt_duration_seconds.clone()))?;
@@ -347,7 +343,7 @@ impl Metrics {
                 "transponder_notifications_admitted_per_event",
                 "Number of notifications admitted to the push dispatcher per event",
             )
-            .buckets(per_event_count_buckets()),
+            .buckets(PER_EVENT_COUNT_BUCKETS.to_vec()),
         )?;
         registry.register(Box::new(notifications_admitted_per_event.clone()))?;
 
@@ -414,7 +410,7 @@ impl Metrics {
                 "transponder_push_dispatch_admission_duration_seconds",
                 "Duration of push dispatcher admission by outcome",
             )
-            .buckets(parse_duration_buckets()),
+            .buckets(PARSE_DURATION_BUCKETS.to_vec()),
             &["outcome"],
         )?;
         registry.register(Box::new(push_dispatch_admission_duration_seconds.clone()))?;
@@ -600,23 +596,29 @@ impl Metrics {
 
     /// Observe end-to-end event processing duration.
     pub fn observe_event_processing_duration(&self, outcome: OutcomeLabel, duration_secs: f64) {
-        self.event_processing_duration_seconds
-            .with_label_values(&[outcome.as_str()])
-            .observe(duration_secs);
+        observe_outcome(
+            &self.event_processing_duration_seconds,
+            outcome,
+            duration_secs,
+        );
     }
 
     /// Observe gift-wrap unwrap duration.
     pub fn observe_gift_wrap_unwrap_duration(&self, outcome: OutcomeLabel, duration_secs: f64) {
-        self.gift_wrap_unwrap_duration_seconds
-            .with_label_values(&[outcome.as_str()])
-            .observe(duration_secs);
+        observe_outcome(
+            &self.gift_wrap_unwrap_duration_seconds,
+            outcome,
+            duration_secs,
+        );
     }
 
     /// Observe notification parse duration.
     pub fn observe_notification_parse_duration(&self, outcome: OutcomeLabel, duration_secs: f64) {
-        self.notification_parse_duration_seconds
-            .with_label_values(&[outcome.as_str()])
-            .observe(duration_secs);
+        observe_outcome(
+            &self.notification_parse_duration_seconds,
+            outcome,
+            duration_secs,
+        );
     }
 
     /// Observe encrypted token count per event.
@@ -631,7 +633,7 @@ impl Metrics {
 
     /// Update dedup cache size.
     pub fn set_dedup_cache_size(&self, size: usize) {
-        self.dedup_cache_size.set(size as i64);
+        set_usize_gauge(&self.dedup_cache_size, size);
     }
 
     /// Record dedup cache evictions.
@@ -679,9 +681,7 @@ impl Metrics {
 
     /// Observe per-token decryption duration.
     pub fn observe_token_decrypt_duration(&self, outcome: OutcomeLabel, duration_secs: f64) {
-        self.token_decrypt_duration_seconds
-            .with_label_values(&[outcome.as_str()])
-            .observe(duration_secs);
+        observe_outcome(&self.token_decrypt_duration_seconds, outcome, duration_secs);
     }
 
     /// Observe the number of notifications admitted to the push dispatcher per event.
@@ -710,22 +710,22 @@ impl Metrics {
 
     /// Update the push queue size.
     pub fn set_push_queue_size(&self, size: usize) {
-        self.push_queue_size.set(size as i64);
+        set_usize_gauge(&self.push_queue_size, size);
     }
 
     /// Update the push queue capacity.
     pub fn set_push_queue_capacity(&self, size: usize) {
-        self.push_queue_capacity.set(size as i64);
+        set_usize_gauge(&self.push_queue_capacity, size);
     }
 
     /// Update available semaphore permits.
     pub fn set_push_semaphore_available(&self, available: usize) {
-        self.push_semaphore_available.set(available as i64);
+        set_usize_gauge(&self.push_semaphore_available, available);
     }
 
     /// Update the push concurrency limit.
     pub fn set_push_concurrency_limit(&self, limit: usize) {
-        self.push_concurrency_limit.set(limit as i64);
+        set_usize_gauge(&self.push_concurrency_limit, limit);
     }
 
     /// Record a push queue rejection.
@@ -739,9 +739,11 @@ impl Metrics {
         outcome: OutcomeLabel,
         duration_secs: f64,
     ) {
-        self.push_dispatch_admission_duration_seconds
-            .with_label_values(&[outcome.as_str()])
-            .observe(duration_secs);
+        observe_outcome(
+            &self.push_dispatch_admission_duration_seconds,
+            outcome,
+            duration_secs,
+        );
     }
 
     /// Record a push retry attempt.
@@ -802,60 +804,9 @@ impl Default for Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prometheus::proto::{Metric, MetricFamily};
-
-    fn metric_matches_labels(metric: &Metric, labels: &[(&str, &str)]) -> bool {
-        labels.iter().all(|(name, value)| {
-            metric
-                .get_label()
-                .iter()
-                .any(|label| label.name() == *name && label.value() == *value)
-        })
-    }
-
-    fn family(metrics: &Metrics, name: &str) -> MetricFamily {
-        metrics
-            .gather()
-            .into_iter()
-            .find(|family| family.name() == name)
-            .unwrap_or_else(|| panic!("metric family {name} not found"))
-    }
-
-    fn counter_value(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> f64 {
-        family(metrics, name)
-            .get_metric()
-            .iter()
-            .find(|metric| metric_matches_labels(metric, labels))
-            .and_then(|metric| metric.get_counter().value)
-            .unwrap_or_default()
-    }
-
-    fn gauge_value(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> f64 {
-        family(metrics, name)
-            .get_metric()
-            .iter()
-            .find(|metric| metric_matches_labels(metric, labels))
-            .and_then(|metric| metric.get_gauge().value)
-            .unwrap_or_default()
-    }
-
-    fn histogram_sample_count(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> u64 {
-        family(metrics, name)
-            .get_metric()
-            .iter()
-            .find(|metric| metric_matches_labels(metric, labels))
-            .and_then(|metric| metric.get_histogram().sample_count)
-            .unwrap_or_default()
-    }
-
-    fn histogram_sample_sum(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> f64 {
-        family(metrics, name)
-            .get_metric()
-            .iter()
-            .find(|metric| metric_matches_labels(metric, labels))
-            .and_then(|metric| metric.get_histogram().sample_sum)
-            .unwrap_or_default()
-    }
+    use crate::test_metrics::{
+        counter_value, gauge_value, histogram_sample_count, histogram_sample_sum,
+    };
 
     #[test]
     fn test_metrics_creation() {
