@@ -50,7 +50,8 @@ pub struct Metrics {
     /// Number of encrypted tokens carried by each parsed event.
     pub tokens_per_event: Histogram,
 
-    /// Decoded size in bytes of kind 446 notification content.
+    /// Size in bytes of the base64-decoded encrypted token blob from kind 446
+    /// notification content.
     pub notification_content_size_bytes: Histogram,
 
     /// Current size of the deduplication cache.
@@ -287,7 +288,7 @@ impl Metrics {
         let notification_content_size_bytes = Histogram::with_opts(
             HistogramOpts::new(
                 "transponder_notification_content_size_bytes",
-                "Decoded size in bytes of kind 446 notification content",
+                "Size in bytes of the base64-decoded encrypted token blob from kind 446 notification content",
             )
             .buckets(NOTIFICATION_CONTENT_SIZE_BUCKETS.to_vec()),
         )?;
@@ -647,7 +648,7 @@ impl Metrics {
         self.tokens_per_event.observe(count as f64);
     }
 
-    /// Observe decoded notification content size in bytes.
+    /// Observe the size in bytes of the base64-decoded encrypted token blob.
     pub fn observe_notification_content_size_bytes(&self, size: usize) {
         self.notification_content_size_bytes.observe(size as f64);
     }

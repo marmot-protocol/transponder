@@ -346,7 +346,7 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 | `transponder_gift_wrap_unwrap_duration_seconds` | Histogram | `outcome` | Duration of NIP-59 gift-wrap unwraps |
 | `transponder_notification_parse_duration_seconds` | Histogram | `outcome` | Duration of notification tag validation, base64 decode, and token splitting |
 | `transponder_tokens_per_event` | Histogram | - | Number of encrypted tokens carried by each parsed event |
-| `transponder_notification_content_size_bytes` | Histogram | - | Decoded size in bytes of kind 446 notification content |
+| `transponder_notification_content_size_bytes` | Histogram | - | Size in bytes of the base64-decoded encrypted token blob from kind 446 notification content |
 | `transponder_dedup_cache_size` | Gauge | - | Current deduplication cache size |
 | `transponder_dedup_cache_evictions_total` | Counter | - | Total dedup cache evictions |
 | `transponder_tokens_decrypted_total` | Counter | - | Total tokens successfully decrypted |

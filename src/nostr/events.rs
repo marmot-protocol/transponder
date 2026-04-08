@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
+use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
 use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
 use crate::error::Result;
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
@@ -288,7 +289,7 @@ impl EventProcessor {
                     );
                     m.observe_tokens_per_event(token_bytes.len());
                     m.observe_notification_content_size_bytes(
-                        token_bytes.iter().map(Vec::len).sum(),
+                        token_bytes.len() * ENCRYPTED_TOKEN_SIZE,
                     );
                 }
                 token_bytes
