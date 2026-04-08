@@ -12,8 +12,8 @@
 //! - Only aggregate counts and operational statistics
 
 use prometheus::{
-    Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry,
+    Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry,
 };
 
 /// All metrics for the Transponder server.
@@ -34,6 +34,25 @@ pub struct Metrics {
 
     /// Total number of events that failed processing.
     pub events_failed_total: IntCounter,
+
+    /// Current number of events actively being processed.
+    pub events_in_flight: IntGauge,
+
+    /// End-to-end duration of event processing by outcome.
+    pub event_processing_duration_seconds: HistogramVec,
+
+    /// Duration of gift-wrap unwrap operations by outcome.
+    pub gift_wrap_unwrap_duration_seconds: HistogramVec,
+
+    /// Duration of notification parsing operations by outcome.
+    pub notification_parse_duration_seconds: HistogramVec,
+
+    /// Number of encrypted tokens carried by each parsed event.
+    pub tokens_per_event: Histogram,
+
+    /// Size in bytes of the base64-decoded encrypted token blob from kind 446
+    /// notification content.
+    pub notification_content_size_bytes: Histogram,
 
     /// Current size of the deduplication cache.
     pub dedup_cache_size: IntGauge,
@@ -57,6 +76,12 @@ pub struct Metrics {
     /// Total number of token decryption failures.
     pub tokens_decryption_failed_total: IntCounter,
 
+    /// Duration of individual token decrypt operations by outcome.
+    pub token_decrypt_duration_seconds: HistogramVec,
+
+    /// Number of notifications admitted to the push dispatcher per event.
+    pub notifications_admitted_per_event: Histogram,
+
     // === Push Dispatcher Metrics ===
     /// Total number of notifications dispatched to push services.
     pub push_dispatched_total: IntCounterVec,
@@ -70,8 +95,21 @@ pub struct Metrics {
     /// Current number of items in the push queue.
     pub push_queue_size: IntGauge,
 
+    /// Maximum number of items the push queue can hold.
+    pub push_queue_capacity: IntGauge,
+
     /// Number of available semaphore permits for concurrent pushes.
     pub push_semaphore_available: IntGauge,
+
+    /// Maximum number of concurrent outbound push requests.
+    pub push_concurrency_limit: IntGauge,
+
+    /// Total number of notifications rejected because the push queue was full,
+    /// the dispatcher was shutting down, or the queue channel was closed.
+    pub push_queue_rejected_total: IntCounter,
+
+    /// Duration of push dispatcher admission by outcome.
+    pub push_dispatch_admission_duration_seconds: HistogramVec,
 
     /// Total number of push retries attempted.
     pub push_retries_total: IntCounterVec,
@@ -93,12 +131,83 @@ pub struct Metrics {
     /// Total number of configured relays.
     pub relays_configured: IntGaugeVec,
 
+    /// Total number of lagged relay notification events encountered.
+    pub relay_notifications_lagged_total: IntCounter,
+
+    /// Total number of relay notifications dropped because the receiver lagged.
+    pub relay_notifications_dropped_total: IntCounter,
+
     // === Server Metrics ===
     /// Timestamp when the server started (Unix seconds).
     pub server_start_time_seconds: Gauge,
 
     /// Server version information.
     pub server_info: IntGaugeVec,
+}
+
+/// Fixed set of outcome label values used by the event-level processing histogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventOutcome {
+    /// Event processing failed.
+    Failed,
+    /// Event was processed successfully.
+    Processed,
+    /// Event was skipped because it was already seen.
+    Duplicate,
+}
+
+impl EventOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Processed => "processed",
+            Self::Duplicate => "duplicate",
+        }
+    }
+}
+
+/// Fixed set of outcome label values used by sub-operation histograms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationOutcome {
+    /// Operation completed successfully.
+    Success,
+    /// Operation failed.
+    Failed,
+}
+
+impl OperationOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+const EVENT_DURATION_BUCKETS: [f64; 12] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
+const PARSE_DURATION_BUCKETS: [f64; 10] = [
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+];
+const TOKEN_DECRYPT_DURATION_BUCKETS: [f64; 10] = [
+    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+];
+const PUSH_ADMISSION_DURATION_BUCKETS: [f64; 8] =
+    [0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01];
+const PER_EVENT_COUNT_BUCKETS: [f64; 9] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+const NOTIFICATION_CONTENT_SIZE_BUCKETS: [f64; 9] = [
+    128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0,
+];
+
+fn observe_label_value(histogram: &HistogramVec, label: &str, value: f64) {
+    histogram.with_label_values(&[label]).observe(value);
+}
+
+fn set_usize_gauge(gauge: &IntGauge, value: usize) {
+    gauge.set(value as i64);
 }
 
 impl Metrics {
@@ -130,6 +239,60 @@ impl Metrics {
             "Total number of events that failed processing",
         ))?;
         registry.register(Box::new(events_failed_total.clone()))?;
+
+        let events_in_flight = IntGauge::with_opts(Opts::new(
+            "transponder_events_in_flight",
+            "Current number of events actively being processed",
+        ))?;
+        registry.register(Box::new(events_in_flight.clone()))?;
+
+        let event_processing_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "transponder_event_processing_duration_seconds",
+                "End-to-end duration of event processing by outcome",
+            )
+            .buckets(EVENT_DURATION_BUCKETS.to_vec()),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(event_processing_duration_seconds.clone()))?;
+
+        let gift_wrap_unwrap_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "transponder_gift_wrap_unwrap_duration_seconds",
+                "Duration of gift-wrap unwrap operations by outcome",
+            )
+            .buckets(EVENT_DURATION_BUCKETS.to_vec()),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(gift_wrap_unwrap_duration_seconds.clone()))?;
+
+        let notification_parse_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "transponder_notification_parse_duration_seconds",
+                "Duration of notification parsing operations by outcome",
+            )
+            .buckets(PARSE_DURATION_BUCKETS.to_vec()),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(notification_parse_duration_seconds.clone()))?;
+
+        let tokens_per_event = Histogram::with_opts(
+            HistogramOpts::new(
+                "transponder_tokens_per_event",
+                "Number of encrypted tokens carried by each parsed event",
+            )
+            .buckets(PER_EVENT_COUNT_BUCKETS.to_vec()),
+        )?;
+        registry.register(Box::new(tokens_per_event.clone()))?;
+
+        let notification_content_size_bytes = Histogram::with_opts(
+            HistogramOpts::new(
+                "transponder_notification_content_size_bytes",
+                "Size in bytes of the base64-decoded encrypted token blob from kind 446 notification content",
+            )
+            .buckets(NOTIFICATION_CONTENT_SIZE_BUCKETS.to_vec()),
+        )?;
+        registry.register(Box::new(notification_content_size_bytes.clone()))?;
 
         let dedup_cache_size = IntGauge::with_opts(Opts::new(
             "transponder_dedup_cache_size",
@@ -183,6 +346,25 @@ impl Metrics {
         ))?;
         registry.register(Box::new(tokens_decryption_failed_total.clone()))?;
 
+        let token_decrypt_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "transponder_token_decrypt_duration_seconds",
+                "Duration of individual token decrypt operations by outcome",
+            )
+            .buckets(TOKEN_DECRYPT_DURATION_BUCKETS.to_vec()),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(token_decrypt_duration_seconds.clone()))?;
+
+        let notifications_admitted_per_event = Histogram::with_opts(
+            HistogramOpts::new(
+                "transponder_notifications_admitted_per_event",
+                "Number of notifications admitted to the push dispatcher per event",
+            )
+            .buckets(PER_EVENT_COUNT_BUCKETS.to_vec()),
+        )?;
+        registry.register(Box::new(notifications_admitted_per_event.clone()))?;
+
         // === Push Dispatcher Metrics ===
         let push_dispatched_total = IntCounterVec::new(
             Opts::new(
@@ -217,11 +399,39 @@ impl Metrics {
         ))?;
         registry.register(Box::new(push_queue_size.clone()))?;
 
+        let push_queue_capacity = IntGauge::with_opts(Opts::new(
+            "transponder_push_queue_capacity",
+            "Maximum number of notifications the push queue can hold",
+        ))?;
+        registry.register(Box::new(push_queue_capacity.clone()))?;
+
         let push_semaphore_available = IntGauge::with_opts(Opts::new(
             "transponder_push_semaphore_available",
             "Number of available permits for concurrent push requests",
         ))?;
         registry.register(Box::new(push_semaphore_available.clone()))?;
+
+        let push_concurrency_limit = IntGauge::with_opts(Opts::new(
+            "transponder_push_concurrency_limit",
+            "Maximum number of concurrent outbound push requests",
+        ))?;
+        registry.register(Box::new(push_concurrency_limit.clone()))?;
+
+        let push_queue_rejected_total = IntCounter::with_opts(Opts::new(
+            "transponder_push_queue_rejected_total",
+            "Total number of notifications rejected because the push queue was full, the dispatcher was shutting down, or the queue channel was closed",
+        ))?;
+        registry.register(Box::new(push_queue_rejected_total.clone()))?;
+
+        let push_dispatch_admission_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "transponder_push_dispatch_admission_duration_seconds",
+                "Duration of push dispatcher admission by outcome",
+            )
+            .buckets(PUSH_ADMISSION_DURATION_BUCKETS.to_vec()),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(push_dispatch_admission_duration_seconds.clone()))?;
 
         let push_retries_total = IntCounterVec::new(
             Opts::new(
@@ -280,6 +490,18 @@ impl Metrics {
         )?;
         registry.register(Box::new(relays_configured.clone()))?;
 
+        let relay_notifications_lagged_total = IntCounter::with_opts(Opts::new(
+            "transponder_relay_notifications_lagged_total",
+            "Total number of lagged relay notification events encountered",
+        ))?;
+        registry.register(Box::new(relay_notifications_lagged_total.clone()))?;
+
+        let relay_notifications_dropped_total = IntCounter::with_opts(Opts::new(
+            "transponder_relay_notifications_dropped_total",
+            "Total number of relay notifications dropped because the receiver lagged",
+        ))?;
+        registry.register(Box::new(relay_notifications_dropped_total.clone()))?;
+
         // === Server Metrics ===
         let server_start_time_seconds = Gauge::with_opts(Opts::new(
             "transponder_server_start_time_seconds",
@@ -302,6 +524,12 @@ impl Metrics {
             events_processed_total,
             events_deduplicated_total,
             events_failed_total,
+            events_in_flight,
+            event_processing_duration_seconds,
+            gift_wrap_unwrap_duration_seconds,
+            notification_parse_duration_seconds,
+            tokens_per_event,
+            notification_content_size_bytes,
             dedup_cache_size,
             dedup_cache_evictions_total,
             tokens_rate_limited_total,
@@ -309,17 +537,25 @@ impl Metrics {
             rate_limit_evictions_total,
             tokens_decrypted_total,
             tokens_decryption_failed_total,
+            token_decrypt_duration_seconds,
+            notifications_admitted_per_event,
             push_dispatched_total,
             push_success_total,
             push_failed_total,
             push_queue_size,
+            push_queue_capacity,
             push_semaphore_available,
+            push_concurrency_limit,
+            push_queue_rejected_total,
+            push_dispatch_admission_duration_seconds,
             push_retries_total,
             push_request_duration_seconds,
             push_response_status_total,
             auth_token_refreshes_total,
             relays_connected,
             relays_configured,
+            relay_notifications_lagged_total,
+            relay_notifications_dropped_total,
             server_start_time_seconds,
             server_info,
         })
@@ -366,9 +602,60 @@ impl Metrics {
         self.events_failed_total.inc();
     }
 
+    /// Increment the number of in-flight events.
+    pub fn inc_events_in_flight(&self) {
+        self.events_in_flight.inc();
+    }
+
+    /// Decrement the number of in-flight events.
+    pub fn dec_events_in_flight(&self) {
+        self.events_in_flight.dec();
+    }
+
+    /// Observe end-to-end event processing duration.
+    pub fn observe_event_processing_duration(&self, outcome: EventOutcome, duration_secs: f64) {
+        observe_label_value(
+            &self.event_processing_duration_seconds,
+            outcome.as_str(),
+            duration_secs,
+        );
+    }
+
+    /// Observe gift-wrap unwrap duration.
+    pub fn observe_gift_wrap_unwrap_duration(&self, outcome: OperationOutcome, duration_secs: f64) {
+        observe_label_value(
+            &self.gift_wrap_unwrap_duration_seconds,
+            outcome.as_str(),
+            duration_secs,
+        );
+    }
+
+    /// Observe notification parse duration.
+    pub fn observe_notification_parse_duration(
+        &self,
+        outcome: OperationOutcome,
+        duration_secs: f64,
+    ) {
+        observe_label_value(
+            &self.notification_parse_duration_seconds,
+            outcome.as_str(),
+            duration_secs,
+        );
+    }
+
+    /// Observe encrypted token count per event.
+    pub fn observe_tokens_per_event(&self, count: usize) {
+        self.tokens_per_event.observe(count as f64);
+    }
+
+    /// Observe the size in bytes of the base64-decoded encrypted token blob.
+    pub fn observe_notification_content_size_bytes(&self, size: usize) {
+        self.notification_content_size_bytes.observe(size as f64);
+    }
+
     /// Update dedup cache size.
     pub fn set_dedup_cache_size(&self, size: usize) {
-        self.dedup_cache_size.set(size as i64);
+        set_usize_gauge(&self.dedup_cache_size, size);
     }
 
     /// Record dedup cache evictions.
@@ -414,6 +701,20 @@ impl Metrics {
         self.tokens_decryption_failed_total.inc();
     }
 
+    /// Observe per-token decryption duration.
+    pub fn observe_token_decrypt_duration(&self, outcome: OperationOutcome, duration_secs: f64) {
+        observe_label_value(
+            &self.token_decrypt_duration_seconds,
+            outcome.as_str(),
+            duration_secs,
+        );
+    }
+
+    /// Observe the number of notifications admitted to the push dispatcher per event.
+    pub fn observe_notifications_admitted_per_event(&self, count: usize) {
+        self.notifications_admitted_per_event.observe(count as f64);
+    }
+
     /// Record a notification dispatched to push queue.
     pub fn record_push_dispatched(&self, platform: &str) {
         self.push_dispatched_total
@@ -435,12 +736,40 @@ impl Metrics {
 
     /// Update the push queue size.
     pub fn set_push_queue_size(&self, size: usize) {
-        self.push_queue_size.set(size as i64);
+        set_usize_gauge(&self.push_queue_size, size);
+    }
+
+    /// Update the push queue capacity.
+    pub fn set_push_queue_capacity(&self, size: usize) {
+        set_usize_gauge(&self.push_queue_capacity, size);
     }
 
     /// Update available semaphore permits.
     pub fn set_push_semaphore_available(&self, available: usize) {
-        self.push_semaphore_available.set(available as i64);
+        set_usize_gauge(&self.push_semaphore_available, available);
+    }
+
+    /// Update the push concurrency limit.
+    pub fn set_push_concurrency_limit(&self, limit: usize) {
+        set_usize_gauge(&self.push_concurrency_limit, limit);
+    }
+
+    /// Record a push queue rejection.
+    pub fn record_push_queue_rejected(&self, count: u64) {
+        self.push_queue_rejected_total.inc_by(count);
+    }
+
+    /// Observe push dispatcher admission duration.
+    pub fn observe_push_dispatch_admission_duration(
+        &self,
+        outcome: OperationOutcome,
+        duration_secs: f64,
+    ) {
+        observe_label_value(
+            &self.push_dispatch_admission_duration_seconds,
+            outcome.as_str(),
+            duration_secs,
+        );
     }
 
     /// Record a push retry attempt.
@@ -476,6 +805,16 @@ impl Metrics {
             .set(count as i64);
     }
 
+    /// Record a lagged relay notification event.
+    pub fn record_relay_notifications_lagged(&self) {
+        self.relay_notifications_lagged_total.inc();
+    }
+
+    /// Record relay notifications dropped due to receiver lag.
+    pub fn record_relay_notifications_dropped(&self, count: u64) {
+        self.relay_notifications_dropped_total.inc_by(count);
+    }
+
     /// Gather all metrics for export.
     pub fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
         self.registry.gather()
@@ -491,6 +830,9 @@ impl Default for Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_metrics::{
+        counter_value, gauge_value, histogram_sample_count, histogram_sample_sum,
+    };
 
     #[test]
     fn test_metrics_creation() {
@@ -506,10 +848,74 @@ mod tests {
         metrics.record_event_processed();
         metrics.record_event_deduplicated();
         metrics.record_event_failed();
+        metrics.inc_events_in_flight();
+        metrics.observe_event_processing_duration(EventOutcome::Processed, 0.01);
+        metrics.observe_gift_wrap_unwrap_duration(OperationOutcome::Success, 0.005);
+        metrics.observe_notification_parse_duration(OperationOutcome::Success, 0.001);
+        metrics.observe_tokens_per_event(3);
+        metrics.observe_notification_content_size_bytes(512);
+        metrics.dec_events_in_flight();
 
-        // Metrics should be incremented
-        let families = metrics.registry.gather();
-        assert!(!families.is_empty());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_received_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            gauge_value(&metrics, "transponder_events_in_flight", &[]),
+            0.0
+        );
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_event_processing_duration_seconds",
+                &[("outcome", EventOutcome::Processed.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_gift_wrap_unwrap_duration_seconds",
+                &[("outcome", OperationOutcome::Success.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_notification_parse_duration_seconds",
+                &[("outcome", OperationOutcome::Success.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_count(&metrics, "transponder_tokens_per_event", &[]),
+            1
+        );
+        assert_eq!(
+            histogram_sample_sum(&metrics, "transponder_tokens_per_event", &[]),
+            3.0
+        );
+        assert_eq!(
+            histogram_sample_count(&metrics, "transponder_notification_content_size_bytes", &[]),
+            1
+        );
+        assert_eq!(
+            histogram_sample_sum(&metrics, "transponder_notification_content_size_bytes", &[]),
+            512.0
+        );
     }
 
     #[test]
@@ -521,10 +927,89 @@ mod tests {
         metrics.record_push_success("apns");
         metrics.record_push_failed("fcm", "invalid_token");
         metrics.set_push_queue_size(100);
+        metrics.set_push_queue_capacity(10_000);
         metrics.set_push_semaphore_available(95);
+        metrics.set_push_concurrency_limit(100);
+        metrics.record_push_queue_rejected(2);
+        metrics.observe_push_dispatch_admission_duration(OperationOutcome::Success, 0.001);
+        metrics.observe_notifications_admitted_per_event(2);
 
-        let families = metrics.registry.gather();
-        assert!(!families.is_empty());
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_dispatched_total",
+                &[("platform", "apns")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_dispatched_total",
+                &[("platform", "fcm")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_success_total",
+                &[("platform", "apns")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_failed_total",
+                &[("platform", "fcm"), ("reason", "invalid_token")],
+            ),
+            1.0
+        );
+        assert_eq!(
+            gauge_value(&metrics, "transponder_push_queue_size", &[]),
+            100.0
+        );
+        assert_eq!(
+            gauge_value(&metrics, "transponder_push_queue_capacity", &[]),
+            10_000.0
+        );
+        assert_eq!(
+            gauge_value(&metrics, "transponder_push_semaphore_available", &[]),
+            95.0
+        );
+        assert_eq!(
+            gauge_value(&metrics, "transponder_push_concurrency_limit", &[]),
+            100.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_push_queue_rejected_total", &[]),
+            2.0
+        );
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_push_dispatch_admission_duration_seconds",
+                &[("outcome", OperationOutcome::Success.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_notifications_admitted_per_event",
+                &[]
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_sum(
+                &metrics,
+                "transponder_notifications_admitted_per_event",
+                &[]
+            ),
+            2.0
+        );
     }
 
     #[test]
@@ -536,8 +1021,38 @@ mod tests {
         metrics.record_push_retry("fcm");
         metrics.record_auth_token_refresh("apns_jwt");
 
-        let families = metrics.registry.gather();
-        assert!(!families.is_empty());
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_push_request_duration_seconds",
+                &[("platform", "apns")],
+            ),
+            1
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_response_status_total",
+                &[("platform", "apns"), ("status", "200")],
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_retries_total",
+                &[("platform", "fcm")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_auth_token_refreshes_total",
+                &[("service", "apns_jwt")],
+            ),
+            1.0
+        );
     }
 
     #[test]
@@ -547,9 +1062,57 @@ mod tests {
         metrics.set_relay_counts(3, 2);
         metrics.set_relays_connected("clearnet", 2);
         metrics.set_relays_connected("onion", 1);
+        metrics.record_relay_notifications_lagged();
+        metrics.record_relay_notifications_dropped(4);
 
-        let families = metrics.registry.gather();
-        assert!(!families.is_empty());
+        assert_eq!(
+            gauge_value(
+                &metrics,
+                "transponder_relays_configured",
+                &[("type", "clearnet")]
+            ),
+            3.0
+        );
+        assert_eq!(
+            gauge_value(
+                &metrics,
+                "transponder_relays_configured",
+                &[("type", "onion")]
+            ),
+            2.0
+        );
+        assert_eq!(
+            gauge_value(
+                &metrics,
+                "transponder_relays_connected",
+                &[("type", "clearnet")]
+            ),
+            2.0
+        );
+        assert_eq!(
+            gauge_value(
+                &metrics,
+                "transponder_relays_connected",
+                &[("type", "onion")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_relay_notifications_lagged_total",
+                &[]
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_relay_notifications_dropped_total",
+                &[]
+            ),
+            4.0
+        );
     }
 
     #[test]
@@ -558,8 +1121,11 @@ mod tests {
 
         metrics.init_server_info("0.1.0");
 
-        let families = metrics.registry.gather();
-        assert!(!families.is_empty());
+        assert!(gauge_value(&metrics, "transponder_server_start_time_seconds", &[]) > 0.0);
+        assert_eq!(
+            gauge_value(&metrics, "transponder_server_info", &[("version", "0.1.0")]),
+            1.0
+        );
     }
 
     #[test]
@@ -569,8 +1135,14 @@ mod tests {
         metrics.set_dedup_cache_size(50000);
         metrics.record_dedup_evictions(100);
 
-        let families = metrics.registry.gather();
-        assert!(!families.is_empty());
+        assert_eq!(
+            gauge_value(&metrics, "transponder_dedup_cache_size", &[]),
+            50_000.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_dedup_cache_evictions_total", &[]),
+            100.0
+        );
     }
 
     #[test]
@@ -579,9 +1151,33 @@ mod tests {
 
         metrics.record_token_decrypted();
         metrics.record_token_decryption_failed();
+        metrics.observe_token_decrypt_duration(OperationOutcome::Success, 0.0005);
+        metrics.observe_token_decrypt_duration(OperationOutcome::Failed, 0.0007);
 
-        let families = metrics.registry.gather();
-        assert!(!families.is_empty());
+        assert_eq!(
+            counter_value(&metrics, "transponder_tokens_decrypted_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_tokens_decryption_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_token_decrypt_duration_seconds",
+                &[("outcome", OperationOutcome::Success.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_token_decrypt_duration_seconds",
+                &[("outcome", OperationOutcome::Failed.as_str())],
+            ),
+            1
+        );
     }
 
     #[test]

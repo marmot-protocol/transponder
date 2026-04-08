@@ -335,16 +335,24 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 
 #### Event Processing
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `transponder_events_received_total` | Counter | Total events received from relays |
-| `transponder_events_processed_total` | Counter | Total events successfully processed |
-| `transponder_events_deduplicated_total` | Counter | Total events skipped (already processed) |
-| `transponder_events_failed_total` | Counter | Total events that failed processing |
-| `transponder_dedup_cache_size` | Gauge | Current deduplication cache size |
-| `transponder_dedup_cache_evictions_total` | Counter | Total dedup cache evictions |
-| `transponder_tokens_decrypted_total` | Counter | Total tokens successfully decrypted |
-| `transponder_tokens_decryption_failed_total` | Counter | Total token decryption failures |
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `transponder_events_received_total` | Counter | - | Total events received from relays |
+| `transponder_events_processed_total` | Counter | - | Total events successfully processed |
+| `transponder_events_deduplicated_total` | Counter | - | Total events skipped (already processed) |
+| `transponder_events_failed_total` | Counter | - | Total events that failed processing |
+| `transponder_events_in_flight` | Gauge | - | Current number of events actively being processed |
+| `transponder_event_processing_duration_seconds` | Histogram | `outcome` | End-to-end duration of event processing |
+| `transponder_gift_wrap_unwrap_duration_seconds` | Histogram | `outcome` | Duration of NIP-59 gift-wrap unwraps |
+| `transponder_notification_parse_duration_seconds` | Histogram | `outcome` | Duration of notification tag validation, base64 decode, and token splitting |
+| `transponder_tokens_per_event` | Histogram | - | Number of encrypted tokens carried by each parsed event |
+| `transponder_notification_content_size_bytes` | Histogram | - | Size in bytes of the base64-decoded encrypted token blob from kind 446 notification content |
+| `transponder_dedup_cache_size` | Gauge | - | Current deduplication cache size |
+| `transponder_dedup_cache_evictions_total` | Counter | - | Total dedup cache evictions |
+| `transponder_tokens_decrypted_total` | Counter | - | Total tokens successfully decrypted |
+| `transponder_tokens_decryption_failed_total` | Counter | - | Total token decryption failures |
+| `transponder_token_decrypt_duration_seconds` | Histogram | `outcome` | Duration of individual token decrypt operations |
+| `transponder_notifications_admitted_per_event` | Histogram | - | Number of notifications admitted to the push dispatcher per event |
 
 #### Token Rate Limiting
 
@@ -356,6 +364,10 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 
 Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` or `hour`
 
+`outcome` values vary by metric group:
+- Event processing: `processed`, `duplicate`, `failed`
+- Gift-wrap unwrap, notification parse, token decrypt, and push admission: `success`, `failed`
+
 #### Push Notifications
 
 | Metric | Type | Labels | Description |
@@ -364,8 +376,11 @@ Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` 
 | `transponder_push_success_total` | Counter | `platform` | Successful push notifications |
 | `transponder_push_failed_total` | Counter | `platform`, `reason` | Failed push notifications |
 | `transponder_push_queue_size` | Gauge | - | Current push queue size |
-| `transponder_push_queue_dropped_total` | Counter | - | Notifications dropped (queue full) |
+| `transponder_push_queue_capacity` | Gauge | - | Maximum number of notifications the push queue can hold |
 | `transponder_push_semaphore_available` | Gauge | - | Available concurrent push permits |
+| `transponder_push_concurrency_limit` | Gauge | - | Maximum number of concurrent outbound push requests |
+| `transponder_push_queue_rejected_total` | Counter | - | Notifications rejected before admission because the push queue was full, the dispatcher was shutting down, or the queue channel was closed |
+| `transponder_push_dispatch_admission_duration_seconds` | Histogram | `outcome` | Time spent admitting notifications into the push dispatcher |
 | `transponder_push_retries_total` | Counter | `platform` | Push retry attempts |
 | `transponder_push_request_duration_seconds` | Histogram | `platform` | Push request duration |
 | `transponder_push_response_status_total` | Counter | `platform`, `status` | Push responses by HTTP status |
@@ -377,6 +392,8 @@ Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` 
 |--------|------|--------|-------------|
 | `transponder_relays_connected` | Gauge | `type` | Currently connected relays |
 | `transponder_relays_configured` | Gauge | `type` | Configured relays |
+| `transponder_relay_notifications_lagged_total` | Counter | - | Number of times the relay notification receiver reported lag |
+| `transponder_relay_notifications_dropped_total` | Counter | - | Total relay notifications dropped because the receiver lagged |
 
 #### Server Info
 

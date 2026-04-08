@@ -102,9 +102,12 @@ impl PushDispatcher {
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
 
-        // Initialize semaphore metric
+        // Initialize push capacity metrics
         if let Some(ref m) = metrics {
+            m.set_push_queue_size(0);
+            m.set_push_queue_capacity(MAX_PENDING_QUEUE_SIZE);
             m.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
+            m.set_push_concurrency_limit(MAX_CONCURRENT_PUSHES);
         }
 
         // Spawn worker tasks
@@ -300,13 +303,8 @@ impl PushDispatcher {
     /// admitted locally". Invalid tokens are silently ignored per MIP-05 spec.
     pub async fn dispatch(&self, payloads: Vec<TokenPayload>) -> Result<usize> {
         let _admission_guard = self.admission_lock.lock().await;
-
-        if self.shutting_down.load(Ordering::SeqCst) {
-            debug!("Dispatcher shutting down, ignoring dispatch request");
-            return Err(Error::Dispatch("Dispatcher is shutting down".to_string()));
-        }
-
-        let mut messages = Vec::with_capacity(payloads.len());
+        let requested_count = payloads.len();
+        let mut messages = Vec::with_capacity(requested_count);
 
         for payload in payloads {
             // Extract token as Zeroizing<String> for automatic cleanup
@@ -338,16 +336,29 @@ impl PushDispatcher {
             messages.push(QueuedPushMessage { platform, token });
         }
 
+        let message_count = messages.len();
+        // Check shutdown after platform/token filtering so post-shutdown requests
+        // always fail while the rejection metric only counts admissible messages.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            if let Some(ref m) = self.metrics {
+                m.record_push_queue_rejected(message_count as u64);
+            }
+            debug!("Dispatcher shutting down, ignoring dispatch request");
+            return Err(Error::Dispatch("Dispatcher is shutting down".to_string()));
+        }
+
         if messages.is_empty() {
             return Ok(0);
         }
 
-        let message_count = messages.len();
         let mut permits =
             self.sender
                 .try_reserve_many(message_count)
                 .map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => {
+                        if let Some(ref m) = self.metrics {
+                            m.record_push_queue_rejected(message_count as u64);
+                        }
                         warn!(
                             requested = message_count,
                             available = self.sender.capacity(),
@@ -358,6 +369,9 @@ impl PushDispatcher {
                         ))
                     }
                     mpsc::error::TrySendError::Closed(_) => {
+                        if let Some(ref m) = self.metrics {
+                            m.record_push_queue_rejected(message_count as u64);
+                        }
                         warn!("Push queue closed, rejecting notification batch");
                         Error::Dispatch("Push queue closed".to_string())
                     }
@@ -484,21 +498,21 @@ impl PushDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_metrics::{
+        counter_value as metric_counter_value, gauge_value as metric_gauge_value,
+    };
     use std::time::Duration;
 
+    fn gauge_metric_value(metrics: &crate::metrics::Metrics, name: &str) -> i64 {
+        metric_gauge_value(metrics, name, &[]) as i64
+    }
+
+    fn counter_metric_value(metrics: &crate::metrics::Metrics, name: &str) -> u64 {
+        metric_counter_value(metrics, name, &[]) as u64
+    }
+
     fn queue_size_metric_value(metrics: &crate::metrics::Metrics) -> i64 {
-        metrics
-            .gather()
-            .into_iter()
-            .find(|family| family.name() == "transponder_push_queue_size")
-            .and_then(|family| {
-                family
-                    .get_metric()
-                    .first()
-                    .and_then(|metric| metric.get_gauge().value)
-            })
-            .map(|value| value as i64)
-            .unwrap_or_default()
+        gauge_metric_value(metrics, "transponder_push_queue_size")
     }
 
     #[tokio::test]
@@ -859,12 +873,147 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_after_shutdown() {
-        let dispatcher = PushDispatcher::new(None, None);
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+
+        let dispatcher = PushDispatcher::new(
+            Some(ApnsClient::mock(
+                ApnsConfig {
+                    enabled: true,
+                    key_id: "KEY123".to_string(),
+                    team_id: "TEAM456".to_string(),
+                    private_key_path: String::new(),
+                    environment: "sandbox".to_string(),
+                    bundle_id: "com.example.app".to_string(),
+                },
+                true,
+            )),
+            None,
+        );
 
         // Shutdown the dispatcher
         dispatcher.wait_for_completion().await;
 
         // Dispatch should be ignored after shutdown
+        let payloads = vec![TokenPayload {
+            platform: Platform::Apns,
+            device_token: vec![0xaa, 0xbb, 0xcc],
+        }];
+
+        let error = dispatcher.dispatch(payloads).await.unwrap_err();
+        assert!(matches!(error, Error::Dispatch(_)));
+    }
+
+    #[tokio::test]
+    async fn test_capacity_metrics_initialized() {
+        use crate::metrics::Metrics;
+
+        let metrics = Metrics::default();
+        let _dispatcher = PushDispatcher::with_metrics(None, None, Some(metrics.clone()));
+
+        assert_eq!(queue_size_metric_value(&metrics), 0);
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_queue_capacity"),
+            MAX_PENDING_QUEUE_SIZE as i64
+        );
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_semaphore_available"),
+            MAX_CONCURRENT_PUSHES as i64
+        );
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_concurrency_limit"),
+            MAX_CONCURRENT_PUSHES as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_after_shutdown_records_rejection_metric() {
+        use crate::config::ApnsConfig;
+        use crate::metrics::Metrics;
+        use crate::push::ApnsClient;
+
+        let metrics = Metrics::default();
+        let dispatcher = PushDispatcher::with_metrics(
+            Some(ApnsClient::mock(
+                ApnsConfig {
+                    enabled: true,
+                    key_id: "KEY123".to_string(),
+                    team_id: "TEAM456".to_string(),
+                    private_key_path: String::new(),
+                    environment: "sandbox".to_string(),
+                    bundle_id: "com.example.app".to_string(),
+                },
+                true,
+            )),
+            None,
+            Some(metrics.clone()),
+        );
+
+        dispatcher.wait_for_completion().await;
+
+        let payloads = vec![TokenPayload {
+            platform: Platform::Apns,
+            device_token: vec![0xaa, 0xbb, 0xcc],
+        }];
+
+        let error = dispatcher.dispatch(payloads).await.unwrap_err();
+        assert!(matches!(error, Error::Dispatch(_)));
+        assert_eq!(
+            counter_metric_value(&metrics, "transponder_push_queue_rejected_total"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_after_shutdown_rejects_only_admissible_payloads() {
+        use crate::config::ApnsConfig;
+        use crate::metrics::Metrics;
+        use crate::push::ApnsClient;
+
+        let metrics = Metrics::default();
+        let dispatcher = PushDispatcher::with_metrics(
+            Some(ApnsClient::mock(
+                ApnsConfig {
+                    enabled: true,
+                    key_id: "KEY123".to_string(),
+                    team_id: "TEAM456".to_string(),
+                    private_key_path: String::new(),
+                    environment: "sandbox".to_string(),
+                    bundle_id: "com.example.app".to_string(),
+                },
+                true,
+            )),
+            None,
+            Some(metrics.clone()),
+        );
+
+        dispatcher.wait_for_completion().await;
+
+        let payloads = vec![
+            TokenPayload {
+                platform: Platform::Apns,
+                device_token: vec![0xaa, 0xbb, 0xcc],
+            },
+            TokenPayload {
+                platform: Platform::Fcm,
+                device_token: b"fcm-token-123".to_vec(),
+            },
+        ];
+
+        let error = dispatcher.dispatch(payloads).await.unwrap_err();
+        assert!(matches!(error, Error::Dispatch(_)));
+        assert_eq!(
+            counter_metric_value(&metrics, "transponder_push_queue_rejected_total"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_after_shutdown_rejects_filtered_batch() {
+        let dispatcher = PushDispatcher::new(None, None);
+
+        dispatcher.wait_for_completion().await;
+
         let payloads = vec![TokenPayload {
             platform: Platform::Apns,
             device_token: vec![0xaa, 0xbb, 0xcc],
@@ -956,6 +1105,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_rejects_batch_larger_than_queue() {
         use crate::config::ApnsConfig;
+        use crate::metrics::Metrics;
         use crate::push::ApnsClient;
 
         let apns_config = ApnsConfig {
@@ -967,7 +1117,9 @@ mod tests {
             bundle_id: "com.example.app".to_string(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
-        let dispatcher = PushDispatcher::new(Some(apns_client), None);
+        let metrics = Metrics::default();
+        let dispatcher =
+            PushDispatcher::with_metrics(Some(apns_client), None, Some(metrics.clone()));
 
         let payloads = vec![
             TokenPayload {
@@ -980,5 +1132,9 @@ mod tests {
         let error = dispatcher.dispatch(payloads).await.unwrap_err();
 
         assert!(matches!(error, Error::Dispatch(message) if message.contains("Push queue full")));
+        assert_eq!(
+            counter_metric_value(&metrics, "transponder_push_queue_rejected_total"),
+            (MAX_PENDING_QUEUE_SIZE + 1) as u64
+        );
     }
 }

@@ -27,6 +27,8 @@ mod server;
 mod shutdown;
 
 #[cfg(test)]
+mod test_metrics;
+#[cfg(test)]
 mod test_vectors;
 
 use config::AppConfig;
@@ -72,6 +74,15 @@ fn classify_notification_receive_error(error: &RecvError) -> NotificationReceive
     match error {
         RecvError::Lagged(_) => NotificationReceiveAction::Continue,
         RecvError::Closed => NotificationReceiveAction::Shutdown,
+    }
+}
+
+fn record_notification_receive_metrics(metrics: Option<&Metrics>, error: &RecvError) {
+    if let RecvError::Lagged(skipped) = error
+        && let Some(metrics) = metrics
+    {
+        metrics.record_relay_notifications_lagged();
+        metrics.record_relay_notifications_dropped(*skipped);
     }
 }
 
@@ -284,6 +295,7 @@ async fn main() -> Result<()> {
     let mut event_shutdown = shutdown.subscribe();
     let event_processor_clone = event_processor.clone();
     let relay_client_clone = relay_client.clone();
+    let event_metrics = metrics.clone();
 
     let event_handle = tokio::spawn(async move {
         let mut notifications = relay_client_clone.notifications();
@@ -304,6 +316,8 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
+                            record_notification_receive_metrics(event_metrics.as_ref(), &e);
+
                             match classify_notification_receive_error(&e) {
                                 NotificationReceiveAction::Continue => {
                                     warn!(error = %e, "Lagged relay notifications, continuing");
@@ -487,6 +501,26 @@ mod tests {
         let action = classify_notification_receive_error(&RecvError::Closed);
 
         assert_eq!(action, NotificationReceiveAction::Shutdown);
+    }
+
+    #[test]
+    fn notification_receive_lag_records_metrics() {
+        let metrics = Metrics::new().unwrap();
+
+        record_notification_receive_metrics(Some(&metrics), &RecvError::Lagged(3));
+
+        assert_eq!(metrics.relay_notifications_lagged_total.get(), 1);
+        assert_eq!(metrics.relay_notifications_dropped_total.get(), 3);
+    }
+
+    #[test]
+    fn notification_receive_close_does_not_record_metrics() {
+        let metrics = Metrics::new().unwrap();
+
+        record_notification_receive_metrics(Some(&metrics), &RecvError::Closed);
+
+        assert_eq!(metrics.relay_notifications_lagged_total.get(), 0);
+        assert_eq!(metrics.relay_notifications_dropped_total.get(), 0);
     }
 
     #[tokio::test]
