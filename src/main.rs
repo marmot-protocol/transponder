@@ -284,6 +284,7 @@ async fn main() -> Result<()> {
     let mut event_shutdown = shutdown.subscribe();
     let event_processor_clone = event_processor.clone();
     let relay_client_clone = relay_client.clone();
+    let event_metrics = metrics.clone();
 
     let event_handle = tokio::spawn(async move {
         let mut notifications = relay_client_clone.notifications();
@@ -304,6 +305,12 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
+                            if let RecvError::Lagged(skipped) = &e
+                                && let Some(ref m) = event_metrics {
+                                m.record_relay_notifications_lagged();
+                                m.record_relay_notifications_dropped(*skipped);
+                            }
+
                             match classify_notification_receive_error(&e) {
                                 NotificationReceiveAction::Continue => {
                                     warn!(error = %e, "Lagged relay notifications, continuing");

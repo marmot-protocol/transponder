@@ -102,9 +102,12 @@ impl PushDispatcher {
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
 
-        // Initialize semaphore metric
+        // Initialize push capacity metrics
         if let Some(ref m) = metrics {
+            m.set_push_queue_size(0);
+            m.set_push_queue_capacity(MAX_PENDING_QUEUE_SIZE);
             m.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
+            m.set_push_concurrency_limit(MAX_CONCURRENT_PUSHES);
         }
 
         // Spawn worker tasks
@@ -302,6 +305,9 @@ impl PushDispatcher {
         let _admission_guard = self.admission_lock.lock().await;
 
         if self.shutting_down.load(Ordering::SeqCst) {
+            if let Some(ref m) = self.metrics {
+                m.record_push_queue_rejected();
+            }
             debug!("Dispatcher shutting down, ignoring dispatch request");
             return Err(Error::Dispatch("Dispatcher is shutting down".to_string()));
         }
@@ -348,6 +354,9 @@ impl PushDispatcher {
                 .try_reserve_many(message_count)
                 .map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => {
+                        if let Some(ref m) = self.metrics {
+                            m.record_push_queue_rejected();
+                        }
                         warn!(
                             requested = message_count,
                             available = self.sender.capacity(),
@@ -358,6 +367,9 @@ impl PushDispatcher {
                         ))
                     }
                     mpsc::error::TrySendError::Closed(_) => {
+                        if let Some(ref m) = self.metrics {
+                            m.record_push_queue_rejected();
+                        }
                         warn!("Push queue closed, rejecting notification batch");
                         Error::Dispatch("Push queue closed".to_string())
                     }

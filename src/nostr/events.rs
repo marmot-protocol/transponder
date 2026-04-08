@@ -5,7 +5,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
@@ -31,6 +31,28 @@ const CLEANUP_BATCH_SIZE: usize = 1000;
 
 /// Default maximum size for the deduplication cache.
 pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
+
+struct InFlightEventGuard {
+    metrics: Option<Metrics>,
+}
+
+impl InFlightEventGuard {
+    fn new(metrics: Option<Metrics>) -> Self {
+        if let Some(ref m) = metrics {
+            m.inc_events_in_flight();
+        }
+
+        Self { metrics }
+    }
+}
+
+impl Drop for InFlightEventGuard {
+    fn drop(&mut self) {
+        if let Some(ref m) = self.metrics {
+            m.dec_events_in_flight();
+        }
+    }
+}
 
 /// Event processor for handling incoming gift-wrapped notifications.
 pub struct EventProcessor {
@@ -150,6 +172,9 @@ impl EventProcessor {
     /// Returns `Ok(true)` if the event was processed, `Ok(false)` if it was
     /// deduplicated (already seen), or an error if processing failed.
     pub async fn process(&self, event: &Event) -> Result<bool> {
+        let _in_flight = InFlightEventGuard::new(self.metrics.clone());
+        let started_at = StdInstant::now();
+
         // Record event received
         if let Some(ref m) = self.metrics {
             m.record_event_received();
@@ -160,6 +185,10 @@ impl EventProcessor {
             trace!(event_id = %event.id, "Skipping duplicate event");
             if let Some(ref m) = self.metrics {
                 m.record_event_deduplicated();
+                m.observe_event_processing_duration(
+                    "duplicate",
+                    started_at.elapsed().as_secs_f64(),
+                );
             }
             return Ok(false);
         }
@@ -179,6 +208,10 @@ impl EventProcessor {
 
                 if let Some(ref m) = self.metrics {
                     m.record_event_processed();
+                    m.observe_event_processing_duration(
+                        "processed",
+                        started_at.elapsed().as_secs_f64(),
+                    );
                 }
                 Ok(true)
             }
@@ -191,6 +224,10 @@ impl EventProcessor {
                 );
                 if let Some(ref m) = self.metrics {
                     m.record_event_failed();
+                    m.observe_event_processing_duration(
+                        "failed",
+                        started_at.elapsed().as_secs_f64(),
+                    );
                 }
                 Ok(false)
             }
@@ -200,15 +237,60 @@ impl EventProcessor {
     /// Inner processing logic for an event.
     async fn process_inner(&self, event: &Event) -> Result<usize> {
         // Unwrap the gift wrap to get the notification request
-        let notification = self.nip59_handler.unwrap(event).await?;
+        let unwrap_started_at = StdInstant::now();
+        let notification = match self.nip59_handler.unwrap(event).await {
+            Ok(notification) => {
+                if let Some(ref m) = self.metrics {
+                    m.observe_gift_wrap_unwrap_duration(
+                        "success",
+                        unwrap_started_at.elapsed().as_secs_f64(),
+                    );
+                }
+                notification
+            }
+            Err(e) => {
+                if let Some(ref m) = self.metrics {
+                    m.observe_gift_wrap_unwrap_duration(
+                        "failed",
+                        unwrap_started_at.elapsed().as_secs_f64(),
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         trace!(
             sender = %notification.sender_pubkey,
             "Unwrapped notification request"
         );
 
+        if let Some(ref m) = self.metrics {
+            m.observe_notification_content_size_bytes(notification.content.len());
+        }
+
         // Parse the encrypted tokens from the content
-        let token_bytes = notification.parse_tokens()?;
+        let parse_started_at = StdInstant::now();
+        let token_bytes = match notification.parse_tokens() {
+            Ok(token_bytes) => {
+                if let Some(ref m) = self.metrics {
+                    m.observe_notification_parse_duration(
+                        "success",
+                        parse_started_at.elapsed().as_secs_f64(),
+                    );
+                    m.observe_tokens_per_event(token_bytes.len());
+                }
+                token_bytes
+            }
+            Err(e) => {
+                if let Some(ref m) = self.metrics {
+                    m.observe_notification_parse_duration(
+                        "failed",
+                        parse_started_at.elapsed().as_secs_f64(),
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         if token_bytes.is_empty() {
             return Ok(0);
@@ -240,10 +322,15 @@ impl EventProcessor {
             }
 
             // Decrypt the token
+            let decrypt_started_at = StdInstant::now();
             let payload = match self.token_decryptor.decrypt_bytes(&bytes) {
                 Ok(p) => {
                     if let Some(ref m) = self.metrics {
                         m.record_token_decrypted();
+                        m.observe_token_decrypt_duration(
+                            "success",
+                            decrypt_started_at.elapsed().as_secs_f64(),
+                        );
                     }
                     p
                 }
@@ -252,6 +339,10 @@ impl EventProcessor {
                     trace!(error = %e, "Failed to decrypt token (ignoring)");
                     if let Some(ref m) = self.metrics {
                         m.record_token_decryption_failed();
+                        m.observe_token_decrypt_duration(
+                            "failed",
+                            decrypt_started_at.elapsed().as_secs_f64(),
+                        );
                     }
                     continue;
                 }
@@ -282,7 +373,28 @@ impl EventProcessor {
         }
 
         // Dispatch notifications
-        self.push_dispatcher.dispatch(payloads).await
+        let dispatch_started_at = StdInstant::now();
+        match self.push_dispatcher.dispatch(payloads).await {
+            Ok(count) => {
+                if let Some(ref m) = self.metrics {
+                    m.observe_push_dispatch_admission_duration(
+                        "success",
+                        dispatch_started_at.elapsed().as_secs_f64(),
+                    );
+                    m.observe_notifications_admitted_per_event(count);
+                }
+                Ok(count)
+            }
+            Err(e) => {
+                if let Some(ref m) = self.metrics {
+                    m.observe_push_dispatch_admission_duration(
+                        "failed",
+                        dispatch_started_at.elapsed().as_secs_f64(),
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Hash arbitrary bytes to a fixed-size key for rate limiting.
