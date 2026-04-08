@@ -304,15 +304,6 @@ impl PushDispatcher {
     pub async fn dispatch(&self, payloads: Vec<TokenPayload>) -> Result<usize> {
         let _admission_guard = self.admission_lock.lock().await;
         let requested_count = payloads.len();
-
-        if self.shutting_down.load(Ordering::SeqCst) {
-            if let Some(ref m) = self.metrics {
-                m.record_push_queue_rejected(requested_count as u64);
-            }
-            debug!("Dispatcher shutting down, ignoring dispatch request");
-            return Err(Error::Dispatch("Dispatcher is shutting down".to_string()));
-        }
-
         let mut messages = Vec::with_capacity(requested_count);
 
         for payload in payloads {
@@ -350,6 +341,8 @@ impl PushDispatcher {
         }
 
         let message_count = messages.len();
+        // Check shutdown after platform/token filtering so the rejection metric only
+        // counts messages that would otherwise have been admissible.
         if self.shutting_down.load(Ordering::SeqCst) {
             if let Some(ref m) = self.metrics {
                 m.record_push_queue_rejected(message_count as u64);
@@ -880,7 +873,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_after_shutdown() {
-        let dispatcher = PushDispatcher::new(None, None);
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+
+        let dispatcher = PushDispatcher::new(
+            Some(ApnsClient::mock(
+                ApnsConfig {
+                    enabled: true,
+                    key_id: "KEY123".to_string(),
+                    team_id: "TEAM456".to_string(),
+                    private_key_path: String::new(),
+                    environment: "sandbox".to_string(),
+                    bundle_id: "com.example.app".to_string(),
+                },
+                true,
+            )),
+            None,
+        );
 
         // Shutdown the dispatcher
         dispatcher.wait_for_completion().await;
@@ -919,10 +928,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_after_shutdown_records_rejection_metric() {
+        use crate::config::ApnsConfig;
         use crate::metrics::Metrics;
+        use crate::push::ApnsClient;
 
         let metrics = Metrics::default();
-        let dispatcher = PushDispatcher::with_metrics(None, None, Some(metrics.clone()));
+        let dispatcher = PushDispatcher::with_metrics(
+            Some(ApnsClient::mock(
+                ApnsConfig {
+                    enabled: true,
+                    key_id: "KEY123".to_string(),
+                    team_id: "TEAM456".to_string(),
+                    private_key_path: String::new(),
+                    environment: "sandbox".to_string(),
+                    bundle_id: "com.example.app".to_string(),
+                },
+                true,
+            )),
+            None,
+            Some(metrics.clone()),
+        );
 
         dispatcher.wait_for_completion().await;
 
@@ -930,6 +955,50 @@ mod tests {
             platform: Platform::Apns,
             device_token: vec![0xaa, 0xbb, 0xcc],
         }];
+
+        let error = dispatcher.dispatch(payloads).await.unwrap_err();
+        assert!(matches!(error, Error::Dispatch(_)));
+        assert_eq!(
+            counter_metric_value(&metrics, "transponder_push_queue_rejected_total"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_after_shutdown_rejects_only_admissible_payloads() {
+        use crate::config::ApnsConfig;
+        use crate::metrics::Metrics;
+        use crate::push::ApnsClient;
+
+        let metrics = Metrics::default();
+        let dispatcher = PushDispatcher::with_metrics(
+            Some(ApnsClient::mock(
+                ApnsConfig {
+                    enabled: true,
+                    key_id: "KEY123".to_string(),
+                    team_id: "TEAM456".to_string(),
+                    private_key_path: String::new(),
+                    environment: "sandbox".to_string(),
+                    bundle_id: "com.example.app".to_string(),
+                },
+                true,
+            )),
+            None,
+            Some(metrics.clone()),
+        );
+
+        dispatcher.wait_for_completion().await;
+
+        let payloads = vec![
+            TokenPayload {
+                platform: Platform::Apns,
+                device_token: vec![0xaa, 0xbb, 0xcc],
+            },
+            TokenPayload {
+                platform: Platform::Fcm,
+                device_token: b"fcm-token-123".to_vec(),
+            },
+        ];
 
         let error = dispatcher.dispatch(payloads).await.unwrap_err();
         assert!(matches!(error, Error::Dispatch(_)));

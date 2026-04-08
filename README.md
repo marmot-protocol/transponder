@@ -346,7 +346,7 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 | `transponder_gift_wrap_unwrap_duration_seconds` | Histogram | `outcome` | Duration of NIP-59 gift-wrap unwraps |
 | `transponder_notification_parse_duration_seconds` | Histogram | `outcome` | Duration of notification tag validation, base64 decode, and token splitting |
 | `transponder_tokens_per_event` | Histogram | - | Number of encrypted tokens carried by each parsed event |
-| `transponder_notification_content_size_bytes` | Histogram | - | Size of kind 446 notification content before base64 decoding |
+| `transponder_notification_content_size_bytes` | Histogram | - | Decoded size in bytes of kind 446 notification content |
 | `transponder_dedup_cache_size` | Gauge | - | Current deduplication cache size |
 | `transponder_dedup_cache_evictions_total` | Counter | - | Total dedup cache evictions |
 | `transponder_tokens_decrypted_total` | Counter | - | Total tokens successfully decrypted |
@@ -362,7 +362,11 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 | `transponder_rate_limit_cache_size` | Gauge | `type` | Current rate limit cache size |
 | `transponder_rate_limit_evictions_total` | Counter | `type` | Rate limit cache evictions |
 
-Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` or `hour`; `outcome` = `success`, `failed`, `processed`, or `duplicate`
+Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` or `hour`
+
+`outcome` values vary by metric group:
+- Event processing: `processed`, `duplicate`, `failed`
+- Gift-wrap unwrap, notification parse, token decrypt, and push admission: `success`, `failed`
 
 #### Push Notifications
 

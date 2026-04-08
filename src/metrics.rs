@@ -50,7 +50,7 @@ pub struct Metrics {
     /// Number of encrypted tokens carried by each parsed event.
     pub tokens_per_event: Histogram,
 
-    /// Size of kind 446 notification content before base64 decoding.
+    /// Decoded size in bytes of kind 446 notification content.
     pub notification_content_size_bytes: Histogram,
 
     /// Current size of the deduplication cache.
@@ -143,12 +143,10 @@ pub struct Metrics {
     pub server_info: IntGaugeVec,
 }
 
-/// Fixed set of outcome label values used by histogram metrics.
+/// Fixed set of outcome label values used by the event-level processing histogram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutcomeLabel {
-    /// Operation completed successfully.
-    Success,
-    /// Operation failed.
+pub enum EventOutcome {
+    /// Event processing failed.
     Failed,
     /// Event was processed successfully.
     Processed,
@@ -156,14 +154,32 @@ pub enum OutcomeLabel {
     Duplicate,
 }
 
-impl OutcomeLabel {
+impl EventOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Processed => "processed",
+            Self::Duplicate => "duplicate",
+        }
+    }
+}
+
+/// Fixed set of outcome label values used by sub-operation histograms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationOutcome {
+    /// Operation completed successfully.
+    Success,
+    /// Operation failed.
+    Failed,
+}
+
+impl OperationOutcome {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
             Self::Failed => "failed",
-            Self::Processed => "processed",
-            Self::Duplicate => "duplicate",
         }
     }
 }
@@ -177,15 +193,15 @@ const PARSE_DURATION_BUCKETS: [f64; 10] = [
 const TOKEN_DECRYPT_DURATION_BUCKETS: [f64; 10] = [
     0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
 ];
+const PUSH_ADMISSION_DURATION_BUCKETS: [f64; 8] =
+    [0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01];
 const PER_EVENT_COUNT_BUCKETS: [f64; 9] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
 const NOTIFICATION_CONTENT_SIZE_BUCKETS: [f64; 9] = [
     128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0,
 ];
 
-fn observe_outcome(histogram: &HistogramVec, outcome: OutcomeLabel, value: f64) {
-    histogram
-        .with_label_values(&[outcome.as_str()])
-        .observe(value);
+fn observe_label_value(histogram: &HistogramVec, label: &str, value: f64) {
+    histogram.with_label_values(&[label]).observe(value);
 }
 
 fn set_usize_gauge(gauge: &IntGauge, value: usize) {
@@ -270,7 +286,7 @@ impl Metrics {
         let notification_content_size_bytes = Histogram::with_opts(
             HistogramOpts::new(
                 "transponder_notification_content_size_bytes",
-                "Size of kind 446 notification content before base64 decoding",
+                "Decoded size in bytes of kind 446 notification content",
             )
             .buckets(NOTIFICATION_CONTENT_SIZE_BUCKETS.to_vec()),
         )?;
@@ -410,7 +426,7 @@ impl Metrics {
                 "transponder_push_dispatch_admission_duration_seconds",
                 "Duration of push dispatcher admission by outcome",
             )
-            .buckets(PARSE_DURATION_BUCKETS.to_vec()),
+            .buckets(PUSH_ADMISSION_DURATION_BUCKETS.to_vec()),
             &["outcome"],
         )?;
         registry.register(Box::new(push_dispatch_admission_duration_seconds.clone()))?;
@@ -595,28 +611,32 @@ impl Metrics {
     }
 
     /// Observe end-to-end event processing duration.
-    pub fn observe_event_processing_duration(&self, outcome: OutcomeLabel, duration_secs: f64) {
-        observe_outcome(
+    pub fn observe_event_processing_duration(&self, outcome: EventOutcome, duration_secs: f64) {
+        observe_label_value(
             &self.event_processing_duration_seconds,
-            outcome,
+            outcome.as_str(),
             duration_secs,
         );
     }
 
     /// Observe gift-wrap unwrap duration.
-    pub fn observe_gift_wrap_unwrap_duration(&self, outcome: OutcomeLabel, duration_secs: f64) {
-        observe_outcome(
+    pub fn observe_gift_wrap_unwrap_duration(&self, outcome: OperationOutcome, duration_secs: f64) {
+        observe_label_value(
             &self.gift_wrap_unwrap_duration_seconds,
-            outcome,
+            outcome.as_str(),
             duration_secs,
         );
     }
 
     /// Observe notification parse duration.
-    pub fn observe_notification_parse_duration(&self, outcome: OutcomeLabel, duration_secs: f64) {
-        observe_outcome(
+    pub fn observe_notification_parse_duration(
+        &self,
+        outcome: OperationOutcome,
+        duration_secs: f64,
+    ) {
+        observe_label_value(
             &self.notification_parse_duration_seconds,
-            outcome,
+            outcome.as_str(),
             duration_secs,
         );
     }
@@ -626,7 +646,7 @@ impl Metrics {
         self.tokens_per_event.observe(count as f64);
     }
 
-    /// Observe inner notification content size in bytes.
+    /// Observe decoded notification content size in bytes.
     pub fn observe_notification_content_size_bytes(&self, size: usize) {
         self.notification_content_size_bytes.observe(size as f64);
     }
@@ -680,8 +700,12 @@ impl Metrics {
     }
 
     /// Observe per-token decryption duration.
-    pub fn observe_token_decrypt_duration(&self, outcome: OutcomeLabel, duration_secs: f64) {
-        observe_outcome(&self.token_decrypt_duration_seconds, outcome, duration_secs);
+    pub fn observe_token_decrypt_duration(&self, outcome: OperationOutcome, duration_secs: f64) {
+        observe_label_value(
+            &self.token_decrypt_duration_seconds,
+            outcome.as_str(),
+            duration_secs,
+        );
     }
 
     /// Observe the number of notifications admitted to the push dispatcher per event.
@@ -736,12 +760,12 @@ impl Metrics {
     /// Observe push dispatcher admission duration.
     pub fn observe_push_dispatch_admission_duration(
         &self,
-        outcome: OutcomeLabel,
+        outcome: OperationOutcome,
         duration_secs: f64,
     ) {
-        observe_outcome(
+        observe_label_value(
             &self.push_dispatch_admission_duration_seconds,
-            outcome,
+            outcome.as_str(),
             duration_secs,
         );
     }
@@ -823,9 +847,9 @@ mod tests {
         metrics.record_event_deduplicated();
         metrics.record_event_failed();
         metrics.inc_events_in_flight();
-        metrics.observe_event_processing_duration(OutcomeLabel::Processed, 0.01);
-        metrics.observe_gift_wrap_unwrap_duration(OutcomeLabel::Success, 0.005);
-        metrics.observe_notification_parse_duration(OutcomeLabel::Success, 0.001);
+        metrics.observe_event_processing_duration(EventOutcome::Processed, 0.01);
+        metrics.observe_gift_wrap_unwrap_duration(OperationOutcome::Success, 0.005);
+        metrics.observe_notification_parse_duration(OperationOutcome::Success, 0.001);
         metrics.observe_tokens_per_event(3);
         metrics.observe_notification_content_size_bytes(512);
         metrics.dec_events_in_flight();
@@ -854,7 +878,7 @@ mod tests {
             histogram_sample_count(
                 &metrics,
                 "transponder_event_processing_duration_seconds",
-                &[("outcome", OutcomeLabel::Processed.as_str())],
+                &[("outcome", EventOutcome::Processed.as_str())],
             ),
             1
         );
@@ -862,7 +886,7 @@ mod tests {
             histogram_sample_count(
                 &metrics,
                 "transponder_gift_wrap_unwrap_duration_seconds",
-                &[("outcome", OutcomeLabel::Success.as_str())],
+                &[("outcome", OperationOutcome::Success.as_str())],
             ),
             1
         );
@@ -870,7 +894,7 @@ mod tests {
             histogram_sample_count(
                 &metrics,
                 "transponder_notification_parse_duration_seconds",
-                &[("outcome", OutcomeLabel::Success.as_str())],
+                &[("outcome", OperationOutcome::Success.as_str())],
             ),
             1
         );
@@ -905,7 +929,7 @@ mod tests {
         metrics.set_push_semaphore_available(95);
         metrics.set_push_concurrency_limit(100);
         metrics.record_push_queue_rejected(2);
-        metrics.observe_push_dispatch_admission_duration(OutcomeLabel::Success, 0.001);
+        metrics.observe_push_dispatch_admission_duration(OperationOutcome::Success, 0.001);
         metrics.observe_notifications_admitted_per_event(2);
 
         assert_eq!(
@@ -964,7 +988,7 @@ mod tests {
             histogram_sample_count(
                 &metrics,
                 "transponder_push_dispatch_admission_duration_seconds",
-                &[("outcome", OutcomeLabel::Success.as_str())],
+                &[("outcome", OperationOutcome::Success.as_str())],
             ),
             1
         );
@@ -1125,8 +1149,8 @@ mod tests {
 
         metrics.record_token_decrypted();
         metrics.record_token_decryption_failed();
-        metrics.observe_token_decrypt_duration(OutcomeLabel::Success, 0.0005);
-        metrics.observe_token_decrypt_duration(OutcomeLabel::Failed, 0.0007);
+        metrics.observe_token_decrypt_duration(OperationOutcome::Success, 0.0005);
+        metrics.observe_token_decrypt_duration(OperationOutcome::Failed, 0.0007);
 
         assert_eq!(
             counter_value(&metrics, "transponder_tokens_decrypted_total", &[]),
@@ -1140,7 +1164,7 @@ mod tests {
             histogram_sample_count(
                 &metrics,
                 "transponder_token_decrypt_duration_seconds",
-                &[("outcome", OutcomeLabel::Success.as_str())],
+                &[("outcome", OperationOutcome::Success.as_str())],
             ),
             1
         );
@@ -1148,7 +1172,7 @@ mod tests {
             histogram_sample_count(
                 &metrics,
                 "transponder_token_decrypt_duration_seconds",
-                &[("outcome", OutcomeLabel::Failed.as_str())],
+                &[("outcome", OperationOutcome::Failed.as_str())],
             ),
             1
         );
