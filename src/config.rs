@@ -69,7 +69,7 @@ fn default_rate_limit_per_hour() -> u32 {
 }
 
 /// Server-specific configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ServerConfig {
     /// Server's Nostr private key (hex or nsec format).
     pub private_key: String,
@@ -127,6 +127,34 @@ pub struct ServerConfig {
     /// Default: 5,000.
     #[serde(default = "default_rate_limit_per_hour")]
     pub device_token_rate_limit_per_hour: u32,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("private_key", &"[REDACTED]")
+            .field("private_key_file", &self.private_key_file)
+            .field("shutdown_timeout_secs", &self.shutdown_timeout_secs)
+            .field("max_dedup_cache_size", &self.max_dedup_cache_size)
+            .field("max_rate_limit_cache_size", &self.max_rate_limit_cache_size)
+            .field(
+                "encrypted_token_rate_limit_per_minute",
+                &self.encrypted_token_rate_limit_per_minute,
+            )
+            .field(
+                "encrypted_token_rate_limit_per_hour",
+                &self.encrypted_token_rate_limit_per_hour,
+            )
+            .field(
+                "device_token_rate_limit_per_minute",
+                &self.device_token_rate_limit_per_minute,
+            )
+            .field(
+                "device_token_rate_limit_per_hour",
+                &self.device_token_rate_limit_per_hour,
+            )
+            .finish()
+    }
 }
 
 fn default_shutdown_timeout() -> u64 {
@@ -536,6 +564,40 @@ mod tests {
         let mut file = Builder::new().suffix(".toml").tempfile().unwrap();
         file.write_all(content.as_bytes()).unwrap();
         file
+    }
+
+    fn test_server_config(private_key: &str) -> ServerConfig {
+        ServerConfig {
+            private_key: private_key.to_string(),
+            private_key_file: String::new(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 100_000,
+            max_rate_limit_cache_size: 100_000,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+        }
+    }
+
+    #[test]
+    fn test_server_config_debug_redacts_private_key() {
+        let config = test_server_config("deadbeef1234");
+
+        let debug_output = format!("{config:?}");
+
+        assert!(!debug_output.contains("deadbeef1234"));
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_app_config_debug_redacts_server_private_key() {
+        let config = from_test_env(&[("TRANSPONDER_SERVER_PRIVATE_KEY", "deadbeef1234")]).unwrap();
+
+        let debug_output = format!("{config:?}");
+
+        assert!(!debug_output.contains("deadbeef1234"));
+        assert!(debug_output.contains("[REDACTED]"));
     }
 
     #[test]
