@@ -7,15 +7,17 @@
 //!
 //! # Security
 //!
-//! All sensitive cryptographic material (keys, shared secrets, decrypted tokens)
-//! is automatically zeroed from memory when dropped using the `zeroize` crate.
+//! Sensitive cryptographic material is stored in zeroizing buffers where possible;
+//! temporary secp256k1 secret keys are erased with the crate's erasure hook.
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit},
 };
 use hkdf::Hkdf;
-use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
+use secp256k1::{
+    Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey, constants::SECRET_KEY_SIZE,
+};
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -214,9 +216,30 @@ impl TokenPayload {
 /// Token decryptor using server's private key.
 #[derive(Clone)]
 pub struct TokenDecryptor {
-    secret_key: SecretKey,
+    // secp256k1::SecretKey is Copy and does not zeroize on drop in 0.29.x.
+    secret_key: Zeroizing<[u8; SECRET_KEY_SIZE]>,
     #[allow(dead_code)]
     secp: Secp256k1<secp256k1::All>,
+}
+
+struct ZeroizingSecretKey(SecretKey);
+
+impl ZeroizingSecretKey {
+    fn from_bytes(bytes: &[u8; SECRET_KEY_SIZE]) -> Result<Self> {
+        SecretKey::from_slice(bytes)
+            .map(Self)
+            .map_err(|e| Error::Crypto(format!("Invalid server secret key: {e}")))
+    }
+
+    fn as_ref(&self) -> &SecretKey {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingSecretKey {
+    fn drop(&mut self) {
+        self.0.non_secure_erase();
+    }
 }
 
 impl TokenDecryptor {
@@ -224,10 +247,14 @@ impl TokenDecryptor {
     ///
     /// # Arguments
     ///
-    /// * `secret_key` - The server's secp256k1 secret key for ECDH key agreement
-    pub fn new(secret_key: SecretKey) -> Self {
+    /// * `secret_key` - The server's secp256k1 secret key for ECDH key agreement.
+    ///   The supplied key is erased before this function returns.
+    pub fn new(secret_key: &mut SecretKey) -> Self {
+        let secret_key_bytes = Zeroizing::new(secret_key.secret_bytes());
+        secret_key.non_secure_erase();
+
         Self {
-            secret_key,
+            secret_key: secret_key_bytes,
             secp: Secp256k1::new(),
         }
     }
@@ -250,10 +277,11 @@ impl TokenDecryptor {
         let ephemeral_xonly = XOnlyPublicKey::from_slice(&token.ephemeral_pubkey)
             .map_err(|e| Error::Crypto(format!("Invalid ephemeral public key: {e}")))?;
         let ephemeral_pubkey = PublicKey::from_x_only_public_key(ephemeral_xonly, Parity::Even);
+        let secret_key = ZeroizingSecretKey::from_bytes(&self.secret_key)?;
 
         // Perform ECDH to get shared point (wrapped for zeroization)
         let shared_point: Zeroizing<[u8; 64]> = Zeroizing::new(
-            secp256k1::ecdh::shared_secret_point(&ephemeral_pubkey, &self.secret_key),
+            secp256k1::ecdh::shared_secret_point(&ephemeral_pubkey, secret_key.as_ref()),
         );
 
         // Use only the x-coordinate (first 32 bytes) as the shared secret
@@ -298,7 +326,9 @@ impl TokenDecryptor {
     #[must_use]
     #[allow(dead_code)]
     pub fn public_key(&self) -> PublicKey {
-        PublicKey::from_secret_key(&self.secp, &self.secret_key)
+        let secret_key = ZeroizingSecretKey::from_bytes(&self.secret_key)
+            .expect("TokenDecryptor stores a validated secp256k1 secret key");
+        PublicKey::from_secret_key(&self.secp, secret_key.as_ref())
     }
 
     /// Get the public key as a hex string (x-only, 32 bytes).
@@ -379,9 +409,20 @@ mod tests {
 
         let keys = Keys::generate();
         let secret_bytes = keys.secret_key().to_secret_bytes();
-        let secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
-        let decryptor = TokenDecryptor::new(secret_key);
+        let mut secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
+        let decryptor = TokenDecryptor::new(&mut secret_key);
         assert_eq!(decryptor.public_key_hex(), keys.public_key().to_hex());
+    }
+
+    #[test]
+    fn test_token_decryptor_stores_secret_as_zeroizing_bytes() {
+        let secret_bytes = [0x11; SECRET_KEY_SIZE];
+        let mut secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
+        let decryptor = TokenDecryptor::new(&mut secret_key);
+
+        let stored_secret: &Zeroizing<[u8; SECRET_KEY_SIZE]> = &decryptor.secret_key;
+        assert_eq!(stored_secret.as_ref(), &secret_bytes);
+        assert_ne!(secret_key.secret_bytes(), secret_bytes);
     }
 
     #[test]

@@ -404,9 +404,10 @@ mod tests {
     fn test_token_encryption_roundtrip() {
         // Generate server keys
         let server_keys = Keys::generate();
-        let secp_secret_key = SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
-            .expect("valid secret key");
-        let decryptor = TokenDecryptor::new(secp_secret_key);
+        let mut secp_secret_key =
+            SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let encryptor = TokenEncryptor::from_keys(&server_keys);
 
         // Create and encrypt a test token
@@ -426,9 +427,10 @@ mod tests {
     #[test]
     fn test_fcm_token_roundtrip() {
         let server_keys = Keys::generate();
-        let secp_secret_key = SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
-            .expect("valid secret key");
-        let decryptor = TokenDecryptor::new(secp_secret_key);
+        let mut secp_secret_key =
+            SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let encryptor = TokenEncryptor::from_keys(&server_keys);
 
         let test_token = TestToken::fcm("test-fcm-device-token-12345");
@@ -520,9 +522,10 @@ mod tests {
 
         // Process like the server would
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key = SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
-            .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let mut secp_secret_key =
+            SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
 
         // Unwrap
         let notification = nip59_handler.unwrap(&gift_wrap).await.unwrap();
