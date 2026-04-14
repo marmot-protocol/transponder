@@ -71,10 +71,12 @@ struct ApnsErrorResponse {
 ///
 /// MIP-05 treats APNs tokens as variable-length opaque bytes. Transponder
 /// hex-encodes those bytes for the APNs device-token URL path, so only reject
-/// empty or non-hex strings here.
+/// empty, odd-length, or non-hex strings here.
 #[must_use]
 fn is_valid_device_token(token: &str) -> bool {
-    !token.is_empty() && token.chars().all(|c| c.is_ascii_hexdigit())
+    !token.is_empty()
+        && token.len().is_multiple_of(2)
+        && token.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// APNs client for sending push notifications.
@@ -402,6 +404,11 @@ mod tests {
     #[test]
     fn test_invalid_device_token_empty() {
         assert!(!is_valid_device_token(""));
+    }
+
+    #[test]
+    fn test_invalid_device_token_odd_length() {
+        assert!(!is_valid_device_token("abc"));
     }
 
     #[test]
