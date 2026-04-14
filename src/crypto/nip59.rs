@@ -17,6 +17,16 @@ const TAG_ENCODING: &str = "encoding";
 const VERSION_MIP05_V1: &str = "mip05-v1";
 const ENCODING_BASE64: &str = "base64";
 
+/// Default maximum number of encrypted tokens accepted in one notification event.
+pub const DEFAULT_MAX_TOKENS_PER_EVENT: usize = 100;
+
+fn max_encoded_token_blob_len(max_tokens: usize) -> usize {
+    max_tokens
+        .saturating_mul(ENCRYPTED_TOKEN_SIZE)
+        .div_ceil(3)
+        .saturating_mul(4)
+}
+
 /// Handler for NIP-59 gift wrap operations.
 #[derive(Clone)]
 pub struct Nip59Handler {
@@ -134,11 +144,29 @@ impl UnwrappedNotification {
     ///
     /// The content is expected to be a single RFC 4648 standard base64 string
     /// containing one or more concatenated encrypted tokens.
+    #[allow(dead_code)]
+    #[must_use = "parsed tokens must be handled or parsing errors will be ignored"]
     pub fn parse_tokens(&self) -> Result<Vec<Vec<u8>>> {
+        self.parse_tokens_with_limit(DEFAULT_MAX_TOKENS_PER_EVENT)
+    }
+
+    /// Parse the encrypted tokens from the content with an event-local token limit.
+    ///
+    /// The base64 input length is checked before decoding so oversized events
+    /// are rejected before allocating a decoded token blob.
+    #[must_use = "parsed tokens must be handled or parsing errors will be ignored"]
+    pub fn parse_tokens_with_limit(&self, max_tokens: usize) -> Result<Vec<Vec<u8>>> {
         use base64::prelude::*;
 
         self.require_tag_value(TAG_VERSION, VERSION_MIP05_V1)?;
         self.require_tag_value(TAG_ENCODING, ENCODING_BASE64)?;
+
+        let max_encoded_len = max_encoded_token_blob_len(max_tokens);
+        if self.content.len() > max_encoded_len {
+            return Err(Error::InvalidToken(format!(
+                "Token blob too large: exceeds maximum of {max_tokens} tokens"
+            )));
+        }
 
         let decoded = BASE64_STANDARD
             .decode(&self.content)
@@ -168,6 +196,10 @@ impl UnwrappedNotification {
 mod tests {
     use super::*;
     use base64::prelude::*;
+
+    fn exceeds_max_tokens_message(max_tokens: usize) -> String {
+        format!("exceeds maximum of {max_tokens} tokens")
+    }
 
     fn valid_tags() -> Tags {
         Tags::parse([
@@ -278,6 +310,45 @@ mod tests {
         for (i, token) in tokens.iter().enumerate() {
             assert_eq!(token, &vec![i as u8; ENCRYPTED_TOKEN_SIZE]);
         }
+    }
+
+    #[test]
+    fn test_parse_accepts_default_max_tokens() {
+        let concatenated = vec![0x42; DEFAULT_MAX_TOKENS_PER_EVENT * ENCRYPTED_TOKEN_SIZE];
+        let notification = notification(BASE64_STANDARD.encode(&concatenated));
+
+        let tokens = notification.parse_tokens().unwrap();
+        assert_eq!(tokens.len(), DEFAULT_MAX_TOKENS_PER_EVENT);
+    }
+
+    #[test]
+    fn test_parse_rejects_more_than_default_max_tokens_before_decode() {
+        let concatenated = vec![0x42; (DEFAULT_MAX_TOKENS_PER_EVENT + 1) * ENCRYPTED_TOKEN_SIZE];
+        let notification = notification(BASE64_STANDARD.encode(&concatenated));
+
+        let result = notification.parse_tokens();
+        assert!(result.is_err());
+        let expected_error = exceeds_max_tokens_message(DEFAULT_MAX_TOKENS_PER_EVENT);
+        assert!(result.unwrap_err().to_string().contains(&expected_error));
+    }
+
+    #[test]
+    fn test_parse_tokens_with_custom_limit() {
+        const MAX_TOKENS: usize = 2;
+
+        let concatenated = vec![0x24; MAX_TOKENS * ENCRYPTED_TOKEN_SIZE];
+        let within_limit = notification(BASE64_STANDARD.encode(&concatenated));
+
+        let tokens = within_limit.parse_tokens_with_limit(MAX_TOKENS).unwrap();
+        assert_eq!(tokens.len(), MAX_TOKENS);
+
+        let concatenated = vec![0x42; (MAX_TOKENS + 1) * ENCRYPTED_TOKEN_SIZE];
+        let over_limit = notification(BASE64_STANDARD.encode(&concatenated));
+
+        let result = over_limit.parse_tokens_with_limit(MAX_TOKENS);
+        assert!(result.is_err());
+        let expected_error = exceeds_max_tokens_message(MAX_TOKENS);
+        assert!(result.unwrap_err().to_string().contains(&expected_error));
     }
 
     #[test]

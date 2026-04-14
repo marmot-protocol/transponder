@@ -24,6 +24,10 @@ shutdown_timeout_secs = 10
 # Default: 100000 entries per cache
 # max_rate_limit_cache_size = 100000
 
+# Maximum encrypted tokens accepted in a single notification event.
+# Default: 100
+# max_tokens_per_event = 100
+
 # Rate limit: max notifications per encrypted token per minute.
 # Limits identical encrypted blobs to prevent replay attacks.
 # Default: 240 (4 per second)

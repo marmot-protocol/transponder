@@ -12,6 +12,7 @@ use config::{Config, ConfigBuilder, File, builder::DefaultState};
 use serde::Deserialize;
 use std::{env, ffi::OsString, path::Path};
 
+use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::error::Result;
 use crate::rate_limiter::{
     DEFAULT_MAX_SIZE as DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE, DEFAULT_RATE_LIMIT_PER_HOUR,
@@ -56,6 +57,10 @@ fn default_max_rate_limit_cache_size() -> usize {
     DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE
 }
 
+fn default_max_tokens_per_event() -> usize {
+    DEFAULT_MAX_TOKENS_PER_EVENT
+}
+
 fn default_rate_limit_per_minute() -> u32 {
     DEFAULT_RATE_LIMIT_PER_MINUTE
 }
@@ -92,6 +97,12 @@ pub struct ServerConfig {
     #[serde(default = "default_max_rate_limit_cache_size")]
     pub max_rate_limit_cache_size: usize,
 
+    /// Maximum encrypted tokens accepted in a single notification event.
+    ///
+    /// Default: 100.
+    #[serde(default = "default_max_tokens_per_event")]
+    pub max_tokens_per_event: usize,
+
     /// Maximum notifications per encrypted token per minute.
     ///
     /// Rate limits identical encrypted blobs to prevent replay attacks.
@@ -127,6 +138,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("shutdown_timeout_secs", &self.shutdown_timeout_secs)
             .field("max_dedup_cache_size", &self.max_dedup_cache_size)
             .field("max_rate_limit_cache_size", &self.max_rate_limit_cache_size)
+            .field("max_tokens_per_event", &self.max_tokens_per_event)
             .field(
                 "encrypted_token_rate_limit_per_minute",
                 &self.encrypted_token_rate_limit_per_minute,
@@ -305,6 +317,10 @@ fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
             DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE as i64,
         )?
         .set_default(
+            "server.max_tokens_per_event",
+            DEFAULT_MAX_TOKENS_PER_EVENT as i64,
+        )?
+        .set_default(
             "server.encrypted_token_rate_limit_per_minute",
             DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
         )?
@@ -420,6 +436,7 @@ fn is_supported_config_key(config_key: &str) -> bool {
                 | "server.shutdown_timeout_secs"
                 | "server.max_dedup_cache_size"
                 | "server.max_rate_limit_cache_size"
+                | "server.max_tokens_per_event"
                 | "server.encrypted_token_rate_limit_per_minute"
                 | "server.encrypted_token_rate_limit_per_hour"
                 | "server.device_token_rate_limit_per_minute"
@@ -558,6 +575,7 @@ mod tests {
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
             max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
@@ -777,6 +795,7 @@ mod tests {
             ("TRANSPONDER_SERVER_PRIVATE_KEY", "env-private-key"),
             ("TRANSPONDER_SERVER_SHUTDOWN_TIMEOUT_SECS", "30"),
             ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "50000"),
+            ("TRANSPONDER_SERVER_MAX_TOKENS_PER_EVENT", "25"),
             ("TRANSPONDER_APNS_KEY_ID", "KEY123"),
             ("TRANSPONDER_HEALTH_BIND_ADDRESS", "127.0.0.1:9090"),
         ])
@@ -785,6 +804,7 @@ mod tests {
         assert_eq!(config.server.private_key, "env-private-key");
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.server.max_dedup_cache_size, 50_000);
+        assert_eq!(config.server.max_tokens_per_event, 25);
         assert_eq!(config.apns.key_id, "KEY123");
         assert_eq!(config.health.bind_address, "127.0.0.1:9090");
     }
@@ -898,6 +918,7 @@ mod tests {
         assert_eq!(default_shutdown_timeout(), 10);
         assert_eq!(default_max_dedup_cache_size(), 100_000);
         assert_eq!(default_max_rate_limit_cache_size(), 100_000);
+        assert_eq!(default_max_tokens_per_event(), DEFAULT_MAX_TOKENS_PER_EVENT);
         assert_eq!(default_rate_limit_per_minute(), 240);
         assert_eq!(default_rate_limit_per_hour(), 5000);
     }
@@ -1022,6 +1043,7 @@ mod tests {
         assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 5000);
         assert_eq!(config.server.device_token_rate_limit_per_minute, 240);
         assert_eq!(config.server.device_token_rate_limit_per_hour, 5000);
+        assert_eq!(config.server.max_tokens_per_event, 100);
     }
 
     #[test]
@@ -1029,6 +1051,7 @@ mod tests {
         let config_content = r#"
             [server]
             private_key = "test"
+            max_tokens_per_event = 25
             encrypted_token_rate_limit_per_minute = 100
             encrypted_token_rate_limit_per_hour = 2000
             device_token_rate_limit_per_minute = 50
@@ -1042,5 +1065,6 @@ mod tests {
         assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 2000);
         assert_eq!(config.server.device_token_rate_limit_per_minute, 50);
         assert_eq!(config.server.device_token_rate_limit_per_hour, 1000);
+        assert_eq!(config.server.max_tokens_per_event, 25);
     }
 }
