@@ -19,6 +19,9 @@ services:
       - ${TRANSPONDER_CREDENTIALS_DIR:-./credentials}:/credentials:ro
     environment:
       TRANSPONDER_SERVER_PRIVATE_KEY_FILE: /run/secrets/transponder_private_key
+      # The host port is bound to 127.0.0.1 above; this keeps Docker port
+      # publishing reachable without exposing it on public host interfaces.
+      TRANSPONDER_HEALTH_BIND_ADDRESS: "0.0.0.0:8080"
       TRANSPONDER_LOGGING_LEVEL: ${TRANSPONDER_LOGGING_LEVEL:-info}
       TRANSPONDER_LOGGING_FORMAT: json
     secrets:
