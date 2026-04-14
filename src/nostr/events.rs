@@ -553,20 +553,20 @@ mod tests {
 
     fn create_processor(server_keys: &Keys) -> EventProcessor {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
         EventProcessor::new(nip59_handler, token_decryptor, push_dispatcher)
     }
 
     fn create_processor_with_cache_size(server_keys: &Keys, cache_size: usize) -> EventProcessor {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
         EventProcessor::with_cache_size(nip59_handler, token_decryptor, push_dispatcher, cache_size)
     }
@@ -580,10 +580,10 @@ mod tests {
         rate_limit_config: TokenRateLimitConfig,
     ) -> (EventProcessor, Metrics) {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let apns_config = ApnsConfig {
             enabled: true,
             key_id: "KEY123".to_string(),
@@ -615,10 +615,10 @@ mod tests {
         server_keys: &Keys,
     ) -> (EventProcessor, Metrics) {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let apns_config = ApnsConfig {
             enabled: true,
             key_id: "KEY123".to_string(),
@@ -1213,10 +1213,10 @@ mod tests {
         rate_limit_config: TokenRateLimitConfig,
     ) -> EventProcessor {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
         EventProcessor::with_full_config(
             nip59_handler,

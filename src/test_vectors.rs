@@ -18,7 +18,9 @@ use chacha20poly1305::{
 use nostr_sdk::prelude::*;
 use sha2::Sha256;
 
-use crate::crypto::token::{ENCRYPTED_TOKEN_SIZE, PLATFORM_APNS, PLATFORM_FCM};
+use crate::crypto::token::{
+    ENCRYPTED_TOKEN_SIZE, MAX_DEVICE_TOKEN_SIZE, PLATFORM_APNS, PLATFORM_FCM, TOKEN_PLAINTEXT_SIZE,
+};
 
 /// MIP-05 HKDF salt for key derivation (same as in token.rs).
 const HKDF_SALT: &[u8] = b"mip05-v1";
@@ -29,9 +31,6 @@ const HKDF_INFO: &[u8] = b"mip05-token-encryption";
 /// Kind for MIP-05 notification requests.
 pub const KIND_NOTIFICATION_REQUEST: u16 = 446;
 
-const TOKEN_PLAINTEXT_SIZE: usize = 220;
-const APNS_DEVICE_TOKEN_SIZE: usize = 32;
-const MAX_FCM_DEVICE_TOKEN_SIZE: usize = 200;
 const TAG_VERSION: &str = "v";
 const TAG_ENCODING: &str = "encoding";
 const VERSION_MIP05_V1: &str = "mip05-v1";
@@ -94,14 +93,9 @@ impl TestToken {
     /// Format: platform || token_length || device_token || random_padding
     fn to_plaintext(&self) -> Vec<u8> {
         match self.platform {
-            PLATFORM_APNS => assert_eq!(
-                self.device_token.len(),
-                APNS_DEVICE_TOKEN_SIZE,
-                "APNs token must be 32 bytes"
-            ),
-            PLATFORM_FCM => assert!(
-                (1..=MAX_FCM_DEVICE_TOKEN_SIZE).contains(&self.device_token.len()),
-                "FCM token must be 1..=200 bytes"
+            PLATFORM_APNS | PLATFORM_FCM => assert!(
+                (1..=MAX_DEVICE_TOKEN_SIZE).contains(&self.device_token.len()),
+                "device token must be 1..={MAX_DEVICE_TOKEN_SIZE} bytes"
             ),
             _ => panic!("unsupported test platform"),
         }
@@ -147,7 +141,7 @@ impl TokenEncryptor {
 
     /// Encrypt a test token.
     ///
-    /// Returns the encrypted token bytes (280 bytes total).
+    /// Returns the encrypted token bytes.
     pub fn encrypt(&self, token: &TestToken) -> Vec<u8> {
         // Generate ephemeral keypair
         let mut ephemeral_secret_bytes = [0u8; 32];
@@ -184,7 +178,7 @@ impl TokenEncryptor {
         let mut encrypted = Vec::with_capacity(ENCRYPTED_TOKEN_SIZE);
         encrypted.extend_from_slice(&ephemeral_xonly.serialize()); // 32 bytes
         encrypted.extend_from_slice(&nonce_bytes); // 12 bytes
-        encrypted.extend_from_slice(&ciphertext); // 236 bytes (220 + 16 tag)
+        encrypted.extend_from_slice(&ciphertext);
 
         assert_eq!(encrypted.len(), ENCRYPTED_TOKEN_SIZE);
         encrypted
@@ -256,7 +250,7 @@ impl NotificationContentBuilder {
         assert_eq!(
             token.len(),
             ENCRYPTED_TOKEN_SIZE,
-            "token should be 280 bytes"
+            "token should be {ENCRYPTED_TOKEN_SIZE} bytes"
         );
         self.tokens.push(token);
         self
@@ -404,9 +398,10 @@ mod tests {
     fn test_token_encryption_roundtrip() {
         // Generate server keys
         let server_keys = Keys::generate();
-        let secp_secret_key = SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
-            .expect("valid secret key");
-        let decryptor = TokenDecryptor::new(secp_secret_key);
+        let mut secp_secret_key =
+            SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let encryptor = TokenEncryptor::from_keys(&server_keys);
 
         // Create and encrypt a test token
@@ -426,9 +421,10 @@ mod tests {
     #[test]
     fn test_fcm_token_roundtrip() {
         let server_keys = Keys::generate();
-        let secp_secret_key = SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
-            .expect("valid secret key");
-        let decryptor = TokenDecryptor::new(secp_secret_key);
+        let mut secp_secret_key =
+            SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let encryptor = TokenEncryptor::from_keys(&server_keys);
 
         let test_token = TestToken::fcm("test-fcm-device-token-12345");
@@ -520,9 +516,10 @@ mod tests {
 
         // Process like the server would
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key = SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
-            .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let mut secp_secret_key =
+            SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
 
         // Unwrap
         let notification = nip59_handler.unwrap(&gift_wrap).await.unwrap();

@@ -7,15 +7,17 @@
 //!
 //! # Security
 //!
-//! All sensitive cryptographic material (keys, shared secrets, decrypted tokens)
-//! is automatically zeroed from memory when dropped using the `zeroize` crate.
+//! Sensitive cryptographic material is stored in zeroizing buffers where possible;
+//! temporary secp256k1 secret keys are erased with the crate's erasure hook.
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit},
 };
 use hkdf::Hkdf;
-use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
+use secp256k1::{
+    Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey, constants::SECRET_KEY_SIZE,
+};
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -27,11 +29,11 @@ const HKDF_SALT: &[u8] = b"mip05-v1";
 /// MIP-05 HKDF info string for token encryption key.
 const HKDF_INFO: &[u8] = b"mip05-token-encryption";
 
-/// Expected size of the encrypted token (280 bytes total).
+/// Expected size of the encrypted token (1084 bytes total).
 /// - 32 bytes: x-only ephemeral public key
 /// - 12 bytes: nonce
-/// - 236 bytes: ciphertext (220-byte plaintext + 16-byte auth tag)
-pub const ENCRYPTED_TOKEN_SIZE: usize = 280;
+/// - 1040 bytes: ciphertext (1024-byte plaintext + 16-byte auth tag)
+pub const ENCRYPTED_TOKEN_SIZE: usize = 1084;
 
 /// Size of x-only secp256k1 public key.
 const PUBKEY_SIZE: usize = 32;
@@ -40,13 +42,10 @@ const PUBKEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 12;
 
 /// Size of decrypted token plaintext.
-const TOKEN_PLAINTEXT_SIZE: usize = 220;
+pub(crate) const TOKEN_PLAINTEXT_SIZE: usize = 1024;
 
-/// Required APNs device token length in bytes.
-const APNS_DEVICE_TOKEN_SIZE: usize = 32;
-
-/// Maximum allowed FCM device token length in bytes.
-const MAX_FCM_DEVICE_TOKEN_SIZE: usize = 200;
+/// Maximum allowed device token length in bytes.
+pub(crate) const MAX_DEVICE_TOKEN_SIZE: usize = TOKEN_PLAINTEXT_SIZE - 3;
 
 /// Platform identifier for APNs (iOS).
 pub const PLATFORM_APNS: u8 = 0x01;
@@ -108,7 +107,7 @@ impl EncryptedToken {
     /// Expected format:
     /// - Bytes 0-31: X-only ephemeral public key
     /// - Bytes 32-43: Nonce
-    /// - Bytes 44-279: Ciphertext with auth tag
+    /// - Bytes 44..: Ciphertext with auth tag
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() != ENCRYPTED_TOKEN_SIZE {
             return Err(Error::InvalidToken(format!(
@@ -168,18 +167,10 @@ impl TokenPayload {
         let platform = Platform::from_byte(data[0])?;
         let token_length = u16::from_be_bytes([data[1], data[2]]) as usize;
 
-        match platform {
-            Platform::Apns if token_length != APNS_DEVICE_TOKEN_SIZE => {
-                return Err(Error::InvalidToken(format!(
-                    "Invalid APNs token length: expected {APNS_DEVICE_TOKEN_SIZE}, got {token_length}"
-                )));
-            }
-            Platform::Fcm if !(1..=MAX_FCM_DEVICE_TOKEN_SIZE).contains(&token_length) => {
-                return Err(Error::InvalidToken(format!(
-                    "Invalid FCM token length: expected 1..={MAX_FCM_DEVICE_TOKEN_SIZE}, got {token_length}"
-                )));
-            }
-            _ => {}
+        if !(1..=MAX_DEVICE_TOKEN_SIZE).contains(&token_length) {
+            return Err(Error::InvalidToken(format!(
+                "Invalid device token length: expected 1..={MAX_DEVICE_TOKEN_SIZE}, got {token_length}"
+            )));
         }
 
         let payload_end = 3 + token_length;
@@ -214,9 +205,30 @@ impl TokenPayload {
 /// Token decryptor using server's private key.
 #[derive(Clone)]
 pub struct TokenDecryptor {
-    secret_key: SecretKey,
+    // secp256k1::SecretKey is Copy and does not zeroize on drop in 0.29.x.
+    secret_key: Zeroizing<[u8; SECRET_KEY_SIZE]>,
     #[allow(dead_code)]
     secp: Secp256k1<secp256k1::All>,
+}
+
+struct ZeroizingSecretKey(SecretKey);
+
+impl ZeroizingSecretKey {
+    fn from_bytes(bytes: &[u8; SECRET_KEY_SIZE]) -> Result<Self> {
+        SecretKey::from_slice(bytes)
+            .map(Self)
+            .map_err(|e| Error::Crypto(format!("Invalid server secret key: {e}")))
+    }
+
+    fn as_ref(&self) -> &SecretKey {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingSecretKey {
+    fn drop(&mut self) {
+        self.0.non_secure_erase();
+    }
 }
 
 impl TokenDecryptor {
@@ -224,10 +236,14 @@ impl TokenDecryptor {
     ///
     /// # Arguments
     ///
-    /// * `secret_key` - The server's secp256k1 secret key for ECDH key agreement
-    pub fn new(secret_key: SecretKey) -> Self {
+    /// * `secret_key` - The server's secp256k1 secret key for ECDH key agreement.
+    ///   The supplied key is erased before this function returns.
+    pub fn new(secret_key: &mut SecretKey) -> Self {
+        let secret_key_bytes = Zeroizing::new(secret_key.secret_bytes());
+        secret_key.non_secure_erase();
+
         Self {
-            secret_key,
+            secret_key: secret_key_bytes,
             secp: Secp256k1::new(),
         }
     }
@@ -250,10 +266,11 @@ impl TokenDecryptor {
         let ephemeral_xonly = XOnlyPublicKey::from_slice(&token.ephemeral_pubkey)
             .map_err(|e| Error::Crypto(format!("Invalid ephemeral public key: {e}")))?;
         let ephemeral_pubkey = PublicKey::from_x_only_public_key(ephemeral_xonly, Parity::Even);
+        let secret_key = ZeroizingSecretKey::from_bytes(&self.secret_key)?;
 
         // Perform ECDH to get shared point (wrapped for zeroization)
         let shared_point: Zeroizing<[u8; 64]> = Zeroizing::new(
-            secp256k1::ecdh::shared_secret_point(&ephemeral_pubkey, &self.secret_key),
+            secp256k1::ecdh::shared_secret_point(&ephemeral_pubkey, secret_key.as_ref()),
         );
 
         // Use only the x-coordinate (first 32 bytes) as the shared secret
@@ -298,7 +315,9 @@ impl TokenDecryptor {
     #[must_use]
     #[allow(dead_code)]
     pub fn public_key(&self) -> PublicKey {
-        PublicKey::from_secret_key(&self.secp, &self.secret_key)
+        let secret_key = ZeroizingSecretKey::from_bytes(&self.secret_key)
+            .expect("TokenDecryptor stores a validated secp256k1 secret key");
+        PublicKey::from_secret_key(&self.secp, secret_key.as_ref())
     }
 
     /// Get the public key as a hex string (x-only, 32 bytes).
@@ -353,24 +372,29 @@ mod tests {
 
     #[test]
     fn test_token_payload_parsing() {
-        let device_token = [0xAA; APNS_DEVICE_TOKEN_SIZE];
-        let data = build_plaintext(PLATFORM_APNS, APNS_DEVICE_TOKEN_SIZE as u16, &device_token);
+        let device_token = [0xAA; 32];
+        let data = build_plaintext(PLATFORM_APNS, device_token.len() as u16, &device_token);
         let payload = TokenPayload::from_decrypted(&data).unwrap();
         assert_eq!(payload.platform, Platform::Apns);
         assert_eq!(payload.device_token, device_token);
     }
 
     #[test]
-    fn test_token_payload_invalid_apns_length() {
+    fn test_token_payload_accepts_variable_apns_length() {
         let data = build_plaintext(PLATFORM_APNS, 31, &[0xAA; 31]);
-        let result = TokenPayload::from_decrypted(&data);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Invalid APNs token length")
+        let payload = TokenPayload::from_decrypted(&data).unwrap();
+        assert_eq!(payload.platform, Platform::Apns);
+        assert_eq!(payload.device_token, [0xAA; 31]);
+
+        let max_device_token = vec![0xBB; MAX_DEVICE_TOKEN_SIZE];
+        let data = build_plaintext(
+            PLATFORM_APNS,
+            max_device_token.len() as u16,
+            &max_device_token,
         );
+        let payload = TokenPayload::from_decrypted(&data).unwrap();
+        assert_eq!(payload.platform, Platform::Apns);
+        assert_eq!(payload.device_token, max_device_token);
     }
 
     #[test]
@@ -379,9 +403,20 @@ mod tests {
 
         let keys = Keys::generate();
         let secret_bytes = keys.secret_key().to_secret_bytes();
-        let secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
-        let decryptor = TokenDecryptor::new(secret_key);
+        let mut secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
+        let decryptor = TokenDecryptor::new(&mut secret_key);
         assert_eq!(decryptor.public_key_hex(), keys.public_key().to_hex());
+    }
+
+    #[test]
+    fn test_token_decryptor_stores_secret_as_zeroizing_bytes() {
+        let secret_bytes = [0x11; SECRET_KEY_SIZE];
+        let mut secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
+        let decryptor = TokenDecryptor::new(&mut secret_key);
+
+        let stored_secret: &Zeroizing<[u8; SECRET_KEY_SIZE]> = &decryptor.secret_key;
+        assert_eq!(stored_secret.as_ref(), &secret_bytes);
+        assert_ne!(secret_key.secret_bytes(), secret_bytes);
     }
 
     #[test]
@@ -441,20 +476,29 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Invalid FCM token length")
+                .contains("Invalid device token length")
         );
     }
 
     #[test]
-    fn test_token_payload_fcm_length_too_large() {
-        let data = build_plaintext(PLATFORM_FCM, 201, &[0x11; 200]);
+    fn test_token_payload_accepts_large_fcm_token() {
+        let device_token = vec![0x11; 201];
+        let data = build_plaintext(PLATFORM_FCM, device_token.len() as u16, &device_token);
+        let payload = TokenPayload::from_decrypted(&data).unwrap();
+        assert_eq!(payload.platform, Platform::Fcm);
+        assert_eq!(payload.device_token, device_token);
+    }
+
+    #[test]
+    fn test_token_payload_device_token_length_too_large() {
+        let data = build_plaintext(PLATFORM_FCM, (MAX_DEVICE_TOKEN_SIZE + 1) as u16, &[]);
         let result = TokenPayload::from_decrypted(&data);
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Invalid FCM token length")
+                .contains("Invalid device token length")
         );
     }
 
@@ -480,7 +524,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Invalid FCM token length")
+                .contains("Invalid device token length")
         );
     }
 
