@@ -202,6 +202,10 @@ mod tests {
     use super::*;
     use base64::prelude::*;
 
+    fn exceeds_max_tokens_message(max_tokens: usize) -> String {
+        format!("exceeds maximum of {max_tokens} tokens")
+    }
+
     fn valid_tags() -> Tags {
         Tags::parse([
             [TAG_VERSION, VERSION_MIP05_V1],
@@ -329,27 +333,21 @@ mod tests {
 
         let result = notification.parse_tokens();
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds maximum of 100 tokens")
-        );
+        let expected_error = exceeds_max_tokens_message(DEFAULT_MAX_TOKENS_PER_EVENT);
+        assert!(result.unwrap_err().to_string().contains(&expected_error));
     }
 
     #[test]
     fn test_parse_tokens_with_custom_limit() {
-        let concatenated = vec![0x42; 3 * ENCRYPTED_TOKEN_SIZE];
+        const MAX_TOKENS: usize = 2;
+
+        let concatenated = vec![0x42; (MAX_TOKENS + 1) * ENCRYPTED_TOKEN_SIZE];
         let notification = notification(BASE64_STANDARD.encode(&concatenated));
 
-        let result = notification.parse_tokens_with_limit(2);
+        let result = notification.parse_tokens_with_limit(MAX_TOKENS);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds maximum of 2 tokens")
-        );
+        let expected_error = exceeds_max_tokens_message(MAX_TOKENS);
+        assert!(result.unwrap_err().to_string().contains(&expected_error));
     }
 
     #[test]

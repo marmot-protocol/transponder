@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(default_shutdown_timeout(), 10);
         assert_eq!(default_max_dedup_cache_size(), 100_000);
         assert_eq!(default_max_rate_limit_cache_size(), 100_000);
-        assert_eq!(default_max_tokens_per_event(), 100);
+        assert_eq!(default_max_tokens_per_event(), DEFAULT_MAX_TOKENS_PER_EVENT);
         assert_eq!(default_rate_limit_per_minute(), 240);
         assert_eq!(default_rate_limit_per_hour(), 5000);
     }
