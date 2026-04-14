@@ -29,11 +29,11 @@ const HKDF_SALT: &[u8] = b"mip05-v1";
 /// MIP-05 HKDF info string for token encryption key.
 const HKDF_INFO: &[u8] = b"mip05-token-encryption";
 
-/// Expected size of the encrypted token (280 bytes total).
+/// Expected size of the encrypted token (1084 bytes total).
 /// - 32 bytes: x-only ephemeral public key
 /// - 12 bytes: nonce
-/// - 236 bytes: ciphertext (220-byte plaintext + 16-byte auth tag)
-pub const ENCRYPTED_TOKEN_SIZE: usize = 280;
+/// - 1040 bytes: ciphertext (1024-byte plaintext + 16-byte auth tag)
+pub const ENCRYPTED_TOKEN_SIZE: usize = 1084;
 
 /// Size of x-only secp256k1 public key.
 const PUBKEY_SIZE: usize = 32;
@@ -42,13 +42,10 @@ const PUBKEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 12;
 
 /// Size of decrypted token plaintext.
-const TOKEN_PLAINTEXT_SIZE: usize = 220;
+pub(crate) const TOKEN_PLAINTEXT_SIZE: usize = 1024;
 
-/// Required APNs device token length in bytes.
-const APNS_DEVICE_TOKEN_SIZE: usize = 32;
-
-/// Maximum allowed FCM device token length in bytes.
-const MAX_FCM_DEVICE_TOKEN_SIZE: usize = 200;
+/// Maximum allowed device token length in bytes.
+pub(crate) const MAX_DEVICE_TOKEN_SIZE: usize = TOKEN_PLAINTEXT_SIZE - 3;
 
 /// Platform identifier for APNs (iOS).
 pub const PLATFORM_APNS: u8 = 0x01;
@@ -110,7 +107,7 @@ impl EncryptedToken {
     /// Expected format:
     /// - Bytes 0-31: X-only ephemeral public key
     /// - Bytes 32-43: Nonce
-    /// - Bytes 44-279: Ciphertext with auth tag
+    /// - Bytes 44..: Ciphertext with auth tag
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() != ENCRYPTED_TOKEN_SIZE {
             return Err(Error::InvalidToken(format!(
@@ -170,18 +167,10 @@ impl TokenPayload {
         let platform = Platform::from_byte(data[0])?;
         let token_length = u16::from_be_bytes([data[1], data[2]]) as usize;
 
-        match platform {
-            Platform::Apns if token_length != APNS_DEVICE_TOKEN_SIZE => {
-                return Err(Error::InvalidToken(format!(
-                    "Invalid APNs token length: expected {APNS_DEVICE_TOKEN_SIZE}, got {token_length}"
-                )));
-            }
-            Platform::Fcm if !(1..=MAX_FCM_DEVICE_TOKEN_SIZE).contains(&token_length) => {
-                return Err(Error::InvalidToken(format!(
-                    "Invalid FCM token length: expected 1..={MAX_FCM_DEVICE_TOKEN_SIZE}, got {token_length}"
-                )));
-            }
-            _ => {}
+        if !(1..=MAX_DEVICE_TOKEN_SIZE).contains(&token_length) {
+            return Err(Error::InvalidToken(format!(
+                "Invalid device token length: expected 1..={MAX_DEVICE_TOKEN_SIZE}, got {token_length}"
+            )));
         }
 
         let payload_end = 3 + token_length;
@@ -383,24 +372,29 @@ mod tests {
 
     #[test]
     fn test_token_payload_parsing() {
-        let device_token = [0xAA; APNS_DEVICE_TOKEN_SIZE];
-        let data = build_plaintext(PLATFORM_APNS, APNS_DEVICE_TOKEN_SIZE as u16, &device_token);
+        let device_token = [0xAA; 32];
+        let data = build_plaintext(PLATFORM_APNS, device_token.len() as u16, &device_token);
         let payload = TokenPayload::from_decrypted(&data).unwrap();
         assert_eq!(payload.platform, Platform::Apns);
         assert_eq!(payload.device_token, device_token);
     }
 
     #[test]
-    fn test_token_payload_invalid_apns_length() {
+    fn test_token_payload_accepts_variable_apns_length() {
         let data = build_plaintext(PLATFORM_APNS, 31, &[0xAA; 31]);
-        let result = TokenPayload::from_decrypted(&data);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Invalid APNs token length")
+        let payload = TokenPayload::from_decrypted(&data).unwrap();
+        assert_eq!(payload.platform, Platform::Apns);
+        assert_eq!(payload.device_token, [0xAA; 31]);
+
+        let max_device_token = vec![0xBB; MAX_DEVICE_TOKEN_SIZE];
+        let data = build_plaintext(
+            PLATFORM_APNS,
+            max_device_token.len() as u16,
+            &max_device_token,
         );
+        let payload = TokenPayload::from_decrypted(&data).unwrap();
+        assert_eq!(payload.platform, Platform::Apns);
+        assert_eq!(payload.device_token, max_device_token);
     }
 
     #[test]
@@ -482,20 +476,29 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Invalid FCM token length")
+                .contains("Invalid device token length")
         );
     }
 
     #[test]
-    fn test_token_payload_fcm_length_too_large() {
-        let data = build_plaintext(PLATFORM_FCM, 201, &[0x11; 200]);
+    fn test_token_payload_accepts_large_fcm_token() {
+        let device_token = vec![0x11; 201];
+        let data = build_plaintext(PLATFORM_FCM, device_token.len() as u16, &device_token);
+        let payload = TokenPayload::from_decrypted(&data).unwrap();
+        assert_eq!(payload.platform, Platform::Fcm);
+        assert_eq!(payload.device_token, device_token);
+    }
+
+    #[test]
+    fn test_token_payload_device_token_length_too_large() {
+        let data = build_plaintext(PLATFORM_FCM, (MAX_DEVICE_TOKEN_SIZE + 1) as u16, &[]);
         let result = TokenPayload::from_decrypted(&data);
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Invalid FCM token length")
+                .contains("Invalid device token length")
         );
     }
 
@@ -521,7 +524,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Invalid FCM token length")
+                .contains("Invalid device token length")
         );
     }
 

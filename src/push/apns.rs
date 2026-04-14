@@ -67,17 +67,14 @@ struct ApnsErrorResponse {
     reason: String,
 }
 
-/// Expected length of an APNs device token in hexadecimal format (32 bytes = 64 hex chars).
-const APNS_DEVICE_TOKEN_LENGTH: usize = 64;
-
 /// Validate an APNs device token format.
 ///
-/// APNs device tokens should be exactly 64 hexadecimal characters (representing 32 bytes).
-/// This validation prevents malformed tokens from being sent to APNs, which is more
-/// efficient than waiting for a server-side rejection.
+/// MIP-05 treats APNs tokens as variable-length opaque bytes. Transponder
+/// hex-encodes those bytes for the APNs device-token URL path, so only reject
+/// empty or non-hex strings here.
 #[must_use]
 fn is_valid_device_token(token: &str) -> bool {
-    token.len() == APNS_DEVICE_TOKEN_LENGTH && token.chars().all(|c| c.is_ascii_hexdigit())
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// APNs client for sending push notifications.
@@ -383,36 +380,27 @@ mod tests {
 
     #[test]
     fn test_valid_device_token() {
+        // Valid short hex token (lowercase)
+        assert!(is_valid_device_token("0123456789abcdef"));
+
         // Valid 64-character hex token (lowercase)
         assert!(is_valid_device_token(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         ));
 
-        // Valid 64-character hex token (uppercase)
+        // Valid longer-than-64-character hex token (uppercase)
         assert!(is_valid_device_token(
-            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF01"
         ));
 
-        // Valid 64-character hex token (mixed case)
+        // Valid mixed-case hex token
         assert!(is_valid_device_token(
             "0123456789AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789AbCdEf"
         ));
     }
 
     #[test]
-    fn test_invalid_device_token_wrong_length() {
-        // Too short
-        assert!(!is_valid_device_token("0123456789abcdef"));
-        assert!(!is_valid_device_token(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"
-        )); // 63 chars
-
-        // Too long
-        assert!(!is_valid_device_token(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
-        )); // 65 chars
-
-        // Empty
+    fn test_invalid_device_token_empty() {
         assert!(!is_valid_device_token(""));
     }
 
@@ -461,9 +449,12 @@ mod tests {
             metrics: None,
         };
 
-        // Test with token that's too short
+        // Test with a token that contains non-hex characters
         let result = client.send("tooshort").await.unwrap();
-        assert!(!result, "Should return false for token that's too short");
+        assert!(
+            !result,
+            "Should return false for token with non-hex characters"
+        );
 
         // Test with token that has invalid characters
         let result = client
