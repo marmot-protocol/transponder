@@ -142,16 +142,18 @@ impl FcmClient {
 
         // Load service account if configured
         let (service_account, encoding_key) = if !config.service_account_path.is_empty() {
-            let data = tokio::fs::read_to_string(&config.service_account_path)
-                .await
-                .map_err(|e| {
-                    Error::Fcm(format!(
-                        "Failed to read service account file '{}': {e}",
-                        config.service_account_path
-                    ))
-                })?;
+            let data = Zeroizing::new(
+                tokio::fs::read_to_string(&config.service_account_path)
+                    .await
+                    .map_err(|e| {
+                        Error::Fcm(format!(
+                            "Failed to read service account file '{}': {e}",
+                            config.service_account_path
+                        ))
+                    })?,
+            );
 
-            let sa: ServiceAccount = serde_json::from_str(&data)
+            let sa: ServiceAccount = serde_json::from_str(data.as_str())
                 .map_err(|e| Error::Fcm(format!("Failed to parse service account JSON: {e}")))?;
 
             let key = EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
