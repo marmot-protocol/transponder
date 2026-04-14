@@ -46,6 +46,7 @@ pub struct AppConfig {
 
 /// Default maximum size for the deduplication cache.
 const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
+const DEFAULT_HEALTH_BIND_ADDRESS: &str = "127.0.0.1:8080";
 const ENV_PREFIX: &str = "TRANSPONDER_";
 
 fn default_max_dedup_cache_size() -> usize {
@@ -266,7 +267,7 @@ fn default_health_enabled() -> bool {
 }
 
 fn default_health_bind_address() -> String {
-    "0.0.0.0:8080".to_string()
+    DEFAULT_HEALTH_BIND_ADDRESS.to_string()
 }
 
 /// Metrics configuration.
@@ -350,7 +351,7 @@ fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
         .set_default("fcm.service_account_path", "")?
         .set_default("fcm.project_id", "")?
         .set_default("health.enabled", true)?
-        .set_default("health.bind_address", "0.0.0.0:8080")?
+        .set_default("health.bind_address", DEFAULT_HEALTH_BIND_ADDRESS)?
         .set_default("metrics.enabled", true)?
         .set_default("logging.level", "info")?
         .set_default("logging.format", "json")?)
@@ -753,7 +754,7 @@ mod tests {
         assert_eq!(config.apns.environment, "production");
         assert!(!config.fcm.enabled);
         assert!(config.health.enabled);
-        assert_eq!(config.health.bind_address, "0.0.0.0:8080");
+        assert_eq!(config.health.bind_address, "127.0.0.1:8080");
         assert!(config.metrics.enabled);
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, "json");
@@ -783,7 +784,7 @@ mod tests {
         assert_eq!(config.apns.environment, "production");
         assert!(!config.fcm.enabled);
         assert!(config.health.enabled);
-        assert_eq!(config.health.bind_address, "0.0.0.0:8080");
+        assert_eq!(config.health.bind_address, "127.0.0.1:8080");
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, "json");
     }
@@ -898,7 +899,7 @@ mod tests {
     #[test]
     fn test_health_config_defaults() {
         assert!(default_health_enabled());
-        assert_eq!(default_health_bind_address(), "0.0.0.0:8080");
+        assert_eq!(default_health_bind_address(), "127.0.0.1:8080");
     }
 
     #[test]

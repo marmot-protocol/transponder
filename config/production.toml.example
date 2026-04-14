@@ -49,7 +49,10 @@ project_id = ""
 
 [health]
 enabled = true
-bind_address = "0.0.0.0:8080"
+# Keep native deployments bound to localhost by default. For Docker Compose,
+# compose.prod.yml overrides this to 0.0.0.0 inside the container while
+# publishing the host port on 127.0.0.1 only.
+bind_address = "127.0.0.1:8080"
 
 [metrics]
 enabled = true
