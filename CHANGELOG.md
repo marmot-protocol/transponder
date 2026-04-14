@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Updated MIP-05 token handling for the expanded 1084-byte encrypted token format and variable-length APNs/FCM device tokens introduced in [marmot-protocol/mdk#254](https://github.com/marmot-protocol/mdk/pull/254) ([#40](https://github.com/marmot-protocol/transponder/pull/40)).
+
 ### Security
 
 - Store the server secp256k1 secret key in zeroizing memory and erase temporary `SecretKey` values used during token decryption, addressing the long-term key retention risk reported in marmot-security#24 ([#36](https://github.com/marmot-protocol/transponder/pull/36)).
