@@ -183,13 +183,6 @@ impl UnwrappedNotification {
             )));
         }
 
-        let token_count = decoded.len() / ENCRYPTED_TOKEN_SIZE;
-        if token_count > max_tokens {
-            return Err(Error::InvalidToken(format!(
-                "Token blob too large: contains {token_count} tokens, maximum is {max_tokens}"
-            )));
-        }
-
         Ok(decoded
             .chunks(ENCRYPTED_TOKEN_SIZE)
             .map(|chunk| chunk.to_vec())
