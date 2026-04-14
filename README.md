@@ -62,6 +62,7 @@ shutdown_timeout_secs = 10
 
 # Rate limiting to prevent spam and replay attacks
 # max_rate_limit_cache_size = 100000           # LRU cache size per limiter
+# max_tokens_per_event = 100                   # Per notification event
 # encrypted_token_rate_limit_per_minute = 240  # Per encrypted token (replay protection)
 # encrypted_token_rate_limit_per_hour = 5000
 # device_token_rate_limit_per_minute = 240     # Per device (spam protection)
