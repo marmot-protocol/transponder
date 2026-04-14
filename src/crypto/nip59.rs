@@ -145,6 +145,7 @@ impl UnwrappedNotification {
     /// The content is expected to be a single RFC 4648 standard base64 string
     /// containing one or more concatenated encrypted tokens.
     #[allow(dead_code)]
+    #[must_use = "parsed tokens must be handled or parsing errors will be ignored"]
     pub fn parse_tokens(&self) -> Result<Vec<Vec<u8>>> {
         self.parse_tokens_with_limit(DEFAULT_MAX_TOKENS_PER_EVENT)
     }
@@ -153,6 +154,7 @@ impl UnwrappedNotification {
     ///
     /// The base64 input length is checked before decoding so oversized events
     /// are rejected before allocating a decoded token blob.
+    #[must_use = "parsed tokens must be handled or parsing errors will be ignored"]
     pub fn parse_tokens_with_limit(&self, max_tokens: usize) -> Result<Vec<Vec<u8>>> {
         use base64::prelude::*;
 
@@ -334,10 +336,16 @@ mod tests {
     fn test_parse_tokens_with_custom_limit() {
         const MAX_TOKENS: usize = 2;
 
-        let concatenated = vec![0x42; (MAX_TOKENS + 1) * ENCRYPTED_TOKEN_SIZE];
-        let notification = notification(BASE64_STANDARD.encode(&concatenated));
+        let concatenated = vec![0x24; MAX_TOKENS * ENCRYPTED_TOKEN_SIZE];
+        let within_limit = notification(BASE64_STANDARD.encode(&concatenated));
 
-        let result = notification.parse_tokens_with_limit(MAX_TOKENS);
+        let tokens = within_limit.parse_tokens_with_limit(MAX_TOKENS).unwrap();
+        assert_eq!(tokens.len(), MAX_TOKENS);
+
+        let concatenated = vec![0x42; (MAX_TOKENS + 1) * ENCRYPTED_TOKEN_SIZE];
+        let over_limit = notification(BASE64_STANDARD.encode(&concatenated));
+
+        let result = over_limit.parse_tokens_with_limit(MAX_TOKENS);
         assert!(result.is_err());
         let expected_error = exceeds_max_tokens_message(MAX_TOKENS);
         assert!(result.unwrap_err().to_string().contains(&expected_error));
