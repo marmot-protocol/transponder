@@ -2,6 +2,7 @@
 //!
 //! Uses service account credentials for OAuth2 authentication.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, trace, warn};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::FcmConfig;
 use crate::error::{Error, Result};
@@ -26,15 +28,31 @@ const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
 
 /// Service account JSON structure.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 #[allow(dead_code)]
 pub(crate) struct ServiceAccount {
     #[serde(rename = "type")]
+    #[zeroize(skip)]
     pub(crate) account_type: String,
+    #[zeroize(skip)]
     pub(crate) project_id: String,
-    pub(crate) private_key: String,
+    pub(crate) private_key: Zeroizing<String>,
+    #[zeroize(skip)]
     pub(crate) client_email: String,
+    #[zeroize(skip)]
     pub(crate) token_uri: String,
+}
+
+impl fmt::Debug for ServiceAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceAccount")
+            .field("account_type", &self.account_type)
+            .field("project_id", &self.project_id)
+            .field("private_key", &"[REDACTED]")
+            .field("client_email", &self.client_email)
+            .field("token_uri", &self.token_uri)
+            .finish()
+    }
 }
 
 /// JWT claims for OAuth2.
@@ -426,7 +444,7 @@ impl FcmClient {
             let sa = ServiceAccount {
                 account_type: "service_account".to_string(),
                 project_id: config.project_id.clone(),
-                private_key: "fake-key".to_string(),
+                private_key: Zeroizing::new("fake-key".to_string()),
                 client_email: "test@test.iam.gserviceaccount.com".to_string(),
                 token_uri: "https://oauth2.googleapis.com/token".to_string(),
             };
@@ -471,6 +489,26 @@ mod tests {
         assert!(json.contains("test-token"));
         assert!(json.contains("high"));
         assert!(json.contains("content_available"));
+    }
+
+    #[test]
+    fn test_service_account_debug_redacts_private_key() {
+        let private_key =
+            "-----BEGIN PRIVATE KEY-----\nsecret-key-material\n-----END PRIVATE KEY-----";
+        let sa = ServiceAccount {
+            account_type: "service_account".to_string(),
+            project_id: "test-project".to_string(),
+            private_key: Zeroizing::new(private_key.to_string()),
+            client_email: "test@test.iam.gserviceaccount.com".to_string(),
+            token_uri: "https://oauth2.googleapis.com/token".to_string(),
+        };
+
+        let debug = format!("{sa:?}");
+
+        assert!(debug.contains("ServiceAccount"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(private_key));
+        assert!(!debug.contains("secret-key-material"));
     }
 
     #[tokio::test]
