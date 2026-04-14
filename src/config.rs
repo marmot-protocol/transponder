@@ -137,6 +137,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("shutdown_timeout_secs", &self.shutdown_timeout_secs)
             .field("max_dedup_cache_size", &self.max_dedup_cache_size)
             .field("max_rate_limit_cache_size", &self.max_rate_limit_cache_size)
+            .field("max_tokens_per_event", &self.max_tokens_per_event)
             .field(
                 "encrypted_token_rate_limit_per_minute",
                 &self.encrypted_token_rate_limit_per_minute,
@@ -573,6 +574,7 @@ mod tests {
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
             max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,

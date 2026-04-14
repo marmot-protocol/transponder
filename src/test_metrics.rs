@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::metrics::Metrics;
 use prometheus::proto::{Metric, MetricFamily};
 
