@@ -13,6 +13,7 @@ shutdown_timeout_secs = 20
 # Reduce them if you are running on a very small VM.
 # max_dedup_cache_size = 100000
 # max_rate_limit_cache_size = 100000
+# max_tokens_per_event = 100
 # encrypted_token_rate_limit_per_minute = 240
 # encrypted_token_rate_limit_per_hour = 5000
 # device_token_rate_limit_per_minute = 240
@@ -48,7 +49,10 @@ project_id = ""
 
 [health]
 enabled = true
-bind_address = "0.0.0.0:8080"
+# Keep native deployments bound to localhost by default. For Docker Compose,
+# compose.prod.yml overrides this to 0.0.0.0 inside the container while
+# publishing the host port on 127.0.0.1 only.
+bind_address = "127.0.0.1:8080"
 
 [metrics]
 enabled = true

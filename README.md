@@ -62,6 +62,7 @@ shutdown_timeout_secs = 10
 
 # Rate limiting to prevent spam and replay attacks
 # max_rate_limit_cache_size = 100000           # LRU cache size per limiter
+# max_tokens_per_event = 100                   # Per notification event
 # encrypted_token_rate_limit_per_minute = 240  # Per encrypted token (replay protection)
 # encrypted_token_rate_limit_per_hour = 5000
 # device_token_rate_limit_per_minute = 240     # Per device (spam protection)
@@ -117,8 +118,8 @@ project_id = ""
 enabled = true
 
 # Address and port to bind the health server to
-# Use "127.0.0.1:8080" to restrict to localhost only
-bind_address = "0.0.0.0:8080"
+# Keep this on localhost unless an internal proxy, VPN, or load balancer needs it
+bind_address = "127.0.0.1:8080"
 
 [metrics]
 # Whether Prometheus metrics are enabled
@@ -217,8 +218,11 @@ docker run -d \
   -v /path/to/config.toml:/etc/transponder/config.toml:ro \
   -v /path/to/credentials:/credentials:ro \
   -e TRANSPONDER_SERVER_PRIVATE_KEY="your-hex-key" \
+  -e TRANSPONDER_HEALTH_BIND_ADDRESS="0.0.0.0:8080" \
   transponder
 ```
+
+Docker port publishing needs the service to listen on the container interface. The command above still binds the host side to `127.0.0.1`, keeping the endpoints local to the host by default.
 
 ### Docker Compose
 
@@ -316,6 +320,8 @@ When enabled, Transponder exposes HTTP endpoints for monitoring:
 | `GET /ready` | Readiness check - can the server process requests? | 200 if relays connected and at least one push service configured |
 | `GET /metrics` | Prometheus metrics (when metrics enabled) | 200 with metrics in Prometheus text format |
 
+The default bind address is `127.0.0.1:8080` so these unauthenticated endpoints stay local. If external health checks are required, bind to a specific internal interface or put the endpoints behind a reverse proxy, VPN, or load balancer with access controls.
+
 ### Readiness Response
 
 ```json
@@ -329,7 +335,7 @@ When enabled, Transponder exposes HTTP endpoints for monitoring:
 
 ## Metrics
 
-Transponder exposes Prometheus metrics at `/metrics` on the health server port (default 8080). Metrics are enabled by default and can be disabled via configuration.
+Transponder exposes Prometheus metrics at `/metrics` on the health server port (default 8080 on localhost). Metrics are enabled by default and can be disabled via configuration.
 
 ### Available Metrics
 
@@ -404,7 +410,7 @@ Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` 
 
 ### Security Note
 
-All metrics are designed to be safe for exposure. They do not include device tokens, user identifiers, message content, or relay URLs.
+Metrics do not include device tokens, user identifiers, message content, or relay URLs, but aggregate operational data can still reveal traffic patterns and deployment state. Keep `/metrics` internal-only unless it is protected by a deliberate access-control layer.
 
 ## Monitoring Integration
 
@@ -467,7 +473,7 @@ The server private key is critical:
 ### Network Security
 
 - **TLS everywhere**: All connections to relays, APNs, and FCM use TLS
-- **Health endpoint exposure**: Consider binding to localhost (`127.0.0.1:8080`) and using a reverse proxy
+- **Health endpoint exposure**: Keep the default localhost bind (`127.0.0.1:8080`) unless an internal proxy, VPN, or load balancer needs it
 - **Firewall rules**: Only expose port 8080 if health checks are needed externally
 - **Prefer localhost binds** in Compose and publish through a reverse proxy only when needed
 - **Default inbound policy**: SSH only

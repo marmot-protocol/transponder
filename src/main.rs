@@ -111,6 +111,7 @@ fn validate_startup_config(server_private_key: &str, relays: &config::RelayConfi
 fn build_rate_limit_config(server: &config::ServerConfig) -> nostr::events::TokenRateLimitConfig {
     nostr::events::TokenRateLimitConfig {
         max_cache_size: server.max_rate_limit_cache_size,
+        max_tokens_per_event: server.max_tokens_per_event,
         encrypted_token_per_minute: server.encrypted_token_rate_limit_per_minute,
         encrypted_token_per_hour: server.encrypted_token_rate_limit_per_hour,
         device_token_per_minute: server.device_token_rate_limit_per_minute,
@@ -591,6 +592,7 @@ mod tests {
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
             max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
@@ -615,6 +617,7 @@ mod tests {
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
             max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
@@ -638,6 +641,7 @@ mod tests {
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
             max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
@@ -658,6 +662,7 @@ mod tests {
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
             max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
@@ -678,6 +683,7 @@ mod tests {
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
             max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
@@ -774,6 +780,7 @@ mod tests {
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
             max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
@@ -794,6 +801,7 @@ mod tests {
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
             max_rate_limit_cache_size: 1234,
+            max_tokens_per_event: 25,
             encrypted_token_rate_limit_per_minute: 111,
             encrypted_token_rate_limit_per_hour: 2222,
             device_token_rate_limit_per_minute: 333,
@@ -803,6 +811,7 @@ mod tests {
         let rate_limit_config = build_rate_limit_config(&server);
 
         assert_eq!(rate_limit_config.max_cache_size, 1234);
+        assert_eq!(rate_limit_config.max_tokens_per_event, 25);
         assert_eq!(rate_limit_config.encrypted_token_per_minute, 111);
         assert_eq!(rate_limit_config.encrypted_token_per_hour, 2222);
         assert_eq!(rate_limit_config.device_token_per_minute, 333);

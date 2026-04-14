@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
+use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
 use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
 use crate::error::Result;
@@ -79,6 +80,8 @@ pub struct EventProcessor {
     encrypted_token_limiter: RateLimiter<[u8; 32]>,
     /// Device token rate limiter.
     device_token_limiter: RateLimiter<[u8; 32]>,
+    /// Maximum encrypted tokens accepted in a single event.
+    max_tokens_per_event: usize,
     metrics: Option<Metrics>,
 }
 
@@ -87,6 +90,8 @@ pub struct EventProcessor {
 pub struct TokenRateLimitConfig {
     /// Maximum entries in each rate limit cache.
     pub max_cache_size: usize,
+    /// Maximum encrypted tokens accepted in a single event.
+    pub max_tokens_per_event: usize,
     /// Max encrypted token requests per minute.
     pub encrypted_token_per_minute: u32,
     /// Max encrypted token requests per hour.
@@ -101,6 +106,7 @@ impl Default for TokenRateLimitConfig {
     fn default() -> Self {
         Self {
             max_cache_size: DEFAULT_MAX_SIZE,
+            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_per_minute: DEFAULT_RATE_LIMIT_PER_MINUTE,
             encrypted_token_per_hour: DEFAULT_RATE_LIMIT_PER_HOUR,
             device_token_per_minute: DEFAULT_RATE_LIMIT_PER_MINUTE,
@@ -177,6 +183,7 @@ impl EventProcessor {
                 max_per_hour: rate_limit_config.device_token_per_hour,
                 max_entries: rate_limit_config.max_cache_size,
             }),
+            max_tokens_per_event: rate_limit_config.max_tokens_per_event,
             metrics,
         }
     }
@@ -280,7 +287,7 @@ impl EventProcessor {
 
         // Parse the encrypted tokens from the content
         let parse_started_at = StageTimer::start();
-        let token_bytes = match notification.parse_tokens() {
+        let token_bytes = match notification.parse_tokens_with_limit(self.max_tokens_per_event) {
             Ok(token_bytes) => {
                 if let Some(ref m) = self.metrics {
                     m.observe_notification_parse_duration(
@@ -546,20 +553,20 @@ mod tests {
 
     fn create_processor(server_keys: &Keys) -> EventProcessor {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
         EventProcessor::new(nip59_handler, token_decryptor, push_dispatcher)
     }
 
     fn create_processor_with_cache_size(server_keys: &Keys, cache_size: usize) -> EventProcessor {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
         EventProcessor::with_cache_size(nip59_handler, token_decryptor, push_dispatcher, cache_size)
     }
@@ -573,10 +580,10 @@ mod tests {
         rate_limit_config: TokenRateLimitConfig,
     ) -> (EventProcessor, Metrics) {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let apns_config = ApnsConfig {
             enabled: true,
             key_id: "KEY123".to_string(),
@@ -608,10 +615,10 @@ mod tests {
         server_keys: &Keys,
     ) -> (EventProcessor, Metrics) {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let apns_config = ApnsConfig {
             enabled: true,
             key_id: "KEY123".to_string(),
@@ -1206,10 +1213,10 @@ mod tests {
         rate_limit_config: TokenRateLimitConfig,
     ) -> EventProcessor {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
-        let secp_secret_key =
+        let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
-        let token_decryptor = TokenDecryptor::new(secp_secret_key);
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
         EventProcessor::with_full_config(
             nip59_handler,
@@ -1231,6 +1238,7 @@ mod tests {
             &server_keys,
             TokenRateLimitConfig {
                 max_cache_size: 100,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
                 encrypted_token_per_minute: 100,
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 1,
@@ -1286,6 +1294,7 @@ mod tests {
             &server_keys,
             TokenRateLimitConfig {
                 max_cache_size: 100,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
                 encrypted_token_per_minute: 100, // High limit for encrypted tokens
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 2, // Only allow 2 per minute per device
@@ -1345,6 +1354,7 @@ mod tests {
             &server_keys,
             TokenRateLimitConfig {
                 max_cache_size: 100,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
                 encrypted_token_per_minute: 2, // Only allow 2 per minute per encrypted token
                 encrypted_token_per_hour: 100,
                 device_token_per_minute: 100, // High limit for device tokens
@@ -1421,6 +1431,7 @@ mod tests {
             &server_keys,
             TokenRateLimitConfig {
                 max_cache_size: 100,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
                 encrypted_token_per_minute: 1,
                 encrypted_token_per_hour: 100,
                 device_token_per_minute: 100,
