@@ -97,6 +97,7 @@ chmod 600 secrets/server_private_key
 - set APNs identifiers and bundle ID
 - set FCM project ID if you want to override the service-account value
 - if you add any `relays.onion` entries, plan to build a Tor-enabled image or binary
+- keep `health.bind_address` on `127.0.0.1:8080` for native deployments unless an internal proxy, VPN, or load balancer needs it
 
 5. Edit `deploy/production.env`:
 
@@ -131,7 +132,7 @@ docker compose -f compose.prod.yml --env-file deploy/production.env up -d
 
 If you built a Tor-enabled image, set `TRANSPONDER_IMAGE=transponder:tor` in `deploy/production.env` before starting the stack.
 
-The Compose stack binds Transponder to `127.0.0.1:${TRANSPONDER_PUBLISHED_PORT}` by default. If you need remote access to `/health`, `/ready`, or `/metrics`, put it behind your existing proxy, VPN, or SSH tunnel rather than publishing it broadly.
+The Compose stack publishes Transponder on `127.0.0.1:${TRANSPONDER_PUBLISHED_PORT}` by default and sets `TRANSPONDER_HEALTH_BIND_ADDRESS=0.0.0.0:8080` inside the container so Docker port publishing can reach it. If you need remote access to `/health`, `/ready`, or `/metrics`, put it behind your existing proxy, VPN, or SSH tunnel rather than publishing it broadly.
 
 ## Native systemd Deployment
 
@@ -194,7 +195,7 @@ curl http://127.0.0.1:<HEALTH_PORT>/ready
 curl http://127.0.0.1:<HEALTH_PORT>/metrics
 ```
 
-For Docker, `TRANSPONDER_PUBLISHED_PORT` defaults to `8080` if unset. For native deployments, `<HEALTH_PORT>` is whatever you configure in `health.bind_address`; the production example defaults to `8080`.
+For Docker, `TRANSPONDER_PUBLISHED_PORT` defaults to `8080` if unset. For native deployments, use the port from `health.bind_address`; the production example defaults to `127.0.0.1:8080`.
 
 `/ready` should return HTTP 200 only when at least one relay is connected and at least one push provider is configured.
 
