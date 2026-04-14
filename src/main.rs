@@ -15,6 +15,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use zeroize::Zeroizing;
 
 mod config;
 mod crypto;
@@ -135,7 +136,7 @@ async fn main() -> Result<()> {
     }
 
     // Load configuration
-    let config = AppConfig::load(&args.config)
+    let mut config = AppConfig::load(&args.config)
         .with_context(|| format!("Failed to load config from {}", args.config))?;
 
     // Initialize logging
@@ -164,14 +165,15 @@ async fn main() -> Result<()> {
         "Starting Transponder"
     );
 
-    let server_private_key = resolve_server_private_key(&config.server)?;
+    let server_private_key = resolve_server_private_key(&mut config.server)?;
 
     // Validate configuration
-    validate_startup_config(&server_private_key, &config.relays)?;
+    validate_startup_config(server_private_key.as_str(), &config.relays)?;
 
     // Create server keys
-    let secret_key = parse_server_secret_key(&server_private_key)?;
+    let secret_key = parse_server_secret_key(server_private_key.as_str())?;
     let keys = Keys::new(secret_key);
+    drop(server_private_key);
 
     info!(
         pubkey = %keys.public_key().to_hex(),
@@ -181,11 +183,9 @@ async fn main() -> Result<()> {
     // Initialize crypto handlers
     let nip59_handler = Nip59Handler::new(keys.clone());
     // Convert nostr_sdk SecretKey to secp256k1 SecretKey for TokenDecryptor
-    let mut secp_secret_key = {
-        let secret_bytes = zeroize::Zeroizing::new(keys.secret_key().to_secret_bytes());
-        secp256k1::SecretKey::from_slice(secret_bytes.as_ref())
-            .context("Failed to create secp256k1 secret key")?
-    };
+    let secret_bytes = Zeroizing::new(keys.secret_key().to_secret_bytes());
+    let mut secp_secret_key = secp256k1::SecretKey::from_slice(secret_bytes.as_ref())
+        .context("Failed to create secp256k1 secret key")?;
     let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
 
     // Initialize push clients
@@ -411,26 +411,36 @@ fn generate_keys() -> Result<()> {
 }
 
 /// Resolve the server private key from config or a mounted secret file.
-fn resolve_server_private_key(config: &config::ServerConfig) -> Result<String> {
+fn resolve_server_private_key(config: &mut config::ServerConfig) -> Result<Zeroizing<String>> {
     let private_key = config.private_key.trim();
     if !private_key.is_empty() {
-        return Ok(private_key.to_string());
+        let private_key = Zeroizing::new(std::mem::take(&mut *config.private_key));
+
+        return if private_key.trim().len() == private_key.len() {
+            Ok(private_key)
+        } else {
+            Ok(Zeroizing::new(private_key.trim().to_string()))
+        };
     }
 
     let private_key_file = config.private_key_file.trim();
     if private_key_file.is_empty() {
-        return Ok(String::new());
+        return Ok(Zeroizing::new(String::new()));
     }
 
     let key_path = Path::new(private_key_file);
-    let key = fs::read_to_string(key_path).with_context(|| {
+    let key = Zeroizing::new(fs::read_to_string(key_path).with_context(|| {
         format!(
             "Failed to read server private key file {}",
             key_path.display()
         )
-    })?;
+    })?);
 
-    Ok(key.trim().to_string())
+    if key.trim().len() == key.len() {
+        Ok(key)
+    } else {
+        Ok(Zeroizing::new(key.trim().to_string()))
+    }
 }
 
 /// Probe a Transponder health endpoint and return a non-zero exit on failure.
@@ -576,8 +586,8 @@ mod tests {
 
     #[test]
     fn resolve_server_private_key_prefers_inline_value() {
-        let config = config::ServerConfig {
-            private_key: "abc123".to_string(),
+        let mut config = config::ServerConfig {
+            private_key: Zeroizing::new("abc123".to_string()),
             private_key_file: "/tmp/ignored".to_string(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
@@ -589,7 +599,11 @@ mod tests {
             device_token_rate_limit_per_hour: 5000,
         };
 
-        assert_eq!(resolve_server_private_key(&config).unwrap(), "abc123");
+        assert_eq!(
+            resolve_server_private_key(&mut config).unwrap().as_str(),
+            "abc123"
+        );
+        assert_eq!(config.private_key.as_str(), "");
     }
 
     #[test]
@@ -597,8 +611,8 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "abc123").unwrap();
 
-        let config = config::ServerConfig {
-            private_key: String::new(),
+        let mut config = config::ServerConfig {
+            private_key: Zeroizing::new(String::new()),
             private_key_file: file.path().display().to_string(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
@@ -610,7 +624,10 @@ mod tests {
             device_token_rate_limit_per_hour: 5000,
         };
 
-        assert_eq!(resolve_server_private_key(&config).unwrap(), "abc123");
+        assert_eq!(
+            resolve_server_private_key(&mut config).unwrap().as_str(),
+            "abc123"
+        );
     }
 
     #[test]
@@ -618,8 +635,8 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "abc123").unwrap();
 
-        let config = config::ServerConfig {
-            private_key: "   \n\t  ".to_string(),
+        let mut config = config::ServerConfig {
+            private_key: Zeroizing::new("   \n\t  ".to_string()),
             private_key_file: format!("  {}  ", file.path().display()),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
@@ -631,13 +648,16 @@ mod tests {
             device_token_rate_limit_per_hour: 5000,
         };
 
-        assert_eq!(resolve_server_private_key(&config).unwrap(), "abc123");
+        assert_eq!(
+            resolve_server_private_key(&mut config).unwrap().as_str(),
+            "abc123"
+        );
     }
 
     #[test]
     fn resolve_server_private_key_returns_empty_when_unset() {
-        let config = config::ServerConfig {
-            private_key: String::new(),
+        let mut config = config::ServerConfig {
+            private_key: Zeroizing::new(String::new()),
             private_key_file: String::new(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
@@ -649,13 +669,16 @@ mod tests {
             device_token_rate_limit_per_hour: 5000,
         };
 
-        assert_eq!(resolve_server_private_key(&config).unwrap(), "");
+        assert_eq!(
+            resolve_server_private_key(&mut config).unwrap().as_str(),
+            ""
+        );
     }
 
     #[test]
     fn resolve_server_private_key_reports_missing_secret_file() {
-        let config = config::ServerConfig {
-            private_key: String::new(),
+        let mut config = config::ServerConfig {
+            private_key: Zeroizing::new(String::new()),
             private_key_file: "/tmp/definitely-missing-transponder-key".to_string(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
@@ -667,7 +690,7 @@ mod tests {
             device_token_rate_limit_per_hour: 5000,
         };
 
-        let error = resolve_server_private_key(&config)
+        let error = resolve_server_private_key(&mut config)
             .expect_err("missing secret file should return an error");
         assert!(
             error
@@ -751,8 +774,8 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "  {secret_key}  ").unwrap();
 
-        let config = config::ServerConfig {
-            private_key: String::new(),
+        let mut config = config::ServerConfig {
+            private_key: Zeroizing::new(String::new()),
             private_key_file: file.path().display().to_string(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
@@ -764,8 +787,8 @@ mod tests {
             device_token_rate_limit_per_hour: 5000,
         };
 
-        let resolved_key = resolve_server_private_key(&config).unwrap();
-        let parsed_key = parse_server_secret_key(&resolved_key).unwrap();
+        let resolved_key = resolve_server_private_key(&mut config).unwrap();
+        let parsed_key = parse_server_secret_key(resolved_key.as_str()).unwrap();
 
         assert_eq!(parsed_key.to_bech32().unwrap(), secret_key);
     }
@@ -773,7 +796,7 @@ mod tests {
     #[test]
     fn build_rate_limit_config_matches_server_settings() {
         let server = config::ServerConfig {
-            private_key: String::new(),
+            private_key: Zeroizing::new(String::new()),
             private_key_file: String::new(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,

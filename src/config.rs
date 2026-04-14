@@ -9,8 +9,9 @@
 //! is rejected.
 
 use config::{Config, ConfigBuilder, File, builder::DefaultState};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{env, ffi::OsString, path::Path};
+use zeroize::Zeroizing;
 
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::error::Result;
@@ -73,7 +74,8 @@ fn default_rate_limit_per_hour() -> u32 {
 #[derive(Clone, Deserialize)]
 pub struct ServerConfig {
     /// Server's Nostr private key (hex or nsec format).
-    pub private_key: String,
+    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    pub private_key: Zeroizing<String>,
 
     /// Path to a file containing the server's Nostr private key.
     #[serde(default)]
@@ -161,6 +163,15 @@ impl std::fmt::Debug for ServerConfig {
 
 fn default_shutdown_timeout() -> u64 {
     10
+}
+
+fn deserialize_zeroizing_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Zeroizing<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Zeroizing::new)
 }
 
 /// Relay connection configuration.
@@ -570,7 +581,7 @@ mod tests {
 
     fn test_server_config(private_key: &str) -> ServerConfig {
         ServerConfig {
-            private_key: private_key.to_string(),
+            private_key: Zeroizing::new(private_key.to_string()),
             private_key_file: String::new(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
@@ -631,12 +642,30 @@ mod tests {
         let file = create_temp_config(config_content);
         let config = load_with_test_env(file.path(), &[]).unwrap();
 
-        assert_eq!(config.server.private_key, "abc123");
+        assert_eq!(config.server.private_key.as_str(), "abc123");
         assert_eq!(config.server.shutdown_timeout_secs, 10); // default
         assert_eq!(config.relays.clearnet.len(), 1);
         assert!(!config.apns.enabled);
         assert!(!config.fcm.enabled);
         assert!(config.metrics.enabled);
+    }
+
+    #[test]
+    fn test_server_private_key_is_zeroizing_and_debug_redacted() {
+        let config_content = r#"
+            [server]
+            private_key = "abc123"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+        assert_zeroizing_string(&config.server.private_key);
+
+        let debug = format!("{:?}", config.server);
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("abc123"));
     }
 
     #[test]
@@ -712,7 +741,7 @@ mod tests {
         let config = load_with_test_env(file.path(), &[]).unwrap();
 
         assert_eq!(
-            config.server.private_key,
+            config.server.private_key.as_str(),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         assert_eq!(config.server.shutdown_timeout_secs, 30);
@@ -801,7 +830,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(config.server.private_key, "env-private-key");
+        assert_eq!(config.server.private_key.as_str(), "env-private-key");
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.server.max_dedup_cache_size, 50_000);
         assert_eq!(config.server.max_tokens_per_event, 25);
@@ -830,7 +859,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.server.private_key, "env-private-key");
+        assert_eq!(config.server.private_key.as_str(), "env-private-key");
         assert_eq!(config.apns.private_key_path, "/env/key.p8");
     }
 
@@ -968,7 +997,7 @@ mod tests {
         let file = create_temp_config(config_content);
         let config = load_with_test_env(file.path(), &[]).unwrap();
 
-        assert_eq!(config.server.private_key, "test-key");
+        assert_eq!(config.server.private_key.as_str(), "test-key");
         assert!(config.apns.enabled);
         assert_eq!(config.apns.key_id, "MYKEY");
         assert_eq!(config.apns.environment, "production"); // default
