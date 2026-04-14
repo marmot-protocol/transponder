@@ -23,9 +23,12 @@ services:
       # TRANSPONDER_SERVER_PRIVATE_KEY: "your-hex-private-key"
       # TRANSPONDER_APNS_ENABLED: "true"
       # TRANSPONDER_FCM_ENABLED: "true"
+      # The host port is bound to 127.0.0.1 above; this keeps Docker port
+      # publishing reachable without exposing it on public host interfaces.
+      TRANSPONDER_HEALTH_BIND_ADDRESS: "0.0.0.0:8080"
       TRANSPONDER_LOGGING_LEVEL: "info"
     healthcheck:
-      # If you override health.bind_address, update this URL to match.
+      # If you change the health server port, update this URL too.
       test: ["CMD", "/bin/transponder", "healthcheck", "--url", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 10s

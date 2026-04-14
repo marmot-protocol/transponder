@@ -182,7 +182,7 @@ tokio-test = "0.4.5"
 
   [health]
   enabled = true
-  bind_address = "0.0.0.0:8080"
+  bind_address = "127.0.0.1:8080"
 
   [logging]
   # Level: "trace", "debug", "info", "warn", "error", "off"
