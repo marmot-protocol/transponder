@@ -17,7 +17,7 @@ use tracing::{debug, trace, warn};
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
 use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
 use crate::rate_limiter::{
@@ -237,6 +237,10 @@ impl EventProcessor {
                 Ok(true)
             }
             Err(e) => {
+                if Self::should_mark_failed_event_seen(&e) {
+                    self.mark_seen(event.id).await;
+                }
+
                 // Log but don't propagate - we want to continue processing other events
                 warn!(
                     event_id = %event.id,
@@ -253,6 +257,11 @@ impl EventProcessor {
                 Ok(false)
             }
         }
+    }
+
+    /// Returns true when an event failed in a way replaying it cannot fix.
+    fn should_mark_failed_event_seen(error: &Error) -> bool {
+        matches!(error, Error::Crypto(_) | Error::InvalidToken(_))
     }
 
     /// Inner processing logic for an event.
@@ -855,6 +864,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_permanent_failure_is_deduplicated_on_replay() {
+        let server_keys = Keys::generate();
+        let wrong_server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let event = scenarios::single_apns_notification(
+            &wrong_server_keys,
+            &sender_keys,
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        )
+        .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            1.0
+        );
+        assert_eq!(processor.cache_len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_process_failed_event_records_metrics() {
         let server_keys = Keys::generate();
         let wrong_server_keys = Keys::generate();
@@ -938,6 +976,32 @@ mod tests {
             ),
             0.0
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_transient_dispatch_failure_is_retryable() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+
+        let (processor, metrics) =
+            create_processor_with_shutdown_dispatcher_metrics(&server_keys).await;
+
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            2.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            0.0
+        );
+        assert_eq!(processor.cache_len(), 0);
     }
 
     #[tokio::test]
