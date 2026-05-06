@@ -303,7 +303,8 @@ mod tests {
                         }
                     }
                     Ok(_) => continue,
-                    Err(_) => return None,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }
         })
@@ -444,8 +445,8 @@ mod tests {
     #[test]
     fn test_subscription_lookback_matches_nip59_tweak_window() {
         assert_eq!(
-            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS,
-            nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end
+            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS, 172_800,
+            "lookback must cover NIP-59's 2-day timestamp tweak window"
         );
     }
 

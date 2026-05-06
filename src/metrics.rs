@@ -827,7 +827,8 @@ impl Metrics {
 
     /// Set the relay subscription lookback window.
     pub fn set_relay_subscription_lookback(&self, seconds: u64) {
-        self.relay_subscription_lookback_seconds.set(seconds as i64);
+        self.relay_subscription_lookback_seconds
+            .set(i64::try_from(seconds).unwrap_or(i64::MAX));
     }
 
     /// Gather all metrics for export.
@@ -1136,6 +1137,22 @@ mod tests {
                 &[]
             ),
             172_800.0
+        );
+    }
+
+    #[test]
+    fn test_relay_subscription_lookback_saturates_large_values() {
+        let metrics = Metrics::new().unwrap();
+
+        metrics.set_relay_subscription_lookback(u64::MAX);
+
+        assert_eq!(
+            gauge_value(
+                &metrics,
+                "transponder_relay_subscription_lookback_seconds",
+                &[]
+            ),
+            i64::MAX as f64
         );
     }
 
