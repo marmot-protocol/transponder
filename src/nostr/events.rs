@@ -17,7 +17,7 @@ use tracing::{debug, trace, warn};
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
 use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
 use crate::rate_limiter::{
@@ -190,8 +190,11 @@ impl EventProcessor {
 
     /// Process an incoming event.
     ///
-    /// Returns `Ok(true)` if the event was processed, `Ok(false)` if it was
-    /// deduplicated (already seen), or an error if processing failed.
+    /// Returns `Ok(true)` if the event was processed and marked seen.
+    ///
+    /// Returns `Ok(false)` if the event was already seen or if processing
+    /// failed and the failure was logged/recorded. Processing failures are not
+    /// propagated so the event loop can continue with later events.
     pub async fn process(&self, event: &Event) -> Result<bool> {
         let _in_flight = InFlightEventGuard::new(self.metrics.as_ref());
         let started_at = StageTimer::start();
@@ -237,6 +240,10 @@ impl EventProcessor {
                 Ok(true)
             }
             Err(e) => {
+                if Self::is_permanent_error(&e) {
+                    self.mark_seen(event.id).await;
+                }
+
                 // Log but don't propagate - we want to continue processing other events
                 warn!(
                     event_id = %event.id,
@@ -252,6 +259,24 @@ impl EventProcessor {
                 }
                 Ok(false)
             }
+        }
+    }
+
+    /// Returns true when an event failed in a way replaying it cannot fix.
+    fn is_permanent_error(error: &Error) -> bool {
+        match error {
+            Error::Crypto(_) | Error::InvalidToken(_) => true,
+            Error::Config(_)
+            | Error::Nostr(_)
+            | Error::Apns(_)
+            | Error::Fcm(_)
+            | Error::Dispatch(_)
+            | Error::Io(_)
+            | Error::Http(_)
+            | Error::Json(_)
+            | Error::Jwt(_)
+            | Error::Base64(_)
+            | Error::Hex(_) => false,
         }
     }
 
@@ -323,6 +348,7 @@ impl EventProcessor {
         // Rate limiting happens BEFORE decryption intentionally:
         // Prevents wasting CPU on tokens we'll immediately rate-limit anyway.
         let mut payloads = Vec::with_capacity(token_bytes.len());
+        let mut admitted_rate_limit_keys = Vec::with_capacity(token_bytes.len());
         for bytes in token_bytes {
             // Rate limit check 1: encrypted token (replay protection)
             let encrypted_key = Self::hash_bytes(&bytes);
@@ -356,6 +382,8 @@ impl EventProcessor {
                 }
                 Err(e) => {
                     // Silently ignore invalid tokens per MIP-05 spec
+                    // Keep the encrypted-token rate-limit increment: invalid
+                    // encrypted blobs should still spend replay/spam budget.
                     trace!(error = %e, "Failed to decrypt token (ignoring)");
                     if let Some(ref m) = self.metrics {
                         m.record_token_decryption_failed();
@@ -386,6 +414,9 @@ impl EventProcessor {
             }
 
             payloads.push(payload);
+            // Keep this paired with `payloads`: dispatch admission failure
+            // rolls back exactly the rate-limit increments for admitted work.
+            admitted_rate_limit_keys.push((encrypted_key, device_key));
         }
 
         if payloads.is_empty() {
@@ -409,6 +440,15 @@ impl EventProcessor {
                 Ok(count)
             }
             Err(e) => {
+                for (encrypted_key, device_key) in &admitted_rate_limit_keys {
+                    self.encrypted_token_limiter
+                        .rollback_increment(encrypted_key)
+                        .await;
+                    self.device_token_limiter
+                        .rollback_increment(device_key)
+                        .await;
+                }
+
                 if let Some(ref m) = self.metrics {
                     m.observe_push_dispatch_admission_duration(
                         OperationOutcome::Failed,
@@ -614,6 +654,17 @@ mod tests {
     async fn create_processor_with_shutdown_dispatcher_metrics(
         server_keys: &Keys,
     ) -> (EventProcessor, Metrics) {
+        create_processor_with_shutdown_dispatcher_metrics_and_rate_limits(
+            server_keys,
+            TokenRateLimitConfig::default(),
+        )
+        .await
+    }
+
+    async fn create_processor_with_shutdown_dispatcher_metrics_and_rate_limits(
+        server_keys: &Keys,
+        rate_limit_config: TokenRateLimitConfig,
+    ) -> (EventProcessor, Metrics) {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
         let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
@@ -641,7 +692,7 @@ mod tests {
                 token_decryptor,
                 push_dispatcher,
                 DEFAULT_MAX_DEDUP_CACHE_SIZE,
-                TokenRateLimitConfig::default(),
+                rate_limit_config,
                 Some(metrics.clone()),
             ),
             metrics,
@@ -855,6 +906,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_permanent_failure_is_deduplicated_on_replay() {
+        let server_keys = Keys::generate();
+        let wrong_server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let event = scenarios::single_apns_notification(
+            &wrong_server_keys,
+            &sender_keys,
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        )
+        .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            1.0
+        );
+        assert_eq!(processor.cache_len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_process_failed_event_records_metrics() {
         let server_keys = Keys::generate();
         let wrong_server_keys = Keys::generate();
@@ -941,6 +1021,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_transient_dispatch_failure_is_retryable() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+
+        let (processor, metrics) =
+            create_processor_with_shutdown_dispatcher_metrics(&server_keys).await;
+
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            2.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            0.0
+        );
+        assert_eq!(processor.cache_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_dispatch_failure_does_not_spend_rate_limit_budget() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+
+        let (processor, metrics) =
+            create_processor_with_shutdown_dispatcher_metrics_and_rate_limits(
+                &server_keys,
+                TokenRateLimitConfig {
+                    max_cache_size: 100,
+                    max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                    encrypted_token_per_minute: 1,
+                    encrypted_token_per_hour: 1,
+                    device_token_per_minute: 1,
+                    device_token_per_hour: 1,
+                },
+            )
+            .await;
+
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            2.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            0.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            0.0
+        );
+        assert_eq!(processor.cache_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_event_does_not_dispatch_or_rollback_budget() {
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+        use base64::prelude::*;
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let encrypted = encryptor.encrypt(&TestToken::apns(device_token));
+        let encrypted_key = EventProcessor::hash_bytes(&encrypted);
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(BASE64_STANDARD.encode(&encrypted))
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build(&content)
+            .await;
+
+        let (processor, metrics) =
+            create_processor_with_shutdown_dispatcher_metrics_and_rate_limits(
+                &server_keys,
+                TokenRateLimitConfig {
+                    max_cache_size: 100,
+                    max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                    encrypted_token_per_minute: 0,
+                    encrypted_token_per_hour: 100,
+                    device_token_per_minute: 100,
+                    device_token_per_hour: 100,
+                },
+            )
+            .await;
+
+        assert!(processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            processor
+                .encrypted_token_limiter
+                .peek_counts(&encrypted_key)
+                .await,
+            Some((0, 0))
+        );
+        assert_eq!(processor.device_token_limiter.len().await, 0);
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_tokens_rate_limited_total",
+                &[("type", "encrypted_token"), ("reason", "minute")],
+            ),
+            1.0
+        );
+        assert!(metrics.gather().into_iter().all(|family| {
+            family.name() != "transponder_push_dispatch_admission_duration_seconds"
+        }));
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_notifications_admitted_per_event",
+                &[]
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_sum(
+                &metrics,
+                "transponder_notifications_admitted_per_event",
+                &[]
+            ),
+            0.0
+        );
+    }
+
+    #[tokio::test]
     async fn test_process_empty_token_blob() {
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
@@ -978,6 +1203,37 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_invalid_token_failure_is_deduplicated_on_replay() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let event = scenarios::empty_notification(&server_keys, &sender_keys).await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_notification_parse_duration_seconds",
+                &[("outcome", OperationOutcome::Failed.as_str())],
+            ),
+            1
+        );
+        assert_eq!(processor.cache_len(), 1);
     }
 
     #[tokio::test]
