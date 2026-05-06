@@ -76,14 +76,16 @@ struct TokenRequest {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct TokenResponse {
-    access_token: String,
+    access_token: Zeroizing<String>,
     expires_in: u64,
     token_type: String,
 }
 
 /// Cached access token.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct CachedToken {
-    token: String,
+    token: Zeroizing<String>,
+    #[zeroize(skip)]
     expires_at: SystemTime,
 }
 
@@ -175,7 +177,7 @@ impl FcmClient {
     }
 
     /// Get a valid access token, refreshing if necessary.
-    async fn get_access_token(&self) -> Result<String> {
+    async fn get_access_token(&self) -> Result<Zeroizing<String>> {
         // First check with read lock (fast path)
         {
             let cached = self.cached_token.read().await;
@@ -204,7 +206,7 @@ impl FcmClient {
     async fn refresh_token_inner(
         &self,
         cached: &mut tokio::sync::RwLockWriteGuard<'_, Option<CachedToken>>,
-    ) -> Result<String> {
+    ) -> Result<Zeroizing<String>> {
         let sa = self
             .service_account
             .as_ref()
@@ -348,7 +350,7 @@ impl FcmClient {
             &transport_retry,
             "FCM",
             || async {
-                self.build_request(&url, &access_token, device_token)
+                self.build_request(&url, access_token.as_str(), device_token)
                     .send()
                     .await
                     .map_err(Error::from)
@@ -471,6 +473,18 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_partial_json, header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn test_cached_token_stores_access_token_in_zeroizing_string() {
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+
+        let cached = CachedToken {
+            token: Zeroizing::new("cached-access-token".to_string()),
+            expires_at: SystemTime::now() + Duration::from_secs(60),
+        };
+
+        assert_zeroizing_string(&cached.token);
+    }
 
     #[test]
     fn test_fcm_request_serialization() {
@@ -912,14 +926,14 @@ mod tests {
         {
             let mut cached = client.cached_token.write().await;
             *cached = Some(CachedToken {
-                token: "cached-access-token".to_string(),
+                token: Zeroizing::new("cached-access-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             });
         }
 
         // Should return cached token
         let token = client.get_access_token().await.unwrap();
-        assert_eq!(token, "cached-access-token");
+        assert_eq!(token.as_str(), "cached-access-token");
     }
 
     #[tokio::test]
@@ -1065,7 +1079,7 @@ mod tests {
         {
             let mut cached = client.cached_token.write().await;
             *cached = Some(CachedToken {
-                token: "expired-token".to_string(),
+                token: Zeroizing::new("expired-token".to_string()),
                 expires_at: SystemTime::now() - Duration::from_secs(1),
             });
         }
@@ -1109,7 +1123,7 @@ mod tests {
         {
             let mut cached = client.cached_token.write().await;
             *cached = Some(CachedToken {
-                token: "test-token".to_string(),
+                token: Zeroizing::new("test-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             });
         }

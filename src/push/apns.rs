@@ -10,6 +10,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, trace, warn};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::ApnsConfig;
 use crate::error::{Error, Result};
@@ -34,8 +35,10 @@ struct ApnsClaims {
 }
 
 /// Cached JWT token.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct CachedToken {
-    token: String,
+    token: Zeroizing<String>,
+    #[zeroize(skip)]
     expires_at: SystemTime,
 }
 
@@ -131,7 +134,7 @@ impl ApnsClient {
     }
 
     /// Get a valid JWT token, refreshing if necessary.
-    async fn get_token(&self) -> Result<String> {
+    async fn get_token(&self) -> Result<Zeroizing<String>> {
         // First check with read lock (fast path)
         {
             let cached = self.cached_token.read().await;
@@ -161,7 +164,7 @@ impl ApnsClient {
     }
 
     /// Generate a new JWT token.
-    fn generate_token(&self) -> Result<String> {
+    fn generate_token(&self) -> Result<Zeroizing<String>> {
         let encoding_key = self
             .encoding_key
             .as_ref()
@@ -181,7 +184,7 @@ impl ApnsClient {
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(self.config.key_id.clone());
 
-        let token = encode(&header, &claims, encoding_key)?;
+        let token = Zeroizing::new(encode(&header, &claims, encoding_key)?);
 
         if let Some(metrics) = &self.metrics {
             metrics.record_auth_token_refresh("apns_jwt");
@@ -246,7 +249,7 @@ impl ApnsClient {
             &transport_retry,
             "APNs",
             || async {
-                self.build_request(&url, &token)
+                self.build_request(&url, token.as_str())
                     .send()
                     .await
                     .map_err(Error::from)
@@ -360,6 +363,7 @@ mod tests {
     use base64::Engine;
     use wiremock::matchers::{header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zeroize::Zeroizing;
 
     fn test_config() -> ApnsConfig {
         ApnsConfig {
@@ -378,6 +382,18 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("content-available"));
         assert!(json.contains("1"));
+    }
+
+    #[test]
+    fn test_cached_token_stores_jwt_in_zeroizing_string() {
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+
+        let cached = CachedToken {
+            token: Zeroizing::new("cached-jwt".to_string()),
+            expires_at: SystemTime::now() + Duration::from_secs(60),
+        };
+
+        assert_zeroizing_string(&cached.token);
     }
 
     #[test]
@@ -450,7 +466,7 @@ mod tests {
             config,
             encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
             cached_token: Arc::new(RwLock::new(Some(CachedToken {
-                token: "test-token".to_string(),
+                token: Zeroizing::new("test-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
             metrics: None,
@@ -529,7 +545,7 @@ mod tests {
             },
             encoding_key: None,
             cached_token: Arc::new(RwLock::new(Some(CachedToken {
-                token: "test-token".to_string(),
+                token: Zeroizing::new("test-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
             metrics: None,
@@ -830,14 +846,14 @@ mod tests {
         {
             let mut cached = client.cached_token.write().await;
             *cached = Some(CachedToken {
-                token: "cached-test-token".to_string(),
+                token: Zeroizing::new("cached-test-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             });
         }
 
         // Should return cached token
         let token = client.get_token().await.unwrap();
-        assert_eq!(token, "cached-test-token");
+        assert_eq!(token.as_str(), "cached-test-token");
     }
 
     #[tokio::test]
@@ -858,7 +874,7 @@ mod tests {
         {
             let mut cached = client.cached_token.write().await;
             *cached = Some(CachedToken {
-                token: "expired-token".to_string(),
+                token: Zeroizing::new("expired-token".to_string()),
                 expires_at: SystemTime::now() - Duration::from_secs(1), // Already expired
             });
         }
@@ -885,14 +901,14 @@ mod tests {
         {
             let mut cached = client.cached_token.write().await;
             *cached = Some(CachedToken {
-                token: "valid-cached-token".to_string(),
+                token: Zeroizing::new("valid-cached-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600), // 1 hour in the future
             });
         }
 
         // Should return cached token (no encoding key needed since we have valid cache)
         let token = client.get_token().await.unwrap();
-        assert_eq!(token, "valid-cached-token");
+        assert_eq!(token.as_str(), "valid-cached-token");
     }
 
     #[tokio::test]
@@ -966,7 +982,7 @@ mod tests {
             config,
             encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
             cached_token: Arc::new(RwLock::new(Some(CachedToken {
-                token: "test-cached-token".to_string(),
+                token: Zeroizing::new("test-cached-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
             metrics: None,
@@ -979,7 +995,7 @@ mod tests {
 
         // Get token from cache
         let token = client.get_token().await.unwrap();
-        assert_eq!(token, "test-cached-token");
+        assert_eq!(token.as_str(), "test-cached-token");
 
         // Make request manually (simulating what send() does)
         let response = client
@@ -988,7 +1004,7 @@ mod tests {
             .header("apns-push-type", "background")
             .header("apns-priority", "5")
             .header("apns-topic", "com.example.app")
-            .header("authorization", format!("bearer {}", token))
+            .header("authorization", format!("bearer {}", token.as_str()))
             .json(&payload)
             .send()
             .await
@@ -1178,7 +1194,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
         {
             let cached = client.cached_token.read().await;
             assert!(cached.is_some());
-            assert_eq!(cached.as_ref().unwrap().token, token1);
+            assert_eq!(cached.as_ref().unwrap().token.as_str(), token1.as_str());
         }
 
         // Get token again - should return cached token (same value)
@@ -1218,7 +1234,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             config,
             encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
             cached_token: Arc::new(RwLock::new(Some(CachedToken {
-                token: "test-token".to_string(),
+                token: Zeroizing::new("test-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
             metrics: None,
