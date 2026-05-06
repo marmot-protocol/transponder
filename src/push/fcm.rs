@@ -66,24 +66,25 @@ struct OAuthClaims {
 }
 
 /// OAuth2 token request.
-#[derive(Debug, Serialize)]
+// Debug intentionally omitted: assertion contains credential material.
+#[derive(Serialize)]
 struct TokenRequest {
     grant_type: String,
-    assertion: String,
+    assertion: Zeroizing<String>,
 }
 
 /// OAuth2 token response.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+// Debug intentionally omitted: access_token contains credential material.
+#[derive(Deserialize)]
 struct TokenResponse {
-    access_token: String,
-    expires_in: u64,
-    token_type: String,
+    access_token: Zeroizing<String>,
 }
 
 /// Cached access token.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct CachedToken {
-    token: String,
+    token: Zeroizing<String>,
+    #[zeroize(skip)]
     expires_at: SystemTime,
 }
 
@@ -175,7 +176,7 @@ impl FcmClient {
     }
 
     /// Get a valid access token, refreshing if necessary.
-    async fn get_access_token(&self) -> Result<String> {
+    async fn get_access_token(&self) -> Result<Zeroizing<String>> {
         // First check with read lock (fast path)
         {
             let cached = self.cached_token.read().await;
@@ -204,7 +205,7 @@ impl FcmClient {
     async fn refresh_token_inner(
         &self,
         cached: &mut tokio::sync::RwLockWriteGuard<'_, Option<CachedToken>>,
-    ) -> Result<String> {
+    ) -> Result<Zeroizing<String>> {
         let sa = self
             .service_account
             .as_ref()
@@ -231,7 +232,7 @@ impl FcmClient {
         };
 
         let header = Header::new(Algorithm::RS256);
-        let jwt = encode(&header, &claims, encoding_key)?;
+        let jwt = Zeroizing::new(encode(&header, &claims, encoding_key)?);
 
         let request = TokenRequest {
             grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
@@ -255,18 +256,22 @@ impl FcmClient {
 
         let token_response: TokenResponse = response.json().await?;
 
-        // Cache the token while still holding the write lock
-        **cached = Some(CachedToken {
-            token: token_response.access_token.clone(),
+        // Cache the token while still holding the write lock. The caller gets a
+        // short-lived zeroizing clone for request construction while the cache
+        // owns the reusable copy.
+        let cached_token = CachedToken {
+            token: token_response.access_token,
             expires_at: SystemTime::now() + TOKEN_LIFETIME,
-        });
+        };
+        let outbound_token = cached_token.token.clone();
+        **cached = Some(cached_token);
 
         if let Some(metrics) = &self.metrics {
             metrics.record_auth_token_refresh("fcm_oauth");
         }
 
         trace!("Refreshed FCM access token");
-        Ok(token_response.access_token)
+        Ok(outbound_token)
     }
 
     /// Get the project ID, from config or service account.
@@ -348,7 +353,7 @@ impl FcmClient {
             &transport_retry,
             "FCM",
             || async {
-                self.build_request(&url, &access_token, device_token)
+                self.build_request(&url, access_token.as_str(), device_token)
                     .send()
                     .await
                     .map_err(Error::from)
@@ -471,6 +476,49 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_partial_json, header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn test_cached_token_stores_access_token_in_zeroizing_string() {
+        // Compile-time guard: cached credentials must stay zeroizing.
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+
+        let cached = CachedToken {
+            token: Zeroizing::new("cached-access-token".to_string()),
+            expires_at: SystemTime::now() + Duration::from_secs(60),
+        };
+
+        assert_zeroizing_string(&cached.token);
+    }
+
+    #[test]
+    fn test_token_request_stores_assertion_in_zeroizing_string() {
+        // Compile-time guard: OAuth assertions must stay zeroizing.
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+
+        let request = TokenRequest {
+            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+            assertion: Zeroizing::new("signed-jwt-assertion".to_string()),
+        };
+
+        assert_zeroizing_string(&request.assertion);
+    }
+
+    #[test]
+    fn test_token_response_deserializes_access_token_as_zeroizing_string() {
+        // Compile-time guard: provider bearer tokens must deserialize directly
+        // into zeroizing storage while ignoring unused response metadata.
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+
+        let response: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "provider-access-token",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+        }))
+        .unwrap();
+
+        assert_eq!(response.access_token.as_str(), "provider-access-token");
+        assert_zeroizing_string(&response.access_token);
+    }
 
     #[test]
     fn test_fcm_request_serialization() {
@@ -912,14 +960,14 @@ mod tests {
         {
             let mut cached = client.cached_token.write().await;
             *cached = Some(CachedToken {
-                token: "cached-access-token".to_string(),
+                token: Zeroizing::new("cached-access-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             });
         }
 
         // Should return cached token
         let token = client.get_access_token().await.unwrap();
-        assert_eq!(token, "cached-access-token");
+        assert_eq!(token.as_str(), "cached-access-token");
     }
 
     #[tokio::test]
@@ -1065,7 +1113,7 @@ mod tests {
         {
             let mut cached = client.cached_token.write().await;
             *cached = Some(CachedToken {
-                token: "expired-token".to_string(),
+                token: Zeroizing::new("expired-token".to_string()),
                 expires_at: SystemTime::now() - Duration::from_secs(1),
             });
         }
@@ -1109,7 +1157,7 @@ mod tests {
         {
             let mut cached = client.cached_token.write().await;
             *cached = Some(CachedToken {
-                token: "test-token".to_string(),
+                token: Zeroizing::new("test-token".to_string()),
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             });
         }
