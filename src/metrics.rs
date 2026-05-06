@@ -137,6 +137,9 @@ pub struct Metrics {
     /// Total number of relay notifications dropped because the receiver lagged.
     pub relay_notifications_dropped_total: IntCounter,
 
+    /// Relay subscription lookback window in seconds.
+    pub relay_subscription_lookback_seconds: IntGauge,
+
     // === Server Metrics ===
     /// Timestamp when the server started (Unix seconds).
     pub server_start_time_seconds: Gauge,
@@ -502,6 +505,12 @@ impl Metrics {
         ))?;
         registry.register(Box::new(relay_notifications_dropped_total.clone()))?;
 
+        let relay_subscription_lookback_seconds = IntGauge::with_opts(Opts::new(
+            "transponder_relay_subscription_lookback_seconds",
+            "Relay subscription lookback window in seconds",
+        ))?;
+        registry.register(Box::new(relay_subscription_lookback_seconds.clone()))?;
+
         // === Server Metrics ===
         let server_start_time_seconds = Gauge::with_opts(Opts::new(
             "transponder_server_start_time_seconds",
@@ -556,6 +565,7 @@ impl Metrics {
             relays_configured,
             relay_notifications_lagged_total,
             relay_notifications_dropped_total,
+            relay_subscription_lookback_seconds,
             server_start_time_seconds,
             server_info,
         })
@@ -815,6 +825,12 @@ impl Metrics {
         self.relay_notifications_dropped_total.inc_by(count);
     }
 
+    /// Set the relay subscription lookback window.
+    pub fn set_relay_subscription_lookback(&self, seconds: u64) {
+        self.relay_subscription_lookback_seconds
+            .set(i64::try_from(seconds).unwrap_or(i64::MAX));
+    }
+
     /// Gather all metrics for export.
     pub fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
         self.registry.gather()
@@ -1064,6 +1080,7 @@ mod tests {
         metrics.set_relays_connected("onion", 1);
         metrics.record_relay_notifications_lagged();
         metrics.record_relay_notifications_dropped(4);
+        metrics.set_relay_subscription_lookback(172_800);
 
         assert_eq!(
             gauge_value(
@@ -1112,6 +1129,30 @@ mod tests {
                 &[]
             ),
             4.0
+        );
+        assert_eq!(
+            gauge_value(
+                &metrics,
+                "transponder_relay_subscription_lookback_seconds",
+                &[]
+            ),
+            172_800.0
+        );
+    }
+
+    #[test]
+    fn test_relay_subscription_lookback_saturates_large_values() {
+        let metrics = Metrics::new().unwrap();
+
+        metrics.set_relay_subscription_lookback(u64::MAX);
+
+        assert_eq!(
+            gauge_value(
+                &metrics,
+                "transponder_relay_subscription_lookback_seconds",
+                &[]
+            ),
+            i64::MAX as f64
         );
     }
 

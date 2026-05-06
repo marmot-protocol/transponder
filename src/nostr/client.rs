@@ -17,6 +17,13 @@ use crate::metrics::Metrics;
 // Type alias to avoid confusion with our RelayStatus
 use nostr_sdk::RelayStatus as NostrRelayStatus;
 
+/// Maximum NIP-59 timestamp randomization window for gift wraps.
+///
+/// NIP-59 gift wraps intentionally randomize `created_at` into the past to
+/// reduce timing correlation. Relay subscriptions must look back by the same
+/// window or relays will filter out compliant gift wraps before delivery.
+const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end;
+
 #[cfg(feature = "tor")]
 const TOR_FEATURE_ENABLED: bool = true;
 #[cfg(not(feature = "tor"))]
@@ -62,6 +69,7 @@ impl RelayClient {
 
         if let Some(metrics) = &metrics {
             metrics.set_relay_counts(config.clearnet.len(), config.onion.len());
+            metrics.set_relay_subscription_lookback(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS);
         }
 
         Ok(Self {
@@ -154,13 +162,23 @@ impl RelayClient {
 
     /// Subscribe to gift-wrapped events for the server's public key.
     pub async fn subscribe(&self, server_pubkey: PublicKey) -> Result<()> {
+        let since = Timestamp::from_secs(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS),
+        );
+
         // Create filter for kind 1059 (gift wrap) events addressed to us
         let filter = Filter::new()
             .kind(Kind::GiftWrap)
             .pubkey(server_pubkey)
-            .since(Timestamp::now());
+            .since(since);
 
-        debug!(pubkey = %server_pubkey, "Subscribing to gift wrap events");
+        debug!(
+            pubkey = %server_pubkey,
+            lookback_secs = NIP59_TIMESTAMP_TWEAK_WINDOW_SECS,
+            "Subscribing to gift wrap events"
+        );
 
         self.client
             .subscribe(filter, None)
@@ -272,6 +290,29 @@ fn validate_relay_config(config: &RelayConfig) -> Result<()> {
 mod tests {
     use super::*;
 
+    async fn receive_gift_wrap(
+        notifications: &mut broadcast::Receiver<RelayPoolNotification>,
+        timeout: std::time::Duration,
+    ) -> Option<Box<Event>> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                match notifications.recv().await {
+                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                        if event.kind == Kind::GiftWrap {
+                            return Some(event);
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     #[test]
     fn test_relay_status_default() {
         let status = RelayStatus::default();
@@ -349,6 +390,64 @@ mod tests {
         assert!(result.is_ok());
 
         client.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_receives_nip59_backdated_gift_wraps() {
+        use nostr_relay_builder::MockRelay;
+        use std::time::Duration;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let server_keys = Keys::generate();
+        let server_pubkey = server_keys.public_key();
+        let config = test_relay_config(vec![relay_url.to_string()]);
+
+        let receiver = RelayClient::new(server_keys, config).await.unwrap();
+        receiver.client.add_relay(&relay_url).await.unwrap();
+        receiver.client.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        receiver.subscribe(server_pubkey).await.unwrap();
+        let mut notifications = receiver.notifications();
+
+        let sender_keys = Keys::generate();
+        let sender = Client::builder().signer(sender_keys.clone()).build();
+        sender.add_relay(&relay_url).await.unwrap();
+        sender.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let backdated = Timestamp::from_secs(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS),
+        );
+        let gift_wrap = EventBuilder::new(Kind::GiftWrap, "ignored")
+            .tags([Tag::public_key(server_pubkey)])
+            .custom_created_at(backdated)
+            .sign_with_keys(&sender_keys)
+            .unwrap();
+
+        sender.send_event(&gift_wrap).await.unwrap();
+
+        let received = receive_gift_wrap(&mut notifications, Duration::from_secs(2)).await;
+
+        assert!(
+            matches!(received.as_deref(), Some(event) if event.id == gift_wrap.id),
+            "subscription must receive kind 1059 events backdated within the NIP-59 tweak window"
+        );
+
+        receiver.disconnect().await.unwrap();
+        sender.disconnect().await;
+    }
+
+    #[test]
+    fn test_subscription_lookback_matches_nip59_tweak_window() {
+        assert_eq!(
+            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS, 172_800,
+            "lookback must cover NIP-59's 2-day timestamp tweak window"
+        );
     }
 
     #[tokio::test]
