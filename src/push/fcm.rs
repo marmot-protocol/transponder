@@ -69,7 +69,7 @@ struct OAuthClaims {
 #[derive(Debug, Serialize)]
 struct TokenRequest {
     grant_type: String,
-    assertion: String,
+    assertion: Zeroizing<String>,
 }
 
 /// OAuth2 token response.
@@ -233,7 +233,7 @@ impl FcmClient {
         };
 
         let header = Header::new(Algorithm::RS256);
-        let jwt = encode(&header, &claims, encoding_key)?;
+        let jwt = Zeroizing::new(encode(&header, &claims, encoding_key)?);
 
         let request = TokenRequest {
             grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
@@ -484,6 +484,18 @@ mod tests {
         };
 
         assert_zeroizing_string(&cached.token);
+    }
+
+    #[test]
+    fn test_token_request_stores_assertion_in_zeroizing_string() {
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+
+        let request = TokenRequest {
+            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+            assertion: Zeroizing::new("signed-jwt-assertion".to_string()),
+        };
+
+        assert_zeroizing_string(&request.assertion);
     }
 
     #[test]
