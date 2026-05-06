@@ -66,6 +66,7 @@ struct OAuthClaims {
 }
 
 /// OAuth2 token request.
+// Debug intentionally omitted: assertion contains credential material.
 #[derive(Serialize)]
 struct TokenRequest {
     grant_type: String,
@@ -73,12 +74,10 @@ struct TokenRequest {
 }
 
 /// OAuth2 token response.
+// Debug intentionally omitted: access_token contains credential material.
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct TokenResponse {
     access_token: Zeroizing<String>,
-    expires_in: u64,
-    token_type: String,
 }
 
 /// Cached access token.
@@ -257,18 +256,22 @@ impl FcmClient {
 
         let token_response: TokenResponse = response.json().await?;
 
-        // Cache the token while still holding the write lock
-        **cached = Some(CachedToken {
-            token: token_response.access_token.clone(),
+        // Cache the token while still holding the write lock. The caller gets a
+        // short-lived zeroizing clone for request construction while the cache
+        // owns the reusable copy.
+        let cached_token = CachedToken {
+            token: token_response.access_token,
             expires_at: SystemTime::now() + TOKEN_LIFETIME,
-        });
+        };
+        let outbound_token = cached_token.token.clone();
+        **cached = Some(cached_token);
 
         if let Some(metrics) = &self.metrics {
             metrics.record_auth_token_refresh("fcm_oauth");
         }
 
         trace!("Refreshed FCM access token");
-        Ok(token_response.access_token)
+        Ok(outbound_token)
     }
 
     /// Get the project ID, from config or service account.
@@ -476,6 +479,7 @@ mod tests {
 
     #[test]
     fn test_cached_token_stores_access_token_in_zeroizing_string() {
+        // Compile-time guard: cached credentials must stay zeroizing.
         fn assert_zeroizing_string(_: &Zeroizing<String>) {}
 
         let cached = CachedToken {
@@ -488,6 +492,7 @@ mod tests {
 
     #[test]
     fn test_token_request_stores_assertion_in_zeroizing_string() {
+        // Compile-time guard: OAuth assertions must stay zeroizing.
         fn assert_zeroizing_string(_: &Zeroizing<String>) {}
 
         let request = TokenRequest {
@@ -496,6 +501,23 @@ mod tests {
         };
 
         assert_zeroizing_string(&request.assertion);
+    }
+
+    #[test]
+    fn test_token_response_deserializes_access_token_as_zeroizing_string() {
+        // Compile-time guard: provider bearer tokens must deserialize directly
+        // into zeroizing storage while ignoring unused response metadata.
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+
+        let response: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "provider-access-token",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+        }))
+        .unwrap();
+
+        assert_eq!(response.access_token.as_str(), "provider-access-token");
+        assert_zeroizing_string(&response.access_token);
     }
 
     #[test]

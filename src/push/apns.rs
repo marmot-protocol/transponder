@@ -153,14 +153,17 @@ impl ApnsClient {
             return Ok(token.token.clone());
         }
 
-        // Generate and cache new token
+        // Generate and cache new token. The caller gets a short-lived zeroizing
+        // clone for request construction while the cache owns the reusable copy.
         let token = self.generate_token()?;
-        *cached = Some(CachedToken {
-            token: token.clone(),
+        let cached_token = CachedToken {
+            token,
             expires_at: SystemTime::now() + TOKEN_LIFETIME,
-        });
+        };
+        let outbound_token = cached_token.token.clone();
+        *cached = Some(cached_token);
 
-        Ok(token)
+        Ok(outbound_token)
     }
 
     /// Generate a new JWT token.
@@ -386,6 +389,7 @@ mod tests {
 
     #[test]
     fn test_cached_token_stores_jwt_in_zeroizing_string() {
+        // Compile-time guard: cached credentials must stay zeroizing.
         fn assert_zeroizing_string(_: &Zeroizing<String>) {}
 
         let cached = CachedToken {
