@@ -175,7 +175,9 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// Rolls back one previously allowed increment for a key.
     ///
     /// This is used when downstream admission fails after a rate-limit check
-    /// has already reserved capacity for work that will not run.
+    /// has already reserved capacity for work that will not run. If both
+    /// counters reach zero, the entry is removed so the failed admission leaves
+    /// no window-start trace for the next real request.
     pub async fn rollback_increment(&self, key: &K) {
         let mut entries = self.entries.write().await;
         let should_remove = if let Some(entry) = entries.get_mut(key) {
