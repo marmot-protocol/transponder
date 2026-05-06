@@ -1045,6 +1045,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_invalid_token_failure_is_deduplicated_on_replay() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let event = scenarios::empty_notification(&server_keys, &sender_keys).await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_notification_parse_duration_seconds",
+                &[("outcome", OperationOutcome::Failed.as_str())],
+            ),
+            1
+        );
+        assert_eq!(processor.cache_len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_process_multi_token_notification() {
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
