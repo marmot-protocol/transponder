@@ -1,6 +1,8 @@
 /target
 /trees/*
 !/trees/.gitkeep
+/plans/
+/reviews/
 
 # Config files (may contain secrets)
 config/local.toml
