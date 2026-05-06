@@ -11,17 +11,26 @@ env:
 
 permissions:
   contents: read
-  pull-requests: write
-  actions: read
 
 jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      percentage: ${{ steps.coverage.outputs.percentage }}
+      covered: ${{ steps.coverage.outputs.covered }}
+      total: ${{ steps.coverage.outputs.total }}
+      baseline: ${{ steps.compare.outputs.baseline }}
+      decreased: ${{ steps.compare.outputs.decreased }}
+      diff: ${{ steps.compare.outputs.diff }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -48,9 +57,14 @@ jobs:
       - name: Extract coverage percentage
         id: coverage
         run: |
-          COVERAGE=$(jq '.data[0].totals.lines.percent' coverage.json)
-          echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
-          echo "Current coverage: $COVERAGE%"
+          COVERAGE=$(.github/scripts/read-coverage-metric.sh lines.percent coverage.json '.data[0].totals.lines.percent')
+          COVERED=$(.github/scripts/read-coverage-metric.sh lines.covered coverage.json '.data[0].totals.lines.covered')
+          TOTAL=$(.github/scripts/read-coverage-metric.sh lines.count coverage.json '.data[0].totals.lines.count')
+
+          echo "percentage=${COVERAGE}" >> "$GITHUB_OUTPUT"
+          echo "covered=${COVERED}" >> "$GITHUB_OUTPUT"
+          echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
+          echo "Current coverage: ${COVERAGE}%"
 
       - name: Upload coverage JSON artifact
         uses: actions/upload-artifact@v4
@@ -76,31 +90,32 @@ jobs:
         id: compare
         run: |
           if [ -f baseline/coverage.json ]; then
-            BASELINE=$(jq '.data[0].totals.lines.percent' baseline/coverage.json)
-            CURRENT=$(jq '.data[0].totals.lines.percent' coverage.json)
-            
-            echo "baseline=$BASELINE" >> $GITHUB_OUTPUT
-            echo "Baseline coverage (master): $BASELINE%"
-            echo "Current coverage (PR): $CURRENT%"
-            
+            BASELINE=$(.github/scripts/read-coverage-metric.sh lines.percent baseline/coverage.json '.data[0].totals.lines.percent')
+            CURRENT=$(.github/scripts/read-coverage-metric.sh lines.percent coverage.json '.data[0].totals.lines.percent')
+            DIFF=""
+
+            echo "baseline=${BASELINE}" >> "$GITHUB_OUTPUT"
+            echo "Baseline coverage (master): ${BASELINE}%"
+            echo "Current coverage (PR): ${CURRENT}%"
+
             # Compare using awk for floating point comparison
-            DECREASED=$(awk "BEGIN {print ($CURRENT < $BASELINE) ? 1 : 0}")
-            
+            DECREASED=$(awk -v current="$CURRENT" -v baseline="$BASELINE" 'BEGIN {print (current < baseline) ? 1 : 0}')
+
             if [ "$DECREASED" -eq 1 ]; then
-              DIFF=$(awk "BEGIN {printf \"%.2f\", $BASELINE - $CURRENT}")
-              echo "::error::Coverage decreased by ${DIFF}% (from ${BASELINE}% to ${CURRENT}%)"
-              echo "Coverage must not decrease. Please add tests to maintain or improve coverage."
-              echo "decreased=true" >> $GITHUB_OUTPUT
-              exit 1
+              DIFF=$(awk -v current="$CURRENT" -v baseline="$BASELINE" 'BEGIN {printf "%.2f", baseline - current}')
+              echo "decreased=true" >> "$GITHUB_OUTPUT"
             else
-              DIFF=$(awk "BEGIN {printf \"%.2f\", $CURRENT - $BASELINE}")
+              DIFF=$(awk -v current="$CURRENT" -v baseline="$BASELINE" 'BEGIN {printf "%.2f", current - baseline}')
               echo "Coverage change: +${DIFF}%"
-              echo "decreased=false" >> $GITHUB_OUTPUT
+              echo "decreased=false" >> "$GITHUB_OUTPUT"
             fi
+
+            echo "diff=${DIFF}" >> "$GITHUB_OUTPUT"
           else
             echo "No baseline coverage found on master. Skipping comparison."
-            echo "baseline=N/A" >> $GITHUB_OUTPUT
-            echo "decreased=false" >> $GITHUB_OUTPUT
+            echo "baseline=N/A" >> "$GITHUB_OUTPUT"
+            echo "decreased=false" >> "$GITHUB_OUTPUT"
+            echo "diff=0.00" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Generate HTML report
@@ -113,65 +128,119 @@ jobs:
           path: target/llvm-cov/html
           retention-days: 30
 
+      - name: Fail if coverage decreased
+        if: github.event_name == 'pull_request' && steps.compare.outputs.decreased == 'true'
+        run: |
+          echo "::error::Coverage decreased by ${{ steps.compare.outputs.diff }}% (from ${{ steps.compare.outputs.baseline }}% to ${{ steps.coverage.outputs.percentage }}%)"
+          echo "Coverage must not decrease. Please add tests to maintain or improve coverage."
+          exit 1
+
+  coverage-comment:
+    name: Coverage Comment
+    runs-on: ubuntu-latest
+    needs: coverage
+    if: github.event_name == 'pull_request' && always()
+    permissions:
+      pull-requests: write
+    steps:
       - name: Add coverage comment to PR
-        if: github.event_name == 'pull_request' && always()
         uses: actions/github-script@v7
+        env:
+          COVERAGE_PERCENT: ${{ needs.coverage.outputs.percentage }}
+          COVERED_LINES: ${{ needs.coverage.outputs.covered }}
+          TOTAL_LINES: ${{ needs.coverage.outputs.total }}
+          BASELINE_PERCENT: ${{ needs.coverage.outputs.baseline }}
+          COVERAGE_DECREASED: ${{ needs.coverage.outputs.decreased }}
         with:
           script: |
-            const fs = require('fs');
-            const coverage = JSON.parse(fs.readFileSync('coverage.json', 'utf8'));
-            const percent = coverage.data[0].totals.lines.percent.toFixed(2);
-            const covered = coverage.data[0].totals.lines.covered;
-            const total = coverage.data[0].totals.lines.count;
-            
-            let baselineInfo = '';
-            const baseline = '${{ steps.compare.outputs.baseline }}';
-            const decreased = '${{ steps.compare.outputs.decreased }}';
-            
-            if (baseline && baseline !== 'N/A') {
-              const diff = (parseFloat(percent) - parseFloat(baseline)).toFixed(2);
-              const sign = diff >= 0 ? '+' : '';
-              const status = decreased === 'true' ? ' :x:' : ' :white_check_mark:';
-              baselineInfo = `| Change from master | **${sign}${diff}%**${status} |`;
+            const readNumber = (name, options = {}) => {
+              const raw = process.env[name];
+              if (!raw) {
+                return null;
+              }
+
+              const value = Number(raw);
+              if (!Number.isFinite(value)) {
+                throw new Error(`Invalid numeric coverage metric: ${name}`);
+              }
+
+              if (options.integer && !Number.isInteger(value)) {
+                throw new Error(`Invalid integer coverage metric: ${name}`);
+              }
+
+              return value;
+            };
+
+            const percentValue = readNumber('COVERAGE_PERCENT');
+            const coveredValue = readNumber('COVERED_LINES', { integer: true });
+            const totalValue = readNumber('TOTAL_LINES', { integer: true });
+
+            if (percentValue === null || coveredValue === null || totalValue === null) {
+              core.warning('Coverage metrics were not available; skipping PR coverage comment.');
+              return;
             }
-            
+
+            const percent = percentValue.toFixed(2);
+            const covered = coveredValue.toString();
+            const total = totalValue.toString();
+
+            let baselineInfo = '';
+            const baselineRaw = process.env.BASELINE_PERCENT;
+            const decreased = process.env.COVERAGE_DECREASED;
+
+            if (baselineRaw && baselineRaw !== 'N/A') {
+              const baselineValue = Number(baselineRaw);
+              if (!Number.isFinite(baselineValue)) {
+                throw new Error('Invalid numeric coverage metric: BASELINE_PERCENT');
+              }
+
+              const diffValue = Number((percentValue - baselineValue).toFixed(2));
+              const sign = diffValue > 0 ? '+' : '';
+              const status = decreased === 'true' ? ' :x:' : ' :white_check_mark:';
+              baselineInfo = `| Change from master | **${sign}${diffValue.toFixed(2)}%**${status} |`;
+            }
+
             const statusEmoji = decreased === 'true' ? ':x:' : ':white_check_mark:';
-            
-            const body = `## ${statusEmoji} Code Coverage Report
-            
-            | Metric | Value |
-            |--------|-------|
-            | Line Coverage | **${percent}%** |
-            | Lines Covered | ${covered} / ${total} |
-            ${baselineInfo}
-            
-            ${decreased === 'true' ? '> :warning: **Coverage has decreased!** Please add tests to maintain or improve coverage.' : ''}
-            
-            <details>
-            <summary>View detailed coverage</summary>
-            
-            Download the \`coverage-html\` artifact from this workflow run to view the detailed coverage report.
-            
-            Or run locally:
-            \`\`\`bash
-            cargo llvm-cov --html
-            open target/llvm-cov/html/index.html
-            \`\`\`
-            
-            </details>`;
-            
+            const commentMarker = '<!-- transponder-coverage-report -->';
+
+            const body = [
+              commentMarker,
+              `## ${statusEmoji} Code Coverage Report`,
+              '',
+              '| Metric | Value |',
+              '|--------|-------|',
+              `| Line Coverage | **${percent}%** |`,
+              `| Lines Covered | ${covered} / ${total} |`,
+              ...(baselineInfo ? [baselineInfo] : []),
+              '',
+              ...(decreased === 'true'
+                ? ['> :warning: **Coverage has decreased!** Please add tests to maintain or improve coverage.', '']
+                : []),
+              '<details>',
+              '<summary>View detailed coverage</summary>',
+              '',
+              'Download the `coverage-html` artifact from this workflow run to view the detailed coverage report.',
+              '',
+              'Or run locally:',
+              '```bash',
+              'cargo llvm-cov --html',
+              'open target/llvm-cov/html/index.html',
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
             // Find existing comment
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-            
+
             const botComment = comments.find(comment => 
-              comment.user.type === 'Bot' && 
-              comment.body.includes('Code Coverage Report')
+              comment.body.includes(commentMarker)
             );
-            
+
             if (botComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
