@@ -66,14 +66,14 @@ struct OAuthClaims {
 }
 
 /// OAuth2 token request.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct TokenRequest {
     grant_type: String,
     assertion: Zeroizing<String>,
 }
 
 /// OAuth2 token response.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[allow(dead_code)]
 struct TokenResponse {
     access_token: Zeroizing<String>,
