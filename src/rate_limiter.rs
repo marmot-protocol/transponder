@@ -172,6 +172,25 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         RateLimitResult::Allowed
     }
 
+    /// Rolls back one previously allowed increment for a key.
+    ///
+    /// This is used when downstream admission fails after a rate-limit check
+    /// has already reserved capacity for work that will not run.
+    pub async fn rollback_increment(&self, key: &K) {
+        let mut entries = self.entries.write().await;
+        let should_remove = if let Some(entry) = entries.get_mut(key) {
+            entry.minute_count = entry.minute_count.saturating_sub(1);
+            entry.hour_count = entry.hour_count.saturating_sub(1);
+            entry.minute_count == 0 && entry.hour_count == 0
+        } else {
+            false
+        };
+
+        if should_remove {
+            entries.pop(key);
+        }
+    }
+
     /// Removes stale entries that haven't been accessed recently.
     ///
     /// Entries are considered stale if both windows have expired
@@ -256,6 +275,23 @@ mod tests {
 
         // Different key should still work
         assert!(limiter.check_and_increment(&2u64).await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_rollback_increment_refunds_allowed_request() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1,
+            max_per_hour: 1,
+            max_entries: 100,
+        });
+
+        assert!(limiter.check_and_increment(&1u64).await.is_allowed());
+        assert!(!limiter.check_and_increment(&1u64).await.is_allowed());
+
+        limiter.rollback_increment(&1u64).await;
+
+        assert_eq!(limiter.len().await, 0);
+        assert!(limiter.check_and_increment(&1u64).await.is_allowed());
     }
 
     #[tokio::test]

@@ -261,7 +261,20 @@ impl EventProcessor {
 
     /// Returns true when an event failed in a way replaying it cannot fix.
     fn should_mark_failed_event_seen(error: &Error) -> bool {
-        matches!(error, Error::Crypto(_) | Error::InvalidToken(_))
+        match error {
+            Error::Crypto(_) | Error::InvalidToken(_) => true,
+            Error::Config(_)
+            | Error::Nostr(_)
+            | Error::Apns(_)
+            | Error::Fcm(_)
+            | Error::Dispatch(_)
+            | Error::Io(_)
+            | Error::Http(_)
+            | Error::Json(_)
+            | Error::Jwt(_)
+            | Error::Base64(_)
+            | Error::Hex(_) => false,
+        }
     }
 
     /// Inner processing logic for an event.
@@ -332,6 +345,7 @@ impl EventProcessor {
         // Rate limiting happens BEFORE decryption intentionally:
         // Prevents wasting CPU on tokens we'll immediately rate-limit anyway.
         let mut payloads = Vec::with_capacity(token_bytes.len());
+        let mut admitted_rate_limit_keys = Vec::with_capacity(token_bytes.len());
         for bytes in token_bytes {
             // Rate limit check 1: encrypted token (replay protection)
             let encrypted_key = Self::hash_bytes(&bytes);
@@ -394,6 +408,7 @@ impl EventProcessor {
                 continue;
             }
 
+            admitted_rate_limit_keys.push((encrypted_key, device_key));
             payloads.push(payload);
         }
 
@@ -418,6 +433,15 @@ impl EventProcessor {
                 Ok(count)
             }
             Err(e) => {
+                for (encrypted_key, device_key) in &admitted_rate_limit_keys {
+                    self.encrypted_token_limiter
+                        .rollback_increment(encrypted_key)
+                        .await;
+                    self.device_token_limiter
+                        .rollback_increment(device_key)
+                        .await;
+                }
+
                 if let Some(ref m) = self.metrics {
                     m.observe_push_dispatch_admission_duration(
                         OperationOutcome::Failed,
@@ -623,6 +647,17 @@ mod tests {
     async fn create_processor_with_shutdown_dispatcher_metrics(
         server_keys: &Keys,
     ) -> (EventProcessor, Metrics) {
+        create_processor_with_shutdown_dispatcher_metrics_and_rate_limits(
+            server_keys,
+            TokenRateLimitConfig::default(),
+        )
+        .await
+    }
+
+    async fn create_processor_with_shutdown_dispatcher_metrics_and_rate_limits(
+        server_keys: &Keys,
+        rate_limit_config: TokenRateLimitConfig,
+    ) -> (EventProcessor, Metrics) {
         let nip59_handler = Nip59Handler::new(server_keys.clone());
         let mut secp_secret_key =
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
@@ -650,7 +685,7 @@ mod tests {
                 token_decryptor,
                 push_dispatcher,
                 DEFAULT_MAX_DEDUP_CACHE_SIZE,
-                TokenRateLimitConfig::default(),
+                rate_limit_config,
                 Some(metrics.clone()),
             ),
             metrics,
@@ -996,6 +1031,47 @@ mod tests {
         assert_eq!(
             counter_value(&metrics, "transponder_events_failed_total", &[]),
             2.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            0.0
+        );
+        assert_eq!(processor.cache_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_dispatch_failure_does_not_spend_rate_limit_budget() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+
+        let (processor, metrics) =
+            create_processor_with_shutdown_dispatcher_metrics_and_rate_limits(
+                &server_keys,
+                TokenRateLimitConfig {
+                    max_cache_size: 100,
+                    max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                    encrypted_token_per_minute: 1,
+                    encrypted_token_per_hour: 1,
+                    device_token_per_minute: 1,
+                    device_token_per_hour: 1,
+                },
+            )
+            .await;
+
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            2.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            0.0
         );
         assert_eq!(
             counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
