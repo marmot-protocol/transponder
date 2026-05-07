@@ -3,6 +3,7 @@
 //! Handles connections to ClearNet relays, optional Tor relays, subscription
 //! management, and automatic reconnection.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use nostr_sdk::RelayStatus as NostrRelayStatus;
 /// reduce timing correlation. Relay subscriptions must look back by the same
 /// window or relays will filter out compliant gift wraps before delivery.
 const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end;
+const INBOX_RELAY_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(feature = "tor")]
 const TOR_FEATURE_ENABLED: bool = true;
@@ -248,20 +250,34 @@ impl RelayClient {
 
     /// Publish a kind 10050 event to advertise inbox relays.
     pub async fn publish_inbox_relays(&self) -> Result<()> {
-        let relay_urls: Vec<Tag> = self
-            .config
-            .clearnet
-            .iter()
-            .chain(self.config.onion.iter())
-            .map(|url| Tag::custom(TagKind::Relay, [url.as_str()]))
-            .collect();
+        let relay_urls = self.configured_inbox_relays();
 
         if relay_urls.is_empty() {
             warn!("No relays configured for kind 10050 publication");
             return Ok(());
         }
 
-        let builder = EventBuilder::new(Kind::Custom(10050), "").tags(relay_urls);
+        let event_is_current = match self.inbox_relay_event_is_current(&relay_urls).await {
+            Ok(current) => current,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Skipping kind 10050 publish; could not verify existing inbox relay list"
+                );
+                return Ok(());
+            }
+        };
+
+        if event_is_current {
+            info!("Skipping kind 10050 publish; inbox relay list unchanged");
+            return Ok(());
+        }
+
+        let relay_tags: Vec<Tag> = relay_urls
+            .iter()
+            .map(|url| Tag::custom(TagKind::Relay, [url.as_str()]))
+            .collect();
+        let builder = EventBuilder::new(Kind::Custom(10050), "").tags(relay_tags);
 
         match self.client.send_event_builder(builder).await {
             Ok(output) => {
@@ -274,6 +290,47 @@ impl RelayClient {
 
         Ok(())
     }
+
+    fn configured_inbox_relays(&self) -> BTreeSet<String> {
+        self.config
+            .clearnet
+            .iter()
+            .chain(self.config.onion.iter())
+            .cloned()
+            .collect()
+    }
+
+    async fn inbox_relay_event_is_current(&self, relay_urls: &BTreeSet<String>) -> Result<bool> {
+        let public_key = self
+            .client
+            .public_key()
+            .await
+            .map_err(|e| Error::Nostr(format!("Failed to get signer public key: {e}")))?;
+
+        let filter = Filter::new()
+            .kind(Kind::Custom(10050))
+            .author(public_key)
+            .limit(1);
+        let events = self
+            .client
+            .fetch_events(filter, INBOX_RELAY_FETCH_TIMEOUT)
+            .await
+            .map_err(|e| Error::Nostr(format!("Failed to fetch existing kind 10050 event: {e}")))?;
+
+        Ok(events
+            .first()
+            .is_some_and(|event| inbox_relay_tags(event) == *relay_urls))
+    }
+}
+
+fn inbox_relay_tags(event: &Event) -> BTreeSet<String> {
+    event
+        .tags
+        .as_slice()
+        .iter()
+        .filter(|tag| tag.kind() == TagKind::Relay)
+        .filter_map(|tag| tag.content().map(str::to_owned))
+        .collect()
 }
 
 fn validate_relay_config(config: &RelayConfig) -> Result<()> {
@@ -629,6 +686,73 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         client.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_publish_inbox_relays_skips_when_existing_relay_list_matches() {
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+        let relay_url_string = relay_url.to_string();
+
+        let keys = Keys::generate();
+        let original_event = EventBuilder::new(Kind::Custom(10050), "")
+            .tag(Tag::custom(TagKind::Relay, [relay_url_string.as_str()]))
+            .custom_created_at(Timestamp::from_secs(1_700_000_000))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let publisher = Client::builder().signer(keys.clone()).build();
+        publisher.add_relay(&relay_url).await.unwrap();
+        publisher.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        publisher.send_event(&original_event).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = RelayConfig {
+            clearnet: vec![relay_url_string],
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        let client = RelayClient::new(keys.clone(), config).await.unwrap();
+        client.client.add_relay(&relay_url).await.unwrap();
+        client.client.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let result = client.publish_inbox_relays().await;
+        assert!(result.is_ok());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let observer = Client::builder().signer(Keys::generate()).build();
+        observer.add_relay(&relay_url).await.unwrap();
+        observer.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let events = observer
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(10050))
+                    .author(keys.public_key())
+                    .limit(1),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        let latest = events.first().expect("kind 10050 event should exist");
+
+        assert_eq!(
+            latest.id, original_event.id,
+            "matching relay list must not be republished with a fresh timestamp"
+        );
+        assert_eq!(latest.created_at, original_event.created_at);
+
+        client.disconnect().await.unwrap();
+        publisher.disconnect().await;
+        observer.disconnect().await;
     }
 
     #[cfg(feature = "tor")]
