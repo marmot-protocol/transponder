@@ -21,7 +21,7 @@ shutdown_timeout_secs = 10
 # max_dedup_cache_size = 100000
 
 # Maximum size for rate limit caches (encrypted_token and device_token).
-# Each cache uses LRU eviction to prevent unbounded memory growth.
+# Unknown keys are rate limited at capacity until cleanup removes stale entries.
 # Default: 100000 entries per cache
 # max_rate_limit_cache_size = 100000
 

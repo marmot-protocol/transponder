@@ -23,6 +23,7 @@ Why these numbers make sense today:
 - the dispatcher allows up to 100 concurrent outbound push requests
 - the push queue is bounded at 10,000 pending notifications
 - the event deduplication and rate-limit caches default to 100,000 entries each
+- new rate-limit keys are rejected at capacity, so size these caches with headroom for legitimate unique devices and adversarial noise
 - Tor adds noticeable memory and connection-management overhead, which is why the default build leaves it disabled
 
 If you need to run on a smaller VM, lower the cache sizes in `config/production.toml`.

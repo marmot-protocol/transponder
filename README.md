@@ -64,7 +64,7 @@ shutdown_timeout_secs = 10
 # max_dedup_cache_size = 100000
 
 # Rate limiting to prevent spam and replay attacks
-# max_rate_limit_cache_size = 100000           # LRU cache size per limiter
+# max_rate_limit_cache_size = 100000           # Tracked keys per limiter
 # max_tokens_per_event = 100                   # Per notification event
 # encrypted_token_rate_limit_per_minute = 240  # Per encrypted token (replay protection)
 # encrypted_token_rate_limit_per_hour = 5000
@@ -372,9 +372,9 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 |--------|------|--------|-------------|
 | `transponder_tokens_rate_limited_total` | Counter | `type`, `reason` | Tokens skipped due to rate limiting |
 | `transponder_rate_limit_cache_size` | Gauge | `type` | Current rate limit cache size |
-| `transponder_rate_limit_evictions_total` | Counter | `type` | Rate limit cache evictions |
+| `transponder_rate_limit_evictions_total` | Counter | `type` | Stale rate limit entries removed during cleanup |
 
-Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute` or `hour`
+Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute`, `hour`, or `capacity`
 
 `outcome` values vary by metric group:
 - Event processing: `processed`, `duplicate`, `failed`
