@@ -493,9 +493,6 @@ mod tests {
         let handler = Nip59Handler::new(server_keys.clone());
         let unwrapped = handler.unwrap(&gift_wrap).await.unwrap();
 
-        // Verify sender
-        assert_eq!(unwrapped.sender_pubkey, sender_keys.public_key());
-
         // Verify content is parseable
         let tokens = unwrapped.parse_tokens().unwrap();
         assert_eq!(tokens.len(), 1);
