@@ -257,7 +257,18 @@ impl RelayClient {
             return Ok(());
         }
 
-        if self.inbox_relay_event_is_current(&relay_urls).await? {
+        let event_is_current = match self.inbox_relay_event_is_current(&relay_urls).await {
+            Ok(current) => current,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Skipping kind 10050 publish; could not verify existing inbox relay list"
+                );
+                return Ok(());
+            }
+        };
+
+        if event_is_current {
             info!("Skipping kind 10050 publish; inbox relay list unchanged");
             return Ok(());
         }
