@@ -78,6 +78,10 @@ clearnet = [
     "wss://nos.lol"
 ]
 
+# Reject ws:// ClearNet relays by default. Enable only for local development
+# with loopback/mock relays that cannot serve TLS.
+allow_unencrypted_clearnet_relays = false
+
 # Tor/onion relays (optional)
 # Requires a build with `--features tor` and a host that can support Tor traffic
 onion = []
@@ -479,6 +483,7 @@ The server private key is critical:
 ### Network Security
 
 - **TLS everywhere**: All connections to relays, APNs, and FCM use TLS
+- **Relay TLS enforcement**: ClearNet relay URLs must use `wss://`; `ws://` requires an explicit local-development opt-in
 - **Health endpoint exposure**: Keep the default localhost bind (`127.0.0.1:8080`) unless an internal proxy, VPN, or load balancer needs it
 - **Firewall rules**: Only expose port 8080 if health checks are needed externally
 - **Prefer localhost binds** in Compose and publish through a reverse proxy only when needed

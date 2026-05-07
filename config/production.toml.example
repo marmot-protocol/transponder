@@ -27,6 +27,9 @@ clearnet = [
     "wss://nos.lol",
 ]
 
+# Keep false in production. ClearNet relay URLs must use wss://.
+allow_unencrypted_clearnet_relays = false
+
 # Add onion relays only if you intend to run a Tor-enabled build and can spare
 # additional memory/CPU for Tor circuits.
 # Build with: docker build --build-arg CARGO_FEATURES='--features tor' -t transponder:local .

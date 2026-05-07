@@ -209,6 +209,7 @@ mod tests {
         let keys = Keys::generate();
         let relay_config = RelayConfig {
             clearnet: vec![relay_url.to_string()],
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -267,6 +268,7 @@ mod tests {
         let keys = Keys::generate();
         let relay_config = RelayConfig {
             clearnet: vec![relay_url.to_string()],
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -324,6 +326,7 @@ mod tests {
         let keys = Keys::generate();
         let relay_config = RelayConfig {
             clearnet: vec![relay_url.to_string()],
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -366,6 +369,7 @@ mod tests {
         let keys = Keys::generate();
         let relay_config = RelayConfig {
             clearnet: vec![relay_url.to_string()],
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -410,6 +414,7 @@ mod tests {
         let keys = Keys::generate();
         let relay_config = RelayConfig {
             clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 1,
@@ -464,6 +469,7 @@ mod tests {
         let keys = Keys::generate();
         let relay_config = RelayConfig {
             clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 1,
@@ -523,6 +529,7 @@ mod tests {
         let keys = Keys::generate();
         let relay_config = RelayConfig {
             clearnet: vec![relay_url.to_string()],
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
