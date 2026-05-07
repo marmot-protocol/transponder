@@ -334,6 +334,30 @@ fn inbox_relay_tags(event: &Event) -> BTreeSet<String> {
 }
 
 fn validate_relay_config(config: &RelayConfig) -> Result<()> {
+    for url in &config.clearnet {
+        if clearnet_relay_uses_tls(url) {
+            continue;
+        }
+
+        if clearnet_relay_uses_plaintext_ws(url) {
+            if config.allow_unencrypted_clearnet_relays {
+                warn!(
+                    relay = %url,
+                    "Unencrypted ClearNet relay URL explicitly allowed; use only for local development"
+                );
+                continue;
+            }
+
+            return Err(Error::Nostr(format!(
+                "ClearNet relay '{url}' must use wss://; set relays.allow_unencrypted_clearnet_relays=true only for local development"
+            )));
+        }
+
+        return Err(Error::Nostr(format!(
+            "ClearNet relay '{url}' must use wss://"
+        )));
+    }
+
     if !TOR_FEATURE_ENABLED && !config.onion.is_empty() {
         return Err(Error::Nostr(
             "Onion relays are configured, but this build does not include Tor support. Rebuild with `--features tor`.".to_string(),
@@ -341,6 +365,18 @@ fn validate_relay_config(config: &RelayConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn clearnet_relay_uses_tls(url: &str) -> bool {
+    clearnet_relay_scheme(url).is_some_and(|scheme| scheme.eq_ignore_ascii_case("wss"))
+}
+
+fn clearnet_relay_uses_plaintext_ws(url: &str) -> bool {
+    clearnet_relay_scheme(url).is_some_and(|scheme| scheme.eq_ignore_ascii_case("ws"))
+}
+
+fn clearnet_relay_scheme(url: &str) -> Option<&str> {
+    url.split_once("://").map(|(scheme, _)| scheme)
 }
 
 #[cfg(test)]
@@ -382,11 +418,57 @@ mod tests {
     fn test_relay_config(clearnet: Vec<String>) -> RelayConfig {
         RelayConfig {
             clearnet,
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5, // Short timeout for tests
         }
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_rejects_unencrypted_clearnet_relays() {
+        let keys = Keys::generate();
+        let config = RelayConfig {
+            clearnet: vec!["ws://relay.example.com".to_string()],
+            allow_unencrypted_clearnet_relays: false,
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        let result = RelayClient::new(keys, config).await;
+
+        assert!(result.is_err());
+        let err = result
+            .err()
+            .expect("ws:// clearnet relay should be rejected");
+        assert!(err.to_string().contains("must use wss://"));
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_allows_unencrypted_clearnet_relays_when_enabled() {
+        let keys = Keys::generate();
+        let config = test_relay_config(vec!["ws://127.0.0.1:12345".to_string()]);
+
+        let result = RelayClient::new(keys, config).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_rejects_malformed_clearnet_relay_even_when_unencrypted_enabled() {
+        let keys = Keys::generate();
+        let config = test_relay_config(vec!["relay.example.com".to_string()]);
+
+        let result = RelayClient::new(keys, config).await;
+
+        assert!(result.is_err());
+        let err = result
+            .err()
+            .expect("malformed clearnet relay should be rejected");
+        assert!(err.to_string().contains("must use wss://"));
     }
 
     #[tokio::test]
@@ -512,6 +594,7 @@ mod tests {
         let keys = Keys::generate();
         let config = RelayConfig {
             clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -641,6 +724,7 @@ mod tests {
         let keys = Keys::generate();
         let config = RelayConfig {
             clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -665,6 +749,7 @@ mod tests {
         let keys = Keys::generate();
         let config = RelayConfig {
             clearnet: vec![relay_url.to_string()],
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -712,6 +797,7 @@ mod tests {
 
         let config = RelayConfig {
             clearnet: vec![relay_url_string],
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -761,6 +847,7 @@ mod tests {
         let keys = Keys::generate();
         let config = RelayConfig {
             clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
             onion: vec!["ws://example.onion".to_string()],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -781,6 +868,7 @@ mod tests {
         let keys = Keys::generate();
         let config = RelayConfig {
             clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -799,6 +887,7 @@ mod tests {
         let keys = Keys::generate();
         let config = RelayConfig {
             clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -820,6 +909,7 @@ mod tests {
         let keys = Keys::generate();
         let config = RelayConfig {
             clearnet: vec![relay_url.to_string()],
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -845,6 +935,7 @@ mod tests {
         let config = RelayConfig {
             // Use a relay URL that won't connect
             clearnet: vec!["ws://192.0.2.1:9999".to_string()], // TEST-NET address, won't route
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,

@@ -703,6 +703,7 @@ mod tests {
     fn validate_startup_config_rejects_missing_private_key() {
         let relays = config::RelayConfig {
             clearnet: vec!["wss://relay.example.com".to_string()],
+            allow_unencrypted_clearnet_relays: false,
             onion: Vec::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -718,6 +719,7 @@ mod tests {
     fn validate_startup_config_rejects_missing_relays() {
         let relays = config::RelayConfig {
             clearnet: Vec::new(),
+            allow_unencrypted_clearnet_relays: false,
             onion: Vec::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -734,6 +736,7 @@ mod tests {
     fn validate_startup_config_rejects_onion_relays_without_tor_feature() {
         let relays = config::RelayConfig {
             clearnet: vec!["wss://relay.example.com".to_string()],
+            allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
@@ -750,6 +753,7 @@ mod tests {
     fn validate_startup_config_accepts_onion_only_relays() {
         let relays = config::RelayConfig {
             clearnet: Vec::new(),
+            allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,

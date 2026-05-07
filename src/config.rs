@@ -182,6 +182,13 @@ pub struct RelayConfig {
     #[serde(default)]
     pub clearnet: Vec<String>,
 
+    /// Whether unencrypted ws:// ClearNet relay URLs are allowed.
+    ///
+    /// This should remain false in production. It exists for local development
+    /// and tests that use loopback mock relays without TLS.
+    #[serde(default)]
+    pub allow_unencrypted_clearnet_relays: bool,
+
     /// Tor/onion relay URLs.
     #[serde(default)]
     pub onion: Vec<String>,
@@ -348,6 +355,7 @@ fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
             DEFAULT_RATE_LIMIT_PER_HOUR as i64,
         )?
         .set_default("relays.clearnet", Vec::<String>::new())?
+        .set_default("relays.allow_unencrypted_clearnet_relays", false)?
         .set_default("relays.onion", Vec::<String>::new())?
         .set_default("relays.reconnect_interval_secs", 5)?
         .set_default("relays.max_reconnect_attempts", 10)?
@@ -452,6 +460,7 @@ fn is_supported_config_key(config_key: &str) -> bool {
                 | "server.encrypted_token_rate_limit_per_hour"
                 | "server.device_token_rate_limit_per_minute"
                 | "server.device_token_rate_limit_per_hour"
+                | "relays.allow_unencrypted_clearnet_relays"
                 | "relays.reconnect_interval_secs"
                 | "relays.max_reconnect_attempts"
                 | "relays.connection_timeout_secs"
@@ -645,6 +654,7 @@ mod tests {
         assert_eq!(config.server.private_key.as_str(), "abc123");
         assert_eq!(config.server.shutdown_timeout_secs, 10); // default
         assert_eq!(config.relays.clearnet.len(), 1);
+        assert!(!config.relays.allow_unencrypted_clearnet_relays);
         assert!(!config.apns.enabled);
         assert!(!config.fcm.enabled);
         assert!(config.metrics.enabled);
@@ -747,6 +757,7 @@ mod tests {
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.relays.clearnet.len(), 2);
         assert_eq!(config.relays.onion.len(), 1);
+        assert!(!config.relays.allow_unencrypted_clearnet_relays);
         assert_eq!(config.relays.reconnect_interval_secs, 10);
         assert_eq!(config.relays.max_reconnect_attempts, 5);
         assert!(config.apns.enabled);
@@ -776,6 +787,7 @@ mod tests {
         assert_eq!(config.server.shutdown_timeout_secs, 10);
         assert!(config.relays.clearnet.is_empty());
         assert!(config.relays.onion.is_empty());
+        assert!(!config.relays.allow_unencrypted_clearnet_relays);
         assert_eq!(config.relays.reconnect_interval_secs, 5);
         assert_eq!(config.relays.max_reconnect_attempts, 10);
         assert_eq!(config.relays.connection_timeout_secs, 30);
@@ -806,6 +818,7 @@ mod tests {
         assert_eq!(config.server.shutdown_timeout_secs, 10);
         assert!(config.relays.clearnet.is_empty());
         assert!(config.relays.onion.is_empty());
+        assert!(!config.relays.allow_unencrypted_clearnet_relays);
         assert_eq!(config.relays.reconnect_interval_secs, 5);
         assert_eq!(config.relays.max_reconnect_attempts, 10);
         assert_eq!(config.relays.connection_timeout_secs, 30);
@@ -825,6 +838,10 @@ mod tests {
             ("TRANSPONDER_SERVER_SHUTDOWN_TIMEOUT_SECS", "30"),
             ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "50000"),
             ("TRANSPONDER_SERVER_MAX_TOKENS_PER_EVENT", "25"),
+            (
+                "TRANSPONDER_RELAYS_ALLOW_UNENCRYPTED_CLEARNET_RELAYS",
+                "true",
+            ),
             ("TRANSPONDER_APNS_KEY_ID", "KEY123"),
             ("TRANSPONDER_HEALTH_BIND_ADDRESS", "127.0.0.1:9090"),
         ])
@@ -834,6 +851,7 @@ mod tests {
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.server.max_dedup_cache_size, 50_000);
         assert_eq!(config.server.max_tokens_per_event, 25);
+        assert!(config.relays.allow_unencrypted_clearnet_relays);
         assert_eq!(config.apns.key_id, "KEY123");
         assert_eq!(config.health.bind_address, "127.0.0.1:9090");
     }

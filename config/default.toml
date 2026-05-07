@@ -53,6 +53,10 @@ clearnet = [
     "wss://nos.lol"
 ]
 
+# Reject ws:// ClearNet relays by default. Enable only for local development
+# with loopback/mock relays that cannot serve TLS.
+allow_unencrypted_clearnet_relays = false
+
 # Tor/onion relays (optional)
 # Requires a binary built with: cargo build --features tor
 onion = []
