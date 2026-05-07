@@ -27,7 +27,7 @@ jobs:
       decreased: ${{ steps.compare.outputs.decreased }}
       diff: ${{ steps.compare.outputs.diff }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -41,7 +41,7 @@ jobs:
         uses: taiki-e/install-action@e5de28abeb52d916c5e5875d54b21a9e738b61ec # cargo-llvm-cov
 
       - name: Cache cargo registry
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: |
             ~/.cargo/registry
@@ -67,7 +67,7 @@ jobs:
           echo "Current coverage: ${COVERAGE}%"
 
       - name: Upload coverage JSON artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage-json-${{ github.event_name == 'push' && 'master' || github.event.number }}
           path: coverage.json
@@ -77,7 +77,7 @@ jobs:
       - name: Download baseline coverage from master
         if: github.event_name == 'pull_request'
         id: download-baseline
-        uses: dawidd6/action-download-artifact@bf251b5aa9c2f7eeb574a96ee720e24f801b7c11 # v6
+        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151 # v21
         with:
           workflow: coverage.yml
           branch: master
@@ -122,7 +122,7 @@ jobs:
         run: cargo llvm-cov --all-features --html
 
       - name: Upload HTML coverage report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage-html
           path: target/llvm-cov/html
@@ -144,7 +144,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Add coverage comment to PR
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
         env:
           COVERAGE_PERCENT: ${{ needs.coverage.outputs.percentage }}
           COVERED_LINES: ${{ needs.coverage.outputs.covered }}
