@@ -77,13 +77,9 @@ impl Nip59Handler {
             )));
         }
 
-        // Extract the sender's public key
-        let sender_pubkey = unwrapped.sender;
-
         let rumor = unwrapped.rumor;
 
         Ok(UnwrappedNotification {
-            sender_pubkey,
             content: rumor.content,
             tags: rumor.tags,
             created_at: rumor.created_at,
@@ -92,11 +88,8 @@ impl Nip59Handler {
 }
 
 /// Unwrapped notification request data.
-#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct UnwrappedNotification {
-    /// Public key of the sender.
-    pub sender_pubkey: PublicKey,
     /// Content containing encrypted tokens as a single base64 blob.
     pub content: String,
     /// Rumor tags used for versioning and content encoding validation.
@@ -211,7 +204,6 @@ mod tests {
 
     fn notification(content: String) -> UnwrappedNotification {
         UnwrappedNotification {
-            sender_pubkey: Keys::generate().public_key(),
             content,
             tags: valid_tags(),
             created_at: Timestamp::now(),
@@ -243,7 +235,6 @@ mod tests {
     #[test]
     fn test_parse_rejects_missing_version_tag() {
         let notification = UnwrappedNotification {
-            sender_pubkey: Keys::generate().public_key(),
             content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
             tags: Tags::parse([[TAG_ENCODING, ENCODING_BASE64]]).unwrap(),
             created_at: Timestamp::now(),
@@ -256,6 +247,27 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Missing required v tag")
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_missing_version_tag_value() {
+        let notification = UnwrappedNotification {
+            content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
+            tags: Tags::from_list(vec![
+                Tag::parse([TAG_VERSION]).unwrap(),
+                Tag::parse([TAG_ENCODING, ENCODING_BASE64]).unwrap(),
+            ]),
+            created_at: Timestamp::now(),
+        };
+
+        let result = notification.parse_tokens();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing value for required v tag")
         );
     }
 
@@ -364,7 +376,6 @@ mod tests {
     #[test]
     fn test_parse_rejects_invalid_encoding_tag() {
         let notification = UnwrappedNotification {
-            sender_pubkey: Keys::generate().public_key(),
             content: BASE64_STANDARD.encode(vec![0x11; ENCRYPTED_TOKEN_SIZE]),
             tags: Tags::parse([[TAG_VERSION, VERSION_MIP05_V1], [TAG_ENCODING, "hex"]]).unwrap(),
             created_at: Timestamp::now(),

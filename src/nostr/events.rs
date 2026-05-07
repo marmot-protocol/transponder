@@ -305,10 +305,7 @@ impl EventProcessor {
             }
         };
 
-        trace!(
-            sender = %notification.sender_pubkey,
-            "Unwrapped notification request"
-        );
+        trace!("Unwrapped notification request");
 
         // Parse the encrypted tokens from the content
         let parse_started_at = StageTimer::start();
