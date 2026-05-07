@@ -139,6 +139,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// - `Allowed` if the request is within limits (counters are incremented)
     /// - `ExceededMinuteLimit` if per-minute limit is reached
     /// - `ExceededHourLimit` if per-hour limit is reached
+    /// - `ExceededCapacityLimit` if the cache is full and the key is unknown
     pub async fn check_and_increment(&self, key: &K) -> RateLimitResult {
         let now = Instant::now();
         let mut entries = self.entries.write().await;
@@ -219,6 +220,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         // Collect stale keys (hour window expired)
         let stale: Vec<K> = entries
             .iter()
+            .rev()
             .take(CLEANUP_BATCH_SIZE)
             .filter(|(_, entry)| now.duration_since(entry.hour_window_start) >= hour)
             .map(|(k, _)| k.clone())
@@ -407,6 +409,29 @@ mod tests {
         let stats = limiter.cleanup().await;
         assert_eq!(stats.evicted, 2);
         assert_eq!(stats.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_scans_stale_lru_entries_first() {
+        tokio::time::pause();
+
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: CLEANUP_BATCH_SIZE + 1,
+        });
+
+        for key in 0..=CLEANUP_BATCH_SIZE as u64 {
+            assert!(limiter.check_and_increment(&key).await.is_allowed());
+        }
+
+        tokio::time::advance(Duration::from_secs(3601)).await;
+
+        assert!(limiter.check_and_increment(&0u64).await.is_allowed());
+
+        let stats = limiter.cleanup().await;
+        assert_eq!(stats.evicted, CLEANUP_BATCH_SIZE);
+        assert_eq!(stats.remaining, 1);
     }
 
     #[tokio::test]
