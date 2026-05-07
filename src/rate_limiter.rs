@@ -32,6 +32,8 @@ pub enum RateLimitResult {
     ExceededMinuteLimit,
     /// Exceeded per-hour limit.
     ExceededHourLimit,
+    /// Cache is full and cannot admit a new key safely.
+    ExceededCapacityLimit,
 }
 
 impl RateLimitResult {
@@ -48,6 +50,7 @@ impl RateLimitResult {
             Self::Allowed => None,
             Self::ExceededMinuteLimit => Some("minute"),
             Self::ExceededHourLimit => Some("hour"),
+            Self::ExceededCapacityLimit => Some("capacity"),
         }
     }
 }
@@ -88,7 +91,11 @@ pub struct RateLimitConfig {
     pub max_per_minute: u32,
     /// Maximum requests per hour.
     pub max_per_hour: u32,
-    /// Maximum entries in the cache (LRU eviction).
+    /// Maximum entries in the cache.
+    ///
+    /// Unknown keys are rate limited once this capacity is reached. Existing
+    /// entries remain tracked until their windows expire and cleanup removes
+    /// them.
     pub max_entries: usize,
 }
 
@@ -104,8 +111,9 @@ impl Default for RateLimitConfig {
 
 /// Fixed-window rate limiter with per-minute and per-hour limits.
 ///
-/// Uses an LRU cache to bound memory usage. When the cache is full,
-/// the least recently used entries are evicted.
+/// Uses a bounded cache to limit memory usage. When the cache is full,
+/// unknown keys are rejected until cleanup removes stale entries. This
+/// preserves existing counters under adversarial cache pressure.
 pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
     entries: RwLock<LruCache<K, RateLimitEntry>>,
     max_per_minute: u32,
@@ -135,10 +143,14 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         let now = Instant::now();
         let mut entries = self.entries.write().await;
 
-        // Get or create entry (updates LRU position)
+        // Get or create entry (updates access position). Unknown keys are
+        // rejected at capacity so pressure cannot evict existing counters.
         let entry = if let Some(entry) = entries.get_mut(key) {
             entry
         } else {
+            if entries.len() >= entries.cap().get() {
+                return RateLimitResult::ExceededCapacityLimit;
+            }
             entries.put(key.clone(), RateLimitEntry::new(now));
             entries.get_mut(key).expect("just inserted")
         };
@@ -398,7 +410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lru_eviction() {
+    async fn test_rejects_new_keys_at_capacity() {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
@@ -410,12 +422,41 @@ mod tests {
         limiter.check_and_increment(&3u64).await;
         assert_eq!(limiter.len().await, 3);
 
-        // Adding 4th should evict LRU (key 1)
-        limiter.check_and_increment(&4u64).await;
+        assert_eq!(
+            limiter.check_and_increment(&4u64).await,
+            RateLimitResult::ExceededCapacityLimit
+        );
         assert_eq!(limiter.len().await, 3);
+        assert_eq!(limiter.peek_counts(&1u64).await, Some((1, 1)));
+    }
 
-        // Key 1 should have been evicted
-        assert_eq!(limiter.peek_counts(&1u64).await, None);
+    #[tokio::test]
+    async fn test_cache_pressure_does_not_reset_limited_key() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1,
+            max_per_hour: 100,
+            max_entries: 2,
+        });
+
+        assert_eq!(
+            limiter.check_and_increment(&1u64).await,
+            RateLimitResult::Allowed
+        );
+        assert_eq!(
+            limiter.check_and_increment(&1u64).await,
+            RateLimitResult::ExceededMinuteLimit
+        );
+
+        assert_eq!(
+            limiter.check_and_increment(&2u64).await,
+            RateLimitResult::Allowed
+        );
+        assert!(!limiter.check_and_increment(&3u64).await.is_allowed());
+
+        assert_eq!(
+            limiter.check_and_increment(&1u64).await,
+            RateLimitResult::ExceededMinuteLimit
+        );
     }
 
     #[tokio::test]
@@ -423,6 +464,7 @@ mod tests {
         assert!(RateLimitResult::Allowed.is_allowed());
         assert!(!RateLimitResult::ExceededMinuteLimit.is_allowed());
         assert!(!RateLimitResult::ExceededHourLimit.is_allowed());
+        assert!(!RateLimitResult::ExceededCapacityLimit.is_allowed());
 
         assert_eq!(RateLimitResult::Allowed.limit_reason(), None);
         assert_eq!(
@@ -432,6 +474,10 @@ mod tests {
         assert_eq!(
             RateLimitResult::ExceededHourLimit.limit_reason(),
             Some("hour")
+        );
+        assert_eq!(
+            RateLimitResult::ExceededCapacityLimit.limit_reason(),
+            Some("capacity")
         );
     }
 
