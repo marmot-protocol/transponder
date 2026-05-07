@@ -81,8 +81,7 @@ chmod 700 credentials secrets
 2. Create the server private key secret file:
 
 ```bash
-printf '%s\n' 'YOUR_64_CHAR_HEX_PRIVATE_KEY' > secrets/server_private_key
-chmod 600 secrets/server_private_key
+./target/release/transponder generate-keys --output secrets/server_private_key
 ```
 
 3. Place push credentials in `credentials/`:

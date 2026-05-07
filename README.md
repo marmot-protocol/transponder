@@ -50,9 +50,12 @@ Transponder uses TOML configuration files with environment variable overrides. T
 ```toml
 [server]
 # Server's Nostr private key in hex format (64 hex characters)
-# REQUIRED - Generate with: transponder generate-keys
-# SECURITY: Store in environment variable for production
+# Prefer private_key_file for production secret handling.
 private_key = ""
+
+# Alternative: path to a file containing the private key.
+# Generate with: transponder generate-keys --output /path/to/server.key
+# private_key_file = "/run/secrets/transponder_private_key"
 
 # Graceful shutdown timeout in seconds
 shutdown_timeout_secs = 10
@@ -138,11 +141,14 @@ format = "json"
 
 Override any config value using environment variables with the pattern `TRANSPONDER_<SECTION>_<KEY>`.
 The first underscore after `TRANSPONDER` separates the section from the key, so
-`TRANSPONDER_SERVER_PRIVATE_KEY` maps to `server.private_key`:
+`TRANSPONDER_SERVER_PRIVATE_KEY_FILE` maps to `server.private_key_file`:
 
 ```bash
-# Required: Server private key
-export TRANSPONDER_SERVER_PRIVATE_KEY="your-64-char-hex-private-key"
+# Recommended: mounted server private key file
+export TRANSPONDER_SERVER_PRIVATE_KEY_FILE="/run/secrets/transponder_private_key"
+
+# Also supported, but easier to capture in shell history or logs:
+# export TRANSPONDER_SERVER_PRIVATE_KEY="your-64-char-hex-private-key"
 
 # Push services
 export TRANSPONDER_APNS_ENABLED=true
@@ -165,17 +171,18 @@ export TRANSPONDER_LOGGING_FORMAT="pretty"
 
 ### Generating a Server Key Pair
 
-The server requires a secp256k1 private key for Nostr identity and token decryption. Use the built-in command to generate a new key pair:
+The server requires a secp256k1 private key for Nostr identity and token decryption. Use the built-in command to generate a new key pair and write the secret directly to a restricted file:
 
 ```bash
 # Using transponder (recommended)
-./target/release/transponder generate-keys
+./target/release/transponder generate-keys --output secrets/server_private_key
 ```
 
 This outputs:
-- **Private key (hex)**: 64-character hex string for your config
 - **Public key (hex)**: For clients that need the raw public key
 - **Public key (npub)**: Bech32-encoded format, easier to share
+
+The private key is not printed by default. Use `--show-private-key` only in a secure, non-logged terminal session.
 
 Alternatively, you can use [nak](https://github.com/fiatjaf/nak), a general-purpose Nostr CLI tool:
 
@@ -264,8 +271,7 @@ cp deploy/production.env.example deploy/production.env
 mkdir -p credentials secrets
 chmod 700 credentials secrets
 
-printf '%s\n' 'YOUR_64_CHAR_HEX_PRIVATE_KEY' > secrets/server_private_key
-chmod 600 secrets/server_private_key
+./target/release/transponder generate-keys --output secrets/server_private_key
 
 docker login dhi.io
 docker build -t transponder:local .
@@ -457,7 +463,7 @@ Nostr Relays (ClearNet/Tor)
 ### Credential Management
 
 - **Never commit credentials** to version control
-- **Use environment variables** for sensitive values in production
+- **Use secret files or a secrets manager** for sensitive values in production
 - **Prefer mounted secret files** for the server private key in Docker/Compose
 - **Restrict file permissions** on config files: `chmod 600 config/local.toml`
 - **Mount credentials read-only** in Docker: `-v /path:/credentials:ro`

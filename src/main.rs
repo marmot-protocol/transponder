@@ -5,9 +5,13 @@
 //! decrypts notification requests, and dispatches silent push notifications
 //! to APNs and FCM.
 
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{fs, path::Path};
+use std::{
+    fs::{self, File, OpenOptions},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -56,7 +60,15 @@ struct Args {
 #[derive(clap::Subcommand, Debug)]
 enum Command {
     /// Generate a new Nostr key pair for the server
-    GenerateKeys,
+    GenerateKeys {
+        /// Write the generated private key to this file with 0600 permissions
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Print the generated private key to stdout
+        #[arg(long)]
+        show_private_key: bool,
+    },
     /// Probe a running Transponder instance for container health checks
     Healthcheck {
         /// Health endpoint URL to probe
@@ -130,7 +142,10 @@ async fn main() -> Result<()> {
     // Handle subcommands
     if let Some(command) = args.command {
         return match command {
-            Command::GenerateKeys => generate_keys(),
+            Command::GenerateKeys {
+                output,
+                show_private_key,
+            } => generate_keys(output.as_deref(), show_private_key),
             Command::Healthcheck { url } => run_healthcheck(&url).await,
         };
     }
@@ -385,24 +400,65 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Generate a new Nostr key pair and print to stdout.
-fn generate_keys() -> Result<()> {
+fn create_private_key_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    options
+        .open(path)
+        .with_context(|| format!("Failed to create private key file {}", path.display()))
+}
+
+fn write_private_key_file(path: &Path, secret_hex: &str) -> Result<()> {
+    let mut file = create_private_key_file(path)?;
+    file.write_all(secret_hex.as_bytes())
+        .with_context(|| format!("Failed to write private key file {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("Failed to write private key file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Failed to sync private key file {}", path.display()))
+}
+
+/// Generate a new Nostr key pair.
+fn generate_keys(output: Option<&Path>, show_private_key: bool) -> Result<()> {
     let keys = Keys::generate();
+    let secret_hex = Zeroizing::new(keys.secret_key().to_secret_hex());
+
+    if let Some(path) = output {
+        write_private_key_file(path, secret_hex.as_str())?;
+    }
 
     println!("Generated new Nostr key pair:\n");
-    println!("Private key (hex): {}", keys.secret_key().to_secret_hex());
     println!("Public key (hex):  {}", keys.public_key().to_hex());
     println!("Public key (npub): {}", keys.public_key().to_bech32()?);
     println!();
-    println!("Add the private key to your configuration:");
-    println!("  [server]");
-    println!("  private_key = \"{}\"", keys.secret_key().to_secret_hex());
-    println!();
-    println!("Or set via environment variable:");
-    println!(
-        "  export TRANSPONDER_SERVER_PRIVATE_KEY=\"{}\"",
-        keys.secret_key().to_secret_hex()
-    );
+
+    if show_private_key {
+        eprintln!(
+            "WARNING: The private key below enables decryption of ALL notification tokens. Do not share, log, or commit it."
+        );
+        println!("Private key (hex): {}", secret_hex.as_str());
+        println!();
+    }
+
+    if let Some(path) = output {
+        println!("Secret written to: {}", path.display());
+        println!("Configure the server with:");
+        println!("  [server]");
+        println!("  private_key_file = \"{}\"", path.display());
+    } else if !show_private_key {
+        println!("Secret material was not printed.");
+        println!("Store a fresh secret directly in a restricted file:");
+        println!("  transponder generate-keys --output /path/to/transponder-server.key");
+        println!("Use --show-private-key only in a secure, non-logged terminal.");
+    }
+
     println!();
     println!("Share the public key (hex or npub) with clients so they can");
     println!("encrypt notification tokens for your server.");

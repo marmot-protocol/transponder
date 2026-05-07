@@ -4,6 +4,7 @@
 [server]
 # Recommended for production: supply the key via
 # TRANSPONDER_SERVER_PRIVATE_KEY_FILE=/run/secrets/transponder_private_key
+# Generate with: transponder generate-keys --output /run/secrets/transponder_private_key
 private_key = ""
 # private_key_file = "/run/secrets/transponder_private_key"
 
