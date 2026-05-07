@@ -3,11 +3,12 @@
 
 [server]
 # Server's Nostr private key (hex format)
-# REQUIRED: Set via TRANSPONDER_SERVER_PRIVATE_KEY environment variable
+# Prefer private_key_file for production secret handling.
 private_key = ""
 
 # Alternative: path to a file containing the private key.
 # Useful with Docker secrets or other mounted secret files.
+# Generate with: transponder generate-keys --output /run/secrets/transponder_private_key
 # private_key_file = "/run/secrets/transponder_private_key"
 
 # Graceful shutdown timeout in seconds
