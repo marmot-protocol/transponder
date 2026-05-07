@@ -88,6 +88,7 @@ impl Nip59Handler {
 }
 
 /// Unwrapped notification request data.
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct UnwrappedNotification {
     /// Content containing encrypted tokens as a single base64 blob.
@@ -208,6 +209,32 @@ mod tests {
             tags: valid_tags(),
             created_at: Timestamp::now(),
         }
+    }
+
+    fn contains_hex_run(input: &str, target_len: usize) -> bool {
+        let mut run_len = 0;
+
+        for ch in input.chars() {
+            if ch.is_ascii_hexdigit() {
+                run_len += 1;
+                if run_len >= target_len {
+                    return true;
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+
+        false
+    }
+
+    #[test]
+    fn test_unwrapped_notification_debug_excludes_sender_metadata() {
+        let notification = notification(BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]));
+        let debug = format!("{notification:?}");
+
+        assert!(!debug.contains("sender"));
+        assert!(!contains_hex_run(&debug, 64));
     }
 
     #[test]
