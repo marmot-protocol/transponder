@@ -234,37 +234,18 @@ impl ApnsClient {
             .json(&ApnsPayload::default())
     }
 
-    /// Send a single push notification attempt without retry.
-    ///
-    /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
-    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
-        let start = Instant::now();
-        let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
+    async fn invalidate_cached_token(&self) {
+        let mut cached = self.cached_token.write().await;
+        if cached.take().is_some() {
+            debug!("Invalidated cached APNs JWT after authentication rejection");
+        }
+    }
 
-        // Add authorization header
-        let token = match self.get_token().await {
-            Ok(t) => t,
-            Err(e) => return SendAttemptResult::Permanent(e),
-        };
-
-        let transport_retry = RetryConfig::default();
-        let response = match retry::with_transport_retry(
-            &transport_retry,
-            "APNs",
-            || async {
-                self.build_request(&url, token.as_str())
-                    .send()
-                    .await
-                    .map_err(Error::from)
-            },
-            self.metrics.as_ref(),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => return SendAttemptResult::Permanent(e),
-        };
-
+    async fn handle_response(
+        &self,
+        start: Instant,
+        response: reqwest::Response,
+    ) -> SendAttemptResult {
         let status = response.status();
 
         if let Some(metrics) = &self.metrics {
@@ -285,6 +266,7 @@ impl ApnsClient {
                 SendAttemptResult::Success(false)
             }
             403 => {
+                self.invalidate_cached_token().await;
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
@@ -326,6 +308,40 @@ impl ApnsClient {
                 SendAttemptResult::Success(false)
             }
         }
+    }
+
+    /// Send a single push notification attempt without retry.
+    ///
+    /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
+    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+        let start = Instant::now();
+        let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
+
+        // Add authorization header
+        let token = match self.get_token().await {
+            Ok(t) => t,
+            Err(e) => return SendAttemptResult::Permanent(e),
+        };
+
+        let transport_retry = RetryConfig::default();
+        let response = match retry::with_transport_retry(
+            &transport_retry,
+            "APNs",
+            || async {
+                self.build_request(&url, token.as_str())
+                    .send()
+                    .await
+                    .map_err(Error::from)
+            },
+            self.metrics.as_ref(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return SendAttemptResult::Permanent(e),
+        };
+
+        self.handle_response(start, response).await
     }
 
     /// Check if the client is properly configured.
@@ -706,6 +722,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn test_auth_error_invalidates_cached_token() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "reason": "BadJwtToken"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("poisoned-jwt".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client.handle_response(Instant::now(), response).await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Apns(ref message))
+                if message.contains("BadJwtToken")
+        ));
+        assert!(client.cached_token.read().await.is_none());
     }
 
     #[test]
