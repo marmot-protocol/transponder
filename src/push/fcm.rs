@@ -331,6 +331,85 @@ impl FcmClient {
             .json(&request)
     }
 
+    async fn invalidate_cached_token(&self) {
+        let mut cached = self.cached_token.write().await;
+        if cached.take().is_some() {
+            debug!("Invalidated cached FCM OAuth token after authentication rejection");
+        }
+    }
+
+    async fn handle_response(
+        &self,
+        start: Instant,
+        response: reqwest::Response,
+    ) -> SendAttemptResult {
+        let status = response.status();
+
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_push_duration("fcm", start.elapsed().as_secs_f64());
+            metrics.record_push_response_status("fcm", status.as_u16());
+        }
+
+        match status.as_u16() {
+            200 => {
+                trace!("FCM notification sent successfully");
+                SendAttemptResult::Success(true)
+            }
+            400 => {
+                let error: FcmErrorResponse = response.json().await.unwrap_or(FcmErrorResponse {
+                    error: FcmError {
+                        code: 400,
+                        message: "Unknown".to_string(),
+                        status: "INVALID_ARGUMENT".to_string(),
+                    },
+                });
+                warn!(
+                    status = %error.error.status,
+                    message = %error.error.message,
+                    "FCM bad request"
+                );
+                SendAttemptResult::Success(false)
+            }
+            401 => {
+                // Auth error - permanent for this request, refresh on the next one.
+                self.invalidate_cached_token().await;
+                error!("FCM authentication error");
+                SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
+            }
+            404 => {
+                // Token not found (device unregistered)
+                debug!("FCM token not found (device unregistered)");
+                SendAttemptResult::Success(false)
+            }
+            429 => {
+                // Rate limited - retriable
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| retry::parse_retry_after(Some(v)));
+                SendAttemptResult::Retriable {
+                    status_code: 429,
+                    retry_after,
+                }
+            }
+            500..=599 => {
+                // Server error - retriable
+                let body = response.text().await.unwrap_or_default();
+                debug!(status = %status, body = %body, "FCM server error (retriable)");
+                SendAttemptResult::Retriable {
+                    status_code: status.as_u16(),
+                    retry_after: None,
+                }
+            }
+            _ => {
+                let body = response.text().await.unwrap_or_default();
+                warn!(status = %status, body = %body, "FCM unexpected response");
+                SendAttemptResult::Success(false)
+            }
+        }
+    }
+
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
@@ -368,70 +447,7 @@ impl FcmClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        let status = response.status();
-
-        if let Some(metrics) = &self.metrics {
-            metrics.observe_push_duration("fcm", start.elapsed().as_secs_f64());
-            metrics.record_push_response_status("fcm", status.as_u16());
-        }
-
-        match status.as_u16() {
-            200 => {
-                trace!("FCM notification sent successfully");
-                SendAttemptResult::Success(true)
-            }
-            400 => {
-                let error: FcmErrorResponse = response.json().await.unwrap_or(FcmErrorResponse {
-                    error: FcmError {
-                        code: 400,
-                        message: "Unknown".to_string(),
-                        status: "INVALID_ARGUMENT".to_string(),
-                    },
-                });
-                warn!(
-                    status = %error.error.status,
-                    message = %error.error.message,
-                    "FCM bad request"
-                );
-                SendAttemptResult::Success(false)
-            }
-            401 => {
-                // Auth error - permanent, don't retry
-                error!("FCM authentication error");
-                SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
-            }
-            404 => {
-                // Token not found (device unregistered)
-                debug!("FCM token not found (device unregistered)");
-                SendAttemptResult::Success(false)
-            }
-            429 => {
-                // Rate limited - retriable
-                let retry_after = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| retry::parse_retry_after(Some(v)));
-                SendAttemptResult::Retriable {
-                    status_code: 429,
-                    retry_after,
-                }
-            }
-            500..=599 => {
-                // Server error - retriable
-                let body = response.text().await.unwrap_or_default();
-                debug!(status = %status, body = %body, "FCM server error (retriable)");
-                SendAttemptResult::Retriable {
-                    status_code: status.as_u16(),
-                    retry_after: None,
-                }
-            }
-            _ => {
-                let body = response.text().await.unwrap_or_default();
-                warn!(status = %status, body = %body, "FCM unexpected response");
-                SendAttemptResult::Success(false)
-            }
-        }
+        self.handle_response(start, response).await
     }
 
     /// Check if the client is properly configured.
@@ -784,6 +800,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_auth_error_invalidates_cached_token() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 401,
+                    "message": "Request had invalid authentication credentials.",
+                    "status": "UNAUTHENTICATED"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let client = FcmClient::mock(config, false);
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("poisoned-access-token".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let response = Client::new()
+            .post(format!(
+                "{}/v1/projects/test-project/messages:send",
+                mock_server.uri()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client.handle_response(Instant::now(), response).await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("Authentication error")
+        ));
+        assert!(client.cached_token.read().await.is_none());
     }
 
     #[tokio::test]
