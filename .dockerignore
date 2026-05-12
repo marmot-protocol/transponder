@@ -3,6 +3,8 @@
 target
 trees
 credentials
+secrets
+deploy/*.env
 .env
 .env.*
 config/local.toml
