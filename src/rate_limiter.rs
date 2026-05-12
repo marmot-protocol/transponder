@@ -78,11 +78,18 @@ impl RateLimitEntry {
 }
 
 fn prune_hits(hits: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+    let old_len = hits.len();
+
     while hits
         .front()
         .is_some_and(|hit| now.duration_since(*hit) >= window)
     {
         hits.pop_front();
+    }
+
+    let new_len = hits.len();
+    if old_len > new_len && (new_len == 0 || hits.capacity() > new_len.saturating_mul(2).max(8)) {
+        hits.shrink_to_fit();
     }
 }
 
@@ -121,6 +128,11 @@ impl Default for RateLimitConfig {
 }
 
 /// Sliding-window rate limiter with per-minute and per-hour limits.
+///
+/// Each active entry stores admitted request timestamps for true sliding-window
+/// enforcement, so memory scales with the number of admitted hits per key. With
+/// the defaults, a hot key can hold up to roughly 5,240 `Instant` values across
+/// the minute and hour windows before older hits are pruned.
 ///
 /// Uses a bounded cache to limit memory usage. When the cache is full,
 /// unknown keys are rejected until cleanup removes stale entries. This
