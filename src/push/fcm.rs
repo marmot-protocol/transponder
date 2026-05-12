@@ -276,14 +276,16 @@ impl FcmClient {
 
     /// Get the project ID, from config or service account.
     fn project_id(&self) -> Result<&str> {
-        if !self.config.project_id.is_empty() {
-            return Ok(&self.config.project_id);
-        }
+        let project_id = if !self.config.project_id.is_empty() {
+            self.config.project_id.as_str()
+        } else {
+            self.service_account
+                .as_ref()
+                .map(|sa| sa.project_id.as_str())
+                .ok_or_else(|| Error::Fcm("No project ID configured".to_string()))?
+        };
 
-        self.service_account
-            .as_ref()
-            .map(|sa| sa.project_id.as_str())
-            .ok_or_else(|| Error::Fcm("No project ID configured".to_string()))
+        validate_project_id(project_id)
     }
 
     /// Send a silent push notification to a device.
@@ -441,6 +443,24 @@ impl FcmClient {
 
         self.service_account.is_some() && self.encoding_key.is_some()
     }
+}
+
+fn validate_project_id(project_id: &str) -> Result<&str> {
+    if project_id.is_empty() {
+        return Err(Error::Fcm("No project ID configured".to_string()));
+    }
+
+    if !project_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(Error::Fcm(
+            "Invalid FCM project ID: must contain only ASCII letters, digits, and hyphens"
+                .to_string(),
+        ));
+    }
+
+    Ok(project_id)
 }
 
 #[cfg(test)]
@@ -856,13 +876,10 @@ mod tests {
             project_id: String::new(), // Empty - should fall back to service account
         };
 
-        // Need a client with service account but empty project_id in config
-        let client = FcmClient::mock(config, true);
-        // The mock sets project_id to the config's project_id, which is empty
-        // So we need to manually check that it falls back to service account
-        // Since mock uses config.project_id for sa.project_id, this test needs adjustment
-        // Let's just verify the fallback logic works
-        assert!(client.project_id().is_ok());
+        let mut client = FcmClient::mock(config, true);
+        client.service_account.as_mut().unwrap().project_id = "service-project".to_string();
+
+        assert_eq!(client.project_id().unwrap(), "service-project");
     }
 
     #[test]
@@ -1165,6 +1182,47 @@ mod tests {
         let result = client.send("test-device-token").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No project ID"));
+    }
+
+    #[tokio::test]
+    async fn test_send_rejects_invalid_config_project_id_before_auth() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "x/../../admin/v1".to_string(),
+        };
+
+        let client = FcmClient::mock(config, false);
+
+        let result = client.send("test-device-token").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid FCM project ID")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_rejects_invalid_service_account_project_id_before_auth() {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: String::new(),
+        };
+
+        let mut client = FcmClient::mock(config, true);
+        client.service_account.as_mut().unwrap().project_id = "x/../../admin/v1".to_string();
+
+        let result = client.send("test-device-token").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid FCM project ID")
+        );
     }
 
     #[tokio::test]
