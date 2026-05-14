@@ -203,7 +203,8 @@ impl EventProcessor {
         if let Some(ref m) = self.metrics {
             m.record_event_received();
         }
-        info!("Received Nostr notification event");
+
+        info!(event_id = %event.id, "Received Nostr notification event");
 
         // Check for duplicates
         if self.is_duplicate(&event.id).await {
@@ -245,10 +246,7 @@ impl EventProcessor {
                 }
 
                 // Log but don't propagate - we want to continue processing other events
-                warn!(
-                    error = %e,
-                    "Failed to process event"
-                );
+                warn!(error = %e, "Failed to process event");
                 if let Some(ref m) = self.metrics {
                     m.record_event_failed();
                     m.observe_event_processing_duration(

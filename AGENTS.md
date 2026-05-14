@@ -200,5 +200,5 @@ TRANSPONDER_RELAYS_CLEARNET='["wss://relay.example.com"]'
 
 ### Debugging relay connections
 ```bash
-TRANSPONDER_LOGGING_LEVEL=debug TRANSPONDER_LOGGING_FORMAT=pretty cargo run -- --config config/local.toml
+RUST_LOG=info,transponder=debug,nostr_relay_pool=info,reqwest=warn,hyper_util=warn,h2=warn TRANSPONDER_LOGGING_FORMAT=pretty cargo run -- --config config/local.toml
 ```

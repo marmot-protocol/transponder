@@ -35,7 +35,7 @@ run-local:
 
 # Run the server with debug logging
 run-debug:
-    TRANSPONDER_LOGGING_LEVEL=debug TRANSPONDER_LOGGING_FORMAT=pretty cargo run -- --config config/local.toml
+    RUST_LOG=info,transponder=debug,nostr_relay_pool=info,reqwest=warn,hyper_util=warn,h2=warn TRANSPONDER_LOGGING_FORMAT=pretty cargo run -- --config config/local.toml
 
 # Run all tests
 test:

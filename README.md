@@ -169,8 +169,9 @@ export TRANSPONDER_RELAYS_CLEARNET="wss://relay.example.com,wss://relay2.example
 export TRANSPONDER_RELAYS_ONION="wss://exampleonionrelay.onion" # requires `--features tor`
 
 # Logging
-export TRANSPONDER_LOGGING_LEVEL="debug"
+export TRANSPONDER_LOGGING_LEVEL="info"
 export TRANSPONDER_LOGGING_FORMAT="pretty"
+export RUST_LOG="info,transponder=debug,nostr_relay_pool=info,nostr_sdk=info,nostr=info,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,tower=warn,rustls=warn,tungstenite=warn,tokio_tungstenite=warn"
 ```
 
 ### Generating a Server Key Pair
@@ -516,8 +517,8 @@ cargo test
 # Run the optional Tor relay build
 cargo test --features tor
 
-# Run with verbose logging
-RUST_LOG=debug cargo run -- --config config/local.toml
+# Run with verbose Transponder logging without dependency debug chatter
+RUST_LOG=info,transponder=debug,nostr_relay_pool=info,reqwest=warn,hyper_util=warn,h2=warn cargo run -- --config config/local.toml
 
 # Format code
 cargo fmt

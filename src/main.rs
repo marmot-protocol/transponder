@@ -525,8 +525,8 @@ async fn run_healthcheck(url: &str) -> Result<()> {
 
 /// Initialize the tracing subscriber based on configuration.
 fn init_logging(config: &config::LoggingConfig) -> Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_log_filter(&config.level)));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
 
     match config.format.as_str() {
         "json" => {
@@ -555,22 +555,6 @@ fn init_logging(config: &config::LoggingConfig) -> Result<()> {
     Ok(())
 }
 
-/// Build the default log filter from config.
-///
-/// Simple levels apply to Transponder while keeping dependencies at `info`,
-/// which avoids noisy HTTP/2 frame logs from crates such as `h2` and `reqwest`.
-/// Operators can still use `RUST_LOG` or explicit directives for full control.
-fn default_log_filter(level: &str) -> String {
-    let level = level.trim();
-    if level.contains('=') || level.contains(',') {
-        level.to_string()
-    } else if level.eq_ignore_ascii_case("off") {
-        "off".to_string()
-    } else {
-        format!("info,transponder={level}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,24 +562,6 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
-
-    #[test]
-    fn logging_filter_keeps_dependency_debug_logs_out_of_simple_debug_level() {
-        assert_eq!(default_log_filter("debug"), "info,transponder=debug");
-    }
-
-    #[test]
-    fn logging_filter_preserves_explicit_directives() {
-        assert_eq!(
-            default_log_filter("transponder=debug,h2=warn"),
-            "transponder=debug,h2=warn"
-        );
-    }
-
-    #[test]
-    fn logging_filter_preserves_off_level() {
-        assert_eq!(default_log_filter("off"), "off");
-    }
 
     #[test]
     fn notification_receive_lag_is_recoverable() {
