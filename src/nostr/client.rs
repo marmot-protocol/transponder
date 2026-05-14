@@ -96,7 +96,7 @@ impl RelayClient {
         for url in &self.config.clearnet {
             match self.client.add_relay(url).await {
                 Ok(_) => {
-                    info!(relay = %url, "Added ClearNet relay");
+                    debug!(relay = %url, "Added ClearNet relay");
                 }
                 Err(e) => {
                     warn!(relay = %url, error = %e, "Failed to add ClearNet relay");
@@ -108,13 +108,19 @@ impl RelayClient {
         for url in &self.config.onion {
             match self.client.add_relay(url).await {
                 Ok(_) => {
-                    info!(relay = %url, "Added Tor relay");
+                    debug!(relay = %url, "Added Tor relay");
                 }
                 Err(e) => {
                     warn!(relay = %url, error = %e, "Failed to add Tor relay");
                 }
             }
         }
+
+        info!(
+            clearnet = self.config.clearnet.len(),
+            tor = self.config.onion.len(),
+            "Configured relay subscriptions"
+        );
 
         // Connect to all added relays (nostr-sdk connects in the background)
         self.client.connect().await;
@@ -281,7 +287,8 @@ impl RelayClient {
 
         match self.client.send_event_builder(builder).await {
             Ok(output) => {
-                info!(event_id = %output.id(), "Published kind 10050 inbox relay list");
+                debug!(event_id = %output.id(), "Published kind 10050 inbox relay list");
+                info!("Published kind 10050 inbox relay list");
             }
             Err(e) => {
                 error!(error = %e, "Failed to publish kind 10050 event");
