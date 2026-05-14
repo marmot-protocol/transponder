@@ -12,7 +12,7 @@ use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
@@ -204,9 +204,11 @@ impl EventProcessor {
             m.record_event_received();
         }
 
+        info!(event_id = %event.id, "Received Nostr notification event");
+
         // Check for duplicates
         if self.is_duplicate(&event.id).await {
-            trace!(event_id = %event.id, "Skipping duplicate event");
+            trace!("Skipping duplicate event");
             if let Some(ref m) = self.metrics {
                 m.record_event_deduplicated();
                 m.observe_event_processing_duration(
@@ -224,9 +226,8 @@ impl EventProcessor {
                 // This avoids dropping events due to transient failures.
                 self.mark_seen(event.id).await;
 
-                debug!(
-                    event_id = %event.id,
-                    notifications_sent = count,
+                info!(
+                    notifications_admitted = count,
                     "Processed notification event"
                 );
 
@@ -245,11 +246,7 @@ impl EventProcessor {
                 }
 
                 // Log but don't propagate - we want to continue processing other events
-                warn!(
-                    event_id = %event.id,
-                    error = %e,
-                    "Failed to process event"
-                );
+                warn!(error = %e, "Failed to process event");
                 if let Some(ref m) = self.metrics {
                     m.record_event_failed();
                     m.observe_event_processing_duration(
@@ -305,7 +302,7 @@ impl EventProcessor {
             }
         };
 
-        trace!("Unwrapped notification request");
+        info!("Unwrapped notification request");
 
         // Parse the encrypted tokens from the content
         let parse_started_at = StageTimer::start();
@@ -338,7 +335,7 @@ impl EventProcessor {
             return Ok(0);
         }
 
-        debug!(token_count = token_bytes.len(), "Decrypting tokens");
+        info!(token_count = token_bytes.len(), "Decrypting tokens");
 
         // Decrypt each token and dispatch notifications, with rate limiting.
         //

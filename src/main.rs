@@ -162,6 +162,7 @@ async fn main() -> Result<()> {
         match Metrics::new() {
             Ok(m) => {
                 m.init_server_info(env!("CARGO_PKG_VERSION"));
+                info!("Metrics initialized");
                 Some(m)
             }
             Err(e) => {
@@ -170,7 +171,7 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        debug!("Metrics disabled");
+        info!("Metrics disabled");
         None
     };
 
@@ -190,7 +191,7 @@ async fn main() -> Result<()> {
     let keys = Keys::new(secret_key);
     drop(server_private_key);
 
-    info!(
+    debug!(
         pubkey = %keys.public_key().to_hex(),
         "Server public key"
     );
@@ -208,7 +209,10 @@ async fn main() -> Result<()> {
         match ApnsClient::with_metrics(config.apns.clone(), metrics.clone()).await {
             Ok(client) => {
                 if client.is_configured() {
-                    info!("APNs client initialized");
+                    info!(
+                        environment = %config.apns.environment,
+                        "APNs push service configured"
+                    );
                     Some(client)
                 } else {
                     warn!("APNs enabled but not fully configured");
@@ -221,7 +225,7 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        debug!("APNs disabled");
+        info!("APNs push service disabled");
         None
     };
 
@@ -229,7 +233,7 @@ async fn main() -> Result<()> {
         match FcmClient::with_metrics(config.fcm.clone(), metrics.clone()).await {
             Ok(client) => {
                 if client.is_configured() {
-                    info!("FCM client initialized");
+                    info!("FCM push service configured");
                     Some(client)
                 } else {
                     warn!("FCM enabled but not fully configured");
@@ -242,7 +246,7 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        debug!("FCM disabled");
+        info!("FCM push service disabled");
         None
     };
 

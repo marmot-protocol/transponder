@@ -10,7 +10,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::FcmConfig;
@@ -352,7 +352,7 @@ impl FcmClient {
 
         match status.as_u16() {
             200 => {
-                trace!("FCM notification sent successfully");
+                info!("FCM notification accepted");
                 SendAttemptResult::Success(true)
             }
             400 => {
@@ -378,7 +378,7 @@ impl FcmClient {
             }
             404 => {
                 // Token not found (device unregistered)
-                debug!("FCM token not found (device unregistered)");
+                info!("FCM token not found");
                 SendAttemptResult::Success(false)
             }
             429 => {
@@ -395,16 +395,14 @@ impl FcmClient {
             }
             500..=599 => {
                 // Server error - retriable
-                let body = response.text().await.unwrap_or_default();
-                debug!(status = %status, body = %body, "FCM server error (retriable)");
+                debug!(status = %status, "FCM server error (retriable)");
                 SendAttemptResult::Retriable {
                     status_code: status.as_u16(),
                     retry_after: None,
                 }
             }
             _ => {
-                let body = response.text().await.unwrap_or_default();
-                warn!(status = %status, body = %body, "FCM unexpected response");
+                warn!(status = %status, "FCM unexpected response");
                 SendAttemptResult::Success(false)
             }
         }

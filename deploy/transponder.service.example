@@ -26,6 +26,7 @@ ReadOnlyPaths=/etc/transponder/config.toml /etc/transponder/secrets /etc/transpo
 ReadWritePaths=/var/lib/transponder
 Environment=TRANSPONDER_SERVER_PRIVATE_KEY_FILE=/etc/transponder/secrets/server_private_key
 Environment=TRANSPONDER_LOGGING_LEVEL=info
+Environment=RUST_LOG=info,transponder=debug,nostr_relay_pool=info,nostr_sdk=info,nostr=info,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,tower=warn,rustls=warn,tungstenite=warn,tokio_tungstenite=warn
 
 [Install]
 WantedBy=multi-user.target

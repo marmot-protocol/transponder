@@ -103,6 +103,7 @@ chmod 700 credentials secrets
 
 - confirm paths
 - set a different image tag if you build a Tor-enabled image
+- set `RUST_LOG` for the Transponder and dependency log levels you want at runtime
 
 ## Docker Compose Deployment
 

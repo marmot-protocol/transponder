@@ -9,7 +9,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::ApnsConfig;
@@ -255,7 +255,7 @@ impl ApnsClient {
 
         match status.as_u16() {
             200 => {
-                trace!("APNs notification sent successfully");
+                info!("APNs notification accepted");
                 SendAttemptResult::Success(true)
             }
             400 => {
@@ -278,7 +278,7 @@ impl ApnsClient {
             }
             410 => {
                 // Token is no longer valid (device unregistered)
-                debug!("APNs token no longer valid (device unregistered)");
+                info!("APNs token no longer valid");
                 SendAttemptResult::Success(false)
             }
             429 => {
@@ -295,16 +295,14 @@ impl ApnsClient {
             }
             500..=599 => {
                 // Server error - retriable
-                let body = response.text().await.unwrap_or_default();
-                debug!(status = %status, body = %body, "APNs server error (retriable)");
+                debug!(status = %status, "APNs server error (retriable)");
                 SendAttemptResult::Retriable {
                     status_code: status.as_u16(),
                     retry_after: None,
                 }
             }
             _ => {
-                let body = response.text().await.unwrap_or_default();
-                warn!(status = %status, body = %body, "APNs unexpected response");
+                warn!(status = %status, "APNs unexpected response");
                 SendAttemptResult::Success(false)
             }
         }
