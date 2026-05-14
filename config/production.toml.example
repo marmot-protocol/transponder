@@ -46,6 +46,7 @@ team_id = ""
 private_key_path = "/credentials/AuthKey_XXXXXXXXXX.p8"
 environment = "production"
 bundle_id = ""
+payload_mode = "silent"
 
 [fcm]
 enabled = false

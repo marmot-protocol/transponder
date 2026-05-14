@@ -627,6 +627,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
         let metrics = Metrics::new().expect("metrics");
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
@@ -673,6 +674,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
         let metrics = Metrics::new().expect("metrics");
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(

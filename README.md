@@ -109,6 +109,10 @@ environment = "production"
 # Your iOS app's bundle identifier (e.g., "com.example.myapp")
 bundle_id = ""
 
+# APNs payload mode: "silent" or "nse_prototype_alert"
+# Keep production silent. Use nse_prototype_alert only for staging NSE prototype testing.
+payload_mode = "silent"
+
 [fcm]
 # Enable FCM for Android push notifications
 enabled = false
@@ -160,6 +164,7 @@ export TRANSPONDER_APNS_KEY_ID="ABCD123456"
 export TRANSPONDER_APNS_TEAM_ID="TEAM123456"
 export TRANSPONDER_APNS_PRIVATE_KEY_PATH="/path/to/AuthKey.p8"
 export TRANSPONDER_APNS_BUNDLE_ID="com.example.app"
+export TRANSPONDER_APNS_PAYLOAD_MODE="silent"
 
 export TRANSPONDER_FCM_ENABLED=true
 export TRANSPONDER_FCM_SERVICE_ACCOUNT_PATH="/path/to/service-account.json"

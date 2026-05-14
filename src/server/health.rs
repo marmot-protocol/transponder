@@ -549,6 +549,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let push_dispatcher = Arc::new(PushDispatcher::new(Some(apns_client), None));
