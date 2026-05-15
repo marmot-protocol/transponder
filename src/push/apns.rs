@@ -9,10 +9,10 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, trace};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::config::ApnsConfig;
+use crate::config::{ApnsConfig, ApnsPayloadMode};
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 use crate::push::retry::{self, RetryConfig, SendAttemptResult};
@@ -42,24 +42,105 @@ pub(crate) struct CachedToken {
     expires_at: SystemTime,
 }
 
-/// APNs silent notification payload.
+/// APNs notification payload.
 #[derive(Debug, Serialize)]
-struct ApnsPayload {
-    aps: ApnsAps,
+#[serde(untagged)]
+enum ApnsPayload {
+    Silent(ApnsSilentPayload),
+    NsePrototypeAlert(ApnsNsePrototypeAlertPayload),
 }
 
 #[derive(Debug, Serialize)]
-struct ApnsAps {
+struct ApnsSilentPayload {
+    aps: ApnsSilentAps,
+}
+
+#[derive(Debug, Serialize)]
+struct ApnsSilentAps {
     #[serde(rename = "content-available")]
     content_available: u8,
 }
 
 impl Default for ApnsPayload {
     fn default() -> Self {
-        Self {
-            aps: ApnsAps {
+        Self::Silent(ApnsSilentPayload {
+            aps: ApnsSilentAps {
                 content_available: 1,
             },
+        })
+    }
+}
+
+impl From<ApnsPayloadMode> for ApnsPayload {
+    fn from(mode: ApnsPayloadMode) -> Self {
+        match mode {
+            ApnsPayloadMode::Silent => Self::default(),
+            ApnsPayloadMode::NsePrototypeAlert => {
+                Self::NsePrototypeAlert(ApnsNsePrototypeAlertPayload::default())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ApnsNsePrototypeAlertPayload {
+    aps: ApnsNsePrototypeAps,
+    wn_nse_prototype: bool,
+}
+
+impl Default for ApnsNsePrototypeAlertPayload {
+    fn default() -> Self {
+        Self {
+            aps: ApnsNsePrototypeAps::default(),
+            wn_nse_prototype: true,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ApnsNsePrototypeAps {
+    alert: ApnsAlert,
+    #[serde(rename = "mutable-content")]
+    mutable_content: u8,
+    sound: &'static str,
+}
+
+impl Default for ApnsNsePrototypeAps {
+    fn default() -> Self {
+        Self {
+            alert: ApnsAlert {
+                title: "White Noise",
+                body: "New encrypted message",
+            },
+            mutable_content: 1,
+            sound: "default",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ApnsAlert {
+    title: &'static str,
+    body: &'static str,
+}
+
+fn redacted_device_token_id(_device_token: &str) -> &'static str {
+    "<redacted_device_token>"
+}
+
+#[derive(Debug)]
+struct ApnsRequestParts {
+    push_type: &'static str,
+    priority: &'static str,
+    payload: ApnsPayload,
+}
+
+impl ApnsRequestParts {
+    fn for_mode(mode: ApnsPayloadMode) -> Self {
+        Self {
+            push_type: mode.push_type(),
+            priority: mode.priority(),
+            payload: ApnsPayload::from(mode),
         }
     }
 }
@@ -225,13 +306,15 @@ impl ApnsClient {
     }
 
     fn build_request(&self, url: &str, auth_token: &str) -> reqwest::RequestBuilder {
+        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
+
         self.http_client
             .post(url)
-            .header("apns-push-type", "background")
-            .header("apns-priority", "5")
+            .header("apns-push-type", request_parts.push_type)
+            .header("apns-priority", request_parts.priority)
             .header("apns-topic", &self.config.bundle_id)
             .header("authorization", format!("bearer {auth_token}"))
-            .json(&ApnsPayload::default())
+            .json(&request_parts.payload)
     }
 
     async fn invalidate_cached_token(&self) {
@@ -255,14 +338,22 @@ impl ApnsClient {
 
         match status.as_u16() {
             200 => {
-                info!("APNs notification accepted");
+                debug!(
+                    payload_mode = %self.config.payload_mode,
+                    status = status.as_u16(),
+                    "APNs notification accepted"
+                );
                 SendAttemptResult::Success(true)
             }
             400 => {
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
-                warn!(reason = %error.reason, "APNs bad request");
+                debug!(
+                    payload_mode = %self.config.payload_mode,
+                    reason = %error.reason,
+                    "APNs bad request"
+                );
                 SendAttemptResult::Success(false)
             }
             403 => {
@@ -270,7 +361,11 @@ impl ApnsClient {
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
-                error!(reason = %error.reason, "APNs authentication error");
+                debug!(
+                    payload_mode = %self.config.payload_mode,
+                    reason = %error.reason,
+                    "APNs authentication error"
+                );
                 SendAttemptResult::Permanent(Error::Apns(format!(
                     "Authentication error: {}",
                     error.reason
@@ -278,7 +373,10 @@ impl ApnsClient {
             }
             410 => {
                 // Token is no longer valid (device unregistered)
-                info!("APNs token no longer valid");
+                debug!(
+                    payload_mode = %self.config.payload_mode,
+                    "APNs token no longer valid"
+                );
                 SendAttemptResult::Success(false)
             }
             429 => {
@@ -288,6 +386,10 @@ impl ApnsClient {
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| retry::parse_retry_after(Some(v)));
+                debug!(
+                    payload_mode = %self.config.payload_mode,
+                    "APNs rate limited request"
+                );
                 SendAttemptResult::Retriable {
                     status_code: 429,
                     retry_after,
@@ -295,14 +397,22 @@ impl ApnsClient {
             }
             500..=599 => {
                 // Server error - retriable
-                debug!(status = %status, "APNs server error (retriable)");
+                debug!(
+                    payload_mode = %self.config.payload_mode,
+                    status = %status,
+                    "APNs server error (retriable)"
+                );
                 SendAttemptResult::Retriable {
                     status_code: status.as_u16(),
                     retry_after: None,
                 }
             }
             _ => {
-                warn!(status = %status, "APNs unexpected response");
+                debug!(
+                    payload_mode = %self.config.payload_mode,
+                    status = %status,
+                    "APNs unexpected response"
+                );
                 SendAttemptResult::Success(false)
             }
         }
@@ -314,6 +424,16 @@ impl ApnsClient {
     async fn send_once(&self, device_token: &str) -> SendAttemptResult {
         let start = Instant::now();
         let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
+        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
+
+        debug!(
+            payload_mode = %self.config.payload_mode,
+            push_type = request_parts.push_type,
+            priority = request_parts.priority,
+            topic = %self.config.bundle_id,
+            device_token = redacted_device_token_id(device_token),
+            "Sending APNs notification"
+        );
 
         // Add authorization header
         let token = match self.get_token().await {
@@ -390,7 +510,17 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         }
+    }
+
+    fn header_value<'a>(request: &'a reqwest::Request, name: &str) -> &'a str {
+        request.headers().get(name).unwrap().to_str().unwrap()
+    }
+
+    fn request_json(request: &reqwest::Request) -> serde_json::Value {
+        let body = request.body().and_then(reqwest::Body::as_bytes).unwrap();
+        serde_json::from_slice(body).unwrap()
     }
 
     #[test]
@@ -399,6 +529,86 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("content-available"));
         assert!(json.contains("1"));
+    }
+
+    #[test]
+    fn test_device_token_redaction_is_not_token_derived() {
+        assert_eq!(
+            redacted_device_token_id("00112233445566778899aabbccddeeff"),
+            "<redacted_device_token>"
+        );
+        assert_eq!(
+            redacted_device_token_id("ffeeddccbbaa99887766554433221100"),
+            "<redacted_device_token>"
+        );
+    }
+
+    #[test]
+    fn test_silent_mode_builds_background_headers_and_payload() {
+        let mut config = test_config();
+        config.payload_mode = ApnsPayloadMode::Silent;
+        config.bundle_id = "dev.ipf.whitenoise.staging".to_string();
+        let client = ApnsClient::mock(config, false);
+
+        let request = client
+            .build_request(
+                "https://api.push.apple.com/3/device/aabbccdd11223344",
+                "test-token",
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(header_value(&request, "apns-push-type"), "background");
+        assert_eq!(header_value(&request, "apns-priority"), "5");
+        assert_eq!(
+            header_value(&request, "apns-topic"),
+            "dev.ipf.whitenoise.staging"
+        );
+        assert_eq!(
+            request_json(&request),
+            serde_json::json!({
+                "aps": {
+                    "content-available": 1
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_nse_prototype_alert_mode_builds_alert_headers_and_payload() {
+        let mut config = test_config();
+        config.payload_mode = ApnsPayloadMode::NsePrototypeAlert;
+        config.bundle_id = "dev.ipf.whitenoise.staging".to_string();
+        let client = ApnsClient::mock(config, false);
+
+        let request = client
+            .build_request(
+                "https://api.push.apple.com/3/device/aabbccdd11223344",
+                "test-token",
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(header_value(&request, "apns-push-type"), "alert");
+        assert_eq!(header_value(&request, "apns-priority"), "10");
+        assert_eq!(
+            header_value(&request, "apns-topic"),
+            "dev.ipf.whitenoise.staging"
+        );
+        assert_eq!(
+            request_json(&request),
+            serde_json::json!({
+                "aps": {
+                    "alert": {
+                        "title": "White Noise",
+                        "body": "New encrypted message"
+                    },
+                    "mutable-content": 1,
+                    "sound": "default"
+                },
+                "wn_nse_prototype": true
+            })
+        );
     }
 
     #[test]
@@ -477,6 +687,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient {
@@ -521,6 +732,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: String::new(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::new(config).await.unwrap();
@@ -560,6 +772,7 @@ mod tests {
                 private_key_path: String::new(),
                 environment: "sandbox".to_string(),
                 bundle_id: "com.example.app".to_string(),
+                payload_mode: Default::default(),
             },
             encoding_key: None,
             cached_token: Arc::new(RwLock::new(Some(CachedToken {
@@ -769,6 +982,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -784,6 +998,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -799,6 +1014,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -814,6 +1030,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: String::new(), // Missing
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -829,6 +1046,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::mock(config, false); // No encoding key
@@ -876,6 +1094,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::mock(config, false);
@@ -894,6 +1113,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -921,6 +1141,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         // Create a client without an encoding key to test the error case
@@ -949,6 +1170,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::mock(config, false); // No encoding key
@@ -976,6 +1198,7 @@ mod tests {
             private_key_path: String::new(), // Empty path
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::new(config).await.unwrap();
@@ -991,6 +1214,7 @@ mod tests {
             private_key_path: "/nonexistent/key.p8".to_string(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let result = ApnsClient::new(config).await;
@@ -1031,6 +1255,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient {
@@ -1078,6 +1303,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         // Client without encoding key - should fail when trying to generate
@@ -1112,6 +1338,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             private_key_path: file.path().to_string_lossy().to_string(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::new(config).await.unwrap();
@@ -1142,6 +1369,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             private_key_path: file.path().to_string_lossy().to_string(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let metrics = Metrics::default();
@@ -1233,6 +1461,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             private_key_path: file.path().to_string_lossy().to_string(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient::new(config).await.unwrap();
@@ -1283,6 +1512,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let client = ApnsClient {

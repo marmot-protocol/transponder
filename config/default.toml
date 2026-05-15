@@ -86,6 +86,10 @@ environment = "production"
 # iOS app bundle identifier
 bundle_id = ""
 
+# APNs payload mode: "silent" or "nse_prototype_alert"
+# Keep production silent. Use nse_prototype_alert only for staging NSE prototype testing.
+payload_mode = "silent"
+
 [fcm]
 # Whether FCM (Android) push notifications are enabled
 enabled = false

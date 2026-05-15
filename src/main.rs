@@ -211,6 +211,7 @@ async fn main() -> Result<()> {
                 if client.is_configured() {
                     info!(
                         environment = %config.apns.environment,
+                        payload_mode = %config.apns.payload_mode,
                         "APNs push service configured"
                     );
                     Some(client)

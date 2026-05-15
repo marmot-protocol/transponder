@@ -246,6 +246,47 @@ pub struct ApnsConfig {
     /// Bundle ID for the iOS app.
     #[serde(default)]
     pub bundle_id: String,
+
+    /// APNs payload mode.
+    #[serde(default)]
+    pub payload_mode: ApnsPayloadMode,
+}
+
+/// APNs payload mode.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApnsPayloadMode {
+    /// Silent background push used by the normal MIP-05 flow.
+    #[default]
+    Silent,
+
+    /// Alert payload for exercising the iOS Notification Service Extension prototype.
+    NsePrototypeAlert,
+}
+
+impl ApnsPayloadMode {
+    pub(crate) fn push_type(self) -> &'static str {
+        match self {
+            Self::Silent => "background",
+            Self::NsePrototypeAlert => "alert",
+        }
+    }
+
+    pub(crate) fn priority(self) -> &'static str {
+        match self {
+            Self::Silent => "5",
+            Self::NsePrototypeAlert => "10",
+        }
+    }
+}
+
+impl std::fmt::Display for ApnsPayloadMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Silent => f.write_str("silent"),
+            Self::NsePrototypeAlert => f.write_str("nse_prototype_alert"),
+        }
+    }
 }
 
 fn default_apns_environment() -> String {
@@ -366,6 +407,7 @@ fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
         .set_default("apns.private_key_path", "")?
         .set_default("apns.environment", "production")?
         .set_default("apns.bundle_id", "")?
+        .set_default("apns.payload_mode", "silent")?
         .set_default("fcm.enabled", false)?
         .set_default("fcm.service_account_path", "")?
         .set_default("fcm.project_id", "")?
@@ -470,6 +512,7 @@ fn is_supported_config_key(config_key: &str) -> bool {
                 | "apns.private_key_path"
                 | "apns.environment"
                 | "apns.bundle_id"
+                | "apns.payload_mode"
                 | "fcm.enabled"
                 | "fcm.service_account_path"
                 | "fcm.project_id"
@@ -687,6 +730,7 @@ mod tests {
             private_key_path: "/path/to/key.p8".to_string(),
             environment: "production".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         assert!(config.is_production());
@@ -702,6 +746,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: String::new(),
+            payload_mode: Default::default(),
         };
 
         assert!(!config.is_production());
@@ -944,6 +989,46 @@ mod tests {
     }
 
     #[test]
+    fn test_apns_payload_mode_defaults_to_silent() {
+        let config = from_test_env(&[]).unwrap();
+
+        assert_eq!(config.apns.payload_mode, ApnsPayloadMode::Silent);
+    }
+
+    #[test]
+    fn test_apns_payload_mode_parses_nse_prototype_alert() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+
+            [apns]
+            payload_mode = "nse_prototype_alert"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+
+        assert_eq!(config.apns.payload_mode, ApnsPayloadMode::NsePrototypeAlert);
+    }
+
+    #[test]
+    fn test_apns_payload_mode_rejects_unknown_value() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+
+            [apns]
+            payload_mode = "loud_plaintext"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+
+        assert!(error.to_string().contains("payload_mode"), "{error}");
+        assert!(error.to_string().contains("loud_plaintext"), "{error}");
+    }
+
+    #[test]
     fn test_health_config_defaults() {
         assert!(default_health_enabled());
         assert_eq!(default_health_bind_address(), "127.0.0.1:8080");
@@ -979,6 +1064,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "production".to_string(),
             bundle_id: String::new(),
+            payload_mode: Default::default(),
         };
         assert!(config.is_production());
     }
@@ -992,6 +1078,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "development".to_string(),
             bundle_id: String::new(),
+            payload_mode: Default::default(),
         };
         assert!(!config.is_production());
     }

@@ -573,6 +573,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let apns_client = ApnsClient::mock(config, true);
@@ -639,6 +640,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let dispatcher = PushDispatcher::new(Some(apns_client), None);
@@ -689,6 +691,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
 
@@ -762,6 +765,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
 
         let metrics = Metrics::default();
@@ -806,6 +810,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
 
@@ -836,6 +841,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: String::new(),
+            payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, false);
         let dispatcher = PushDispatcher::new(Some(apns_client), None);
@@ -885,6 +891,7 @@ mod tests {
                     private_key_path: String::new(),
                     environment: "sandbox".to_string(),
                     bundle_id: "com.example.app".to_string(),
+                    payload_mode: Default::default(),
                 },
                 true,
             )),
@@ -942,6 +949,7 @@ mod tests {
                     private_key_path: String::new(),
                     environment: "sandbox".to_string(),
                     bundle_id: "com.example.app".to_string(),
+                    payload_mode: Default::default(),
                 },
                 true,
             )),
@@ -980,6 +988,7 @@ mod tests {
                     private_key_path: String::new(),
                     environment: "sandbox".to_string(),
                     bundle_id: "com.example.app".to_string(),
+                    payload_mode: Default::default(),
                 },
                 true,
             )),
@@ -1036,6 +1045,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let dispatcher = PushDispatcher::new(Some(apns_client), None);
@@ -1057,6 +1067,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
         let dispatcher = Arc::new(PushDispatcher::new(
             Some(ApnsClient::mock(apns_config, true)),
@@ -1115,6 +1126,7 @@ mod tests {
             private_key_path: String::new(),
             environment: "sandbox".to_string(),
             bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let metrics = Metrics::default();
