@@ -8,9 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, trace};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::{ApnsConfig, ApnsPayloadMode};
@@ -125,9 +124,8 @@ struct ApnsAlert {
     body: &'static str,
 }
 
-fn redacted_device_token_id(device_token: &str) -> String {
-    let digest = Sha256::digest(device_token.as_bytes());
-    format!("sha256:{}", hex::encode(&digest[..6]))
+fn redacted_device_token_id(_device_token: &str) -> &'static str {
+    "<redacted_device_token>"
 }
 
 #[derive(Debug)]
@@ -330,7 +328,6 @@ impl ApnsClient {
         &self,
         start: Instant,
         response: reqwest::Response,
-        device_token_id: &str,
     ) -> SendAttemptResult {
         let status = response.status();
 
@@ -341,8 +338,7 @@ impl ApnsClient {
 
         match status.as_u16() {
             200 => {
-                info!(
-                    token_id = %device_token_id,
+                debug!(
                     payload_mode = %self.config.payload_mode,
                     status = status.as_u16(),
                     "APNs notification accepted"
@@ -353,8 +349,7 @@ impl ApnsClient {
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
-                warn!(
-                    token_id = %device_token_id,
+                debug!(
                     payload_mode = %self.config.payload_mode,
                     reason = %error.reason,
                     "APNs bad request"
@@ -366,8 +361,7 @@ impl ApnsClient {
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
-                error!(
-                    token_id = %device_token_id,
+                debug!(
                     payload_mode = %self.config.payload_mode,
                     reason = %error.reason,
                     "APNs authentication error"
@@ -379,8 +373,7 @@ impl ApnsClient {
             }
             410 => {
                 // Token is no longer valid (device unregistered)
-                info!(
-                    token_id = %device_token_id,
+                debug!(
                     payload_mode = %self.config.payload_mode,
                     "APNs token no longer valid"
                 );
@@ -394,7 +387,6 @@ impl ApnsClient {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| retry::parse_retry_after(Some(v)));
                 debug!(
-                    token_id = %device_token_id,
                     payload_mode = %self.config.payload_mode,
                     "APNs rate limited request"
                 );
@@ -406,7 +398,6 @@ impl ApnsClient {
             500..=599 => {
                 // Server error - retriable
                 debug!(
-                    token_id = %device_token_id,
                     payload_mode = %self.config.payload_mode,
                     status = %status,
                     "APNs server error (retriable)"
@@ -417,8 +408,7 @@ impl ApnsClient {
                 }
             }
             _ => {
-                warn!(
-                    token_id = %device_token_id,
+                debug!(
                     payload_mode = %self.config.payload_mode,
                     status = %status,
                     "APNs unexpected response"
@@ -434,15 +424,14 @@ impl ApnsClient {
     async fn send_once(&self, device_token: &str) -> SendAttemptResult {
         let start = Instant::now();
         let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
-        let device_token_id = redacted_device_token_id(device_token);
         let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
 
         debug!(
-            token_id = %device_token_id,
             payload_mode = %self.config.payload_mode,
             push_type = request_parts.push_type,
             priority = request_parts.priority,
             topic = %self.config.bundle_id,
+            device_token = redacted_device_token_id(device_token),
             "Sending APNs notification"
         );
 
@@ -470,8 +459,7 @@ impl ApnsClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(start, response, &device_token_id)
-            .await
+        self.handle_response(start, response).await
     }
 
     /// Check if the client is properly configured.
@@ -541,6 +529,18 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("content-available"));
         assert!(json.contains("1"));
+    }
+
+    #[test]
+    fn test_device_token_redaction_is_not_token_derived() {
+        assert_eq!(
+            redacted_device_token_id("00112233445566778899aabbccddeeff"),
+            "<redacted_device_token>"
+        );
+        assert_eq!(
+            redacted_device_token_id("ffeeddccbbaa99887766554433221100"),
+            "<redacted_device_token>"
+        );
     }
 
     #[test]
@@ -963,9 +963,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client
-            .handle_response(Instant::now(), response, "sha256:test")
-            .await;
+        let result = client.handle_response(Instant::now(), response).await;
 
         assert!(matches!(
             result,
