@@ -74,8 +74,8 @@ shutdown_timeout_secs = 10
 [relays]
 # ClearNet relays to subscribe to
 clearnet = [
-    "wss://relay.damus.io",
-    "wss://nos.lol"
+    "wss://relay.eu.whitenoise.chat",
+    "wss://relay.us.whitenoise.chat"
 ]
 
 # Reject ws:// ClearNet relays by default. Enable only for local development
@@ -170,7 +170,7 @@ export TRANSPONDER_FCM_ENABLED=true
 export TRANSPONDER_FCM_SERVICE_ACCOUNT_PATH="/path/to/service-account.json"
 
 # Relays (comma-separated)
-export TRANSPONDER_RELAYS_CLEARNET="wss://relay.example.com,wss://relay2.example.com"
+export TRANSPONDER_RELAYS_CLEARNET="wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat"
 export TRANSPONDER_RELAYS_ONION="wss://exampleonionrelay.onion" # requires `--features tor`
 
 # Logging

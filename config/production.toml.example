@@ -23,8 +23,8 @@ shutdown_timeout_secs = 20
 
 [relays]
 clearnet = [
-    "wss://relay.damus.io",
-    "wss://nos.lol",
+    "wss://relay.eu.whitenoise.chat",
+    "wss://relay.us.whitenoise.chat",
 ]
 
 # Keep false in production. ClearNet relay URLs must use wss://.

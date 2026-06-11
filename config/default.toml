@@ -50,8 +50,8 @@ shutdown_timeout_secs = 10
 [relays]
 # ClearNet relays to subscribe to
 clearnet = [
-    "wss://relay.damus.io",
-    "wss://nos.lol"
+    "wss://relay.eu.whitenoise.chat",
+    "wss://relay.us.whitenoise.chat"
 ]
 
 # Reject ws:// ClearNet relays by default. Enable only for local development

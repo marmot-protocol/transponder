@@ -151,8 +151,8 @@ tokio-test = "0.4.5"
   [relays]
   # ClearNet relays to subscribe to
   clearnet = [
-    "wss://relay.damus.io",
-    "wss://nos.lol"
+    "wss://relay.eu.whitenoise.chat",
+    "wss://relay.us.whitenoise.chat"
   ]
 
   # Tor/onion relays (requires tor feature)
