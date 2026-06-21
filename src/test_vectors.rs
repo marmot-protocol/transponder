@@ -290,17 +290,19 @@ impl GiftWrapBuilder {
         }
     }
 
-    /// Build a gift-wrapped notification request event.
+    /// Build a gift-wrapped notification request event (MIP-05 spec shape).
     ///
     /// # Arguments
     /// * `content` - The base64 content (concatenated encrypted tokens)
     pub async fn build(&self, content: &str) -> Event {
-        self.build_with_tags(content, false).await
+        self.build_with_tags(content, true).await
     }
 
-    /// Build a gift-wrapped notification request with the legacy `encoding=base64` tag.
-    pub async fn build_with_legacy_encoding_tag(&self, content: &str) -> Event {
-        self.build_with_tags(content, true).await
+    /// Build a gift-wrapped notification request without the `encoding` tag.
+    ///
+    /// Matches the Darkmatter / Marmot compatibility shape.
+    pub async fn build_without_encoding_tag(&self, content: &str) -> Event {
+        self.build_with_tags(content, false).await
     }
 
     async fn build_with_tags(&self, content: &str, include_encoding_tag: bool) -> Event {
@@ -496,7 +498,7 @@ mod tests {
             .build();
 
         let gift_wrap = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build(&content)
+            .build_without_encoding_tag(&content)
             .await;
 
         let handler = Nip59Handler::new(server_keys.clone());
@@ -508,7 +510,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gift_wrap_unwrap_roundtrip_with_legacy_encoding_tag() {
+    async fn test_gift_wrap_unwrap_roundtrip() {
         use crate::crypto::Nip59Handler;
 
         let server_keys = Keys::generate();
@@ -519,7 +521,7 @@ mod tests {
             .build();
 
         let gift_wrap = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build_with_legacy_encoding_tag(&content)
+            .build(&content)
             .await;
 
         let handler = Nip59Handler::new(server_keys.clone());

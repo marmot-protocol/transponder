@@ -134,24 +134,32 @@ impl UnwrappedNotification {
         Ok(())
     }
 
-    /// Returns the value of the first `encoding` tag, if present.
-    fn find_encoding_tag_value(&self) -> Option<&str> {
-        self.tags
-            .iter()
-            .find(|tag| tag.kind() == TagKind::custom(TAG_ENCODING))
-            .and_then(|tag| tag.content())
-    }
-
     /// Validates an optional `encoding` tag.
     ///
-    /// Absent tag defaults to base64 (current MIP-05 / Darkmatter spec).
+    /// Zero `encoding` tags defaults to base64 (current Darkmatter / Marmot spec).
+    /// If present, every `encoding` tag must carry the value `base64`.
     fn validate_encoding_tag(&self) -> Result<()> {
-        match self.find_encoding_tag_value() {
-            None | Some(ENCODING_BASE64) => Ok(()),
-            Some(value) => Err(Error::InvalidToken(format!(
-                "Unsupported encoding tag value: {value}"
-            ))),
+        for tag in self
+            .tags
+            .iter()
+            .filter(|tag| tag.kind() == TagKind::custom(TAG_ENCODING))
+        {
+            match tag.content() {
+                Some(ENCODING_BASE64) => {}
+                Some(value) => {
+                    return Err(Error::InvalidToken(format!(
+                        "Unsupported encoding tag value: {value}"
+                    )));
+                }
+                None => {
+                    return Err(Error::InvalidToken(
+                        "Missing value for encoding tag".to_string(),
+                    ));
+                }
+            }
         }
+
+        Ok(())
     }
 
     /// Parse the encrypted tokens from the content.
@@ -450,6 +458,49 @@ mod tests {
         let tokens = notification.parse_tokens().unwrap();
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0], token);
+    }
+
+    #[test]
+    fn test_parse_rejects_malformed_encoding_tag_missing_value() {
+        let notification = UnwrappedNotification {
+            content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
+            tags: Tags::from_list(vec![
+                Tag::parse([TAG_VERSION, VERSION_MIP05_V1]).unwrap(),
+                Tag::parse([TAG_ENCODING]).unwrap(),
+            ]),
+            created_at: Timestamp::now(),
+        };
+
+        let result = notification.parse_tokens();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing value for encoding tag")
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_duplicate_conflicting_encoding_tags() {
+        let notification = UnwrappedNotification {
+            content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
+            tags: Tags::from_list(vec![
+                Tag::parse([TAG_VERSION, VERSION_MIP05_V1]).unwrap(),
+                Tag::parse([TAG_ENCODING, ENCODING_BASE64]).unwrap(),
+                Tag::parse([TAG_ENCODING, "hex"]).unwrap(),
+            ]),
+            created_at: Timestamp::now(),
+        };
+
+        let result = notification.parse_tokens();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported encoding tag value")
+        );
     }
 
     #[test]
