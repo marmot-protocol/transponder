@@ -93,7 +93,7 @@ impl Nip59Handler {
 pub struct UnwrappedNotification {
     /// Content containing encrypted tokens as a single base64 blob.
     pub content: String,
-    /// Rumor tags used for versioning and content encoding validation.
+    /// Rumor tags used for versioning and optional content encoding validation.
     pub tags: Tags,
     /// When the rumor was created.
     pub created_at: Timestamp,
@@ -134,6 +134,26 @@ impl UnwrappedNotification {
         Ok(())
     }
 
+    /// Returns the value of the first `encoding` tag, if present.
+    fn find_encoding_tag_value(&self) -> Option<&str> {
+        self.tags
+            .iter()
+            .find(|tag| tag.kind() == TagKind::custom(TAG_ENCODING))
+            .and_then(|tag| tag.content())
+    }
+
+    /// Validates an optional `encoding` tag.
+    ///
+    /// Absent tag defaults to base64 (current MIP-05 / Darkmatter spec).
+    fn validate_encoding_tag(&self) -> Result<()> {
+        match self.find_encoding_tag_value() {
+            None | Some(ENCODING_BASE64) => Ok(()),
+            Some(value) => Err(Error::InvalidToken(format!(
+                "Unsupported encoding tag value: {value}"
+            ))),
+        }
+    }
+
     /// Parse the encrypted tokens from the content.
     ///
     /// The content is expected to be a single RFC 4648 standard base64 string
@@ -153,7 +173,7 @@ impl UnwrappedNotification {
         use base64::prelude::*;
 
         self.require_tag_value(TAG_VERSION, VERSION_MIP05_V1)?;
-        self.require_tag_value(TAG_ENCODING, ENCODING_BASE64)?;
+        self.validate_encoding_tag()?;
 
         let max_encoded_len = max_encoded_token_blob_len(max_tokens);
         if self.content.len() > max_encoded_len {
@@ -195,7 +215,11 @@ mod tests {
         format!("exceeds maximum of {max_tokens} tokens")
     }
 
-    fn valid_tags() -> Tags {
+    fn version_only_tags() -> Tags {
+        Tags::parse([[TAG_VERSION, VERSION_MIP05_V1]]).unwrap()
+    }
+
+    fn valid_tags_with_encoding() -> Tags {
         Tags::parse([
             [TAG_VERSION, VERSION_MIP05_V1],
             [TAG_ENCODING, ENCODING_BASE64],
@@ -206,7 +230,15 @@ mod tests {
     fn notification(content: String) -> UnwrappedNotification {
         UnwrappedNotification {
             content,
-            tags: valid_tags(),
+            tags: version_only_tags(),
+            created_at: Timestamp::now(),
+        }
+    }
+
+    fn notification_with_encoding(content: String) -> UnwrappedNotification {
+        UnwrappedNotification {
+            content,
+            tags: valid_tags_with_encoding(),
             created_at: Timestamp::now(),
         }
     }
@@ -398,6 +430,26 @@ mod tests {
         let result = notification.parse_tokens();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not a multiple"));
+    }
+
+    #[test]
+    fn test_parse_succeeds_without_encoding_tag() {
+        let token = vec![0x01; ENCRYPTED_TOKEN_SIZE];
+        let notification = notification(BASE64_STANDARD.encode(&token));
+
+        let tokens = notification.parse_tokens().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], token);
+    }
+
+    #[test]
+    fn test_parse_succeeds_with_encoding_tag() {
+        let token = vec![0x01; ENCRYPTED_TOKEN_SIZE];
+        let notification = notification_with_encoding(BASE64_STANDARD.encode(&token));
+
+        let tokens = notification.parse_tokens().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], token);
     }
 
     #[test]
