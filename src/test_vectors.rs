@@ -304,7 +304,8 @@ impl GiftWrapBuilder {
     }
 
     async fn build_with_tags(&self, content: &str, include_encoding_tag: bool) -> Event {
-        let mut tags = vec![Tag::parse([TAG_VERSION, VERSION_MIP05_V1]).expect("valid version tag")];
+        let mut tags =
+            vec![Tag::parse([TAG_VERSION, VERSION_MIP05_V1]).expect("valid version tag")];
         if include_encoding_tag {
             tags.push(Tag::parse([TAG_ENCODING, ENCODING_BASE64]).expect("valid encoding tag"));
         }
