@@ -294,6 +294,7 @@ impl GiftWrapBuilder {
     ///
     /// # Arguments
     /// * `content` - The base64 content (concatenated encrypted tokens)
+    #[must_use = "event must be used or creation effort is wasted"]
     pub async fn build(&self, content: &str) -> Event {
         self.build_with_tags(content, true).await
     }
@@ -301,6 +302,7 @@ impl GiftWrapBuilder {
     /// Build a gift-wrapped notification request without the `encoding` tag.
     ///
     /// Matches the Darkmatter / Marmot compatibility shape.
+    #[must_use = "event must be used or creation effort is wasted"]
     pub async fn build_without_encoding_tag(&self, content: &str) -> Event {
         self.build_with_tags(content, false).await
     }
