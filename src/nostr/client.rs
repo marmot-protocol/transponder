@@ -3,7 +3,7 @@
 //! Handles connections to ClearNet relays, optional Tor relays, subscription
 //! management, and automatic reconnection.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +26,12 @@ use nostr_sdk::RelayStatus as NostrRelayStatus;
 const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end;
 const INBOX_RELAY_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayKind {
+    Clearnet,
+    Onion,
+}
+
 #[cfg(feature = "tor")]
 const TOR_FEATURE_ENABLED: bool = true;
 #[cfg(not(feature = "tor"))]
@@ -46,6 +52,7 @@ pub struct RelayStatus {
 pub struct RelayClient {
     client: Client,
     config: RelayConfig,
+    relay_kinds: BTreeMap<RelayUrl, RelayKind>,
     status: Arc<RwLock<RelayStatus>>,
     metrics: Option<Metrics>,
 }
@@ -66,6 +73,7 @@ impl RelayClient {
         validate_relay_config(&config)?;
 
         let client = Client::builder().signer(keys).build();
+        let relay_kinds = configured_relay_kinds(&config);
 
         let total = config.clearnet.len() + config.onion.len();
 
@@ -77,6 +85,7 @@ impl RelayClient {
         Ok(Self {
             client,
             config,
+            relay_kinds,
             status: Arc::new(RwLock::new(RelayStatus {
                 clearnet_connected: 0,
                 tor_connected: 0,
@@ -211,10 +220,9 @@ impl RelayClient {
 
         for (url, relay) in &relays {
             if relay.status() == NostrRelayStatus::Connected {
-                if url.as_str().contains(".onion") {
-                    tor += 1;
-                } else {
-                    clearnet += 1;
+                match relay_kind_for_url(url, &self.relay_kinds) {
+                    RelayKind::Clearnet => clearnet += 1,
+                    RelayKind::Onion => tor += 1,
                 }
             }
         }
@@ -338,6 +346,34 @@ fn inbox_relay_tags(event: &Event) -> BTreeSet<String> {
         .filter(|tag| tag.kind() == TagKind::Relay)
         .filter_map(|tag| tag.content().map(str::to_owned))
         .collect()
+}
+
+fn configured_relay_kinds(config: &RelayConfig) -> BTreeMap<RelayUrl, RelayKind> {
+    let mut relay_kinds = BTreeMap::new();
+
+    for url in &config.clearnet {
+        if let Ok(url) = RelayUrl::parse(url) {
+            relay_kinds.insert(url, RelayKind::Clearnet);
+        }
+    }
+
+    for url in &config.onion {
+        if let Ok(url) = RelayUrl::parse(url) {
+            relay_kinds.insert(url, RelayKind::Onion);
+        }
+    }
+
+    relay_kinds
+}
+
+fn relay_kind_for_url(
+    url: &RelayUrl,
+    configured_relay_kinds: &BTreeMap<RelayUrl, RelayKind>,
+) -> RelayKind {
+    configured_relay_kinds
+        .get(url)
+        .copied()
+        .unwrap_or(RelayKind::Clearnet)
 }
 
 fn validate_relay_config(config: &RelayConfig) -> Result<()> {
@@ -508,6 +544,41 @@ mod tests {
 
         // Disconnect
         client.disconnect().await.unwrap();
+    }
+
+    #[test]
+    fn test_relay_kind_uses_configured_origin_not_onion_substring() {
+        let config = RelayConfig {
+            clearnet: vec![
+                "wss://relay.onionmail.example.com".to_string(),
+                "wss://relay.example.com/path/.onion".to_string(),
+            ],
+            allow_unencrypted_clearnet_relays: false,
+            onion: vec!["wss://hidden.example.onion/".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+        let relay_kinds = configured_relay_kinds(&config);
+
+        let clearnet_host_contains_onion =
+            RelayUrl::parse("wss://relay.onionmail.example.com").unwrap();
+        let clearnet_path_contains_onion =
+            RelayUrl::parse("wss://relay.example.com/path/.onion").unwrap();
+        let onion_without_trailing_slash = RelayUrl::parse("wss://hidden.example.onion").unwrap();
+
+        assert_eq!(
+            relay_kind_for_url(&clearnet_host_contains_onion, &relay_kinds),
+            RelayKind::Clearnet
+        );
+        assert_eq!(
+            relay_kind_for_url(&clearnet_path_contains_onion, &relay_kinds),
+            RelayKind::Clearnet
+        );
+        assert_eq!(
+            relay_kind_for_url(&onion_without_trailing_slash, &relay_kinds),
+            RelayKind::Onion
+        );
     }
 
     #[tokio::test]
