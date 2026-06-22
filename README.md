@@ -150,7 +150,8 @@ key can retain up to `per_minute + per_hour` `Instant` timestamps for precise
 sliding-window enforcement. Worst-case timestamp storage is therefore
 `max_rate_limit_cache_size × (per_minute + per_hour)` per limiter: with the
 defaults, `100000 × (240 + 5000) ≈ 524M` timestamps for the encrypted-token
-limiter, and the same bound again for the device-token limiter. Lower
+limiter (about 8.4 GB at 16 bytes per timestamp, before `VecDeque` overhead),
+and the same bound again for the device-token limiter. Lower
 `max_rate_limit_cache_size` on memory-constrained deployments.
 
 ### Environment Variables

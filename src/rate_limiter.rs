@@ -142,7 +142,8 @@ impl Default for RateLimitConfig {
 /// size: `max_entries * (max_per_minute + max_per_hour)` timestamp values per
 /// limiter. With the default 100,000-key cache and 240/minute plus 5,000/hour
 /// limits, one fully saturated limiter can retain roughly 524,000,000 `Instant`
-/// values before pruning; production event processing owns separate encrypted-
+/// values before pruning (about 8.4 GB at 16 bytes per timestamp, before
+/// `VecDeque` overhead). Production event processing owns separate encrypted-
 /// token and device-token limiters, so size `max_entries` and process memory for
 /// both caches.
 ///

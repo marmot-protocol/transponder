@@ -99,8 +99,9 @@ pub struct ServerConfig {
     /// can retain up to `per_minute + per_hour` admitted-hit timestamps, so
     /// worst-case timestamp storage is `max_rate_limit_cache_size *
     /// (per_minute + per_hour)` per limiter. With the defaults, that is roughly
-    /// 524,000,000 `Instant` values per limiter, and Transponder creates two
-    /// such limiters.
+    /// 524,000,000 `Instant` values per limiter (about 8.4 GB at 16 bytes per
+    /// timestamp, before `VecDeque` overhead), and Transponder creates two such
+    /// limiters.
     ///
     /// Unknown keys are rate limited at capacity until cleanup removes stale
     /// entries. Default: 100,000 entries per cache.

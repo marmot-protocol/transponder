@@ -23,7 +23,8 @@ shutdown_timeout_secs = 10
 # Maximum tracked keys for each rate limit cache (encrypted_token and device_token).
 # This caps key count, not timestamp storage: worst-case timestamps per limiter
 # are max_rate_limit_cache_size * (per_minute + per_hour), or ~524M Instant
-# values with the defaults. Transponder has two such limiters.
+# values with the defaults (~8.4 GB at 16 B/timestamp before overhead).
+# Transponder has two such limiters.
 # Unknown keys are rate limited at capacity until cleanup removes stale entries.
 # Default: 100000 entries per cache
 # max_rate_limit_cache_size = 100000
