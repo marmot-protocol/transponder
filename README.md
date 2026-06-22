@@ -71,6 +71,11 @@ shutdown_timeout_secs = 10
 # device_token_rate_limit_per_minute = 240     # Per device (spam protection)
 # device_token_rate_limit_per_hour = 5000
 
+# CPU-exhaustion DoS protection (admission control before gift-wrap unwrap)
+# max_concurrent_event_processing = 64            # Bounds in-flight unwrap (ECDH) work
+# global_unwrap_rate_limit_per_minute = 600       # Global pre-unwrap throttle (all senders)
+# global_unwrap_rate_limit_per_hour = 30000
+
 [relays]
 # ClearNet relays to subscribe to
 clearnet = [
@@ -372,6 +377,7 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 | `transponder_events_processed_total` | Counter | - | Total events successfully processed |
 | `transponder_events_deduplicated_total` | Counter | - | Total events skipped (already processed) |
 | `transponder_events_failed_total` | Counter | - | Total events that failed processing |
+| `transponder_events_shed_total` | Counter | - | Total events shed by global admission control before the gift-wrap unwrap (ECDH) was attempted |
 | `transponder_events_in_flight` | Gauge | - | Current number of events actively being processed |
 | `transponder_event_processing_duration_seconds` | Histogram | `outcome` | End-to-end duration of event processing |
 | `transponder_gift_wrap_unwrap_duration_seconds` | Histogram | `outcome` | Duration of NIP-59 gift-wrap unwraps |

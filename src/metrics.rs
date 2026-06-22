@@ -35,6 +35,10 @@ pub struct Metrics {
     /// Total number of events that failed processing.
     pub events_failed_total: IntCounter,
 
+    /// Total number of events shed by global admission control before the
+    /// gift-wrap unwrap (ECDH) was attempted.
+    pub events_shed_total: IntCounter,
+
     /// Current number of events actively being processed.
     pub events_in_flight: IntGauge,
 
@@ -242,6 +246,12 @@ impl Metrics {
             "Total number of events that failed processing",
         ))?;
         registry.register(Box::new(events_failed_total.clone()))?;
+
+        let events_shed_total = IntCounter::with_opts(Opts::new(
+            "transponder_events_shed_total",
+            "Total number of events shed by global admission control before the gift-wrap unwrap (ECDH) was attempted",
+        ))?;
+        registry.register(Box::new(events_shed_total.clone()))?;
 
         let events_in_flight = IntGauge::with_opts(Opts::new(
             "transponder_events_in_flight",
@@ -533,6 +543,7 @@ impl Metrics {
             events_processed_total,
             events_deduplicated_total,
             events_failed_total,
+            events_shed_total,
             events_in_flight,
             event_processing_duration_seconds,
             gift_wrap_unwrap_duration_seconds,
@@ -610,6 +621,11 @@ impl Metrics {
     /// Record a failed event.
     pub fn record_event_failed(&self) {
         self.events_failed_total.inc();
+    }
+
+    /// Record an event shed by global admission control before unwrap.
+    pub fn record_event_shed(&self) {
+        self.events_shed_total.inc();
     }
 
     /// Increment the number of in-flight events.
@@ -864,6 +880,7 @@ mod tests {
         metrics.record_event_processed();
         metrics.record_event_deduplicated();
         metrics.record_event_failed();
+        metrics.record_event_shed();
         metrics.inc_events_in_flight();
         metrics.observe_event_processing_duration(EventOutcome::Processed, 0.01);
         metrics.observe_gift_wrap_unwrap_duration(OperationOutcome::Success, 0.005);
@@ -886,6 +903,10 @@ mod tests {
         );
         assert_eq!(
             counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_shed_total", &[]),
             1.0
         );
         assert_eq!(

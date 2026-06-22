@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::error::Result;
 use crate::rate_limiter::{
+    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE,
     DEFAULT_MAX_SIZE as DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE, DEFAULT_RATE_LIMIT_PER_HOUR,
     DEFAULT_RATE_LIMIT_PER_MINUTE,
 };
@@ -50,8 +51,27 @@ const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
 const DEFAULT_HEALTH_BIND_ADDRESS: &str = "127.0.0.1:8080";
 const ENV_PREFIX: &str = "TRANSPONDER_";
 
+/// Default maximum number of events processed concurrently.
+///
+/// Caps the total in-flight gift-wrap unwrap (ECDH) work so a flood cannot
+/// spawn unbounded crypto tasks, while still draining the relay broadcast
+/// channel quickly enough to avoid `Lagged` overflow.
+const DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING: usize = 64;
+
 fn default_max_dedup_cache_size() -> usize {
     DEFAULT_MAX_DEDUP_CACHE_SIZE
+}
+
+fn default_max_concurrent_event_processing() -> usize {
+    DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING
+}
+
+fn default_global_unwrap_rate_limit_per_minute() -> u32 {
+    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE
+}
+
+fn default_global_unwrap_rate_limit_per_hour() -> u32 {
+    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR
 }
 
 fn default_max_rate_limit_cache_size() -> usize {
@@ -139,6 +159,31 @@ pub struct ServerConfig {
     /// Default: 5,000.
     #[serde(default = "default_rate_limit_per_hour")]
     pub device_token_rate_limit_per_hour: u32,
+
+    /// Maximum number of events processed concurrently.
+    ///
+    /// Bounds total in-flight gift-wrap unwrap (ECDH) work. The relay event
+    /// loop admits up to this many events at once; excess events wait for a
+    /// permit. This drains the broadcast channel quickly (avoiding `Lagged`
+    /// overflow) while capping CPU spent on asymmetric crypto.
+    /// Default: 64.
+    #[serde(default = "default_max_concurrent_event_processing")]
+    pub max_concurrent_event_processing: usize,
+
+    /// Global maximum gift-wrap unwraps (ECDH) per minute, across all senders.
+    ///
+    /// Cheap admission control checked BEFORE the gift-wrap unwrap. The server
+    /// pubkey is public and gift wraps are sender-anonymous, so this global
+    /// throttle sheds floods before spending asymmetric-crypto cycles.
+    /// Default: 600 (10 per second).
+    #[serde(default = "default_global_unwrap_rate_limit_per_minute")]
+    pub global_unwrap_rate_limit_per_minute: u32,
+
+    /// Global maximum gift-wrap unwraps (ECDH) per hour, across all senders.
+    ///
+    /// Default: 30,000.
+    #[serde(default = "default_global_unwrap_rate_limit_per_hour")]
+    pub global_unwrap_rate_limit_per_hour: u32,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -165,6 +210,18 @@ impl std::fmt::Debug for ServerConfig {
             .field(
                 "device_token_rate_limit_per_hour",
                 &self.device_token_rate_limit_per_hour,
+            )
+            .field(
+                "max_concurrent_event_processing",
+                &self.max_concurrent_event_processing,
+            )
+            .field(
+                "global_unwrap_rate_limit_per_minute",
+                &self.global_unwrap_rate_limit_per_minute,
+            )
+            .field(
+                "global_unwrap_rate_limit_per_hour",
+                &self.global_unwrap_rate_limit_per_hour,
             )
             .finish()
     }
@@ -404,6 +461,18 @@ fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
             "server.device_token_rate_limit_per_hour",
             DEFAULT_RATE_LIMIT_PER_HOUR as i64,
         )?
+        .set_default(
+            "server.max_concurrent_event_processing",
+            DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING as i64,
+        )?
+        .set_default(
+            "server.global_unwrap_rate_limit_per_minute",
+            DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE as i64,
+        )?
+        .set_default(
+            "server.global_unwrap_rate_limit_per_hour",
+            DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR as i64,
+        )?
         .set_default("relays.clearnet", Vec::<String>::new())?
         .set_default("relays.allow_unencrypted_clearnet_relays", false)?
         .set_default("relays.onion", Vec::<String>::new())?
@@ -511,6 +580,9 @@ fn is_supported_config_key(config_key: &str) -> bool {
                 | "server.encrypted_token_rate_limit_per_hour"
                 | "server.device_token_rate_limit_per_minute"
                 | "server.device_token_rate_limit_per_hour"
+                | "server.max_concurrent_event_processing"
+                | "server.global_unwrap_rate_limit_per_minute"
+                | "server.global_unwrap_rate_limit_per_hour"
                 | "relays.allow_unencrypted_clearnet_relays"
                 | "relays.reconnect_interval_secs"
                 | "relays.max_reconnect_attempts"
@@ -652,6 +724,9 @@ mod tests {
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
             device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
         }
     }
 
@@ -1062,6 +1137,9 @@ mod tests {
         assert_eq!(default_max_tokens_per_event(), DEFAULT_MAX_TOKENS_PER_EVENT);
         assert_eq!(default_rate_limit_per_minute(), 240);
         assert_eq!(default_rate_limit_per_hour(), 5000);
+        assert_eq!(default_max_concurrent_event_processing(), 64);
+        assert_eq!(default_global_unwrap_rate_limit_per_minute(), 600);
+        assert_eq!(default_global_unwrap_rate_limit_per_hour(), 30_000);
     }
 
     #[test]
@@ -1187,6 +1265,9 @@ mod tests {
         assert_eq!(config.server.device_token_rate_limit_per_minute, 240);
         assert_eq!(config.server.device_token_rate_limit_per_hour, 5000);
         assert_eq!(config.server.max_tokens_per_event, 100);
+        assert_eq!(config.server.max_concurrent_event_processing, 64);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 600);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 30_000);
     }
 
     #[test]
@@ -1199,6 +1280,9 @@ mod tests {
             encrypted_token_rate_limit_per_hour = 2000
             device_token_rate_limit_per_minute = 50
             device_token_rate_limit_per_hour = 1000
+            max_concurrent_event_processing = 32
+            global_unwrap_rate_limit_per_minute = 300
+            global_unwrap_rate_limit_per_hour = 15000
         "#;
 
         let file = create_temp_config(config_content);
@@ -1209,5 +1293,28 @@ mod tests {
         assert_eq!(config.server.device_token_rate_limit_per_minute, 50);
         assert_eq!(config.server.device_token_rate_limit_per_hour, 1000);
         assert_eq!(config.server.max_tokens_per_event, 25);
+        assert_eq!(config.server.max_concurrent_event_processing, 32);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 300);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 15_000);
+    }
+
+    #[test]
+    fn test_global_unwrap_admission_env_overrides() {
+        let config = from_test_env(&[
+            ("TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING", "16"),
+            (
+                "TRANSPONDER_SERVER_GLOBAL_UNWRAP_RATE_LIMIT_PER_MINUTE",
+                "120",
+            ),
+            (
+                "TRANSPONDER_SERVER_GLOBAL_UNWRAP_RATE_LIMIT_PER_HOUR",
+                "7200",
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(config.server.max_concurrent_event_processing, 16);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 120);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 7200);
     }
 }

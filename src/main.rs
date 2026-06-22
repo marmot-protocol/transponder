@@ -16,6 +16,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use nostr_sdk::prelude::*;
+use tokio::sync::Semaphore;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -128,11 +129,23 @@ fn build_rate_limit_config(server: &config::ServerConfig) -> nostr::events::Toke
         encrypted_token_per_hour: server.encrypted_token_rate_limit_per_hour,
         device_token_per_minute: server.device_token_rate_limit_per_minute,
         device_token_per_hour: server.device_token_rate_limit_per_hour,
+        global_unwrap_per_minute: server.global_unwrap_rate_limit_per_minute,
+        global_unwrap_per_hour: server.global_unwrap_rate_limit_per_hour,
     }
 }
 
 fn parse_server_secret_key(server_private_key: &str) -> Result<SecretKey> {
     SecretKey::parse(server_private_key).context("Invalid server private key")
+}
+
+/// Number of permits to use for the event-processing semaphore.
+///
+/// Bounds total in-flight gift-wrap unwrap (ECDH) work. A configured value of
+/// zero would deadlock the event loop (no permit could ever be acquired), so it
+/// is clamped up to a single permit, preserving sequential processing.
+#[must_use]
+fn event_processing_permits(max_concurrent_event_processing: usize) -> usize {
+    max_concurrent_event_processing.max(1)
 }
 
 #[tokio::main]
@@ -328,8 +341,21 @@ async fn main() -> Result<()> {
 
     // Start event processing loop
     let mut event_shutdown = shutdown.subscribe();
-    let event_processor_clone = event_processor.clone();
     let event_metrics = metrics.clone();
+
+    // Bounded-concurrency dispatch.
+    //
+    // Each admitted event is processed in its own spawned task, gated by a
+    // semaphore. The receive loop drains the broadcast channel quickly so it
+    // does not fall behind and trigger `Lagged` overflow, while the semaphore
+    // caps total in-flight gift-wrap unwrap (ECDH) work so a flood cannot spawn
+    // unbounded crypto tasks. An owned permit is acquired BEFORE spawning and
+    // dropped when the spawned task finishes; when the budget is exhausted the
+    // loop awaits a free permit (applying back-pressure) but still consumes
+    // events promptly once a slot frees.
+    let event_permits = event_processing_permits(config.server.max_concurrent_event_processing);
+    let event_semaphore = Arc::new(Semaphore::new(event_permits));
+    let event_processor_loop = event_processor.clone();
 
     let event_handle = tokio::spawn(async move {
         loop {
@@ -341,11 +367,28 @@ async fn main() -> Result<()> {
                 result = notifications.recv() => {
                     match result {
                         Ok(notification) => {
-                            if let RelayPoolNotification::Event { event, .. } = notification
-                                && let Err(e) = event_processor_clone.process(&event).await
-                            {
-                                debug!(error = %e, "Event processing error");
-                            }
+                            let RelayPoolNotification::Event { event, .. } = notification else {
+                                continue;
+                            };
+
+                            // Acquire a permit before spawning so total in-flight
+                            // unwrap work stays bounded. `acquire_owned` only errors
+                            // if the semaphore is closed, which never happens here.
+                            let Ok(permit) =
+                                Arc::clone(&event_semaphore).acquire_owned().await
+                            else {
+                                break;
+                            };
+
+                            let processor = event_processor_loop.clone();
+                            tokio::spawn(async move {
+                                // Hold the permit for the lifetime of the task; it
+                                // is released when `permit` is dropped on return.
+                                let _permit = permit;
+                                if let Err(e) = processor.process(&event).await {
+                                    debug!(error = %e, "Event processing error");
+                                }
+                            });
                         }
                         Err(e) => {
                             record_notification_receive_metrics(event_metrics.as_ref(), &e);
@@ -573,6 +616,38 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
+    fn event_processing_permits_clamps_zero_to_one() {
+        assert_eq!(event_processing_permits(0), 1);
+    }
+
+    #[test]
+    fn event_processing_permits_preserves_positive_values() {
+        assert_eq!(event_processing_permits(1), 1);
+        assert_eq!(event_processing_permits(64), 64);
+        assert_eq!(event_processing_permits(1000), 1000);
+    }
+
+    #[tokio::test]
+    async fn event_semaphore_caps_in_flight_permits() {
+        let permits = event_processing_permits(3);
+        let semaphore = Arc::new(Semaphore::new(permits));
+
+        // Acquire up to the cap; all succeed.
+        let p1 = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let _p2 = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let _p3 = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // No permit is available while the cap is reached.
+        assert!(Arc::clone(&semaphore).try_acquire_owned().is_err());
+
+        // Releasing one permit frees a slot for the next event.
+        drop(p1);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(Arc::clone(&semaphore).try_acquire_owned().is_ok());
+    }
+
+    #[test]
     fn notification_receive_lag_is_recoverable() {
         let action = classify_notification_receive_error(&RecvError::Lagged(3));
 
@@ -666,6 +741,9 @@ mod tests {
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
             device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
         };
 
         assert_eq!(
@@ -691,6 +769,9 @@ mod tests {
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
             device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
         };
 
         assert_eq!(
@@ -715,6 +796,9 @@ mod tests {
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
             device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
         };
 
         assert_eq!(
@@ -736,6 +820,9 @@ mod tests {
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
             device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
         };
 
         assert_eq!(
@@ -757,6 +844,9 @@ mod tests {
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
             device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
         };
 
         let error = resolve_server_private_key(&mut config)
@@ -858,6 +948,9 @@ mod tests {
             encrypted_token_rate_limit_per_hour: 5000,
             device_token_rate_limit_per_minute: 240,
             device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
         };
 
         let resolved_key = resolve_server_private_key(&mut config).unwrap();
@@ -879,6 +972,9 @@ mod tests {
             encrypted_token_rate_limit_per_hour: 2222,
             device_token_rate_limit_per_minute: 333,
             device_token_rate_limit_per_hour: 4444,
+            max_concurrent_event_processing: 7,
+            global_unwrap_rate_limit_per_minute: 555,
+            global_unwrap_rate_limit_per_hour: 6666,
         };
 
         let rate_limit_config = build_rate_limit_config(&server);
@@ -889,5 +985,7 @@ mod tests {
         assert_eq!(rate_limit_config.encrypted_token_per_hour, 2222);
         assert_eq!(rate_limit_config.device_token_per_minute, 333);
         assert_eq!(rate_limit_config.device_token_per_hour, 4444);
+        assert_eq!(rate_limit_config.global_unwrap_per_minute, 555);
+        assert_eq!(rate_limit_config.global_unwrap_per_hour, 6666);
     }
 }

@@ -21,8 +21,8 @@ use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
 use crate::rate_limiter::{
-    DEFAULT_MAX_SIZE, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig,
-    RateLimiter,
+    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
+    DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig, RateLimiter,
 };
 
 /// Duration to keep event IDs for deduplication (5 minutes).
@@ -76,6 +76,13 @@ pub struct EventProcessor {
     push_dispatcher: Arc<PushDispatcher>,
     /// Event ID deduplication cache.
     seen_events: Arc<RwLock<LruCache<EventId, Instant>>>,
+    /// Global pre-unwrap admission limiter.
+    ///
+    /// Checked BEFORE the gift-wrap unwrap (ECDH + seal decryption) using a
+    /// single fixed key so it acts as a cheap global throttle. The server's
+    /// pubkey is public, so anyone can flood it with valid gift wraps; this
+    /// budget sheds that traffic before spending asymmetric-crypto cycles.
+    global_unwrap_limiter: RateLimiter<()>,
     /// Encrypted token rate limiter.
     encrypted_token_limiter: RateLimiter<[u8; 32]>,
     /// Device token rate limiter.
@@ -100,6 +107,10 @@ pub struct TokenRateLimitConfig {
     pub device_token_per_minute: u32,
     /// Max device token requests per hour.
     pub device_token_per_hour: u32,
+    /// Global max gift-wrap unwraps (ECDH) per minute, across all senders.
+    pub global_unwrap_per_minute: u32,
+    /// Global max gift-wrap unwraps (ECDH) per hour, across all senders.
+    pub global_unwrap_per_hour: u32,
 }
 
 impl Default for TokenRateLimitConfig {
@@ -111,6 +122,8 @@ impl Default for TokenRateLimitConfig {
             encrypted_token_per_hour: DEFAULT_RATE_LIMIT_PER_HOUR,
             device_token_per_minute: DEFAULT_RATE_LIMIT_PER_MINUTE,
             device_token_per_hour: DEFAULT_RATE_LIMIT_PER_HOUR,
+            global_unwrap_per_minute: DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE,
+            global_unwrap_per_hour: DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR,
         }
     }
 }
@@ -173,6 +186,12 @@ impl EventProcessor {
             token_decryptor,
             push_dispatcher,
             seen_events: Arc::new(RwLock::new(LruCache::new(cache_size))),
+            // A single fixed `()` key, so capacity of 1 entry is sufficient.
+            global_unwrap_limiter: RateLimiter::new(RateLimitConfig {
+                max_per_minute: rate_limit_config.global_unwrap_per_minute,
+                max_per_hour: rate_limit_config.global_unwrap_per_hour,
+                max_entries: 1,
+            }),
             encrypted_token_limiter: RateLimiter::new(RateLimitConfig {
                 max_per_minute: rate_limit_config.encrypted_token_per_minute,
                 max_per_hour: rate_limit_config.encrypted_token_per_hour,
@@ -206,8 +225,17 @@ impl EventProcessor {
 
         info!(event_id = %event.id, "Received Nostr notification event");
 
-        // Check for duplicates
-        if self.is_duplicate(&event.id).await {
+        // Check for duplicates and atomically reserve the event ID.
+        //
+        // The reservation (check-and-mark) happens under a single write-lock
+        // critical section so concurrent deliveries of the same event ID — now
+        // possible because the event loop in `main.rs` processes events in
+        // bounded-concurrency spawned tasks — cannot both pass the dedup gate
+        // and dispatch duplicate notifications. The reservation is rolled back
+        // (`release_reservation`) on admission shedding and on transient
+        // failures so those events remain eligible for retry, preserving the
+        // prior "not marked seen on transient failure" semantics.
+        if !self.try_reserve(event.id).await {
             trace!("Skipping duplicate event");
             if let Some(ref m) = self.metrics {
                 m.record_event_deduplicated();
@@ -219,11 +247,41 @@ impl EventProcessor {
             return Ok(false);
         }
 
+        // Global pre-unwrap admission control.
+        //
+        // Checked BEFORE the expensive NIP-59 gift-wrap unwrap (ECDH + seal
+        // decryption). The per-token limiters run only AFTER unwrap, so they
+        // cannot protect against a flood of valid-but-junk gift wraps. The
+        // server pubkey is public and gift wraps are sender-anonymous, so a
+        // cheap GLOBAL throttle is the correct admission control here. When the
+        // budget is exceeded we shed the event without unwrapping. The event is
+        // NOT marked seen: shedding is transient back-pressure, not a permanent
+        // failure, so the event may be processed later once budget recovers.
+        // The reservation taken above is released so the retry is not treated
+        // as a duplicate.
+        let admission = self.global_unwrap_limiter.check_and_increment(&()).await;
+        if !admission.is_allowed() {
+            self.release_reservation(&event.id).await;
+            trace!(
+                reason = admission.limit_reason(),
+                "Shed event before unwrap (global admission control)"
+            );
+            if let Some(ref m) = self.metrics {
+                m.record_event_shed();
+                m.observe_event_processing_duration(
+                    EventOutcome::Failed,
+                    started_at.elapsed_secs(),
+                );
+            }
+            return Ok(false);
+        }
+
         // Process the event
         match self.process_inner(event).await {
             Ok(count) => {
-                // Mark as seen only after successful processing.
-                // This avoids dropping events due to transient failures.
+                // Refresh the seen timestamp now that processing succeeded, so
+                // the dedup window is measured from completion. The reservation
+                // taken above already keeps the event marked seen.
                 self.mark_seen(event.id).await;
 
                 info!(
@@ -242,7 +300,13 @@ impl EventProcessor {
             }
             Err(e) => {
                 if Self::is_permanent_error(&e) {
+                    // Permanent failures stay marked seen (via the reservation)
+                    // so replays short-circuit as duplicates.
                     self.mark_seen(event.id).await;
+                } else {
+                    // Transient failures release the reservation so the event
+                    // can be retried on a later delivery.
+                    self.release_reservation(&event.id).await;
                 }
 
                 // Log but don't propagate - we want to continue processing other events
@@ -471,12 +535,67 @@ impl EventProcessor {
     }
 
     /// Check if an event has been seen recently.
+    #[cfg(test)]
     async fn is_duplicate(&self, event_id: &EventId) -> bool {
         let seen = self.seen_events.read().await;
         seen.contains(event_id)
     }
 
-    /// Mark an event as seen.
+    /// Atomically reserve an event ID for processing.
+    ///
+    /// Returns `true` if the reservation succeeded (the event was previously
+    /// unseen and is now marked seen), or `false` if the event was already
+    /// seen/reserved — i.e. a duplicate.
+    ///
+    /// The check-and-insert happens under a single write-lock critical section
+    /// so that concurrent deliveries of the same Nostr event ID (common when
+    /// the same event arrives from multiple relays) cannot both observe the
+    /// event as unseen. Without this, the bounded-concurrency event loop in
+    /// `main.rs` — which spawns a task per event — would let duplicates race
+    /// past a non-atomic check-then-mark sequence and dispatch duplicate push
+    /// notifications.
+    ///
+    /// On transient (retryable) processing failure or admission shedding, the
+    /// reservation must be released with [`Self::release_reservation`] so the
+    /// event can be retried later.
+    async fn try_reserve(&self, event_id: EventId) -> bool {
+        let mut seen = self.seen_events.write().await;
+        if seen.contains(&event_id) {
+            return false;
+        }
+        seen.put(event_id, Instant::now());
+
+        // Update cache size metric
+        if let Some(ref m) = self.metrics {
+            m.set_dedup_cache_size(seen.len());
+        }
+        true
+    }
+
+    /// Release a previously reserved event ID.
+    ///
+    /// Used to roll back a [`Self::try_reserve`] when processing did not reach
+    /// a terminal state (transient failure or pre-unwrap admission shedding),
+    /// so the event remains eligible for retry. This is the inverse of the
+    /// reservation and preserves the prior "not marked seen on transient
+    /// failure" semantics.
+    async fn release_reservation(&self, event_id: &EventId) {
+        let mut seen = self.seen_events.write().await;
+        seen.pop(event_id);
+
+        // Update cache size metric
+        if let Some(ref m) = self.metrics {
+            m.set_dedup_cache_size(seen.len());
+        }
+    }
+
+    /// Refresh the seen timestamp for an already-reserved event.
+    ///
+    /// Called when processing reaches a terminal state (success or permanent
+    /// failure) to keep the dedup entry. The entry already exists from
+    /// [`Self::try_reserve`]; this updates its timestamp so the dedup window is
+    /// measured from completion. Kept distinct from `try_reserve` for clarity
+    /// at the call sites.
     async fn mark_seen(&self, event_id: EventId) {
         let mut seen = self.seen_events.write().await;
         seen.put(event_id, Instant::now());
@@ -524,6 +643,11 @@ impl EventProcessor {
                 "Cleaned up event deduplication cache"
             );
         }
+
+        // Clean global pre-unwrap admission limiter cache.
+        // It only holds a single fixed key, but cleaning it keeps the limiter
+        // memory bounded and behavior consistent with the other limiters.
+        self.global_unwrap_limiter.cleanup().await;
 
         // Clean encrypted token rate limiter cache
         let encrypted_stats = self.encrypted_token_limiter.cleanup().await;
@@ -853,6 +977,75 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_process_concurrent_duplicates_dispatch_once() {
+        // Regression test for the dedup race introduced by bounded-concurrency
+        // event processing in `main.rs`: the same Nostr event ID can be
+        // delivered concurrently (e.g. from multiple relays) and processed in
+        // parallel spawned tasks. The dedup check-and-mark must be atomic so
+        // exactly one delivery is processed and the rest short-circuit as
+        // duplicates, instead of all of them unwrapping and dispatching
+        // duplicate push notifications.
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let event = scenarios::single_apns_notification(
+            &server_keys,
+            &sender_keys,
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        )
+        .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+        let processor = Arc::new(processor);
+
+        // Fan out many concurrent processings of the SAME event.
+        const CONCURRENCY: usize = 32;
+        let mut handles = Vec::with_capacity(CONCURRENCY);
+        for _ in 0..CONCURRENCY {
+            let processor = Arc::clone(&processor);
+            let event = event.clone();
+            handles.push(tokio::spawn(async move { processor.process(&event).await }));
+        }
+
+        let mut processed_true = 0usize;
+        for handle in handles {
+            if handle.await.expect("task panicked").expect("process ok") {
+                processed_true += 1;
+            }
+        }
+
+        // Exactly one delivery should report a successful (non-duplicate)
+        // processing; every other delivery is deduplicated.
+        assert_eq!(
+            processed_true, 1,
+            "exactly one concurrent delivery must be processed"
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            1.0,
+            "the event must be dispatched exactly once across concurrent deliveries"
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            (CONCURRENCY - 1) as f64,
+            "all but one concurrent delivery must be deduplicated"
+        );
+        // Push dispatch admission is recorded once per processed event, so an
+        // exactly-once value here proves the expensive unwrap+dispatch path ran
+        // only once despite the concurrent flood.
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_notifications_admitted_per_event",
+                &[]
+            ),
+            1,
+            "notifications must be admitted/dispatched for exactly one delivery"
+        );
+        assert_eq!(processor.cache_len(), 1);
+    }
+
     #[tokio::test]
     async fn test_process_different_events_not_deduplicated() {
         let server_keys = Keys::generate();
@@ -1061,6 +1254,8 @@ mod tests {
                     encrypted_token_per_hour: 1,
                     device_token_per_minute: 1,
                     device_token_per_hour: 1,
+                    global_unwrap_per_minute: 1000,
+                    global_unwrap_per_hour: 10000,
                 },
             )
             .await;
@@ -1114,6 +1309,8 @@ mod tests {
                     encrypted_token_per_hour: 100,
                     device_token_per_minute: 100,
                     device_token_per_hour: 100,
+                    global_unwrap_per_minute: 1000,
+                    global_unwrap_per_hour: 10000,
                 },
             )
             .await;
@@ -1495,6 +1692,8 @@ mod tests {
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 1,
                 device_token_per_hour: 100,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
             },
         );
 
@@ -1551,6 +1750,8 @@ mod tests {
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 2, // Only allow 2 per minute per device
                 device_token_per_hour: 100,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
             },
         );
 
@@ -1611,6 +1812,8 @@ mod tests {
                 encrypted_token_per_hour: 100,
                 device_token_per_minute: 100, // High limit for device tokens
                 device_token_per_hour: 1000,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
             },
         );
 
@@ -1688,6 +1891,8 @@ mod tests {
                 encrypted_token_per_hour: 100,
                 device_token_per_minute: 100,
                 device_token_per_hour: 1000,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
             },
         );
 
@@ -1724,6 +1929,138 @@ mod tests {
         assert!(
             result3.unwrap(),
             "Token should be allowed after window reset"
+        );
+    }
+
+    // === Global Pre-Unwrap Admission Control Tests ===
+
+    fn flood_rate_limit_config(
+        global_unwrap_per_minute: u32,
+        global_unwrap_per_hour: u32,
+    ) -> TokenRateLimitConfig {
+        TokenRateLimitConfig {
+            max_cache_size: 100,
+            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+            // Generous per-token limits so only the global limiter can shed.
+            encrypted_token_per_minute: 100_000,
+            encrypted_token_per_hour: 100_000,
+            device_token_per_minute: 100_000,
+            device_token_per_hour: 100_000,
+            global_unwrap_per_minute,
+            global_unwrap_per_hour,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_global_limiter_sheds_flood_before_unwrap() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        // Allow exactly 2 unwraps per minute. The third flood event must be shed.
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            flood_rate_limit_config(2, 1000),
+        );
+
+        let limit = 2usize;
+        for _ in 0..limit {
+            // Distinct event IDs so dedup never short-circuits the unwrap path.
+            let event =
+                scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+            assert!(processor.process(&event).await.unwrap());
+        }
+
+        // The (N+1)th event exceeds the global budget and is shed.
+        let flood_event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(!processor.process(&flood_event).await.unwrap());
+
+        // Exactly one event was shed.
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_shed_total", &[]),
+            1.0
+        );
+
+        // The shed event was NOT unwrapped: only `limit` unwraps were observed.
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_gift_wrap_unwrap_duration_seconds",
+                &[("outcome", OperationOutcome::Success.as_str())],
+            ),
+            limit as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_limiter_does_not_mark_shed_event_seen() {
+        tokio::time::pause();
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        // Only 1 unwrap per minute allowed.
+        let (processor, _metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            flood_rate_limit_config(1, 1000),
+        );
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+
+        // First event consumes the global budget.
+        assert!(processor.process(&event).await.unwrap());
+
+        // Same event again: deduplicated, so it is not shed.
+        assert!(!processor.process(&event).await.unwrap());
+
+        // A different event is shed (budget exhausted) and must NOT be marked seen.
+        let flood_event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(!processor.process(&flood_event).await.unwrap());
+        assert!(!processor.is_duplicate(&flood_event.id).await);
+
+        // After the window resets, the previously shed event is admitted.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(processor.process(&flood_event).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_global_limiter_recovers_after_window() {
+        tokio::time::pause();
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            flood_rate_limit_config(1, 1000),
+        );
+
+        let event1 =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&event1).await.unwrap());
+
+        let event2 =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(!processor.process(&event2).await.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_shed_total", &[]),
+            1.0
+        );
+
+        // Past the minute window, budget recovers and events flow again.
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        let event3 =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&event3).await.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_shed_total", &[]),
+            1.0
         );
     }
 }
