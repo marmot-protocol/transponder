@@ -149,6 +149,7 @@ impl PushDispatcher {
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
         metrics: Option<Metrics>,
+        backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) {
         let platform_str = match platform {
             Platform::Apns => "apns",
@@ -158,7 +159,7 @@ impl PushDispatcher {
         match platform {
             Platform::Apns => {
                 if let Some(client) = apns_client {
-                    match client.send(token.as_str()).await {
+                    match client.send(token.as_str(), backoff_permit.as_deref_mut()).await {
                         Ok(true) => {
                             trace!("APNs notification sent");
                             if let Some(ref m) = metrics {
@@ -182,7 +183,7 @@ impl PushDispatcher {
             }
             Platform::Fcm => {
                 if let Some(client) = fcm_client {
-                    match client.send(token.as_str()).await {
+                    match client.send(token.as_str(), backoff_permit.as_deref_mut()).await {
                         Ok(true) => {
                             trace!("FCM notification sent");
                             if let Some(ref m) = metrics {
@@ -243,16 +244,27 @@ impl PushDispatcher {
                         let semaphore = semaphore.clone();
 
                         tokio::spawn(async move {
+                            // Wrap the permit so the send's internal backoff
+                            // can release the in-flight slot during sleeps and
+                            // re-acquire it before the next attempt.
+                            let mut backoff_permit = crate::push::retry::BackoffPermit::new(
+                                semaphore.clone(),
+                                permit,
+                            );
+
                             Self::send_push(
                                 platform,
                                 token,
                                 apns_client,
                                 fcm_client,
                                 metrics.clone(),
+                                Some(&mut backoff_permit),
                             )
                             .await;
 
-                            drop(permit);
+                            // Release the held permit (owned by backoff_permit)
+                            // before reading available permits for the metric.
+                            drop(backoff_permit);
 
                             if let Some(ref m) = metrics {
                                 m.set_push_semaphore_available(semaphore.available_permits());

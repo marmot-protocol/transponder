@@ -285,7 +285,15 @@ impl ApnsClient {
     ///
     /// This method automatically retries transient failures (429, 5xx) with
     /// exponential backoff.
-    pub async fn send(&self, device_token: &str) -> Result<bool> {
+    ///
+    /// When `backoff_permit` is `Some`, the dispatcher concurrency permit is
+    /// released during backoff sleeps and re-acquired before each retry, so a
+    /// sleeping retry does not occupy an in-flight concurrency slot.
+    pub async fn send(
+        &self,
+        device_token: &str,
+        backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
+    ) -> Result<bool> {
         // Validate token format before sending
         if !is_valid_device_token(device_token) {
             trace!(
@@ -300,6 +308,7 @@ impl ApnsClient {
             &retry_config,
             "APNs",
             || self.send_once(device_token),
+            backoff_permit,
             self.metrics.as_ref(),
         )
         .await
@@ -702,7 +711,7 @@ mod tests {
         };
 
         // Test with a token that contains non-hex characters
-        let result = client.send("tooshort").await.unwrap();
+        let result = client.send("tooshort", None).await.unwrap();
         assert!(
             !result,
             "Should return false for token with non-hex characters"
@@ -710,7 +719,10 @@ mod tests {
 
         // Test with token that has invalid characters
         let result = client
-            .send("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg")
+            .send(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -719,7 +731,7 @@ mod tests {
         );
 
         // Test with empty token
-        let result = client.send("").await.unwrap();
+        let result = client.send("", None).await.unwrap();
         assert!(!result, "Should return false for empty token");
     }
 

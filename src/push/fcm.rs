@@ -295,12 +295,21 @@ impl FcmClient {
     ///
     /// This method automatically retries transient failures (429, 5xx) with
     /// exponential backoff.
-    pub async fn send(&self, device_token: &str) -> Result<bool> {
+    ///
+    /// When `backoff_permit` is `Some`, the dispatcher concurrency permit is
+    /// released during backoff sleeps and re-acquired before each retry, so a
+    /// sleeping retry does not occupy an in-flight concurrency slot.
+    pub async fn send(
+        &self,
+        device_token: &str,
+        backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
+    ) -> Result<bool> {
         let retry_config = RetryConfig::default();
         retry::with_retry(
             &retry_config,
             "FCM",
             || self.send_once(device_token),
+            backoff_permit,
             self.metrics.as_ref(),
         )
         .await
@@ -1243,7 +1252,7 @@ mod tests {
             });
         }
 
-        let result = client.send("test-device-token").await;
+        let result = client.send("test-device-token", None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No project ID"));
     }
@@ -1258,7 +1267,7 @@ mod tests {
 
         let client = FcmClient::mock(config, false);
 
-        let result = client.send("test-device-token").await;
+        let result = client.send("test-device-token", None).await;
         assert!(result.is_err());
         assert!(
             result
@@ -1279,7 +1288,7 @@ mod tests {
         let mut client = FcmClient::mock(config, true);
         client.service_account.as_mut().unwrap().project_id = "x/../../admin/v1".to_string();
 
-        let result = client.send("test-device-token").await;
+        let result = client.send("test-device-token", None).await;
         assert!(result.is_err());
         assert!(
             result
@@ -1300,7 +1309,7 @@ mod tests {
         // Client without service account - will fail to get access token
         let client = FcmClient::mock(config, false);
 
-        let result = client.send("test-device-token").await;
+        let result = client.send("test-device-token", None).await;
         assert!(result.is_err());
         assert!(
             result
