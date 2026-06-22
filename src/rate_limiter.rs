@@ -49,7 +49,7 @@ pub enum RateLimitResult {
     ExceededMinuteLimit,
     /// Exceeded per-hour limit.
     ExceededHourLimit,
-    /// Cache is full and cannot admit a new key safely.
+    /// Cache is full and no entry can be evicted safely for a new key.
     ExceededCapacityLimit,
 }
 
@@ -91,6 +91,15 @@ impl RateLimitEntry {
         prune_hits(&mut self.minute_hits, now, Duration::from_secs(60));
         prune_hits(&mut self.hour_hits, now, Duration::from_secs(3600));
     }
+
+    fn is_empty(&self) -> bool {
+        self.minute_hits.is_empty() && self.hour_hits.is_empty()
+    }
+
+    fn is_below_limits(&self, max_per_minute: u32, max_per_hour: u32) -> bool {
+        self.minute_hits.len() < max_per_minute as usize
+            && self.hour_hits.len() < max_per_hour as usize
+    }
 }
 
 fn prune_hits(hits: &mut VecDeque<Instant>, now: Instant, window: Duration) {
@@ -131,9 +140,9 @@ pub struct RateLimitConfig {
     /// timestamps. Each key may retain up to `max_per_minute + max_per_hour`
     /// admitted-hit timestamps until its windows expire, so worst-case
     /// timestamp storage per limiter is `max_entries * (max_per_minute +
-    /// max_per_hour)`. Unknown keys are rate limited once this capacity is
-    /// reached. Existing entries remain tracked until their windows expire and
-    /// cleanup removes them.
+    /// max_per_hour)`. When this key capacity is reached, admission evicts the
+    /// least-recently-used entry that is stale or still below its own rate
+    /// limits; if no safe victim is found, the unknown key is rejected.
     pub max_entries: usize,
 }
 
@@ -164,8 +173,9 @@ impl Default for RateLimitConfig {
 /// both caches.
 ///
 /// Uses a bounded cache to limit tracked key cardinality. When the cache is
-/// full, unknown keys are rejected until cleanup removes stale entries. This
-/// preserves existing counters under adversarial cache pressure.
+/// full, admission evicts the least-recently-used stale or still-unlimited entry
+/// before rejecting a new key, so one-hit junk cannot globally deny legitimate
+/// new tokens while keys already at their rate limit keep their counters.
 pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
     entries: RwLock<LruCache<K, RateLimitEntry>>,
     max_per_minute: u32,
@@ -185,23 +195,61 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         }
     }
 
+    fn evict_lru_admission_candidate(
+        entries: &mut LruCache<K, RateLimitEntry>,
+        now: Instant,
+        max_per_minute: u32,
+        max_per_hour: u32,
+    ) -> bool {
+        let candidate_keys: Vec<K> = entries
+            .iter()
+            .rev()
+            .take(CLEANUP_BATCH_SIZE)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for key in candidate_keys {
+            let should_evict = entries.peek_mut(&key).is_some_and(|entry| {
+                entry.prune(now);
+                entry.is_empty() || entry.is_below_limits(max_per_minute, max_per_hour)
+            });
+
+            if should_evict {
+                entries.pop(&key);
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Checks if a request is allowed and increments counters if so.
     ///
     /// Returns:
     /// - `Allowed` if the request is within limits (counters are incremented)
     /// - `ExceededMinuteLimit` if per-minute limit is reached
     /// - `ExceededHourLimit` if per-hour limit is reached
-    /// - `ExceededCapacityLimit` if the cache is full and the key is unknown
+    /// - `ExceededCapacityLimit` if the cache is full and has no safe eviction
+    ///   victim for the unknown key
     pub async fn check_and_increment(&self, key: &K) -> RateLimitResult {
         let now = Instant::now();
         let mut entries = self.entries.write().await;
 
-        // Get or create entry (updates access position). Unknown keys are
-        // rejected at capacity so pressure cannot evict existing counters.
+        // Get or create entry (updates access position). At capacity, admit an
+        // unknown key by evicting an old stale or still-unlimited entry. Entries
+        // already sitting at their rate limit are protected so cache pressure
+        // cannot reset a limited key's counters.
         let entry = if let Some(entry) = entries.get_mut(key) {
             entry
         } else {
-            if entries.len() >= entries.cap().get() {
+            if entries.len() >= entries.cap().get()
+                && !Self::evict_lru_admission_candidate(
+                    &mut entries,
+                    now,
+                    self.max_per_minute,
+                    self.max_per_hour,
+                )
+            {
                 return RateLimitResult::ExceededCapacityLimit;
             }
             entries.put(key.clone(), RateLimitEntry::new());
@@ -542,9 +590,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rejects_new_keys_at_capacity() {
+    async fn test_cache_pressure_evicts_oldest_unlimited_key_for_new_key() {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: 3,
+        });
+
+        limiter.check_and_increment(&1u64).await;
+        limiter.check_and_increment(&2u64).await;
+        limiter.check_and_increment(&3u64).await;
+        assert_eq!(limiter.len().await, 3);
+
+        assert_eq!(
+            limiter.check_and_increment(&4u64).await,
+            RateLimitResult::Allowed
+        );
+        assert_eq!(limiter.len().await, 3);
+        assert_eq!(limiter.peek_counts(&1u64).await, None);
+        assert_eq!(limiter.peek_counts(&2u64).await, Some((1, 1)));
+        assert_eq!(limiter.peek_counts(&4u64).await, Some((1, 1)));
+    }
+
+    #[tokio::test]
+    async fn test_rejects_new_keys_at_capacity_when_no_safe_eviction_exists() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1,
             max_per_hour: 100,
             max_entries: 3,
         });
