@@ -275,6 +275,17 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to connect to relays")?;
 
+    // Obtain the broadcast receiver BEFORE issuing the subscription REQ.
+    //
+    // `notifications()` returns a fresh `tokio::sync::broadcast::Receiver`, which
+    // only observes messages broadcast after it is created. The subscription uses a
+    // 2-day lookback, so relays immediately stream the stored backlog of gift wraps.
+    // If the receiver were created after `subscribe()` (e.g. inside the spawned event
+    // task), any backlog delivered before the task is first polled would be broadcast
+    // to zero receivers and silently dropped — broadcast channels do not replay
+    // history. Creating the receiver first closes that startup window entirely.
+    let mut notifications = relay_client.notifications();
+
     // Subscribe to events
     relay_client
         .subscribe(keys.public_key())
@@ -318,12 +329,9 @@ async fn main() -> Result<()> {
     // Start event processing loop
     let mut event_shutdown = shutdown.subscribe();
     let event_processor_clone = event_processor.clone();
-    let relay_client_clone = relay_client.clone();
     let event_metrics = metrics.clone();
 
     let event_handle = tokio::spawn(async move {
-        let mut notifications = relay_client_clone.notifications();
-
         loop {
             tokio::select! {
                 _ = event_shutdown.changed() => {
