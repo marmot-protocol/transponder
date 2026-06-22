@@ -116,10 +116,28 @@ where
     }
 }
 
+/// Decide whether a transport (`reqwest`) error is safe to retry.
+///
+/// Only connection-establishment failures are retriable: when
+/// [`reqwest::Error::is_connect`] is true the request body was never sent to
+/// the provider, so retrying cannot produce a duplicate delivery of a
+/// non-idempotent POST. Any other transport error (read/timeout, response
+/// body, decode, etc.) may have occurred *after* the provider already accepted
+/// the request, so it must not be retried.
+fn should_retry_transport(err: &reqwest::Error) -> bool {
+    err.is_connect()
+}
+
 /// Execute an async transport operation with exponential backoff retry.
 ///
-/// Only `Error::Http` failures are retried. The last transport error is
-/// returned once the retry budget is exhausted.
+/// Only `Error::Http` failures whose underlying `reqwest::Error` is a
+/// connection-establishment error (see [`should_retry_transport`]) are
+/// retried. Restricting retries to pre-delivery connect errors avoids
+/// duplicating non-idempotent POSTs (a read/timeout error can fire *after* the
+/// provider already accepted the request) and bounds worst-case permit-hold
+/// time: post-connect hangs consume the full client timeout and are no longer
+/// multiplied by the transport retry budget. Any non-connect `Error::Http`,
+/// and any non-`Http` error, is returned immediately.
 #[must_use = "retry result indicates success/failure and should not be ignored"]
 pub async fn with_transport_retry<T, F, Fut>(
     config: &RetryConfig,
@@ -137,7 +155,9 @@ where
     loop {
         match operation().await {
             Ok(result) => return Ok(result),
-            Err(Error::Http(error)) if retries < config.max_retries => {
+            Err(Error::Http(error))
+                if retries < config.max_retries && should_retry_transport(&error) =>
+            {
                 retries += 1;
 
                 if let Some(metrics) = metrics {
@@ -156,7 +176,7 @@ where
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
-            Err(Error::Http(error)) => {
+            Err(Error::Http(error)) if should_retry_transport(&error) => {
                 warn!(
                     service = service_name,
                     error = %error,
@@ -165,6 +185,9 @@ where
                 );
                 return Err(Error::Http(error));
             }
+            // Non-connect transport errors are not retriable: the provider may
+            // already have accepted the (non-idempotent) request, so return
+            // immediately without retrying.
             Err(error) => return Err(error),
         }
     }
@@ -499,5 +522,67 @@ mod tests {
 
         assert!(matches!(result, Err(Error::Http(_))));
         assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_with_transport_retry_does_not_retry_non_connect_error() {
+        let config = RetryConfig {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(1),
+        };
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+        let client = Client::new();
+
+        // A request to an unsupported URL scheme produces a `reqwest::Error`
+        // whose `is_connect()` is false: the request was never dispatched to a
+        // provider, but it is *not* a connection-establishment failure, so it
+        // must be treated as non-retriable.
+        let result: crate::error::Result<bool> = with_transport_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                let client = client.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let error = client
+                        .get("ftp://example.invalid/resource")
+                        .send()
+                        .await
+                        .unwrap_err();
+                    assert!(!error.is_connect());
+                    Err(Error::from(error))
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::Http(_))));
+        // The operation is invoked exactly once: no retry for non-connect errors.
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_should_retry_transport_connect_error_is_retriable() {
+        // A connection refused on a closed port is a connect error => retriable.
+        let client = Client::new();
+        let error = client.get("http://127.0.0.1:9").send().await.unwrap_err();
+        assert!(error.is_connect());
+        assert!(should_retry_transport(&error));
+    }
+
+    #[tokio::test]
+    async fn test_should_retry_transport_non_connect_error_is_not_retriable() {
+        // An unsupported URL scheme is not a connect error => not retriable.
+        let client = Client::new();
+        let error = client
+            .get("ftp://example.invalid/resource")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!error.is_connect());
+        assert!(!should_retry_transport(&error));
     }
 }
