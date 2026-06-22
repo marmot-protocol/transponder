@@ -225,8 +225,17 @@ impl EventProcessor {
 
         info!(event_id = %event.id, "Received Nostr notification event");
 
-        // Check for duplicates
-        if self.is_duplicate(&event.id).await {
+        // Check for duplicates and atomically reserve the event ID.
+        //
+        // The reservation (check-and-mark) happens under a single write-lock
+        // critical section so concurrent deliveries of the same event ID — now
+        // possible because the event loop in `main.rs` processes events in
+        // bounded-concurrency spawned tasks — cannot both pass the dedup gate
+        // and dispatch duplicate notifications. The reservation is rolled back
+        // (`release_reservation`) on admission shedding and on transient
+        // failures so those events remain eligible for retry, preserving the
+        // prior "not marked seen on transient failure" semantics.
+        if !self.try_reserve(event.id).await {
             trace!("Skipping duplicate event");
             if let Some(ref m) = self.metrics {
                 m.record_event_deduplicated();
@@ -248,8 +257,11 @@ impl EventProcessor {
         // budget is exceeded we shed the event without unwrapping. The event is
         // NOT marked seen: shedding is transient back-pressure, not a permanent
         // failure, so the event may be processed later once budget recovers.
+        // The reservation taken above is released so the retry is not treated
+        // as a duplicate.
         let admission = self.global_unwrap_limiter.check_and_increment(&()).await;
         if !admission.is_allowed() {
+            self.release_reservation(&event.id).await;
             trace!(
                 reason = admission.limit_reason(),
                 "Shed event before unwrap (global admission control)"
@@ -267,8 +279,9 @@ impl EventProcessor {
         // Process the event
         match self.process_inner(event).await {
             Ok(count) => {
-                // Mark as seen only after successful processing.
-                // This avoids dropping events due to transient failures.
+                // Refresh the seen timestamp now that processing succeeded, so
+                // the dedup window is measured from completion. The reservation
+                // taken above already keeps the event marked seen.
                 self.mark_seen(event.id).await;
 
                 info!(
@@ -287,7 +300,13 @@ impl EventProcessor {
             }
             Err(e) => {
                 if Self::is_permanent_error(&e) {
+                    // Permanent failures stay marked seen (via the reservation)
+                    // so replays short-circuit as duplicates.
                     self.mark_seen(event.id).await;
+                } else {
+                    // Transient failures release the reservation so the event
+                    // can be retried on a later delivery.
+                    self.release_reservation(&event.id).await;
                 }
 
                 // Log but don't propagate - we want to continue processing other events
@@ -516,12 +535,67 @@ impl EventProcessor {
     }
 
     /// Check if an event has been seen recently.
+    #[cfg(test)]
     async fn is_duplicate(&self, event_id: &EventId) -> bool {
         let seen = self.seen_events.read().await;
         seen.contains(event_id)
     }
 
-    /// Mark an event as seen.
+    /// Atomically reserve an event ID for processing.
+    ///
+    /// Returns `true` if the reservation succeeded (the event was previously
+    /// unseen and is now marked seen), or `false` if the event was already
+    /// seen/reserved — i.e. a duplicate.
+    ///
+    /// The check-and-insert happens under a single write-lock critical section
+    /// so that concurrent deliveries of the same Nostr event ID (common when
+    /// the same event arrives from multiple relays) cannot both observe the
+    /// event as unseen. Without this, the bounded-concurrency event loop in
+    /// `main.rs` — which spawns a task per event — would let duplicates race
+    /// past a non-atomic check-then-mark sequence and dispatch duplicate push
+    /// notifications.
+    ///
+    /// On transient (retryable) processing failure or admission shedding, the
+    /// reservation must be released with [`Self::release_reservation`] so the
+    /// event can be retried later.
+    async fn try_reserve(&self, event_id: EventId) -> bool {
+        let mut seen = self.seen_events.write().await;
+        if seen.contains(&event_id) {
+            return false;
+        }
+        seen.put(event_id, Instant::now());
+
+        // Update cache size metric
+        if let Some(ref m) = self.metrics {
+            m.set_dedup_cache_size(seen.len());
+        }
+        true
+    }
+
+    /// Release a previously reserved event ID.
+    ///
+    /// Used to roll back a [`Self::try_reserve`] when processing did not reach
+    /// a terminal state (transient failure or pre-unwrap admission shedding),
+    /// so the event remains eligible for retry. This is the inverse of the
+    /// reservation and preserves the prior "not marked seen on transient
+    /// failure" semantics.
+    async fn release_reservation(&self, event_id: &EventId) {
+        let mut seen = self.seen_events.write().await;
+        seen.pop(event_id);
+
+        // Update cache size metric
+        if let Some(ref m) = self.metrics {
+            m.set_dedup_cache_size(seen.len());
+        }
+    }
+
+    /// Refresh the seen timestamp for an already-reserved event.
+    ///
+    /// Called when processing reaches a terminal state (success or permanent
+    /// failure) to keep the dedup entry. The entry already exists from
+    /// [`Self::try_reserve`]; this updates its timestamp so the dedup window is
+    /// measured from completion. Kept distinct from `try_reserve` for clarity
+    /// at the call sites.
     async fn mark_seen(&self, event_id: EventId) {
         let mut seen = self.seen_events.write().await;
         seen.put(event_id, Instant::now());
@@ -901,6 +975,75 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_process_concurrent_duplicates_dispatch_once() {
+        // Regression test for the dedup race introduced by bounded-concurrency
+        // event processing in `main.rs`: the same Nostr event ID can be
+        // delivered concurrently (e.g. from multiple relays) and processed in
+        // parallel spawned tasks. The dedup check-and-mark must be atomic so
+        // exactly one delivery is processed and the rest short-circuit as
+        // duplicates, instead of all of them unwrapping and dispatching
+        // duplicate push notifications.
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let event = scenarios::single_apns_notification(
+            &server_keys,
+            &sender_keys,
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        )
+        .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+        let processor = Arc::new(processor);
+
+        // Fan out many concurrent processings of the SAME event.
+        const CONCURRENCY: usize = 32;
+        let mut handles = Vec::with_capacity(CONCURRENCY);
+        for _ in 0..CONCURRENCY {
+            let processor = Arc::clone(&processor);
+            let event = event.clone();
+            handles.push(tokio::spawn(async move { processor.process(&event).await }));
+        }
+
+        let mut processed_true = 0usize;
+        for handle in handles {
+            if handle.await.expect("task panicked").expect("process ok") {
+                processed_true += 1;
+            }
+        }
+
+        // Exactly one delivery should report a successful (non-duplicate)
+        // processing; every other delivery is deduplicated.
+        assert_eq!(
+            processed_true, 1,
+            "exactly one concurrent delivery must be processed"
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            1.0,
+            "the event must be dispatched exactly once across concurrent deliveries"
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            (CONCURRENCY - 1) as f64,
+            "all but one concurrent delivery must be deduplicated"
+        );
+        // Push dispatch admission is recorded once per processed event, so an
+        // exactly-once value here proves the expensive unwrap+dispatch path ran
+        // only once despite the concurrent flood.
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_notifications_admitted_per_event",
+                &[]
+            ),
+            1,
+            "notifications must be admitted/dispatched for exactly one delivery"
+        );
+        assert_eq!(processor.cache_len(), 1);
     }
 
     #[tokio::test]
