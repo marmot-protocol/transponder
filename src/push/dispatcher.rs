@@ -229,14 +229,13 @@ impl PushDispatcher {
                         let permit = match semaphore.clone().acquire_owned().await {
                             Ok(p) => p,
                             Err(_) => {
+                                // The dispatcher never closes this semaphore today; if a
+                                // future change does, the dequeued token is zeroed as this
+                                // loop scope unwinds.
                                 debug!("Push semaphore closed, dispatcher exiting");
                                 break;
                             }
                         };
-
-                        if let Some(ref m) = metrics {
-                            m.set_push_semaphore_available(semaphore.available_permits());
-                        }
 
                         let apns_client = apns_client.clone();
                         let fcm_client = fcm_client.clone();
@@ -449,7 +448,11 @@ impl PushDispatcher {
         for _ in 0..MAX_CONCURRENT_PUSHES {
             match self.semaphore.acquire().await {
                 Ok(permit) => permits.push(permit),
-                Err(_) => break,
+                Err(_) => {
+                    // The dispatcher does not close this semaphore. If a future change
+                    // does, stop waiting rather than hanging shutdown.
+                    break;
+                }
             }
         }
         drop(permits);
@@ -1099,8 +1102,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrency_limit_is_semaphore_capacity() {
-        let dispatcher = PushDispatcher::new(None, None);
+    async fn test_concurrency_limit_blocks_when_semaphore_is_saturated() {
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+        };
+        let dispatcher = Arc::new(PushDispatcher::new(
+            Some(ApnsClient::mock(apns_config, true)),
+            None,
+        ));
+        assert_eq!(
+            dispatcher.semaphore.available_permits(),
+            MAX_CONCURRENT_PUSHES
+        );
+
+        // Saturate the semaphore as if MAX_CONCURRENT_PUSHES sends are already
+        // in flight. The next queued push is the 101st send and must block in
+        // the dispatcher until a permit is released.
+        let saturated_permits = dispatcher
+            .semaphore
+            .acquire_many(MAX_CONCURRENT_PUSHES as u32)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dispatcher
+                .dispatch(vec![TokenPayload {
+                    platform: Platform::Apns,
+                    device_token: vec![0xaa, 0xbb, 0xcc],
+                }])
+                .await
+                .unwrap(),
+            1
+        );
+
+        let shutdown_dispatcher = dispatcher.clone();
+        let shutdown_handle = tokio::spawn(async move {
+            shutdown_dispatcher.wait_for_completion().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !shutdown_handle.is_finished(),
+            "the 101st send should wait for semaphore capacity before shutdown can drain"
+        );
+
+        drop(saturated_permits);
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown_handle)
+            .await
+            .expect("shutdown should complete after a permit is released")
+            .expect("shutdown task should not panic");
         assert_eq!(
             dispatcher.semaphore.available_permits(),
             MAX_CONCURRENT_PUSHES
