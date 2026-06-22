@@ -140,9 +140,10 @@ pub struct RateLimitConfig {
     /// timestamps. Each key may retain up to `max_per_minute + max_per_hour`
     /// admitted-hit timestamps until its windows expire, so worst-case
     /// timestamp storage per limiter is `max_entries * (max_per_minute +
-    /// max_per_hour)`. When this key capacity is reached, admission evicts the
-    /// least-recently-used entry that is stale or still below its own rate
-    /// limits; if no safe victim is found, the unknown key is rejected.
+    /// max_per_hour)`. When this key capacity is reached, admission first looks
+    /// for a least-recently-used stale entry to evict, then falls back to the
+    /// least-recently-used entry that is still below its own rate limits; if no
+    /// safe victim is found, the unknown key is rejected.
     pub max_entries: usize,
 }
 
@@ -173,9 +174,11 @@ impl Default for RateLimitConfig {
 /// both caches.
 ///
 /// Uses a bounded cache to limit tracked key cardinality. When the cache is
-/// full, admission evicts the least-recently-used stale or still-unlimited entry
-/// before rejecting a new key, so one-hit junk cannot globally deny legitimate
-/// new tokens while keys already at their rate limit keep their counters.
+/// full, admission first evicts the least-recently-used stale entry; if none is
+/// found in the bounded scan window, it falls back to a least-recently-used
+/// still-unlimited entry. This favors availability for legitimate new tokens
+/// over perfect accounting for below-limit keys under active cache pressure,
+/// while preserving counters for keys already at their rate limit.
 pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
     entries: RwLock<LruCache<K, RateLimitEntry>>,
     max_per_minute: u32,
@@ -201,23 +204,26 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         max_per_minute: u32,
         max_per_hour: u32,
     ) -> bool {
-        let candidate_keys: Vec<K> = entries
-            .iter()
-            .rev()
-            .take(CLEANUP_BATCH_SIZE)
-            .map(|(key, _)| key.clone())
-            .collect();
+        let mut stale_candidate = None;
+        let mut below_limit_candidate = None;
 
-        for key in candidate_keys {
-            let should_evict = entries.peek_mut(&key).is_some_and(|entry| {
-                entry.prune(now);
-                entry.is_empty() || entry.is_below_limits(max_per_minute, max_per_hour)
-            });
-
-            if should_evict {
-                entries.pop(&key);
-                return true;
+        for (key, entry) in entries.iter_mut().rev().take(CLEANUP_BATCH_SIZE) {
+            entry.prune(now);
+            if entry.is_empty() {
+                stale_candidate = Some(key.clone());
+                break;
             }
+
+            if below_limit_candidate.is_none()
+                && entry.is_below_limits(max_per_minute, max_per_hour)
+            {
+                below_limit_candidate = Some(key.clone());
+            }
+        }
+
+        if let Some(key) = stale_candidate.or(below_limit_candidate) {
+            entries.pop(&key);
+            return true;
         }
 
         false
@@ -610,6 +616,68 @@ mod tests {
         assert_eq!(limiter.peek_counts(&1u64).await, None);
         assert_eq!(limiter.peek_counts(&2u64).await, Some((1, 1)));
         assert_eq!(limiter.peek_counts(&4u64).await, Some((1, 1)));
+    }
+
+    #[test]
+    fn test_admission_eviction_prefers_stale_victim_over_below_limit_victim() {
+        let now = Instant::now();
+        let stale_hit = now
+            .checked_sub(Duration::from_secs(3601))
+            .expect("test instant should support one-hour subtraction");
+        let mut below_limit_entry = RateLimitEntry::new();
+        below_limit_entry.minute_hits.push_back(now);
+        below_limit_entry.hour_hits.push_back(now);
+        let mut stale_entry = RateLimitEntry::new();
+        stale_entry.minute_hits.push_back(stale_hit);
+        stale_entry.hour_hits.push_back(stale_hit);
+
+        let mut entries = LruCache::new(NonZeroUsize::new(3).expect("non-zero test capacity"));
+        entries.put(1u64, below_limit_entry);
+        entries.put(2u64, stale_entry);
+        entries.put(3u64, RateLimitEntry::new());
+
+        assert!(RateLimiter::evict_lru_admission_candidate(
+            &mut entries,
+            now,
+            10,
+            100
+        ));
+
+        assert!(entries.contains(&1u64));
+        assert!(!entries.contains(&2u64));
+        assert!(entries.contains(&3u64));
+    }
+
+    #[tokio::test]
+    async fn test_admission_scan_prunes_stale_candidate_when_cache_exceeds_batch_size() {
+        tokio::time::pause();
+
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: CLEANUP_BATCH_SIZE + 1,
+        });
+
+        for key in 0..=CLEANUP_BATCH_SIZE as u64 {
+            assert!(limiter.check_and_increment(&key).await.is_allowed());
+        }
+        assert_eq!(limiter.len().await, CLEANUP_BATCH_SIZE + 1);
+
+        tokio::time::advance(Duration::from_secs(3601)).await;
+
+        let new_key = CLEANUP_BATCH_SIZE as u64 + 1;
+        assert_eq!(
+            limiter.check_and_increment(&new_key).await,
+            RateLimitResult::Allowed
+        );
+
+        assert_eq!(limiter.len().await, CLEANUP_BATCH_SIZE + 1);
+        assert_eq!(limiter.peek_counts(&0u64).await, None);
+        assert_eq!(
+            limiter.peek_counts(&(CLEANUP_BATCH_SIZE as u64)).await,
+            Some((1, 1))
+        );
+        assert_eq!(limiter.peek_counts(&new_key).await, Some((1, 1)));
     }
 
     #[tokio::test]
