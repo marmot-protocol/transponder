@@ -64,7 +64,7 @@ shutdown_timeout_secs = 10
 # max_dedup_cache_size = 100000
 
 # Rate limiting to prevent spam and replay attacks
-# max_rate_limit_cache_size = 100000           # Tracked keys per limiter
+# max_rate_limit_cache_size = 100000           # Tracked keys per limiter, not total timestamps
 # max_tokens_per_event = 100                   # Per notification event
 # encrypted_token_rate_limit_per_minute = 240  # Per encrypted token (replay protection)
 # encrypted_token_rate_limit_per_hour = 5000
@@ -144,6 +144,15 @@ level = "info"
 # Log format: "json" (structured, for production) or "pretty" (human-readable)
 format = "json"
 ```
+
+Rate-limit memory scales with admitted hits, not just tracked keys. Each active
+key can retain up to `per_minute + per_hour` `Instant` timestamps for precise
+sliding-window enforcement. Worst-case timestamp storage is therefore
+`max_rate_limit_cache_size × (per_minute + per_hour)` per limiter: with the
+defaults, `100000 × (240 + 5000) ≈ 524M` timestamps for the encrypted-token
+limiter (about 8.4 GB at 16 bytes per timestamp, before `VecDeque` overhead),
+and the same bound again for the device-token limiter. Lower
+`max_rate_limit_cache_size` on memory-constrained deployments.
 
 ### Environment Variables
 
@@ -381,7 +390,7 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `transponder_tokens_rate_limited_total` | Counter | `type`, `reason` | Tokens skipped due to rate limiting |
-| `transponder_rate_limit_cache_size` | Gauge | `type` | Current rate limit cache size |
+| `transponder_rate_limit_cache_size` | Gauge | `type` | Current rate limit cache size in tracked keys, not stored timestamps |
 | `transponder_rate_limit_evictions_total` | Counter | `type` | Stale rate limit entries removed during cleanup |
 
 Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute`, `hour`, or `capacity`

@@ -23,7 +23,8 @@ Why these numbers make sense today:
 - the dispatcher allows up to 100 concurrent outbound push requests
 - the push queue is bounded at 10,000 pending notifications
 - the event deduplication and rate-limit caches default to 100,000 entries each
-- new rate-limit keys are rejected at capacity, so size these caches with headroom for legitimate unique devices and adversarial noise
+- rate-limit cache entries retain admitted-hit timestamps for sliding-window precision; worst-case timestamp storage is `max_rate_limit_cache_size × (per_minute + per_hour)` per limiter (about 8.4 GB at 16 bytes per timestamp with the defaults, before `VecDeque` overhead), and Transponder runs separate encrypted-token and device-token limiters
+- new rate-limit keys are rejected at capacity, so size these caches with headroom for legitimate unique devices, adversarial noise, and process memory limits
 - Tor adds noticeable memory and connection-management overhead, which is why the default build leaves it disabled
 
 If you need to run on a smaller VM, lower the cache sizes in `config/production.toml`.

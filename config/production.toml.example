@@ -13,6 +13,10 @@ shutdown_timeout_secs = 20
 # These defaults are reasonable for small to medium deployments.
 # Reduce them if you are running on a very small VM.
 # max_dedup_cache_size = 100000
+# Rate-limit cache size caps tracked keys, not stored timestamps. Worst-case
+# timestamps per limiter are max_rate_limit_cache_size * (per_minute + per_hour),
+# or ~524M Instant values with the defaults (~8.4 GB at 16 B/timestamp before
+# overhead); Transponder has two limiters.
 # Unknown rate-limit keys are rejected at capacity until stale entries are cleaned up.
 # max_rate_limit_cache_size = 100000
 # max_tokens_per_event = 100
