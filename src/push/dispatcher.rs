@@ -1175,7 +1175,16 @@ mod tests {
     /// decrement per batch raced ahead of the increment and was clamped away,
     /// leaving the gauge stuck above 0 and climbing. We run several batches and
     /// assert the gauge returns to exactly 0 each time — i.e. no upward drift.
-    #[tokio::test]
+    ///
+    /// This test deliberately uses a **multi-threaded** runtime. The race only
+    /// manifests when a worker task runs concurrently with `dispatch()` on a
+    /// different thread: under the default current-thread runtime there is no
+    /// `.await` point between the (buggy) post-loop increment and the sends, so
+    /// a worker can never be polled in between and the buggy ordering would pass
+    /// undetected. With `worker_threads = 2` the worker pool can dequeue and
+    /// decrement on a separate thread while `dispatch()` is still running,
+    /// reproducing the lost-decrement race the fix guards against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_queue_depth_does_not_drift_across_batches() {
         use crate::config::ApnsConfig;
         use crate::metrics::Metrics;
