@@ -377,6 +377,18 @@ impl PushDispatcher {
                     }
                 })?;
 
+        // Increment the queue depth for the whole batch *before* sending any
+        // message into the channel. A message becomes dequeueable the instant
+        // `permit.send(...)` runs, so a worker can decrement `queue_depth`
+        // immediately. If the increment happened after the send loop, that
+        // worker decrement could fire while `queue_depth` is still 0; the
+        // saturating `checked_sub` would drop it, and the subsequent batch
+        // increment would over-count, drifting the gauge upward over time.
+        // `admission_lock` serializes dispatch calls, so accounting for the
+        // batch up front cannot double-count.
+        Self::increment_queue_depth(&self.queue_depth, message_count);
+        Self::update_queue_size_metric(&self.metrics, &self.queue_depth);
+
         for message in messages {
             let platform_str = match message.platform {
                 Platform::Apns => "apns",
@@ -395,10 +407,6 @@ impl PushDispatcher {
                 m.record_push_dispatched(platform_str);
             }
         }
-
-        Self::increment_queue_depth(&self.queue_depth, message_count);
-        // Update queue size after the full batch is admitted.
-        Self::update_queue_size_metric(&self.metrics, &self.queue_depth);
 
         Ok(message_count)
     }
@@ -1148,5 +1156,74 @@ mod tests {
             counter_metric_value(&metrics, "transponder_push_queue_rejected_total"),
             (MAX_PENDING_QUEUE_SIZE + 1) as u64
         );
+    }
+
+    /// Regression test for the increment-after-send race in `dispatch()`.
+    ///
+    /// `dispatch()` must increment `queue_depth` for the whole batch *before*
+    /// sending any message into the channel. A message becomes dequeueable the
+    /// instant `permit.send(...)` runs, so a worker can decrement `queue_depth`
+    /// immediately. If the increment happened after the send loop, a worker
+    /// decrement could fire while `queue_depth` was still 0; the saturating
+    /// `checked_sub` would silently drop it, and the later batch increment would
+    /// over-count. Across many batches the `transponder_push_queue_size` gauge
+    /// would drift upward and stop reflecting the real queue depth.
+    ///
+    /// Here each dispatched message is fully drained (the mock send succeeds and
+    /// no permits are held back), so the *correct* steady-state gauge value is
+    /// exactly 0 after every batch. With the buggy ordering at least one
+    /// decrement per batch raced ahead of the increment and was clamped away,
+    /// leaving the gauge stuck above 0 and climbing. We run several batches and
+    /// assert the gauge returns to exactly 0 each time — i.e. no upward drift.
+    #[tokio::test]
+    async fn test_queue_depth_does_not_drift_across_batches() {
+        use crate::config::ApnsConfig;
+        use crate::metrics::Metrics;
+        use crate::push::ApnsClient;
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: "sandbox".to_string(),
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+        };
+
+        let metrics = Metrics::default();
+        let dispatcher = PushDispatcher::with_metrics(
+            Some(ApnsClient::mock(apns_config, true)),
+            None,
+            Some(metrics.clone()),
+        );
+
+        // Many small batches maximize the number of opportunities for a worker
+        // to dequeue (and decrement) before the batch increment would have run
+        // under the old ordering.
+        for _ in 0..50 {
+            let payloads = vec![
+                TokenPayload {
+                    platform: Platform::Apns,
+                    device_token: vec![0xaa, 0xbb, 0xcc],
+                };
+                4
+            ];
+            assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 4);
+
+            // Let the worker pool fully drain the batch.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            // The queue is genuinely empty now; the gauge must read exactly 0.
+            // Any value above 0 means decrements were lost to the race and the
+            // counter has drifted upward.
+            assert_eq!(
+                queue_size_metric_value(&metrics),
+                0,
+                "queue_size gauge drifted above 0 — decrement-after-send race regressed"
+            );
+        }
+
+        dispatcher.wait_for_completion().await;
     }
 }
