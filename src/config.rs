@@ -92,10 +92,18 @@ pub struct ServerConfig {
     #[serde(default = "default_max_dedup_cache_size")]
     pub max_dedup_cache_size: usize,
 
-    /// Maximum size for rate limit caches (encrypted token and device token).
+    /// Maximum tracked keys for each rate limit cache (encrypted token and
+    /// device token).
     ///
-    /// Each cache uses LRU eviction to prevent unbounded memory growth.
-    /// Default: 100,000 entries per cache.
+    /// This caps key cardinality, not total timestamp storage. Each tracked key
+    /// can retain up to `per_minute + per_hour` admitted-hit timestamps, so
+    /// worst-case timestamp storage is `max_rate_limit_cache_size *
+    /// (per_minute + per_hour)` per limiter. With the defaults, that is roughly
+    /// 524,000,000 `Instant` values per limiter, and Transponder creates two
+    /// such limiters.
+    ///
+    /// Unknown keys are rate limited at capacity until cleanup removes stale
+    /// entries. Default: 100,000 entries per cache.
     #[serde(default = "default_max_rate_limit_cache_size")]
     pub max_rate_limit_cache_size: usize,
 

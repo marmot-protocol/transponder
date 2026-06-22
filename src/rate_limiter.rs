@@ -111,9 +111,13 @@ pub struct RateLimitConfig {
     pub max_per_hour: u32,
     /// Maximum entries in the cache.
     ///
-    /// Unknown keys are rate limited once this capacity is reached. Existing
-    /// entries remain tracked until their windows expire and cleanup removes
-    /// them.
+    /// This caps the number of tracked keys, not the total number of stored
+    /// timestamps. Each key may retain up to `max_per_minute + max_per_hour`
+    /// admitted-hit timestamps until its windows expire, so worst-case
+    /// timestamp storage per limiter is `max_entries * (max_per_minute +
+    /// max_per_hour)`. Unknown keys are rate limited once this capacity is
+    /// reached. Existing entries remain tracked until their windows expire and
+    /// cleanup removes them.
     pub max_entries: usize,
 }
 
@@ -134,8 +138,16 @@ impl Default for RateLimitConfig {
 /// the defaults, a hot key can hold up to roughly 5,240 `Instant` values across
 /// the minute and hour windows before older hits are pruned.
 ///
-/// Uses a bounded cache to limit memory usage. When the cache is full,
-/// unknown keys are rejected until cleanup removes stale entries. This
+/// The aggregate bound is the per-key bound multiplied by the configured cache
+/// size: `max_entries * (max_per_minute + max_per_hour)` timestamp values per
+/// limiter. With the default 100,000-key cache and 240/minute plus 5,000/hour
+/// limits, one fully saturated limiter can retain roughly 524,000,000 `Instant`
+/// values before pruning; production event processing owns separate encrypted-
+/// token and device-token limiters, so size `max_entries` and process memory for
+/// both caches.
+///
+/// Uses a bounded cache to limit tracked key cardinality. When the cache is
+/// full, unknown keys are rejected until cleanup removes stale entries. This
 /// preserves existing counters under adversarial cache pressure.
 pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
     entries: RwLock<LruCache<K, RateLimitEntry>>,
