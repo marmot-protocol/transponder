@@ -21,8 +21,8 @@ use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
 use crate::rate_limiter::{
-    DEFAULT_MAX_SIZE, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig,
-    RateLimiter,
+    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
+    DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig, RateLimiter,
 };
 
 /// Duration to keep event IDs for deduplication (5 minutes).
@@ -76,6 +76,13 @@ pub struct EventProcessor {
     push_dispatcher: Arc<PushDispatcher>,
     /// Event ID deduplication cache.
     seen_events: Arc<RwLock<LruCache<EventId, Instant>>>,
+    /// Global pre-unwrap admission limiter.
+    ///
+    /// Checked BEFORE the gift-wrap unwrap (ECDH + seal decryption) using a
+    /// single fixed key so it acts as a cheap global throttle. The server's
+    /// pubkey is public, so anyone can flood it with valid gift wraps; this
+    /// budget sheds that traffic before spending asymmetric-crypto cycles.
+    global_unwrap_limiter: RateLimiter<()>,
     /// Encrypted token rate limiter.
     encrypted_token_limiter: RateLimiter<[u8; 32]>,
     /// Device token rate limiter.
@@ -100,6 +107,10 @@ pub struct TokenRateLimitConfig {
     pub device_token_per_minute: u32,
     /// Max device token requests per hour.
     pub device_token_per_hour: u32,
+    /// Global max gift-wrap unwraps (ECDH) per minute, across all senders.
+    pub global_unwrap_per_minute: u32,
+    /// Global max gift-wrap unwraps (ECDH) per hour, across all senders.
+    pub global_unwrap_per_hour: u32,
 }
 
 impl Default for TokenRateLimitConfig {
@@ -111,6 +122,8 @@ impl Default for TokenRateLimitConfig {
             encrypted_token_per_hour: DEFAULT_RATE_LIMIT_PER_HOUR,
             device_token_per_minute: DEFAULT_RATE_LIMIT_PER_MINUTE,
             device_token_per_hour: DEFAULT_RATE_LIMIT_PER_HOUR,
+            global_unwrap_per_minute: DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE,
+            global_unwrap_per_hour: DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR,
         }
     }
 }
@@ -173,6 +186,12 @@ impl EventProcessor {
             token_decryptor,
             push_dispatcher,
             seen_events: Arc::new(RwLock::new(LruCache::new(cache_size))),
+            // A single fixed `()` key, so capacity of 1 entry is sufficient.
+            global_unwrap_limiter: RateLimiter::new(RateLimitConfig {
+                max_per_minute: rate_limit_config.global_unwrap_per_minute,
+                max_per_hour: rate_limit_config.global_unwrap_per_hour,
+                max_entries: 1,
+            }),
             encrypted_token_limiter: RateLimiter::new(RateLimitConfig {
                 max_per_minute: rate_limit_config.encrypted_token_per_minute,
                 max_per_hour: rate_limit_config.encrypted_token_per_hour,
@@ -213,6 +232,32 @@ impl EventProcessor {
                 m.record_event_deduplicated();
                 m.observe_event_processing_duration(
                     EventOutcome::Duplicate,
+                    started_at.elapsed_secs(),
+                );
+            }
+            return Ok(false);
+        }
+
+        // Global pre-unwrap admission control.
+        //
+        // Checked BEFORE the expensive NIP-59 gift-wrap unwrap (ECDH + seal
+        // decryption). The per-token limiters run only AFTER unwrap, so they
+        // cannot protect against a flood of valid-but-junk gift wraps. The
+        // server pubkey is public and gift wraps are sender-anonymous, so a
+        // cheap GLOBAL throttle is the correct admission control here. When the
+        // budget is exceeded we shed the event without unwrapping. The event is
+        // NOT marked seen: shedding is transient back-pressure, not a permanent
+        // failure, so the event may be processed later once budget recovers.
+        let admission = self.global_unwrap_limiter.check_and_increment(&()).await;
+        if !admission.is_allowed() {
+            trace!(
+                reason = admission.limit_reason(),
+                "Shed event before unwrap (global admission control)"
+            );
+            if let Some(ref m) = self.metrics {
+                m.record_event_shed();
+                m.observe_event_processing_duration(
+                    EventOutcome::Failed,
                     started_at.elapsed_secs(),
                 );
             }
@@ -524,6 +569,11 @@ impl EventProcessor {
                 "Cleaned up event deduplication cache"
             );
         }
+
+        // Clean global pre-unwrap admission limiter cache.
+        // It only holds a single fixed key, but cleaning it keeps the limiter
+        // memory bounded and behavior consistent with the other limiters.
+        self.global_unwrap_limiter.cleanup().await;
 
         // Clean encrypted token rate limiter cache
         let encrypted_stats = self.encrypted_token_limiter.cleanup().await;
@@ -1061,6 +1111,8 @@ mod tests {
                     encrypted_token_per_hour: 1,
                     device_token_per_minute: 1,
                     device_token_per_hour: 1,
+                    global_unwrap_per_minute: 1000,
+                    global_unwrap_per_hour: 10000,
                 },
             )
             .await;
@@ -1114,6 +1166,8 @@ mod tests {
                     encrypted_token_per_hour: 100,
                     device_token_per_minute: 100,
                     device_token_per_hour: 100,
+                    global_unwrap_per_minute: 1000,
+                    global_unwrap_per_hour: 10000,
                 },
             )
             .await;
@@ -1495,6 +1549,8 @@ mod tests {
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 1,
                 device_token_per_hour: 100,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
             },
         );
 
@@ -1551,6 +1607,8 @@ mod tests {
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 2, // Only allow 2 per minute per device
                 device_token_per_hour: 100,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
             },
         );
 
@@ -1611,6 +1669,8 @@ mod tests {
                 encrypted_token_per_hour: 100,
                 device_token_per_minute: 100, // High limit for device tokens
                 device_token_per_hour: 1000,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
             },
         );
 
@@ -1688,6 +1748,8 @@ mod tests {
                 encrypted_token_per_hour: 100,
                 device_token_per_minute: 100,
                 device_token_per_hour: 1000,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
             },
         );
 
@@ -1724,6 +1786,138 @@ mod tests {
         assert!(
             result3.unwrap(),
             "Token should be allowed after window reset"
+        );
+    }
+
+    // === Global Pre-Unwrap Admission Control Tests ===
+
+    fn flood_rate_limit_config(
+        global_unwrap_per_minute: u32,
+        global_unwrap_per_hour: u32,
+    ) -> TokenRateLimitConfig {
+        TokenRateLimitConfig {
+            max_cache_size: 100,
+            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+            // Generous per-token limits so only the global limiter can shed.
+            encrypted_token_per_minute: 100_000,
+            encrypted_token_per_hour: 100_000,
+            device_token_per_minute: 100_000,
+            device_token_per_hour: 100_000,
+            global_unwrap_per_minute,
+            global_unwrap_per_hour,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_global_limiter_sheds_flood_before_unwrap() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        // Allow exactly 2 unwraps per minute. The third flood event must be shed.
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            flood_rate_limit_config(2, 1000),
+        );
+
+        let limit = 2usize;
+        for _ in 0..limit {
+            // Distinct event IDs so dedup never short-circuits the unwrap path.
+            let event =
+                scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+            assert!(processor.process(&event).await.unwrap());
+        }
+
+        // The (N+1)th event exceeds the global budget and is shed.
+        let flood_event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(!processor.process(&flood_event).await.unwrap());
+
+        // Exactly one event was shed.
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_shed_total", &[]),
+            1.0
+        );
+
+        // The shed event was NOT unwrapped: only `limit` unwraps were observed.
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_gift_wrap_unwrap_duration_seconds",
+                &[("outcome", OperationOutcome::Success.as_str())],
+            ),
+            limit as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_limiter_does_not_mark_shed_event_seen() {
+        tokio::time::pause();
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        // Only 1 unwrap per minute allowed.
+        let (processor, _metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            flood_rate_limit_config(1, 1000),
+        );
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+
+        // First event consumes the global budget.
+        assert!(processor.process(&event).await.unwrap());
+
+        // Same event again: deduplicated, so it is not shed.
+        assert!(!processor.process(&event).await.unwrap());
+
+        // A different event is shed (budget exhausted) and must NOT be marked seen.
+        let flood_event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(!processor.process(&flood_event).await.unwrap());
+        assert!(!processor.is_duplicate(&flood_event.id).await);
+
+        // After the window resets, the previously shed event is admitted.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(processor.process(&flood_event).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_global_limiter_recovers_after_window() {
+        tokio::time::pause();
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            flood_rate_limit_config(1, 1000),
+        );
+
+        let event1 =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&event1).await.unwrap());
+
+        let event2 =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(!processor.process(&event2).await.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_shed_total", &[]),
+            1.0
+        );
+
+        // Past the minute window, budget recovers and events flow again.
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        let event3 =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&event3).await.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_shed_total", &[]),
+            1.0
         );
     }
 }

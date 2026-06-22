@@ -47,6 +47,26 @@ shutdown_timeout_secs = 10
 # Default: 5000
 # device_token_rate_limit_per_hour = 5000
 
+# Maximum number of events processed concurrently.
+# Bounds total in-flight gift-wrap unwrap (ECDH) work. The relay event loop
+# admits up to this many events at once and applies back-pressure beyond it,
+# draining the relay channel fast enough to avoid dropping legitimate events
+# while capping CPU spent on asymmetric crypto under a flood.
+# Default: 64
+# max_concurrent_event_processing = 64
+
+# Global pre-unwrap admission control (CPU-exhaustion DoS protection).
+# Checked BEFORE the gift-wrap unwrap (ECDH), across ALL senders, using a single
+# global budget. The server pubkey is public and gift wraps are sender-anonymous,
+# so a cheap global throttle sheds floods before spending asymmetric-crypto
+# cycles. Set well above legitimate single-server load.
+# Default: 600 (10 per second)
+# global_unwrap_rate_limit_per_minute = 600
+
+# Global pre-unwrap admission control: max unwraps per hour across all senders.
+# Default: 30000
+# global_unwrap_rate_limit_per_hour = 30000
+
 [relays]
 # ClearNet relays to subscribe to
 clearnet = [
