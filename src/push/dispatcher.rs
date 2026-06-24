@@ -334,10 +334,8 @@ impl PushDispatcher {
                             // Wrap the permit so the send's internal backoff
                             // can release the in-flight slot during sleeps and
                             // re-acquire it before the next attempt.
-                            let mut backoff_permit = crate::push::retry::BackoffPermit::new(
-                                semaphore.clone(),
-                                permit,
-                            );
+                            let mut backoff_permit =
+                                crate::push::retry::BackoffPermit::new(semaphore.clone(), permit);
 
                             Self::send_push(
                                 platform,
