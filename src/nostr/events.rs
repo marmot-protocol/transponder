@@ -618,6 +618,7 @@ impl EventProcessor {
 
             let expired_keys: Vec<_> = seen
                 .iter()
+                .rev()
                 .take(CLEANUP_BATCH_SIZE)
                 .filter(|(_, seen_at)| now.duration_since(**seen_at) >= DEDUP_WINDOW)
                 .map(|(id, _)| *id)
@@ -1611,6 +1612,54 @@ mod tests {
             0,
             "Expected all expired entries to be removed after two cleanup cycles"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_scans_stale_lru_entries_first() {
+        tokio::time::pause();
+
+        let server_keys = Keys::generate();
+        let processor = create_processor(&server_keys);
+        let old_time = Instant::now() - DEDUP_WINDOW - Duration::from_secs(1);
+        let recent_time = Instant::now();
+        let stale_count = 10;
+        let recent_count = CLEANUP_BATCH_SIZE;
+
+        let event_id = |i: usize| {
+            let mut bytes = [0u8; 32];
+            bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+            EventId::from_byte_array(bytes)
+        };
+        let stale_ids: Vec<_> = (0..stale_count).map(event_id).collect();
+        let recent_ids: Vec<_> = (stale_count..stale_count + recent_count)
+            .map(event_id)
+            .collect();
+
+        {
+            let mut seen = processor.seen_events.write().await;
+            for event_id in &stale_ids {
+                seen.put(*event_id, old_time);
+            }
+            for event_id in &recent_ids {
+                seen.put(*event_id, recent_time);
+            }
+        }
+
+        assert_eq!(processor.cache_len(), stale_count + recent_count);
+
+        processor.cleanup().await;
+
+        assert_eq!(
+            processor.cache_len(),
+            recent_count,
+            "Expected cleanup to reclaim stale entries from the LRU end"
+        );
+        for event_id in stale_ids {
+            assert!(!processor.is_duplicate(&event_id).await);
+        }
+        for event_id in recent_ids {
+            assert!(processor.is_duplicate(&event_id).await);
+        }
     }
 
     #[tokio::test]
