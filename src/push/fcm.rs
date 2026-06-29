@@ -21,14 +21,6 @@ use crate::push::retry::{self, RetryConfig, SendAttemptResult};
 /// FCM OAuth2 token endpoint.
 const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-/// Maximum number of bytes to drain from a failed OAuth token response.
-///
-/// The OAuth endpoint is a network-controlled source, so the failure path must
-/// never buffer an unbounded body into an allocation. The body itself is never
-/// surfaced (Google OAuth errors can echo assertion/JWT material), so this cap
-/// only bounds the work done while draining the connection.
-const OAUTH_ERROR_BODY_READ_CAP: usize = 4 * 1024;
-
 /// FCM OAuth2 scope.
 const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 
@@ -247,7 +239,7 @@ impl FcmClient {
             assertion: jwt,
         };
 
-        let mut response = self
+        let response = self
             .http_client
             .post(OAUTH_TOKEN_URL)
             .form(&request)
@@ -256,10 +248,6 @@ impl FcmClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            // Drain (and discard) a bounded prefix of the body so the failure
-            // path cannot be driven into an unbounded allocation and so no raw
-            // provider content reaches the error/log.
-            drain_bounded(&mut response, OAUTH_ERROR_BODY_READ_CAP).await;
             return Err(Error::Fcm(oauth_failure_message(status)));
         }
 
@@ -501,22 +489,6 @@ fn oauth_failure_message(status: reqwest::StatusCode) -> String {
     format!("OAuth token request failed: {status}")
 }
 
-/// Drain at most `cap` bytes from a response body, discarding the content.
-///
-/// This keeps the failed-request path from buffering a network-controlled body
-/// into an allocation while still consuming enough of the response for the
-/// connection to be reusable. Any read error is ignored: the caller already has
-/// the status it needs and the body is never surfaced.
-async fn drain_bounded(response: &mut reqwest::Response, cap: usize) {
-    let mut read = 0usize;
-    while read < cap {
-        match response.chunk().await {
-            Ok(Some(chunk)) => read = read.saturating_add(chunk.len()),
-            Ok(None) | Err(_) => break,
-        }
-    }
-}
-
 fn validate_project_id(project_id: &str) -> Result<&str> {
     if project_id.is_empty() {
         return Err(Error::Fcm("No project ID configured".to_string()));
@@ -622,7 +594,7 @@ mod tests {
 
         assert_eq!(message, "OAuth token request failed: 400 Bad Request");
 
-        // Independent of any (unbounded) provider body, the message length is a
+        // Independent of any provider body, the message length is a
         // small constant bounded by the status text.
         let secret = "leaked-assertion-jwt-".repeat(100_000);
         assert!(!message.contains(&secret));
@@ -632,16 +604,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_oauth_failure_does_not_propagate_or_buffer_raw_body() {
-        // Regression: the OAuth failure path must not read the body with
-        // `response.text()` (unbounded) nor embed raw provider content into the
-        // error. Drive a real response with an oversized, secret-bearing body
-        // through the same drain + message helpers the failure path uses.
+        // Regression: the OAuth failure path must not read the body nor embed
+        // raw provider content into the error. Drive a real response with an
+        // oversized, secret-bearing body through the same status-only error
+        // construction the failure path uses, then drop the response body
+        // unread.
         let mock_server = MockServer::start().await;
 
         let secret = "assertion-jwt-secret-".repeat(100_000);
         let huge_body =
             format!("{{\"error\":\"invalid_grant\",\"error_description\":\"{secret}\"}}");
-        assert!(huge_body.len() > 10 * OAUTH_ERROR_BODY_READ_CAP);
+        assert!(huge_body.len() > 1_000_000);
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(400).set_body_string(huge_body.clone()))
@@ -649,10 +622,10 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let mut response = Client::new().post(mock_server.uri()).send().await.unwrap();
+        let response = Client::new().post(mock_server.uri()).send().await.unwrap();
 
         let status = response.status();
-        drain_bounded(&mut response, OAUTH_ERROR_BODY_READ_CAP).await;
+        drop(response);
         let error = Error::Fcm(oauth_failure_message(status));
 
         let rendered = error.to_string();
