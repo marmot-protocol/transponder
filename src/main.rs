@@ -152,10 +152,15 @@ async fn acquire_event_processing_permit_or_shutdown(
     semaphore: Arc<Semaphore>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Option<OwnedSemaphorePermit> {
+    // Prefer shutdown over newly available capacity so teardown does not admit
+    // more event-processing work after a shutdown signal is visible.
     tokio::select! {
         biased;
 
-        _ = shutdown.changed() => None,
+        _ = shutdown.changed() => {
+            debug!("Event processor shutting down before permit acquisition");
+            None
+        },
         permit = semaphore.acquire_owned() => permit.ok(),
     }
 }
@@ -384,8 +389,9 @@ async fn main() -> Result<()> {
                             };
 
                             // Acquire a permit before spawning so total in-flight
-                            // unwrap work stays bounded. `acquire_owned` only errors
-                            // if the semaphore is closed, which never happens here.
+                            // unwrap work stays bounded. `None` means shutdown won
+                            // while waiting (or the semaphore closed, which never
+                            // happens here), so intentionally drop this event.
                             let Some(permit) = acquire_event_processing_permit_or_shutdown(
                                 Arc::clone(&event_semaphore),
                                 &mut event_shutdown,
@@ -686,6 +692,10 @@ mod tests {
         let permit_wait =
             acquire_event_processing_permit_or_shutdown(Arc::clone(&semaphore), &mut shutdown_rx);
         tokio::pin!(permit_wait);
+
+        let pending_before_shutdown =
+            tokio::time::timeout(Duration::from_millis(10), &mut permit_wait).await;
+        assert!(pending_before_shutdown.is_err());
 
         shutdown_tx.send(true).unwrap();
 
