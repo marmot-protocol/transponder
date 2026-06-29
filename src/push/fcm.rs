@@ -27,6 +27,14 @@ const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 /// Access token lifetime (50 minutes).
 const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
 
+/// Upper bound on FCM registration token length.
+///
+/// FCM tokens are opaque and have historically been ~150-200 characters, but
+/// the format is undocumented and may grow. This generous bound only exists to
+/// reject obviously-malformed (e.g. unbounded) input before spending an
+/// OAuth-authenticated round-trip; it is not a precise format check.
+const MAX_FCM_TOKEN_LEN: usize = 4096;
+
 /// Service account JSON structure.
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 #[allow(dead_code)]
@@ -296,6 +304,16 @@ impl FcmClient {
     /// This method automatically retries transient failures (429, 5xx) with
     /// exponential backoff.
     pub async fn send(&self, device_token: &str) -> Result<bool> {
+        // Validate token format before spending an OAuth-authenticated round-trip
+        // and FCM quota on a clearly-malformed token (mirrors APNs).
+        if !is_valid_fcm_token(device_token) {
+            trace!(
+                token_len = device_token.len(),
+                "Invalid FCM device token format"
+            );
+            return Ok(false);
+        }
+
         let retry_config = RetryConfig::default();
         retry::with_retry(
             &retry_config,
@@ -457,6 +475,23 @@ impl FcmClient {
 
         self.service_account.is_some() && self.encoding_key.is_some()
     }
+}
+
+/// Cheap sanity check for an FCM registration token.
+///
+/// FCM registration tokens are opaque, so this deliberately only rejects input
+/// that cannot be a valid token: empty strings, unreasonably long strings, and
+/// strings containing characters outside the ASCII alphanumeric plus URL-safe
+/// punctuation set that real tokens use. This mirrors the APNs short-circuit so
+/// a malformed token does not cost a full OAuth-authenticated round-trip and
+/// FCM quota. It does not (and cannot) guarantee the token is live.
+#[must_use]
+fn is_valid_fcm_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_FCM_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
 }
 
 fn validate_project_id(project_id: &str) -> Result<&str> {
@@ -1533,5 +1568,81 @@ mod tests {
             .unwrap();
 
         assert_eq!(response2.status(), 200);
+    }
+
+    #[test]
+    fn test_valid_fcm_token() {
+        // Realistic-looking FCM registration token shape (colon-separated parts
+        // with URL-safe alphanumerics, dashes and underscores).
+        assert!(is_valid_fcm_token(
+            "cZx1AbC-dEf:APA91bH-Token_value.with-allowed_chars0123456789"
+        ));
+
+        // Plain ASCII alphanumeric.
+        assert!(is_valid_fcm_token("abcDEF0123456789"));
+
+        // All individually-allowed punctuation characters.
+        assert!(is_valid_fcm_token("a-b_c:d.e"));
+
+        // A long-but-bounded token is still accepted.
+        assert!(is_valid_fcm_token(&"a".repeat(MAX_FCM_TOKEN_LEN)));
+    }
+
+    #[test]
+    fn test_invalid_fcm_token_empty() {
+        assert!(!is_valid_fcm_token(""));
+    }
+
+    #[test]
+    fn test_invalid_fcm_token_too_long() {
+        assert!(!is_valid_fcm_token(&"a".repeat(MAX_FCM_TOKEN_LEN + 1)));
+    }
+
+    #[test]
+    fn test_invalid_fcm_token_disallowed_chars() {
+        // Whitespace.
+        assert!(!is_valid_fcm_token("token with space"));
+        assert!(!is_valid_fcm_token("token\twith\ttab"));
+        assert!(!is_valid_fcm_token("token\nwith\nnewline"));
+
+        // Control characters.
+        assert!(!is_valid_fcm_token("token\0null"));
+
+        // Non-ASCII / unicode.
+        assert!(!is_valid_fcm_token("tokén-with-unicode"));
+
+        // Other punctuation that is not part of the allowed set.
+        assert!(!is_valid_fcm_token("token/with/slash"));
+        assert!(!is_valid_fcm_token("token!bang"));
+    }
+
+    #[tokio::test]
+    async fn test_send_rejects_invalid_token_without_oauth() {
+        // A client with no service account / encoding key would error on the
+        // OAuth round-trip if it ever reached it. Invalid tokens must instead
+        // short-circuit to Ok(false) before any auth lookup or request build.
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let client = FcmClient::mock(config, false);
+
+        assert!(!client.send("").await.unwrap(), "empty token");
+        assert!(
+            !client.send("token with space").await.unwrap(),
+            "whitespace token"
+        );
+        assert!(
+            !client.send("tokén-with-unicode").await.unwrap(),
+            "unicode token"
+        );
+        assert!(
+            !client
+                .send(&"a".repeat(MAX_FCM_TOKEN_LEN + 1))
+                .await
+                .unwrap(),
+            "overlong token"
+        );
     }
 }
