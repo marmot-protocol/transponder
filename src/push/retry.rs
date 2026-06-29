@@ -100,7 +100,9 @@ where
                 sleep(wait_duration).await;
 
                 // Exponential backoff for next iteration (if not using Retry-After)
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                if retry_after.is_none() {
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
             }
             SendAttemptResult::Retriable { status_code, .. } => {
                 warn!(
@@ -399,6 +401,52 @@ mod tests {
         let elapsed = start.elapsed();
         // Should have used the short retry-after, not the long initial_backoff
         assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_does_not_advance_backoff_while_retry_after_is_used() {
+        let config = RetryConfig {
+            max_retries: 4,
+            initial_backoff: Duration::from_millis(200),
+        };
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(700),
+            with_retry(
+                &config,
+                "test",
+                || {
+                    let count = attempt_count_clone.clone();
+                    async move {
+                        let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempts <= 3 {
+                            SendAttemptResult::Retriable {
+                                status_code: 429,
+                                retry_after: Some(Duration::from_millis(1)),
+                            }
+                        } else if attempts == 4 {
+                            SendAttemptResult::Retriable {
+                                status_code: 503,
+                                retry_after: None,
+                            }
+                        } else {
+                            SendAttemptResult::Success(true)
+                        }
+                    }
+                },
+                None,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "fallback backoff was advanced by Retry-After retries"
+        );
+        assert!(result.unwrap().unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
