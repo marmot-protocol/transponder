@@ -596,10 +596,29 @@ async fn run_healthcheck(url: &str) -> Result<()> {
     anyhow::bail!("Healthcheck failed with status {}", response.status())
 }
 
+fn configured_logging_filter(level: &str) -> Result<EnvFilter> {
+    EnvFilter::try_new(level).with_context(|| format!("invalid logging.level filter: {level}"))
+}
+
+fn logging_filter(config: &config::LoggingConfig) -> Result<EnvFilter> {
+    logging_filter_from_env(config, std::env::var(EnvFilter::DEFAULT_ENV))
+}
+
+fn logging_filter_from_env(
+    config: &config::LoggingConfig,
+    env_filter: std::result::Result<String, std::env::VarError>,
+) -> Result<EnvFilter> {
+    match env_filter {
+        Ok(env_filter) => EnvFilter::try_new(&env_filter)
+            .with_context(|| format!("invalid RUST_LOG filter: {env_filter}")),
+        Err(std::env::VarError::NotPresent) => configured_logging_filter(&config.level),
+        Err(error) => Err(error).context("invalid RUST_LOG environment variable"),
+    }
+}
+
 /// Initialize the tracing subscriber based on configuration.
 fn init_logging(config: &config::LoggingConfig) -> Result<()> {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
+    let filter = logging_filter(config)?;
 
     match config.format.as_str() {
         "json" => {
@@ -739,6 +758,63 @@ mod tests {
 
         assert_eq!(metrics.relay_notifications_lagged_total.get(), 0);
         assert_eq!(metrics.relay_notifications_dropped_total.get(), 0);
+    }
+
+    fn test_logging_config(level: &str) -> config::LoggingConfig {
+        config::LoggingConfig {
+            level: level.to_string(),
+            format: "json".to_string(),
+        }
+    }
+
+    #[test]
+    fn logging_filter_uses_configured_filter_without_env_filter() {
+        assert!(
+            logging_filter_from_env(
+                &test_logging_config("info"),
+                Err(std::env::VarError::NotPresent)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn logging_filter_rejects_invalid_configured_filter_without_panic() {
+        let config = test_logging_config("target=lvl");
+        let result = std::panic::catch_unwind(|| {
+            logging_filter_from_env(&config, Err(std::env::VarError::NotPresent))
+        });
+        let error = match result.expect("invalid logging.level should not panic") {
+            Ok(_) => panic!("invalid logging.level should return an error"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid logging.level filter: target=lvl")
+        );
+    }
+
+    #[test]
+    fn logging_filter_prefers_env_filter_over_invalid_configured_filter() {
+        assert!(
+            logging_filter_from_env(&test_logging_config("target=lvl"), Ok("warn".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn logging_filter_rejects_invalid_env_filter_without_using_config() {
+        let error =
+            logging_filter_from_env(&test_logging_config("info"), Ok("target=lvl".to_string()))
+                .expect_err("invalid RUST_LOG should return an error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid RUST_LOG filter: target=lvl")
+        );
     }
 
     #[tokio::test]
