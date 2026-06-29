@@ -148,6 +148,9 @@ impl RelayClient {
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "Connected to relays"
                 );
+
+                warn_on_degraded_relay_classes(&self.config, &status);
+
                 return Ok(());
             }
 
@@ -340,6 +343,41 @@ fn inbox_relay_tags(event: &Event) -> BTreeSet<String> {
         .collect()
 }
 
+fn warn_on_degraded_relay_classes(config: &RelayConfig, status: &RelayStatus) {
+    let (clearnet_degraded, tor_degraded) = degraded_relay_classes(config, status);
+
+    // A configured relay class with zero live connections silently degrades
+    // the deployment's guarantees: losing all Tor relays weakens the privacy
+    // property, losing all ClearNet relays weakens reachability. Warn
+    // prominently for each such class.
+    if clearnet_degraded {
+        warn!(
+            configured = config.clearnet.len(),
+            "No ClearNet relays connected at startup; configured ClearNet relays are all down"
+        );
+    }
+
+    if tor_degraded {
+        warn!(
+            configured = config.onion.len(),
+            "No Tor relays connected at startup; privacy is degraded because configured Tor relays are all down"
+        );
+    }
+}
+
+fn degraded_relay_classes(config: &RelayConfig, status: &RelayStatus) -> (bool, bool) {
+    (
+        degraded_relay_class(config.clearnet.len(), status.clearnet_connected),
+        degraded_relay_class(config.onion.len(), status.tor_connected),
+    )
+}
+
+/// Returns `true` when a relay class is configured but has zero live
+/// connections, signalling a degraded startup for that class.
+fn degraded_relay_class(configured: usize, connected: usize) -> bool {
+    configured > 0 && connected == 0
+}
+
 fn validate_relay_config(config: &RelayConfig) -> Result<()> {
     for url in &config.clearnet {
         if clearnet_relay_uses_tls(url) {
@@ -411,6 +449,58 @@ mod tests {
         .await
         .ok()
         .flatten()
+    }
+
+    #[test]
+    fn test_degraded_relay_class_flags_configured_class_with_no_connections() {
+        // A configured class with zero live connections is degraded.
+        assert!(degraded_relay_class(2, 0));
+        // A configured class with at least one connection is healthy.
+        assert!(!degraded_relay_class(2, 1));
+        // An unconfigured class is never considered degraded.
+        assert!(!degraded_relay_class(0, 0));
+    }
+
+    #[test]
+    fn test_degraded_relay_classes_and_startup_warnings_cover_each_configured_class() {
+        let config = RelayConfig {
+            clearnet: vec!["wss://relay.example.com".to_string()],
+            allow_unencrypted_clearnet_relays: false,
+            onion: vec!["wss://example.onion".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        for (status, expected) in [
+            (
+                RelayStatus {
+                    clearnet_connected: 0,
+                    tor_connected: 1,
+                    total_configured: 2,
+                },
+                (true, false),
+            ),
+            (
+                RelayStatus {
+                    clearnet_connected: 1,
+                    tor_connected: 0,
+                    total_configured: 2,
+                },
+                (false, true),
+            ),
+            (
+                RelayStatus {
+                    clearnet_connected: 1,
+                    tor_connected: 1,
+                    total_configured: 2,
+                },
+                (false, false),
+            ),
+        ] {
+            assert_eq!(degraded_relay_classes(&config, &status), expected);
+            warn_on_degraded_relay_classes(&config, &status);
+        }
     }
 
     #[test]
