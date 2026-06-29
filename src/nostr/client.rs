@@ -148,6 +148,24 @@ impl RelayClient {
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "Connected to relays"
                 );
+
+                // A configured relay class with zero live connections silently
+                // degrades the deployment's guarantees: losing all Tor relays
+                // weakens the privacy property, losing all ClearNet relays
+                // weakens reachability. Warn prominently for each such class.
+                if degraded_relay_class(self.config.clearnet.len(), status.clearnet_connected) {
+                    warn!(
+                        configured = self.config.clearnet.len(),
+                        "No ClearNet relays connected at startup; configured ClearNet relays are all down"
+                    );
+                }
+                if degraded_relay_class(self.config.onion.len(), status.tor_connected) {
+                    warn!(
+                        configured = self.config.onion.len(),
+                        "No Tor relays connected at startup; privacy is degraded because configured Tor relays are all down"
+                    );
+                }
+
                 return Ok(());
             }
 
@@ -340,6 +358,12 @@ fn inbox_relay_tags(event: &Event) -> BTreeSet<String> {
         .collect()
 }
 
+/// Returns `true` when a relay class is configured but has zero live
+/// connections, signalling a degraded startup for that class.
+fn degraded_relay_class(configured: usize, connected: usize) -> bool {
+    configured > 0 && connected == 0
+}
+
 fn validate_relay_config(config: &RelayConfig) -> Result<()> {
     for url in &config.clearnet {
         if clearnet_relay_uses_tls(url) {
@@ -411,6 +435,16 @@ mod tests {
         .await
         .ok()
         .flatten()
+    }
+
+    #[test]
+    fn test_degraded_relay_class_flags_configured_class_with_no_connections() {
+        // A configured class with zero live connections is degraded.
+        assert!(degraded_relay_class(2, 0));
+        // A configured class with at least one connection is healthy.
+        assert!(!degraded_relay_class(2, 1));
+        // An unconfigured class is never considered degraded.
+        assert!(!degraded_relay_class(0, 0));
     }
 
     #[test]
