@@ -425,6 +425,15 @@ impl ApnsClient {
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
     async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+        self.send_once_with_transport_retry_config(device_token, &RetryConfig::default())
+            .await
+    }
+
+    async fn send_once_with_transport_retry_config(
+        &self,
+        device_token: &str,
+        transport_retry: &RetryConfig,
+    ) -> SendAttemptResult {
         let start = Instant::now();
         let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
 
@@ -444,9 +453,8 @@ impl ApnsClient {
         };
 
         let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
-        let transport_retry = RetryConfig::default();
         let response = match retry::with_transport_retry(
-            &transport_retry,
+            transport_retry,
             "APNs",
             || async {
                 self.build_request(&url, token.as_str(), &request_parts)
@@ -731,7 +739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_once_reuses_precomputed_request_parts_for_transport_attempts() {
+    async fn test_send_once_returns_transport_error_after_connect_retries() {
         let proxy_addr = {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let addr = listener.local_addr().unwrap();
@@ -744,11 +752,9 @@ mod tests {
             .timeout(Duration::from_millis(50))
             .build()
             .unwrap();
-        let mut config = test_config();
-        config.payload_mode = ApnsPayloadMode::NsePrototypeAlert;
         let client = ApnsClient {
             http_client,
-            config,
+            config: test_config(),
             encoding_key: None,
             cached_token: Arc::new(RwLock::new(Some(CachedToken {
                 token: Zeroizing::new("cached-token".to_string()),
@@ -756,8 +762,14 @@ mod tests {
             }))),
             metrics: None,
         };
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(1),
+        };
 
-        let result = client.send_once("aabbccdd11223344").await;
+        let result = client
+            .send_once_with_transport_retry_config("aabbccdd11223344", &retry_config)
+            .await;
 
         assert!(matches!(
             result,
