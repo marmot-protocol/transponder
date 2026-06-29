@@ -120,6 +120,41 @@ struct FcmError {
     status: String,
 }
 
+/// Classification of an FCM error response.
+///
+/// FCM returns `400 INVALID_ARGUMENT` both for a genuinely malformed/expired
+/// token and for malformed payloads or other request-construction errors, and
+/// returns `404 NOT_FOUND` both for an unregistered token *and* for a
+/// wrong/typoed `project_id` in the `/v1/projects/{project_id}/messages:send`
+/// path. Collapsing those into "token dead" would silently drop every
+/// notification on a single config mistake *and* unregister healthy device
+/// tokens, so token death must be signalled explicitly. See issue #111.
+#[derive(Debug, PartialEq, Eq)]
+enum FcmClassification {
+    /// The provider explicitly reported the token as unregistered; the token
+    /// should be treated as dead (`Success(false)`).
+    TokenDead,
+    /// A configuration, payload, or path error that is permanent for this
+    /// provider but unrelated to the device token; must surface as an error
+    /// rather than evicting the token.
+    Permanent,
+}
+
+/// Classify an FCM error `status` as either an unregistered (dead) token or a
+/// permanent provider/configuration error.
+///
+/// Only the explicit `UNREGISTERED` status identifies the device token as dead.
+/// Every other status — including `INVALID_ARGUMENT`, `NOT_FOUND` (which can be
+/// a wrong project ID), and any unrecognised status — is a permanent error so
+/// callers do not evict an otherwise-healthy token.
+#[must_use]
+fn classify_fcm_error(status: &str) -> FcmClassification {
+    match status {
+        "UNREGISTERED" => FcmClassification::TokenDead,
+        _ => FcmClassification::Permanent,
+    }
+}
+
 /// FCM client for sending push notifications.
 pub struct FcmClient {
     pub(crate) http_client: Client,
@@ -359,6 +394,48 @@ impl FcmClient {
         }
     }
 
+    /// Parse an FCM error response and classify it as a dead token or a
+    /// permanent error.
+    ///
+    /// `default_status` is used when the body cannot be parsed (e.g. an empty
+    /// or non-JSON body), preserving the provider's HTTP-status-implied default
+    /// classification. Only an explicit `UNREGISTERED` status is treated as a
+    /// dead device token; every other status — including `INVALID_ARGUMENT` and
+    /// `NOT_FOUND` (which can mean a misconfigured project ID) — is surfaced as
+    /// a permanent error so a healthy token is not evicted. See issue #111.
+    async fn classify_error_response(
+        &self,
+        response: reqwest::Response,
+        default_code: u32,
+        default_status: &str,
+    ) -> SendAttemptResult {
+        let error: FcmErrorResponse = response.json().await.unwrap_or(FcmErrorResponse {
+            error: FcmError {
+                code: default_code,
+                message: "Unknown".to_string(),
+                status: default_status.to_string(),
+            },
+        });
+
+        match classify_fcm_error(&error.error.status) {
+            FcmClassification::TokenDead => {
+                info!(status = %error.error.status, "FCM token unregistered");
+                SendAttemptResult::Success(false)
+            }
+            FcmClassification::Permanent => {
+                warn!(
+                    status = %error.error.status,
+                    message = %error.error.message,
+                    "FCM rejected request (configuration or request error)"
+                );
+                SendAttemptResult::Permanent(Error::Fcm(format!(
+                    "Bad request: {} - {}",
+                    error.error.status, error.error.message
+                )))
+            }
+        }
+    }
+
     async fn handle_response(
         &self,
         start: Instant,
@@ -378,19 +455,8 @@ impl FcmClient {
                 SendAttemptResult::Success(true)
             }
             400 => {
-                let error: FcmErrorResponse = response.json().await.unwrap_or(FcmErrorResponse {
-                    error: FcmError {
-                        code: 400,
-                        message: "Unknown".to_string(),
-                        status: "INVALID_ARGUMENT".to_string(),
-                    },
-                });
-                warn!(
-                    status = %error.error.status,
-                    message = %error.error.message,
-                    "FCM bad request"
-                );
-                SendAttemptResult::Success(false)
+                self.classify_error_response(response, 400, "INVALID_ARGUMENT")
+                    .await
             }
             401 => {
                 // Auth error - permanent for this request, refresh on the next one.
@@ -399,9 +465,8 @@ impl FcmClient {
                 SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
             }
             404 => {
-                // Token not found (device unregistered)
-                info!("FCM token not found");
-                SendAttemptResult::Success(false)
+                self.classify_error_response(response, 404, "NOT_FOUND")
+                    .await
             }
             429 => {
                 // Rate limited - retriable
@@ -775,6 +840,110 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 404);
+    }
+
+    #[test]
+    fn test_classify_fcm_error_unregistered_is_token_dead() {
+        assert_eq!(
+            classify_fcm_error("UNREGISTERED"),
+            FcmClassification::TokenDead
+        );
+    }
+
+    #[test]
+    fn test_classify_fcm_error_other_statuses_are_permanent() {
+        // INVALID_ARGUMENT, NOT_FOUND (wrong project), and unknown statuses must
+        // NOT evict the token.
+        for status in [
+            "INVALID_ARGUMENT",
+            "NOT_FOUND",
+            "PERMISSION_DENIED",
+            "SENDER_ID_MISMATCH",
+            "Unknown",
+            "SOME_FUTURE_STATUS",
+        ] {
+            assert_eq!(
+                classify_fcm_error(status),
+                FcmClassification::Permanent,
+                "status {status} should be classified as a permanent error"
+            );
+        }
+    }
+
+    /// Drive `handle_response` against a mock server returning `status_code`
+    /// with the given FCM error `status`, returning the classified result.
+    async fn fcm_error_result(status_code: u16, status: &str) -> SendAttemptResult {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(
+                ResponseTemplate::new(status_code).set_body_json(serde_json::json!({
+                    "error": {
+                        "code": status_code,
+                        "message": "test error message",
+                        "status": status
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let client = FcmClient::mock(config, false);
+
+        let response = Client::new()
+            .post(format!(
+                "{}/v1/projects/test-project/messages:send",
+                mock_server.uri()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .handle_response(Instant::now(), response, "test-access-token")
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_invalid_argument_is_permanent_error() {
+        // INVALID_ARGUMENT is a malformed-payload/config error, not token death.
+        let result = fcm_error_result(400, "INVALID_ARGUMENT").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("INVALID_ARGUMENT")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_unregistered_is_token_dead() {
+        // An explicit UNREGISTERED status, even on a 400, signals token death.
+        let result = fcm_error_result(400, "UNREGISTERED").await;
+        assert!(matches!(result, SendAttemptResult::Success(false)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_404_unregistered_is_token_dead() {
+        let result = fcm_error_result(404, "UNREGISTERED").await;
+        assert!(matches!(result, SendAttemptResult::Success(false)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_404_not_found_is_permanent_error() {
+        // A 404 without an explicit UNREGISTERED status (e.g. wrong project ID)
+        // must be a permanent error, not token death.
+        let result = fcm_error_result(404, "NOT_FOUND").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("NOT_FOUND")
+        ));
     }
 
     #[tokio::test]
