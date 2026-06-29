@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -59,6 +60,75 @@ struct QueuedPushMessage {
     token: Zeroizing<String>,
 }
 
+/// Tracks the number of spawned send tasks that have not yet finished, so that
+/// graceful shutdown can wait for them to complete.
+///
+/// This is deliberately decoupled from the concurrency [`Semaphore`]: a send
+/// task that is in a retry backoff sleep releases its concurrency permit (see
+/// [`crate::push::retry::BackoffPermit`]) so the slot can be reused, but the
+/// task is still alive and may re-acquire a permit and send again. Counting
+/// permits is therefore *not* a sound proof that all send tasks have finished.
+/// This tracker counts task lifetimes end-to-end instead.
+struct InFlightTracker {
+    count: AtomicUsize,
+    idle: Notify,
+}
+
+impl InFlightTracker {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            idle: Notify::new(),
+        }
+    }
+
+    /// Register a newly spawned send task. The returned guard decrements the
+    /// in-flight count when dropped (i.e. when the send task finishes) and
+    /// wakes any shutdown waiter once the count reaches zero.
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        InFlightGuard {
+            tracker: self.clone(),
+        }
+    }
+
+    /// Wait until no send tasks are in flight.
+    ///
+    /// Uses the register-before-check pattern so a task that finishes between
+    /// the count load and observing the notification cannot be missed: the
+    /// `Notified` future is *enabled* (waiter registered) before the count is
+    /// read. `notify_waiters()` does not store a permit, so the waiter must be
+    /// registered first; `Notified::enable()` registers it eagerly without
+    /// awaiting, which closes the lost-wakeup window.
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            // Register this waiter before reading the count.
+            notified.as_mut().enable();
+            if self.count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// RAII guard returned by [`InFlightTracker::enter`]; decrements the in-flight
+/// count and signals idle when the last in-flight task finishes.
+struct InFlightGuard {
+    tracker: Arc<InFlightTracker>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.tracker.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // Transitioned to zero in-flight tasks; wake any shutdown waiter.
+            self.tracker.idle.notify_waiters();
+        }
+    }
+}
+
 /// Push notification dispatcher.
 pub struct PushDispatcher {
     apns_client: Option<Arc<ApnsClient>>,
@@ -69,6 +139,7 @@ pub struct PushDispatcher {
     shutting_down: Arc<AtomicBool>,
     admission_lock: tokio::sync::Mutex<()>,
     dispatcher_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    inflight: Arc<InFlightTracker>,
     metrics: Option<Metrics>,
 }
 
@@ -95,6 +166,7 @@ impl PushDispatcher {
         let (sender, receiver) = mpsc::channel(MAX_PENDING_QUEUE_SIZE);
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let inflight = Arc::new(InFlightTracker::new());
 
         // Initialize push capacity metrics
         if let Some(ref m) = metrics {
@@ -111,6 +183,7 @@ impl PushDispatcher {
             apns_client.clone(),
             fcm_client.clone(),
             semaphore.clone(),
+            inflight.clone(),
             metrics.clone(),
         );
 
@@ -123,6 +196,7 @@ impl PushDispatcher {
             shutting_down,
             admission_lock: tokio::sync::Mutex::new(()),
             dispatcher_handle: tokio::sync::Mutex::new(Some(dispatcher_handle)),
+            inflight,
             metrics,
         }
     }
@@ -149,6 +223,7 @@ impl PushDispatcher {
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
         metrics: Option<Metrics>,
+        backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) {
         let platform_str = match platform {
             Platform::Apns => "apns",
@@ -158,7 +233,7 @@ impl PushDispatcher {
         match platform {
             Platform::Apns => {
                 if let Some(client) = apns_client {
-                    match client.send(token.as_str()).await {
+                    match client.send(token.as_str(), backoff_permit).await {
                         Ok(true) => {
                             trace!("APNs notification sent");
                             if let Some(ref m) = metrics {
@@ -182,7 +257,7 @@ impl PushDispatcher {
             }
             Platform::Fcm => {
                 if let Some(client) = fcm_client {
-                    match client.send(token.as_str()).await {
+                    match client.send(token.as_str(), backoff_permit).await {
                         Ok(true) => {
                             trace!("FCM notification sent");
                             if let Some(ref m) = metrics {
@@ -215,6 +290,7 @@ impl PushDispatcher {
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
         semaphore: Arc<Semaphore>,
+        inflight: Arc<InFlightTracker>,
         metrics: Option<Metrics>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
@@ -242,17 +318,38 @@ impl PushDispatcher {
                         let metrics = metrics.clone();
                         let semaphore = semaphore.clone();
 
+                        // Register the send task as in-flight BEFORE spawning
+                        // so graceful shutdown can never observe a window where
+                        // a live send task is uncounted. The guard is moved into
+                        // the task and dropped only when the task body finishes
+                        // (after all retries/backoff), independent of whether the
+                        // task currently holds a concurrency permit.
+                        let inflight_guard = inflight.enter();
+
                         tokio::spawn(async move {
+                            // Decrements the in-flight count when this task
+                            // completes, signalling idle to any shutdown waiter.
+                            let _inflight_guard = inflight_guard;
+
+                            // Wrap the permit so the send's internal backoff
+                            // can release the in-flight slot during sleeps and
+                            // re-acquire it before the next attempt.
+                            let mut backoff_permit =
+                                crate::push::retry::BackoffPermit::new(semaphore.clone(), permit);
+
                             Self::send_push(
                                 platform,
                                 token,
                                 apns_client,
                                 fcm_client,
                                 metrics.clone(),
+                                Some(&mut backoff_permit),
                             )
                             .await;
 
-                            drop(permit);
+                            // Release the held permit (owned by backoff_permit)
+                            // before reading available permits for the metric.
+                            drop(backoff_permit);
 
                             if let Some(ref m) = metrics {
                                 m.set_push_semaphore_available(semaphore.available_permits());
@@ -443,19 +540,15 @@ impl PushDispatcher {
             }
         }
 
-        // Wait for all spawned send tasks to finish and release their permits.
-        let mut permits = Vec::with_capacity(MAX_CONCURRENT_PUSHES);
-        for _ in 0..MAX_CONCURRENT_PUSHES {
-            match self.semaphore.acquire().await {
-                Ok(permit) => permits.push(permit),
-                Err(_) => {
-                    // The dispatcher does not close this semaphore. If a future change
-                    // does, stop waiting rather than hanging shutdown.
-                    break;
-                }
-            }
-        }
-        drop(permits);
+        // Wait for all spawned send tasks to finish. We track task lifetimes
+        // explicitly rather than draining concurrency permits: a send task in a
+        // retry backoff sleep releases its permit (see `BackoffPermit`), so
+        // "all permits acquired" does NOT prove every send task has finished —
+        // a sleeping retry holds no permit yet is still alive and may re-acquire
+        // a permit and send again. The in-flight tracker counts task lifetimes
+        // end-to-end, so this honours the drain guarantee even under provider
+        // backoff storms.
+        self.inflight.wait_idle().await;
 
         self.queue_depth.store(0, Ordering::SeqCst);
         if let Some(ref m) = self.metrics {
@@ -1280,5 +1373,135 @@ mod tests {
         }
 
         dispatcher.wait_for_completion().await;
+    }
+
+    #[tokio::test]
+    async fn test_inflight_tracker_blocks_until_guard_dropped() {
+        let tracker = Arc::new(InFlightTracker::new());
+
+        // No in-flight tasks: wait_idle returns immediately.
+        tokio::time::timeout(Duration::from_millis(200), tracker.wait_idle())
+            .await
+            .expect("wait_idle should return immediately with no in-flight tasks");
+
+        // Hold a guard, then assert wait_idle does NOT return until it is dropped.
+        let guard = tracker.enter();
+        assert_eq!(tracker.count.load(Ordering::SeqCst), 1);
+
+        let waiter_tracker = tracker.clone();
+        let waiter = tokio::spawn(async move { waiter_tracker.wait_idle().await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "wait_idle must not complete while a guard is still held"
+        );
+
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_idle should complete after the last guard is dropped")
+            .expect("waiter task should not panic");
+
+        assert_eq!(tracker.count.load(Ordering::SeqCst), 0);
+    }
+
+    /// Regression for transponder#65: graceful shutdown must wait for send tasks
+    /// that are sitting in a retry backoff sleep, even though such a task has
+    /// released its concurrency permit (so "all permits acquired" would wrongly
+    /// declare the pool drained). The drain guarantee is enforced by the
+    /// in-flight task tracker, not by permit accounting.
+    #[tokio::test]
+    async fn test_wait_for_completion_waits_for_retry_task_during_backoff() {
+        use crate::push::retry::{BackoffPermit, RetryConfig, SendAttemptResult, with_retry};
+        use std::sync::atomic::AtomicU32;
+
+        let dispatcher = Arc::new(PushDispatcher::new(None, None));
+
+        // Acquire one real permit from the dispatcher's semaphore and wrap it,
+        // mirroring exactly what spawn_workers does for a send task.
+        let permit = dispatcher
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore should grant a permit");
+        let mut backoff_permit = BackoffPermit::new(dispatcher.semaphore.clone(), permit);
+
+        // Register the simulated send task as in-flight, just like the real path.
+        let guard = dispatcher.inflight.enter();
+
+        // A retry config with a backoff long enough to observe the sleep window
+        // deterministically from the test.
+        let config = RetryConfig {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(300),
+        };
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_op = attempts.clone();
+
+        // Spawn the simulated send task: one retriable result forces a backoff
+        // sleep (during which the permit is released), then success.
+        let send_task = tokio::spawn(async move {
+            let _guard = guard;
+            let result = with_retry(
+                &config,
+                "test",
+                || {
+                    let n = attempts_op.clone();
+                    async move {
+                        if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                            SendAttemptResult::Retriable {
+                                status_code: 429,
+                                retry_after: None,
+                            }
+                        } else {
+                            SendAttemptResult::Success(true)
+                        }
+                    }
+                },
+                Some(&mut backoff_permit),
+                None,
+            )
+            .await;
+            assert!(matches!(result, Ok(true)));
+        });
+
+        // Let the task reach its backoff sleep (first attempt + release of permit).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // During backoff the permit IS released, so the now-unsound "acquire all
+        // permits" approach would observe a fully-available pool and wrongly
+        // declare drain complete. Prove the permit is free:
+        assert_eq!(
+            dispatcher.semaphore.available_permits(),
+            MAX_CONCURRENT_PUSHES,
+            "the retry task should have released its permit during the backoff sleep"
+        );
+
+        // Despite the free permit, wait_for_completion must NOT return while the
+        // retry task is still alive.
+        let shutdown_dispatcher = dispatcher.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_dispatcher.wait_for_completion().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "wait_for_completion must not complete while a retry task is sleeping in backoff"
+        );
+
+        // Once the retry task finishes (re-acquires, succeeds, drops its guard),
+        // shutdown completes.
+        send_task.await.expect("send task should not panic");
+
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("wait_for_completion should complete after the retry task finishes")
+            .expect("shutdown task should not panic");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }
