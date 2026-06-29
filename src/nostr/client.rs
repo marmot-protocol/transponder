@@ -255,6 +255,13 @@ impl RelayClient {
     }
 
     /// Publish a kind 10050 event to advertise inbox relays.
+    ///
+    /// Publication is best-effort and non-fatal: a failure to reach any relay
+    /// (either an outright send error or a send whose `success` set is empty) is
+    /// logged and signaled via the `transponder_inbox_relay_publish_failed_total`
+    /// metric, but this method still returns `Ok(())`. Callers therefore must not
+    /// treat `Ok(())` as proof that the inbox relay list was advertised; rely on
+    /// the metric/logs for that signal.
     pub async fn publish_inbox_relays(&self) -> Result<()> {
         let relay_urls = self.configured_inbox_relays();
 
@@ -286,16 +293,30 @@ impl RelayClient {
         let builder = EventBuilder::new(Kind::Custom(10050), "").tags(relay_tags);
 
         match self.client.send_event_builder(builder).await {
-            Ok(output) => {
+            Ok(output) if !output.success.is_empty() => {
                 debug!(event_id = %output.id(), "Published kind 10050 inbox relay list");
                 info!("Published kind 10050 inbox relay list");
             }
+            Ok(output) => {
+                error!(
+                    relays_failed = output.failed.len(),
+                    "Failed to publish kind 10050 event to any relay"
+                );
+                self.record_inbox_relay_publish_failed();
+            }
             Err(e) => {
                 error!(error = %e, "Failed to publish kind 10050 event");
+                self.record_inbox_relay_publish_failed();
             }
         }
 
         Ok(())
+    }
+
+    fn record_inbox_relay_publish_failed(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_inbox_relay_publish_failed();
+        }
     }
 
     fn configured_inbox_relays(&self) -> BTreeSet<String> {
@@ -776,6 +797,47 @@ mod tests {
 
         // Give it time to publish
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        client.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_publish_inbox_relays_records_metric_when_publish_reaches_no_relays() {
+        use crate::test_metrics::counter_value;
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let keys = Keys::generate();
+        let config = test_relay_config(vec![relay_url.to_string()]);
+        let metrics = Metrics::new().unwrap();
+
+        let client = RelayClient::with_metrics(keys, config, Some(metrics.clone()))
+            .await
+            .unwrap();
+        client.client.add_relay(&relay_url).await.unwrap();
+        client.client.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Shut the relay down so the kind 10050 publish reaches zero relays and
+        // therefore fails to advertise the inbox relay list.
+        mock.shutdown();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Publication is best-effort, so the call still returns Ok(()).
+        let result = client.publish_inbox_relays().await;
+        assert!(result.is_ok());
+
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_inbox_relay_publish_failed_total",
+                &[]
+            ),
+            1.0,
+            "a kind 10050 publish that reaches no relays must increment the failure counter"
+        );
 
         client.disconnect().await.unwrap();
     }
