@@ -541,7 +541,7 @@ mod tests {
             key_id: "KEYID123".to_string(),
             team_id: "TEAMID456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         }
@@ -722,7 +722,7 @@ mod tests {
             key_id: "KEYID123".to_string(),
             team_id: "TEAMID456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -809,7 +809,7 @@ mod tests {
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
         };
@@ -834,7 +834,7 @@ mod tests {
 
         let mut config = test_config();
         // Override the environment to use the mock server
-        config.environment = "sandbox".to_string();
+        config.environment = crate::config::ApnsEnvironment::Sandbox;
 
         let http_client = Client::builder()
             .timeout(Duration::from_secs(5))
@@ -849,7 +849,7 @@ mod tests {
                 key_id: "KEYID123".to_string(),
                 team_id: "TEAMID456".to_string(),
                 private_key_path: String::new(),
-                environment: "sandbox".to_string(),
+                environment: crate::config::ApnsEnvironment::Sandbox,
                 bundle_id: "com.example.app".to_string(),
                 payload_mode: Default::default(),
             },
@@ -1111,7 +1111,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1127,7 +1127,7 @@ mod tests {
             key_id: String::new(), // Missing
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1143,7 +1143,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: String::new(), // Missing
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1159,7 +1159,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: String::new(), // Missing
             payload_mode: Default::default(),
         };
@@ -1175,7 +1175,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1223,7 +1223,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1242,7 +1242,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1270,7 +1270,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1299,7 +1299,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1327,7 +1327,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(), // Empty path
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1343,7 +1343,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: "/nonexistent/key.p8".to_string(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1384,7 +1384,7 @@ mod tests {
             key_id: "KEYID123".to_string(),
             team_id: "TEAMID456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1432,7 +1432,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1467,7 +1467,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: file.path().to_string_lossy().to_string(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1498,7 +1498,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: file.path().to_string_lossy().to_string(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1590,7 +1590,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: file.path().to_string_lossy().to_string(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1641,7 +1641,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             key_id: "KEYID123".to_string(),
             team_id: "TEAMID456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
