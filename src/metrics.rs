@@ -144,6 +144,10 @@ pub struct Metrics {
     /// Relay subscription lookback window in seconds.
     pub relay_subscription_lookback_seconds: IntGauge,
 
+    /// Total number of kind-10050 inbox-relay-list publications that failed to
+    /// reach any relay (best-effort publish; non-fatal at startup).
+    pub inbox_relay_publish_failed_total: IntCounter,
+
     // === Server Metrics ===
     /// Timestamp when the server started (Unix seconds).
     pub server_start_time_seconds: Gauge,
@@ -521,6 +525,12 @@ impl Metrics {
         ))?;
         registry.register(Box::new(relay_subscription_lookback_seconds.clone()))?;
 
+        let inbox_relay_publish_failed_total = IntCounter::with_opts(Opts::new(
+            "transponder_inbox_relay_publish_failed_total",
+            "Total number of kind-10050 inbox-relay-list publications that failed to reach any relay",
+        ))?;
+        registry.register(Box::new(inbox_relay_publish_failed_total.clone()))?;
+
         // === Server Metrics ===
         let server_start_time_seconds = Gauge::with_opts(Opts::new(
             "transponder_server_start_time_seconds",
@@ -577,6 +587,7 @@ impl Metrics {
             relay_notifications_lagged_total,
             relay_notifications_dropped_total,
             relay_subscription_lookback_seconds,
+            inbox_relay_publish_failed_total,
             server_start_time_seconds,
             server_info,
         })
@@ -847,6 +858,14 @@ impl Metrics {
             .set(i64::try_from(seconds).unwrap_or(i64::MAX));
     }
 
+    /// Record a kind-10050 inbox-relay-list publication that reached no relays.
+    ///
+    /// Publishing the inbox relay list is best-effort and non-fatal at startup;
+    /// this counter lets operators alert on the routing breakage it implies.
+    pub fn record_inbox_relay_publish_failed(&self) {
+        self.inbox_relay_publish_failed_total.inc();
+    }
+
     /// Gather all metrics for export.
     pub fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
         self.registry.gather()
@@ -1102,6 +1121,7 @@ mod tests {
         metrics.record_relay_notifications_lagged();
         metrics.record_relay_notifications_dropped(4);
         metrics.set_relay_subscription_lookback(172_800);
+        metrics.record_inbox_relay_publish_failed();
 
         assert_eq!(
             gauge_value(
@@ -1158,6 +1178,14 @@ mod tests {
                 &[]
             ),
             172_800.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_inbox_relay_publish_failed_total",
+                &[]
+            ),
+            1.0
         );
     }
 
