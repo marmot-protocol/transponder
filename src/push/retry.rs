@@ -100,9 +100,7 @@ where
                 sleep(wait_duration).await;
 
                 // Exponential backoff for next iteration (if not using Retry-After)
-                if retry_after.is_none() {
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                }
+                backoff = next_fallback_backoff(backoff, retry_after);
             }
             SendAttemptResult::Retriable { status_code, .. } => {
                 warn!(
@@ -115,6 +113,14 @@ where
             }
             SendAttemptResult::Permanent(e) => return Err(e),
         }
+    }
+}
+
+fn next_fallback_backoff(backoff: Duration, retry_after: Option<Duration>) -> Duration {
+    if retry_after.is_some() {
+        backoff
+    } else {
+        (backoff * 2).min(MAX_BACKOFF)
     }
 }
 
@@ -403,7 +409,22 @@ mod tests {
         assert!(elapsed < Duration::from_secs(1));
     }
 
-    #[tokio::test]
+    #[test]
+    fn test_retry_after_does_not_advance_fallback_backoff() {
+        let initial_backoff = Duration::from_millis(200);
+
+        let backoff_after_retry_after_retries = (0..3).fold(initial_backoff, |backoff, _| {
+            next_fallback_backoff(backoff, Some(Duration::from_millis(1)))
+        });
+
+        assert_eq!(backoff_after_retry_after_retries, initial_backoff);
+        assert_eq!(
+            next_fallback_backoff(backoff_after_retry_after_retries, None),
+            Duration::from_millis(400)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_with_retry_does_not_advance_backoff_while_retry_after_is_used() {
         let config = RetryConfig {
             max_retries: 4,
@@ -413,7 +434,7 @@ mod tests {
         let attempt_count_clone = attempt_count.clone();
 
         let result = tokio::time::timeout(
-            Duration::from_millis(700),
+            Duration::from_millis(250),
             with_retry(
                 &config,
                 "test",
