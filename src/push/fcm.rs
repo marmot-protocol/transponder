@@ -340,9 +340,21 @@ impl FcmClient {
             .json(&request)
     }
 
-    async fn invalidate_cached_token(&self) {
+    /// Invalidate the cached token only if it still matches the one the failing
+    /// request used.
+    ///
+    /// Under concurrency another task may have already refreshed the cache with
+    /// a fresh token between the time this request read its token and the time
+    /// the authentication rejection came back. Evicting unconditionally would
+    /// discard that valid token and force a redundant OAuth round-trip, so the
+    /// eviction is gated on the cached entry still being the failing token.
+    async fn invalidate_cached_token(&self, failing_token: &str) {
         let mut cached = self.cached_token.write().await;
-        if cached.take().is_some() {
+        if cached
+            .as_ref()
+            .is_some_and(|token| token.token.as_str() == failing_token)
+        {
+            *cached = None;
             debug!("Invalidated cached FCM OAuth token after authentication rejection");
         }
     }
@@ -351,6 +363,7 @@ impl FcmClient {
         &self,
         start: Instant,
         response: reqwest::Response,
+        access_token: &str,
     ) -> SendAttemptResult {
         let status = response.status();
 
@@ -381,7 +394,7 @@ impl FcmClient {
             }
             401 => {
                 // Auth error - permanent for this request, refresh on the next one.
-                self.invalidate_cached_token().await;
+                self.invalidate_cached_token(access_token).await;
                 error!("FCM authentication error");
                 SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
             }
@@ -454,7 +467,8 @@ impl FcmClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(start, response).await
+        self.handle_response(start, response, access_token.as_str())
+            .await
     }
 
     /// Check if the client is properly configured.
@@ -849,7 +863,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client.handle_response(Instant::now(), response).await;
+        let result = client
+            .handle_response(Instant::now(), response, "poisoned-access-token")
+            .await;
 
         assert!(matches!(
             result,
@@ -857,6 +873,68 @@ mod tests {
                 if message.contains("Authentication error")
         ));
         assert!(client.cached_token.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auth_error_keeps_token_refreshed_by_concurrent_task() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 401,
+                    "message": "Request had invalid authentication credentials.",
+                    "status": "UNAUTHENTICATED"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let client = FcmClient::mock(config, false);
+
+        // Simulate a concurrent task having already refreshed the cache to a
+        // newer token after the failing request read its (now stale) token.
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("fresh-access-token".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let response = Client::new()
+            .post(format!(
+                "{}/v1/projects/test-project/messages:send",
+                mock_server.uri()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        // The failing request used the older, now-replaced token.
+        let result = client
+            .handle_response(Instant::now(), response, "stale-access-token")
+            .await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("Authentication error")
+        ));
+
+        // The freshly refreshed token must survive the stale rejection.
+        let cached = client.cached_token.read().await;
+        assert_eq!(
+            cached.as_ref().map(|token| token.token.as_str()),
+            Some("fresh-access-token")
+        );
     }
 
     #[tokio::test]

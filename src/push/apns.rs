@@ -329,9 +329,21 @@ impl ApnsClient {
             .json(&request_parts.payload)
     }
 
-    async fn invalidate_cached_token(&self) {
+    /// Invalidate the cached token only if it still matches the one the failing
+    /// request used.
+    ///
+    /// Under concurrency another task may have already refreshed the cache with
+    /// a fresh token between the time this request read its token and the time
+    /// the authentication rejection came back. Evicting unconditionally would
+    /// discard that valid token and force redundant JWT regeneration, so the
+    /// eviction is gated on the cached entry still being the failing token.
+    async fn invalidate_cached_token(&self, failing_token: &str) {
         let mut cached = self.cached_token.write().await;
-        if cached.take().is_some() {
+        if cached
+            .as_ref()
+            .is_some_and(|token| token.token.as_str() == failing_token)
+        {
+            *cached = None;
             debug!("Invalidated cached APNs JWT after authentication rejection");
         }
     }
@@ -340,6 +352,7 @@ impl ApnsClient {
         &self,
         start: Instant,
         response: reqwest::Response,
+        auth_token: &str,
     ) -> SendAttemptResult {
         let status = response.status();
 
@@ -369,7 +382,7 @@ impl ApnsClient {
                 SendAttemptResult::Success(false)
             }
             403 => {
-                self.invalidate_cached_token().await;
+                self.invalidate_cached_token(auth_token).await;
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
@@ -479,7 +492,7 @@ impl ApnsClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(start, response).await
+        self.handle_response(start, response, token.as_str()).await
     }
 
     /// Check if the client is properly configured.
@@ -1029,7 +1042,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client.handle_response(Instant::now(), response).await;
+        let result = client
+            .handle_response(Instant::now(), response, "poisoned-jwt")
+            .await;
 
         assert!(matches!(
             result,
@@ -1037,6 +1052,56 @@ mod tests {
                 if message.contains("BadJwtToken")
         ));
         assert!(client.cached_token.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auth_error_keeps_token_refreshed_by_concurrent_task() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "reason": "InvalidProviderToken"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+
+        // Simulate a concurrent task having already refreshed the cache to a
+        // newer token after the failing request read its (now stale) token.
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("fresh-jwt".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        // The failing request used the older, now-replaced token.
+        let result = client
+            .handle_response(Instant::now(), response, "stale-jwt")
+            .await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Apns(ref message))
+                if message.contains("InvalidProviderToken")
+        ));
+
+        // The freshly refreshed token must survive the stale rejection.
+        let cached = client.cached_token.read().await;
+        assert_eq!(
+            cached.as_ref().map(|token| token.token.as_str()),
+            Some("fresh-jwt")
+        );
     }
 
     #[test]
