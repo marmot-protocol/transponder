@@ -132,8 +132,9 @@ where
                     metrics.record_push_retry(service_name.to_lowercase().as_str());
                 }
 
-                // Use Retry-After header if provided, otherwise use exponential backoff
-                let wait_duration = retry_after.unwrap_or(backoff).min(MAX_BACKOFF);
+                // Honor Retry-After exactly when the provider supplies one. Only cap
+                // locally-computed exponential backoff to avoid runaway delays.
+                let wait_duration = retry_wait_duration(retry_after, backoff);
 
                 warn!(
                     service = service_name,
@@ -171,6 +172,13 @@ where
             }
             SendAttemptResult::Permanent(e) => return Err(e),
         }
+    }
+}
+
+fn retry_wait_duration(retry_after: Option<Duration>, backoff: Duration) -> Duration {
+    match retry_after {
+        Some(server_delay) => server_delay,
+        None => backoff.min(MAX_BACKOFF),
     }
 }
 
@@ -308,6 +316,22 @@ mod tests {
     fn test_parse_retry_after_invalid() {
         assert_eq!(parse_retry_after(Some("invalid")), None);
         assert_eq!(parse_retry_after(Some("not-a-number")), None);
+    }
+
+    #[test]
+    fn test_retry_wait_duration_honors_retry_after_above_max_backoff() {
+        assert_eq!(
+            retry_wait_duration(Some(Duration::from_secs(60)), Duration::from_millis(100)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn test_retry_wait_duration_caps_exponential_backoff() {
+        assert_eq!(
+            retry_wait_duration(None, Duration::from_secs(60)),
+            MAX_BACKOFF
+        );
     }
 
     #[tokio::test]
