@@ -314,9 +314,12 @@ impl ApnsClient {
         .await
     }
 
-    fn build_request(&self, url: &str, auth_token: &str) -> reqwest::RequestBuilder {
-        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
-
+    fn build_request(
+        &self,
+        url: &str,
+        auth_token: &str,
+        request_parts: &ApnsRequestParts,
+    ) -> reqwest::RequestBuilder {
         self.http_client
             .post(url)
             .header("apns-push-type", request_parts.push_type)
@@ -431,14 +434,22 @@ impl ApnsClient {
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
     async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+        self.send_once_with_transport_retry_config(device_token, &RetryConfig::default())
+            .await
+    }
+
+    async fn send_once_with_transport_retry_config(
+        &self,
+        device_token: &str,
+        transport_retry: &RetryConfig,
+    ) -> SendAttemptResult {
         let start = Instant::now();
         let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
-        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
 
         debug!(
             payload_mode = %self.config.payload_mode,
-            push_type = request_parts.push_type,
-            priority = request_parts.priority,
+            push_type = self.config.payload_mode.push_type(),
+            priority = self.config.payload_mode.priority(),
             topic = %self.config.bundle_id,
             device_token = redacted_device_token_id(device_token),
             "Sending APNs notification"
@@ -450,12 +461,12 @@ impl ApnsClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        let transport_retry = RetryConfig::default();
+        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
         let response = match retry::with_transport_retry(
-            &transport_retry,
+            transport_retry,
             "APNs",
             || async {
-                self.build_request(&url, token.as_str())
+                self.build_request(&url, token.as_str(), &request_parts)
                     .send()
                     .await
                     .map_err(Error::from)
@@ -558,11 +569,13 @@ mod tests {
         config.payload_mode = ApnsPayloadMode::Silent;
         config.bundle_id = "dev.ipf.whitenoise.staging".to_string();
         let client = ApnsClient::mock(config, false);
+        let request_parts = ApnsRequestParts::for_mode(client.config.payload_mode);
 
         let request = client
             .build_request(
                 "https://api.push.apple.com/3/device/aabbccdd11223344",
                 "test-token",
+                &request_parts,
             )
             .build()
             .unwrap();
@@ -589,11 +602,13 @@ mod tests {
         config.payload_mode = ApnsPayloadMode::NsePrototypeAlert;
         config.bundle_id = "dev.ipf.whitenoise.staging".to_string();
         let client = ApnsClient::mock(config, false);
+        let request_parts = ApnsRequestParts::for_mode(client.config.payload_mode);
 
         let request = client
             .build_request(
                 "https://api.push.apple.com/3/device/aabbccdd11223344",
                 "test-token",
+                &request_parts,
             )
             .build()
             .unwrap();
@@ -733,6 +748,45 @@ mod tests {
         // Test with empty token
         let result = client.send("", None).await.unwrap();
         assert!(!result, "Should return false for empty token");
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_transport_error_after_connect_retries() {
+        let proxy_addr = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+        let http_client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+            .connect_timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let client = ApnsClient {
+            http_client,
+            config: test_config(),
+            encoding_key: None,
+            cached_token: Arc::new(RwLock::new(Some(CachedToken {
+                token: Zeroizing::new("cached-token".to_string()),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            }))),
+            metrics: None,
+        };
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(1),
+        };
+
+        let result = client
+            .send_once_with_transport_retry_config("aabbccdd11223344", &retry_config)
+            .await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Http(_))
+        ));
     }
 
     #[tokio::test]
