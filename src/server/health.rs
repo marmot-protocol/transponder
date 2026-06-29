@@ -547,7 +547,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };

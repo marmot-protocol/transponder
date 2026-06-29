@@ -307,7 +307,7 @@ pub struct ApnsConfig {
 
     /// APNs environment: "production" or "sandbox".
     #[serde(default = "default_apns_environment")]
-    pub environment: String,
+    pub environment: ApnsEnvironment,
 
     /// Bundle ID for the iOS app.
     #[serde(default)]
@@ -316,6 +316,33 @@ pub struct ApnsConfig {
     /// APNs payload mode.
     #[serde(default)]
     pub payload_mode: ApnsPayloadMode,
+}
+
+/// APNs gateway environment.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ApnsEnvironment {
+    /// Production APNs gateway for App Store builds.
+    #[default]
+    Production,
+
+    /// Sandbox APNs gateway for development builds.
+    Sandbox,
+}
+
+impl ApnsEnvironment {
+    fn is_production(self) -> bool {
+        matches!(self, Self::Production)
+    }
+}
+
+impl std::fmt::Display for ApnsEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Production => f.write_str("production"),
+            Self::Sandbox => f.write_str("sandbox"),
+        }
+    }
 }
 
 /// APNs payload mode.
@@ -355,8 +382,8 @@ impl std::fmt::Display for ApnsPayloadMode {
     }
 }
 
-fn default_apns_environment() -> String {
-    "production".to_string()
+fn default_apns_environment() -> ApnsEnvironment {
+    ApnsEnvironment::Production
 }
 
 /// FCM push notification configuration.
@@ -739,7 +766,7 @@ impl ApnsConfig {
     /// Returns true if targeting production APNs environment.
     #[must_use]
     pub fn is_production(&self) -> bool {
-        self.environment == "production"
+        self.environment.is_production()
     }
 
     /// Returns the APNs base URL for the configured environment.
@@ -879,7 +906,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM123".to_string(),
             private_key_path: "/path/to/key.p8".to_string(),
-            environment: "production".to_string(),
+            environment: ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -895,7 +922,7 @@ mod tests {
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
         };
@@ -988,7 +1015,7 @@ mod tests {
         assert_eq!(config.relays.max_reconnect_attempts, 10);
         assert_eq!(config.relays.connection_timeout_secs, 30);
         assert!(!config.apns.enabled);
-        assert_eq!(config.apns.environment, "production");
+        assert_eq!(config.apns.environment, ApnsEnvironment::Production);
         assert!(!config.fcm.enabled);
         assert!(config.health.enabled);
         assert_eq!(config.health.bind_address, "127.0.0.1:8080");
@@ -1019,7 +1046,7 @@ mod tests {
         assert_eq!(config.relays.max_reconnect_attempts, 10);
         assert_eq!(config.relays.connection_timeout_secs, 30);
         assert!(!config.apns.enabled);
-        assert_eq!(config.apns.environment, "production");
+        assert_eq!(config.apns.environment, ApnsEnvironment::Production);
         assert!(!config.fcm.enabled);
         assert!(config.health.enabled);
         assert_eq!(config.health.bind_address, "127.0.0.1:8080");
@@ -1136,7 +1163,7 @@ mod tests {
 
     #[test]
     fn test_apns_config_defaults() {
-        assert_eq!(default_apns_environment(), "production");
+        assert_eq!(default_apns_environment(), ApnsEnvironment::Production);
     }
 
     #[test]
@@ -1180,6 +1207,69 @@ mod tests {
     }
 
     #[test]
+    fn test_apns_environment_display() {
+        assert_eq!(ApnsEnvironment::Production.to_string(), "production");
+        assert_eq!(ApnsEnvironment::Sandbox.to_string(), "sandbox");
+    }
+
+    #[test]
+    fn test_apns_environment_parses_sandbox_from_file() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+
+            [apns]
+            environment = "sandbox"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+
+        assert_eq!(config.apns.environment, ApnsEnvironment::Sandbox);
+        assert!(!config.apns.is_production());
+        assert_eq!(config.apns.base_url(), "https://api.sandbox.push.apple.com");
+    }
+
+    #[test]
+    fn test_apns_environment_parses_sandbox_from_env() {
+        let config = from_test_env(&[("TRANSPONDER_APNS_ENVIRONMENT", "sandbox")]).unwrap();
+
+        assert_eq!(config.apns.environment, ApnsEnvironment::Sandbox);
+        assert!(!config.apns.is_production());
+    }
+
+    #[test]
+    fn test_apns_environment_rejects_unknown_file_value() {
+        for invalid in ["Production", "prod", "production "] {
+            let config_content = format!(
+                r#"
+                [server]
+                private_key = "test"
+
+                [apns]
+                environment = "{invalid}"
+            "#
+            );
+
+            let file = create_temp_config(&config_content);
+            let error = load_with_test_env(file.path(), &[]).unwrap_err();
+            let message = error.to_string();
+
+            assert!(message.contains("environment"), "{message}");
+            assert!(message.contains(invalid), "{message}");
+        }
+    }
+
+    #[test]
+    fn test_apns_environment_rejects_unknown_env_value() {
+        let error = from_test_env(&[("TRANSPONDER_APNS_ENVIRONMENT", "prod")]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("environment"), "{message}");
+        assert!(message.contains("prod"), "{message}");
+    }
+
+    #[test]
     fn test_health_config_defaults() {
         assert!(default_health_enabled());
         assert_eq!(default_health_bind_address(), "127.0.0.1:8080");
@@ -1216,7 +1306,7 @@ mod tests {
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: ApnsEnvironment::Production,
             bundle_id: String::new(),
             payload_mode: Default::default(),
         };
@@ -1230,7 +1320,7 @@ mod tests {
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            environment: "development".to_string(),
+            environment: ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
         };
@@ -1259,7 +1349,7 @@ mod tests {
         assert_eq!(config.server.private_key.as_str(), "test-key");
         assert!(config.apns.enabled);
         assert_eq!(config.apns.key_id, "MYKEY");
-        assert_eq!(config.apns.environment, "production"); // default
+        assert_eq!(config.apns.environment, ApnsEnvironment::Production); // default
         assert!(!config.fcm.enabled); // default
     }
 
