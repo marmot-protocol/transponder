@@ -16,8 +16,8 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use nostr_sdk::prelude::*;
-use tokio::sync::Semaphore;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use zeroize::Zeroizing;
@@ -146,6 +146,23 @@ fn parse_server_secret_key(server_private_key: &str) -> Result<SecretKey> {
 #[must_use]
 fn event_processing_permits(max_concurrent_event_processing: usize) -> usize {
     max_concurrent_event_processing.max(1)
+}
+
+async fn acquire_event_processing_permit_or_shutdown(
+    semaphore: Arc<Semaphore>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<OwnedSemaphorePermit> {
+    // Prefer shutdown over newly available capacity so teardown does not admit
+    // more event-processing work after a shutdown signal is visible.
+    tokio::select! {
+        biased;
+
+        _ = shutdown.changed() => {
+            debug!("Event processor shutting down before permit acquisition");
+            None
+        },
+        permit = semaphore.acquire_owned() => permit.ok(),
+    }
 }
 
 #[tokio::main]
@@ -351,8 +368,8 @@ async fn main() -> Result<()> {
     // caps total in-flight gift-wrap unwrap (ECDH) work so a flood cannot spawn
     // unbounded crypto tasks. An owned permit is acquired BEFORE spawning and
     // dropped when the spawned task finishes; when the budget is exhausted the
-    // loop awaits a free permit (applying back-pressure) but still consumes
-    // events promptly once a slot frees.
+    // loop awaits a free permit (applying back-pressure) while still remaining
+    // responsive to shutdown signals.
     let event_permits = event_processing_permits(config.server.max_concurrent_event_processing);
     let event_semaphore = Arc::new(Semaphore::new(event_permits));
     let event_processor_loop = event_processor.clone();
@@ -372,10 +389,14 @@ async fn main() -> Result<()> {
                             };
 
                             // Acquire a permit before spawning so total in-flight
-                            // unwrap work stays bounded. `acquire_owned` only errors
-                            // if the semaphore is closed, which never happens here.
-                            let Ok(permit) =
-                                Arc::clone(&event_semaphore).acquire_owned().await
+                            // unwrap work stays bounded. `None` means shutdown won
+                            // while waiting (or the semaphore closed, which never
+                            // happens here), so intentionally drop this event.
+                            let Some(permit) = acquire_event_processing_permit_or_shutdown(
+                                Arc::clone(&event_semaphore),
+                                &mut event_shutdown,
+                            )
+                            .await
                             else {
                                 break;
                             };
@@ -645,6 +666,45 @@ mod tests {
         drop(p1);
         assert_eq!(semaphore.available_permits(), 1);
         assert!(Arc::clone(&semaphore).try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn event_permit_wait_acquires_available_permit() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let permit =
+            acquire_event_processing_permit_or_shutdown(Arc::clone(&semaphore), &mut shutdown_rx)
+                .await
+                .expect("available permit should be acquired");
+
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn event_permit_wait_exits_when_shutdown_arrives() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let _held_permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let permit_wait =
+            acquire_event_processing_permit_or_shutdown(Arc::clone(&semaphore), &mut shutdown_rx);
+        tokio::pin!(permit_wait);
+
+        let pending_before_shutdown =
+            tokio::time::timeout(Duration::from_millis(10), &mut permit_wait).await;
+        assert!(pending_before_shutdown.is_err());
+
+        shutdown_tx.send(true).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut permit_wait)
+            .await
+            .expect("shutdown should interrupt a saturated permit wait");
+
+        assert!(result.is_none());
+        assert_eq!(semaphore.available_permits(), 0);
     }
 
     #[test]
