@@ -637,7 +637,9 @@ impl AppConfig {
         let builder = base_config_builder()?.add_source(File::from(path.as_ref()));
         let config = apply_env_overrides(builder, env_iter)?.build()?;
 
-        Ok(config.try_deserialize()?)
+        let config: Self = config.try_deserialize()?;
+        config.validate()?;
+        Ok(config)
     }
 
     fn from_env_iter<I>(env_iter: I) -> Result<Self>
@@ -646,7 +648,22 @@ impl AppConfig {
     {
         let config = apply_env_overrides(base_config_builder()?, env_iter)?.build()?;
 
-        Ok(config.try_deserialize()?)
+        let config: Self = config.try_deserialize()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validates configuration values that cannot be expressed by the type
+    /// system or `serde` defaults.
+    ///
+    /// Rejects `0` for the rate-limit count fields and the rate-limit cache
+    /// size. A `0` count would either block every request for that limiter
+    /// dimension (a silent push outage) or be silently swapped for the default,
+    /// so an explicit error at load time surfaces the misconfiguration instead
+    /// of letting it reach runtime.
+    fn validate(&self) -> Result<()> {
+        self.server.validate()?;
+        Ok(())
     }
 
     /// Load configuration from a file path with environment variable overrides.
@@ -665,6 +682,56 @@ impl AppConfig {
     #[allow(dead_code)]
     pub fn from_env() -> Result<Self> {
         Self::from_env_iter(env::vars_os())
+    }
+}
+
+impl ServerConfig {
+    /// Rejects rate-limit count fields and the rate-limit cache size set to `0`.
+    ///
+    /// A `0` per-minute/per-hour limit blocks every request for that limiter
+    /// dimension, and a `0` cache size is silently replaced by the default
+    /// rather than honoured. Each error names the offending config field.
+    fn validate(&self) -> std::result::Result<(), config::ConfigError> {
+        let zero_checked_fields = [
+            (
+                "server.encrypted_token_rate_limit_per_minute",
+                u64::from(self.encrypted_token_rate_limit_per_minute),
+            ),
+            (
+                "server.encrypted_token_rate_limit_per_hour",
+                u64::from(self.encrypted_token_rate_limit_per_hour),
+            ),
+            (
+                "server.device_token_rate_limit_per_minute",
+                u64::from(self.device_token_rate_limit_per_minute),
+            ),
+            (
+                "server.device_token_rate_limit_per_hour",
+                u64::from(self.device_token_rate_limit_per_hour),
+            ),
+            (
+                "server.global_unwrap_rate_limit_per_minute",
+                u64::from(self.global_unwrap_rate_limit_per_minute),
+            ),
+            (
+                "server.global_unwrap_rate_limit_per_hour",
+                u64::from(self.global_unwrap_rate_limit_per_hour),
+            ),
+            (
+                "server.max_rate_limit_cache_size",
+                self.max_rate_limit_cache_size as u64,
+            ),
+        ];
+
+        for (field, value) in zero_checked_fields {
+            if value == 0 {
+                return Err(config::ConfigError::Message(format!(
+                    "{field} must be greater than 0"
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1316,5 +1383,96 @@ mod tests {
         assert_eq!(config.server.max_concurrent_event_processing, 16);
         assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 120);
         assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 7200);
+    }
+
+    /// Config fields that must reject a `0` value at load time, paired with the
+    /// TOML key used to set them.
+    const ZERO_REJECTED_FIELDS: &[&str] = &[
+        "encrypted_token_rate_limit_per_minute",
+        "encrypted_token_rate_limit_per_hour",
+        "device_token_rate_limit_per_minute",
+        "device_token_rate_limit_per_hour",
+        "global_unwrap_rate_limit_per_minute",
+        "global_unwrap_rate_limit_per_hour",
+        "max_rate_limit_cache_size",
+    ];
+
+    #[test]
+    fn test_zero_rate_limit_count_fields_rejected_from_file() {
+        for field in ZERO_REJECTED_FIELDS {
+            let config_content = format!(
+                r#"
+                [server]
+                private_key = "test"
+                {field} = 0
+            "#
+            );
+
+            let file = create_temp_config(&config_content);
+            let error = load_with_test_env(file.path(), &[]).unwrap_err();
+            let message = error.to_string();
+
+            assert!(
+                message.contains(&format!("server.{field}")),
+                "expected error to name `server.{field}`, got: {message}"
+            );
+            assert!(
+                message.contains("must be greater than 0"),
+                "expected `must be greater than 0` for `{field}`, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_rate_limit_count_fields_rejected_from_env() {
+        for field in ZERO_REJECTED_FIELDS {
+            let env_key = format!("TRANSPONDER_SERVER_{}", field.to_ascii_uppercase());
+            let error = from_test_env(&[(env_key.as_str(), "0")]).unwrap_err();
+            let message = error.to_string();
+
+            assert!(
+                message.contains(&format!("server.{field}")),
+                "expected error to name `server.{field}`, got: {message}"
+            );
+            assert!(
+                message.contains("must be greater than 0"),
+                "expected `must be greater than 0` for `{field}`, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nonzero_rate_limit_count_fields_accepted() {
+        // Defaults (no overrides) plus a minimal `1` for every guarded field
+        // must both pass validation, so valid custom values keep working.
+        assert!(from_test_env(&[]).is_ok());
+
+        let config = from_test_env(&[
+            (
+                "TRANSPONDER_SERVER_ENCRYPTED_TOKEN_RATE_LIMIT_PER_MINUTE",
+                "1",
+            ),
+            (
+                "TRANSPONDER_SERVER_ENCRYPTED_TOKEN_RATE_LIMIT_PER_HOUR",
+                "1",
+            ),
+            ("TRANSPONDER_SERVER_DEVICE_TOKEN_RATE_LIMIT_PER_MINUTE", "1"),
+            ("TRANSPONDER_SERVER_DEVICE_TOKEN_RATE_LIMIT_PER_HOUR", "1"),
+            (
+                "TRANSPONDER_SERVER_GLOBAL_UNWRAP_RATE_LIMIT_PER_MINUTE",
+                "1",
+            ),
+            ("TRANSPONDER_SERVER_GLOBAL_UNWRAP_RATE_LIMIT_PER_HOUR", "1"),
+            ("TRANSPONDER_SERVER_MAX_RATE_LIMIT_CACHE_SIZE", "1"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 1);
+        assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 1);
+        assert_eq!(config.server.device_token_rate_limit_per_minute, 1);
+        assert_eq!(config.server.device_token_rate_limit_per_hour, 1);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 1);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 1);
+        assert_eq!(config.server.max_rate_limit_cache_size, 1);
     }
 }
