@@ -70,3 +70,11 @@ enabled = true
 [logging]
 level = "info"
 format = "json"
+
+[glitchtip]
+# Error and panic reporting to a GlitchTip instance. Disabled while the DSN is
+# empty. In production, supply the DSN via TRANSPONDER_GLITCHTIP_DSN (see
+# compose.prod.yml) rather than committing it to this file.
+dsn = ""
+environment = "production"
+# traces_sample_rate = 0.0

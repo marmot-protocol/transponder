@@ -37,6 +37,40 @@ toml = "0.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter"] }
 
+# Error reporting (GlitchTip, via the Sentry protocol).
+# default-features = false drops native-tls: the release binary is a fully
+# static musl build on a distroless runtime, so the transport must use rustls.
+# We select `reqwest` (the HTTP transport) + `rustls-no-provider`, but NOT
+# sentry's `transport` feature — an alias for `reqwest + native-tls` that would
+# drag in OpenSSL. `reqwest` alone provides the default transport.
+#
+# `rustls-no-provider` (not `rustls`) keeps the whole build on ONE crypto
+# provider. sentry's `rustls` feature pulls `aws-lc-rs` (a C/assembly library
+# that needs cmake to build on musl), whereas the rest of the tree — nostr-sdk,
+# jsonwebtoken, and our reqwest 0.12 client — already use `ring`. The GlitchTip
+# transport client is built explicitly in `telemetry` with the `ring` provider
+# and bundled webpki roots (see the reqwest13/rustls/webpki-roots deps below).
+sentry = { version = "0.48", default-features = false, features = [
+    "backtrace",
+    "contexts",
+    "panic",
+    "reqwest",
+    "rustls-no-provider",
+    "tracing",
+] }
+
+# Build sentry's HTTP transport client with bundled webpki roots so GlitchTip TLS
+# does not depend on the runtime image shipping a system CA store (the app's own
+# reqwest 0.12 client above makes the same choice). `reqwest13` is aliased
+# because the app client is 0.12; it must match sentry's reqwest 0.13 so the
+# injected client type is identical. `rustls` builds the TLS config, and
+# default-features = false keeps it on `ring` (its defaults would add aws-lc-rs).
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+webpki-roots = "1"
+
 # HTTP server (for health checks)
 axum = "0.8"
 
