@@ -144,3 +144,18 @@ level = "info"
 
 # Log format: "json" (for production) or "pretty" (for development)
 format = "json"
+
+[glitchtip]
+# Error and panic reporting to a GlitchTip (Sentry-compatible) instance.
+# Reporting is OFF until a DSN is set. Prefer supplying the DSN via the
+# TRANSPONDER_GLITCHTIP_DSN environment variable rather than committing it here.
+# Only transponder's own ERROR events and panics are sent; no tokens, keys, or
+# message content leave the process.
+dsn = ""
+
+# Deployment environment tag attached to every event.
+environment = "production"
+
+# Performance-trace sample rate (0.0..=1.0). 0.0 = errors only, which is
+# recommended: transponder has no request transactions to trace.
+# traces_sample_rate = 0.0

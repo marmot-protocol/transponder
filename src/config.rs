@@ -44,6 +44,9 @@ pub struct AppConfig {
 
     /// Logging configuration.
     pub logging: LoggingConfig,
+
+    /// GlitchTip error-reporting configuration.
+    pub glitchtip: GlitchtipConfig,
 }
 
 /// Default maximum size for the deduplication cache.
@@ -427,6 +430,51 @@ fn default_log_format() -> String {
     "json".to_string()
 }
 
+/// GlitchTip (Sentry-compatible) error-reporting configuration.
+///
+/// Reporting is enabled by the presence of a non-empty `dsn`; there is no
+/// separate on/off flag, so there is no way to configure an enabled-but-unusable
+/// state.
+#[derive(Clone, Deserialize)]
+pub struct GlitchtipConfig {
+    /// GlitchTip DSN. Empty disables error reporting.
+    #[serde(default)]
+    pub dsn: String,
+
+    /// Deployment environment tag attached to every event (e.g. "production").
+    #[serde(default = "default_glitchtip_environment")]
+    pub environment: String,
+
+    /// Performance-trace sample rate in the range `0.0..=1.0`.
+    ///
+    /// Default `0.0` (errors only). Transponder is an event loop with no request
+    /// transactions to trace, so raise this only after adding span instrumentation.
+    #[serde(default)]
+    pub traces_sample_rate: f32,
+}
+
+impl std::fmt::Debug for GlitchtipConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The DSN embeds a write-auth key; redact it so a config debug dump never
+        // leaks it, mirroring `ServerConfig`. Empty is shown as-is so a disabled
+        // reporter is not mistaken for a hidden secret.
+        let dsn = if self.dsn.is_empty() {
+            ""
+        } else {
+            "[REDACTED]"
+        };
+        f.debug_struct("GlitchtipConfig")
+            .field("dsn", &dsn)
+            .field("environment", &self.environment)
+            .field("traces_sample_rate", &self.traces_sample_rate)
+            .finish()
+    }
+}
+
+fn default_glitchtip_environment() -> String {
+    "production".to_string()
+}
+
 fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
     Ok(Config::builder()
         // Start with default values
@@ -493,7 +541,10 @@ fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
         .set_default("health.bind_address", DEFAULT_HEALTH_BIND_ADDRESS)?
         .set_default("metrics.enabled", true)?
         .set_default("logging.level", "info")?
-        .set_default("logging.format", "json")?)
+        .set_default("logging.format", "json")?
+        .set_default("glitchtip.dsn", "")?
+        .set_default("glitchtip.environment", "production")?
+        .set_default("glitchtip.traces_sample_rate", 0.0)?)
 }
 
 fn apply_env_overrides<I>(
@@ -602,6 +653,9 @@ fn is_supported_config_key(config_key: &str) -> bool {
                 | "metrics.enabled"
                 | "logging.level"
                 | "logging.format"
+                | "glitchtip.dsn"
+                | "glitchtip.environment"
+                | "glitchtip.traces_sample_rate"
         )
 }
 
@@ -663,6 +717,7 @@ impl AppConfig {
     /// of letting it reach runtime.
     fn validate(&self) -> Result<()> {
         self.server.validate()?;
+        self.glitchtip.validate()?;
         Ok(())
     }
 
@@ -731,6 +786,22 @@ impl ServerConfig {
             }
         }
 
+        Ok(())
+    }
+}
+
+impl GlitchtipConfig {
+    /// Rejects a `traces_sample_rate` outside `0.0..=1.0`.
+    ///
+    /// The Sentry protocol interprets the rate as a probability; a value outside
+    /// the unit interval is a misconfiguration, so it is rejected at load time
+    /// rather than silently clamped.
+    fn validate(&self) -> std::result::Result<(), config::ConfigError> {
+        if !(0.0..=1.0).contains(&self.traces_sample_rate) {
+            return Err(config::ConfigError::Message(
+                "glitchtip.traces_sample_rate must be between 0.0 and 1.0".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1194,6 +1265,99 @@ mod tests {
     fn test_logging_config_defaults() {
         assert_eq!(default_log_level(), "info");
         assert_eq!(default_log_format(), "json");
+    }
+
+    #[test]
+    fn test_glitchtip_config_debug_redacts_dsn() {
+        let config = GlitchtipConfig {
+            dsn: "https://public@glitch.example/1".to_string(),
+            environment: "production".to_string(),
+            traces_sample_rate: 0.0,
+        };
+
+        let debug_output = format!("{config:?}");
+
+        assert!(!debug_output.contains("public@glitch.example"));
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_glitchtip_config_debug_shows_empty_dsn_as_disabled() {
+        let config = GlitchtipConfig {
+            dsn: String::new(),
+            environment: "production".to_string(),
+            traces_sample_rate: 0.0,
+        };
+
+        // An empty DSN is shown as empty (disabled), not "[REDACTED]", which would
+        // misleadingly imply a secret is present.
+        assert!(!format!("{config:?}").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_glitchtip_defaults_disable_reporting() {
+        let config = from_test_env(&[]).unwrap();
+
+        assert_eq!(config.glitchtip.dsn, "");
+        assert_eq!(config.glitchtip.environment, "production");
+        assert_eq!(config.glitchtip.traces_sample_rate, 0.0);
+    }
+
+    #[test]
+    fn test_glitchtip_env_overrides() {
+        // Also exercises the string -> f32 coercion path: `traces_sample_rate`
+        // is the only floating-point config field, so this locks it in.
+        let config = from_test_env(&[
+            ("TRANSPONDER_GLITCHTIP_DSN", "https://key@glitch.example/1"),
+            ("TRANSPONDER_GLITCHTIP_ENVIRONMENT", "staging"),
+            ("TRANSPONDER_GLITCHTIP_TRACES_SAMPLE_RATE", "0.25"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.glitchtip.dsn, "https://key@glitch.example/1");
+        assert_eq!(config.glitchtip.environment, "staging");
+        assert_eq!(config.glitchtip.traces_sample_rate, 0.25);
+    }
+
+    #[test]
+    fn test_glitchtip_traces_sample_rate_above_one_rejected() {
+        let error = from_test_env(&[("TRANSPONDER_GLITCHTIP_TRACES_SAMPLE_RATE", "1.5")])
+            .expect_err("a sample rate above 1.0 should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("glitchtip.traces_sample_rate must be between 0.0 and 1.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_glitchtip_traces_sample_rate_negative_rejected() {
+        let error = from_test_env(&[("TRANSPONDER_GLITCHTIP_TRACES_SAMPLE_RATE", "-0.1")])
+            .expect_err("a negative sample rate should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("glitchtip.traces_sample_rate must be between 0.0 and 1.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_glitchtip_traces_sample_rate_nan_rejected() {
+        // `RangeInclusive::contains` compares with `PartialOrd`, so NaN is not
+        // contained and is rejected rather than silently accepted.
+        let error = from_test_env(&[("TRANSPONDER_GLITCHTIP_TRACES_SAMPLE_RATE", "nan")])
+            .expect_err("a NaN sample rate should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("glitchtip.traces_sample_rate must be between 0.0 and 1.0"),
+            "{error}"
+        );
     }
 
     #[test]

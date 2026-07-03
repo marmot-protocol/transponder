@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Optional error and panic reporting to a GlitchTip (Sentry-compatible) instance, enabled by setting `glitchtip.dsn` (or `TRANSPONDER_GLITCHTIP_DSN`). Only Transponder's own `ERROR` events and panics are sent, over a self-contained TLS transport (bundled roots, no system CA store dependency); dependency-crate errors and lower log levels are dropped, and Transponder never logs or panics with secret material.
+
 ### Fixed
 
 - Limit each notification event to at most 100 encrypted tokens before base64 decoding, preventing oversized events from forcing unbounded token blob allocation and rate-limit work ([#38](https://github.com/marmot-protocol/transponder/pull/38)).

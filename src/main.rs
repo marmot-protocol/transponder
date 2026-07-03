@@ -19,7 +19,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 use zeroize::Zeroizing;
 
 mod config;
@@ -31,6 +31,7 @@ mod push;
 mod rate_limiter;
 mod server;
 mod shutdown;
+mod telemetry;
 
 #[cfg(test)]
 mod test_metrics;
@@ -181,12 +182,41 @@ async fn main() -> Result<()> {
     }
 
     // Load configuration
-    let mut config = AppConfig::load(&args.config)
+    let config = AppConfig::load(&args.config)
         .with_context(|| format!("Failed to load config from {}", args.config))?;
+
+    // Initialize error reporting before logging so a GlitchTip client exists for
+    // the first captured event. The guard is held for the whole process and
+    // dropped last, flushing buffered events — including any fatal error captured
+    // below. It must stay in `main` rather than move into `run`, or it would drop
+    // before that error is recorded.
+    let _glitchtip_guard = telemetry::init(&config.glitchtip)?;
 
     // Initialize logging
     init_logging(&config.logging)?;
 
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        config_path = %args.config,
+        "Starting Transponder"
+    );
+
+    let result = run(config).await;
+    if let Err(error) = &result {
+        error!(error = %error, "Fatal error, shutting down");
+    }
+    result
+}
+
+/// Bring the server up and run until shutdown.
+///
+/// Split from `main` so a failure during startup or the run loop is logged at
+/// `ERROR` — and therefore reported to GlitchTip — instead of only surfacing on
+/// process exit. The GlitchTip guard stays in `main` so it outlives this call
+/// and flushes the captured event. Failures *before* this point (config load,
+/// `telemetry::init`, `init_logging`) occur before the subscriber and client
+/// exist, so they surface only on stderr, not in GlitchTip.
+async fn run(mut config: AppConfig) -> Result<()> {
     // Initialize metrics
     let metrics = if config.metrics.enabled {
         match Metrics::new() {
@@ -204,12 +234,6 @@ async fn main() -> Result<()> {
         info!("Metrics disabled");
         None
     };
-
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        config_path = %args.config,
-        "Starting Transponder"
-    );
 
     let server_private_key = resolve_server_private_key(&mut config.server)?;
 
@@ -601,29 +625,23 @@ fn init_logging(config: &config::LoggingConfig) -> Result<()> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
 
-    match config.format.as_str() {
-        "json" => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer().json())
-                .init();
-        }
-        "pretty" => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer().pretty())
-                .init();
-        }
-        "off" => {
-            // No logging
-        }
-        _ => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer())
-                .init();
-        }
-    }
+    // Build the console layer for the configured format (`None` disables console
+    // logging). The `EnvFilter` is attached per-layer to the fmt layer only, so it
+    // never gates the GlitchTip layer: error reporting stays independent of console
+    // verbosity — a tightened `RUST_LOG`, or `format = "off"`, does not silence it.
+    // The GlitchTip layer carries its own ERROR-level filter (see `telemetry`).
+    let console_layer: Option<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+        match config.format.as_str() {
+            "json" => Some(fmt::layer().json().with_filter(filter).boxed()),
+            "pretty" => Some(fmt::layer().pretty().with_filter(filter).boxed()),
+            "off" => None,
+            _ => Some(fmt::layer().with_filter(filter).boxed()),
+        };
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(telemetry::glitchtip_layer())
+        .init();
 
     Ok(())
 }
