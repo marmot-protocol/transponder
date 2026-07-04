@@ -148,6 +148,14 @@ level = "info"
 
 # Log format: "json" (structured, for production) or "pretty" (human-readable)
 format = "json"
+
+[glitchtip]
+# Error and panic reporting to a GlitchTip (Sentry-compatible) instance.
+# Disabled while dsn is empty. Prefer TRANSPONDER_GLITCHTIP_DSN over committing
+# the DSN. Only transponder's own ERROR events and panics are sent.
+dsn = ""
+environment = "production"
+# traces_sample_rate = 0.0   # 0.0..=1.0; 0.0 = errors only (recommended)
 ```
 
 Rate-limit memory scales with admitted hits, not just tracked keys. Each active
@@ -452,6 +460,12 @@ Typical patterns:
 - scrape `http://127.0.0.1:8080/metrics` from a local Prometheus, VictoriaMetrics, or similar agent
 - forward metrics through an existing reverse proxy or VPN if you need remote scraping
 - keep `/metrics` internal-only unless you have a deliberate access-control story
+
+### Error reporting (GlitchTip)
+
+Transponder can report errors and panics to a [GlitchTip](https://glitchtip.com/) instance (or any Sentry-compatible endpoint). It is disabled unless you set a DSN via the `[glitchtip]` config section or `TRANSPONDER_GLITCHTIP_DSN`.
+
+To preserve the server's privacy guarantees, only `ERROR`-level events emitted by Transponder's own code, plus panics, are sent — dependency-crate errors (which can embed URLs and device tokens) and all lower log levels are dropped before transmission. Transponder never puts tokens, keys, or message content into log or panic messages (an invariant enforced in review; see AGENTS.md), so none reach GlitchTip. TLS trusts bundled roots, so reporting does not depend on the runtime's system CA store. A malformed DSN fails startup rather than silently disabling reporting.
 
 ## How It Works
 

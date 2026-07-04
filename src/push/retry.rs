@@ -3,13 +3,51 @@
 //! Implements retry behavior for transient failures (429 rate limiting, 5xx server errors)
 //! with configurable exponential backoff and optional Retry-After header support.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 use tracing::warn;
 
 use crate::error::Error;
 use crate::metrics::Metrics;
+
+/// Holds the dispatcher concurrency permit and the semaphore it came from, so
+/// that `with_retry` can release the in-flight slot during a backoff sleep and
+/// re-acquire it before the next attempt. This prevents sleeping retries from
+/// occupying concurrency slots that represent actual in-flight requests.
+pub struct BackoffPermit {
+    semaphore: Arc<Semaphore>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl BackoffPermit {
+    /// Create a new `BackoffPermit` wrapping an already-acquired concurrency
+    /// permit and the semaphore it was acquired from.
+    #[must_use]
+    pub fn new(semaphore: Arc<Semaphore>, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            semaphore,
+            permit: Some(permit),
+        }
+    }
+
+    /// Release the held permit (frees the in-flight slot for the sleep window).
+    fn release(&mut self) {
+        self.permit = None;
+    }
+
+    /// Re-acquire a permit before the next attempt. Awaits if all slots are busy.
+    /// Returns `Err` only if the semaphore was closed (shutdown).
+    async fn reacquire(&mut self) -> Result<(), tokio::sync::AcquireError> {
+        if self.permit.is_none() {
+            let p = self.semaphore.clone().acquire_owned().await?;
+            self.permit = Some(p);
+        }
+        Ok(())
+    }
+}
 
 /// Default maximum number of retry attempts.
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
@@ -58,11 +96,18 @@ pub enum SendAttemptResult {
 ///
 /// The `operation` closure should return a `SendAttemptResult` indicating
 /// whether to retry or return the result.
+///
+/// When `backoff_permit` is `Some`, the held concurrency permit is released
+/// for the duration of each backoff sleep and re-acquired before the next
+/// attempt. This keeps sleeping retries from occupying in-flight concurrency
+/// slots. If re-acquisition fails because the semaphore was closed (shutdown),
+/// the retry loop is aborted and `Ok(false)` is returned (the request is shed).
 #[must_use = "retry result indicates success/failure and should not be ignored"]
 pub async fn with_retry<F, Fut>(
     config: &RetryConfig,
     service_name: &str,
     mut operation: F,
+    backoff_permit: Option<&mut BackoffPermit>,
     metrics: Option<&Metrics>,
 ) -> crate::error::Result<bool>
 where
@@ -71,6 +116,8 @@ where
 {
     let mut retries = 0;
     let mut backoff = config.initial_backoff;
+    // Reborrow across loop iterations: `Option<&mut T>` is not `Copy`.
+    let mut backoff_permit = backoff_permit;
 
     loop {
         match operation().await {
@@ -85,8 +132,9 @@ where
                     metrics.record_push_retry(service_name.to_lowercase().as_str());
                 }
 
-                // Use Retry-After header if provided, otherwise use exponential backoff
-                let wait_duration = retry_after.unwrap_or(backoff).min(MAX_BACKOFF);
+                // Honor Retry-After exactly when the provider supplies one. Only cap
+                // locally-computed exponential backoff to avoid runaway delays.
+                let wait_duration = retry_wait_duration(retry_after, backoff);
 
                 warn!(
                     service = service_name,
@@ -97,7 +145,18 @@ where
                     "Retrying push notification"
                 );
 
-                sleep(wait_duration).await;
+                // Release the in-flight slot during the backoff sleep so other
+                // requests can proceed, then re-acquire it before retrying.
+                if let Some(permit) = backoff_permit.as_deref_mut() {
+                    permit.release();
+                    sleep(wait_duration).await;
+                    if permit.reacquire().await.is_err() {
+                        // Semaphore closed (shutdown): shed this request.
+                        return Ok(false);
+                    }
+                } else {
+                    sleep(wait_duration).await;
+                }
 
                 // Exponential backoff for next iteration (if not using Retry-After)
                 backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -113,6 +172,13 @@ where
             }
             SendAttemptResult::Permanent(e) => return Err(e),
         }
+    }
+}
+
+fn retry_wait_duration(retry_after: Option<Duration>, backoff: Duration) -> Duration {
+    match retry_after {
+        Some(server_delay) => server_delay,
+        None => backoff.min(MAX_BACKOFF),
     }
 }
 
@@ -133,11 +199,17 @@ fn should_retry_transport(err: &reqwest::Error) -> bool {
 /// Only `Error::Http` failures whose underlying `reqwest::Error` is a
 /// connection-establishment error (see [`should_retry_transport`]) are
 /// retried. Restricting retries to pre-delivery connect errors avoids
-/// duplicating non-idempotent POSTs (a read/timeout error can fire *after* the
-/// provider already accepted the request) and bounds worst-case permit-hold
+/// duplicating non-idempotent POSTs (a read/timeout error can fire *after*
+/// the provider already accepted the request) and bounds worst-case permit-hold
 /// time: post-connect hangs consume the full client timeout and are no longer
 /// multiplied by the transport retry budget. Any non-connect `Error::Http`,
-/// and any non-`Http` error, is returned immediately.
+/// and any non-`Http` error, is returned immediately. The last transport error
+/// is returned once the retry budget is exhausted.
+///
+/// Transport-level retries are short connect-error retries and are
+/// intentionally not permit-suspended (no `BackoffPermit`), unlike
+/// [`with_retry`] which suspends the concurrency permit across provider
+/// 429/5xx backoff sleeps.
 #[must_use = "retry result indicates success/failure and should not be ignored"]
 pub async fn with_transport_retry<T, F, Fut>(
     config: &RetryConfig,
@@ -246,6 +318,22 @@ mod tests {
         assert_eq!(parse_retry_after(Some("not-a-number")), None);
     }
 
+    #[test]
+    fn test_retry_wait_duration_honors_retry_after_above_max_backoff() {
+        assert_eq!(
+            retry_wait_duration(Some(Duration::from_secs(60)), Duration::from_millis(100)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn test_retry_wait_duration_caps_exponential_backoff() {
+        assert_eq!(
+            retry_wait_duration(None, Duration::from_secs(60)),
+            MAX_BACKOFF
+        );
+    }
+
     #[tokio::test]
     async fn test_with_retry_success_first_attempt() {
         let config = RetryConfig::default();
@@ -262,6 +350,7 @@ mod tests {
                     SendAttemptResult::Success(true)
                 }
             },
+            None,
             None,
         )
         .await;
@@ -298,6 +387,7 @@ mod tests {
                 }
             },
             None,
+            None,
         )
         .await;
 
@@ -329,6 +419,7 @@ mod tests {
                 }
             },
             None,
+            None,
         )
         .await;
 
@@ -356,6 +447,7 @@ mod tests {
                     ))
                 }
             },
+            None,
             None,
         )
         .await;
@@ -393,6 +485,7 @@ mod tests {
                 }
             },
             None,
+            None,
         )
         .await;
 
@@ -409,6 +502,7 @@ mod tests {
             &config,
             "test",
             || async { SendAttemptResult::Success(false) },
+            None,
             None,
         )
         .await;
@@ -446,6 +540,7 @@ mod tests {
                     }
                 }
             },
+            None,
             Some(&metrics),
         )
         .await;
@@ -457,6 +552,63 @@ mod tests {
         // Verify metrics were recorded - gather metrics and check they're non-empty
         let families = metrics.registry.gather();
         assert!(!families.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_releases_permit_during_backoff() {
+        // A single-permit semaphore models one concurrency slot. While the
+        // retry is sleeping in backoff, the slot must be freed so other work
+        // can proceed; it must be re-acquired before the next attempt.
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let mut bp = BackoffPermit::new(sem.clone(), permit);
+
+        let config = RetryConfig {
+            max_retries: 1,
+            initial_backoff: Duration::from_millis(50),
+        };
+
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+
+        let sem_for_assert = sem.clone();
+        let task = tokio::spawn(async move {
+            with_retry(
+                &config,
+                "test",
+                || {
+                    let count = attempt_count_clone.clone();
+                    async move {
+                        let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempts == 1 {
+                            SendAttemptResult::Retriable {
+                                status_code: 429,
+                                retry_after: None,
+                            }
+                        } else {
+                            SendAttemptResult::Success(true)
+                        }
+                    }
+                },
+                Some(&mut bp),
+                None,
+            )
+            .await
+        });
+
+        // Wait until the retry is sleeping in backoff (slot released), then
+        // verify the in-flight slot is available again.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            sem_for_assert.available_permits(),
+            1,
+            "permit should be released during backoff sleep"
+        );
+
+        let result = task.await.unwrap();
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

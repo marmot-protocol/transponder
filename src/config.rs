@@ -44,6 +44,9 @@ pub struct AppConfig {
 
     /// Logging configuration.
     pub logging: LoggingConfig,
+
+    /// GlitchTip error-reporting configuration.
+    pub glitchtip: GlitchtipConfig,
 }
 
 /// Default maximum size for the deduplication cache.
@@ -307,7 +310,7 @@ pub struct ApnsConfig {
 
     /// APNs environment: "production" or "sandbox".
     #[serde(default = "default_apns_environment")]
-    pub environment: String,
+    pub environment: ApnsEnvironment,
 
     /// Bundle ID for the iOS app.
     #[serde(default)]
@@ -316,6 +319,33 @@ pub struct ApnsConfig {
     /// APNs payload mode.
     #[serde(default)]
     pub payload_mode: ApnsPayloadMode,
+}
+
+/// APNs gateway environment.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ApnsEnvironment {
+    /// Production APNs gateway for App Store builds.
+    #[default]
+    Production,
+
+    /// Sandbox APNs gateway for development builds.
+    Sandbox,
+}
+
+impl ApnsEnvironment {
+    fn is_production(self) -> bool {
+        matches!(self, Self::Production)
+    }
+}
+
+impl std::fmt::Display for ApnsEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Production => f.write_str("production"),
+            Self::Sandbox => f.write_str("sandbox"),
+        }
+    }
 }
 
 /// APNs payload mode.
@@ -355,8 +385,8 @@ impl std::fmt::Display for ApnsPayloadMode {
     }
 }
 
-fn default_apns_environment() -> String {
-    "production".to_string()
+fn default_apns_environment() -> ApnsEnvironment {
+    ApnsEnvironment::Production
 }
 
 /// FCM push notification configuration.
@@ -427,6 +457,51 @@ fn default_log_format() -> String {
     "json".to_string()
 }
 
+/// GlitchTip (Sentry-compatible) error-reporting configuration.
+///
+/// Reporting is enabled by the presence of a non-empty `dsn`; there is no
+/// separate on/off flag, so there is no way to configure an enabled-but-unusable
+/// state.
+#[derive(Clone, Deserialize)]
+pub struct GlitchtipConfig {
+    /// GlitchTip DSN. Empty disables error reporting.
+    #[serde(default)]
+    pub dsn: String,
+
+    /// Deployment environment tag attached to every event (e.g. "production").
+    #[serde(default = "default_glitchtip_environment")]
+    pub environment: String,
+
+    /// Performance-trace sample rate in the range `0.0..=1.0`.
+    ///
+    /// Default `0.0` (errors only). Transponder is an event loop with no request
+    /// transactions to trace, so raise this only after adding span instrumentation.
+    #[serde(default)]
+    pub traces_sample_rate: f32,
+}
+
+impl std::fmt::Debug for GlitchtipConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The DSN embeds a write-auth key; redact it so a config debug dump never
+        // leaks it, mirroring `ServerConfig`. Empty is shown as-is so a disabled
+        // reporter is not mistaken for a hidden secret.
+        let dsn = if self.dsn.is_empty() {
+            ""
+        } else {
+            "[REDACTED]"
+        };
+        f.debug_struct("GlitchtipConfig")
+            .field("dsn", &dsn)
+            .field("environment", &self.environment)
+            .field("traces_sample_rate", &self.traces_sample_rate)
+            .finish()
+    }
+}
+
+fn default_glitchtip_environment() -> String {
+    "production".to_string()
+}
+
 fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
     Ok(Config::builder()
         // Start with default values
@@ -493,7 +568,10 @@ fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
         .set_default("health.bind_address", DEFAULT_HEALTH_BIND_ADDRESS)?
         .set_default("metrics.enabled", true)?
         .set_default("logging.level", "info")?
-        .set_default("logging.format", "json")?)
+        .set_default("logging.format", "json")?
+        .set_default("glitchtip.dsn", "")?
+        .set_default("glitchtip.environment", "production")?
+        .set_default("glitchtip.traces_sample_rate", 0.0)?)
 }
 
 fn apply_env_overrides<I>(
@@ -508,9 +586,9 @@ where
             continue;
         };
 
-        let value = value.into_string().map_err(|os_string| {
+        let value = value.into_string().map_err(|_| {
             config::ConfigError::Message(format!(
-                "env variable {env_key:?} contains non-Unicode data: {os_string:?}"
+                "env variable {env_key} contains non-Unicode data"
             ))
         })?;
 
@@ -602,6 +680,9 @@ fn is_supported_config_key(config_key: &str) -> bool {
                 | "metrics.enabled"
                 | "logging.level"
                 | "logging.format"
+                | "glitchtip.dsn"
+                | "glitchtip.environment"
+                | "glitchtip.traces_sample_rate"
         )
 }
 
@@ -637,7 +718,9 @@ impl AppConfig {
         let builder = base_config_builder()?.add_source(File::from(path.as_ref()));
         let config = apply_env_overrides(builder, env_iter)?.build()?;
 
-        Ok(config.try_deserialize()?)
+        let config: Self = config.try_deserialize()?;
+        config.validate()?;
+        Ok(config)
     }
 
     fn from_env_iter<I>(env_iter: I) -> Result<Self>
@@ -646,7 +729,23 @@ impl AppConfig {
     {
         let config = apply_env_overrides(base_config_builder()?, env_iter)?.build()?;
 
-        Ok(config.try_deserialize()?)
+        let config: Self = config.try_deserialize()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validates configuration values that cannot be expressed by the type
+    /// system or `serde` defaults.
+    ///
+    /// Rejects `0` for the rate-limit count fields and the rate-limit cache
+    /// size. A `0` count would either block every request for that limiter
+    /// dimension (a silent push outage) or be silently swapped for the default,
+    /// so an explicit error at load time surfaces the misconfiguration instead
+    /// of letting it reach runtime.
+    fn validate(&self) -> Result<()> {
+        self.server.validate()?;
+        self.glitchtip.validate()?;
+        Ok(())
     }
 
     /// Load configuration from a file path with environment variable overrides.
@@ -668,11 +767,77 @@ impl AppConfig {
     }
 }
 
+impl ServerConfig {
+    /// Rejects rate-limit count fields and the rate-limit cache size set to `0`.
+    ///
+    /// A `0` per-minute/per-hour limit blocks every request for that limiter
+    /// dimension, and a `0` cache size is silently replaced by the default
+    /// rather than honoured. Each error names the offending config field.
+    fn validate(&self) -> std::result::Result<(), config::ConfigError> {
+        let zero_checked_fields = [
+            (
+                "server.encrypted_token_rate_limit_per_minute",
+                u64::from(self.encrypted_token_rate_limit_per_minute),
+            ),
+            (
+                "server.encrypted_token_rate_limit_per_hour",
+                u64::from(self.encrypted_token_rate_limit_per_hour),
+            ),
+            (
+                "server.device_token_rate_limit_per_minute",
+                u64::from(self.device_token_rate_limit_per_minute),
+            ),
+            (
+                "server.device_token_rate_limit_per_hour",
+                u64::from(self.device_token_rate_limit_per_hour),
+            ),
+            (
+                "server.global_unwrap_rate_limit_per_minute",
+                u64::from(self.global_unwrap_rate_limit_per_minute),
+            ),
+            (
+                "server.global_unwrap_rate_limit_per_hour",
+                u64::from(self.global_unwrap_rate_limit_per_hour),
+            ),
+            (
+                "server.max_rate_limit_cache_size",
+                self.max_rate_limit_cache_size as u64,
+            ),
+        ];
+
+        for (field, value) in zero_checked_fields {
+            if value == 0 {
+                return Err(config::ConfigError::Message(format!(
+                    "{field} must be greater than 0"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl GlitchtipConfig {
+    /// Rejects a `traces_sample_rate` outside `0.0..=1.0`.
+    ///
+    /// The Sentry protocol interprets the rate as a probability; a value outside
+    /// the unit interval is a misconfiguration, so it is rejected at load time
+    /// rather than silently clamped.
+    fn validate(&self) -> std::result::Result<(), config::ConfigError> {
+        if !(0.0..=1.0).contains(&self.traces_sample_rate) {
+            return Err(config::ConfigError::Message(
+                "glitchtip.traces_sample_rate must be between 0.0 and 1.0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ApnsConfig {
     /// Returns true if targeting production APNs environment.
     #[must_use]
     pub fn is_production(&self) -> bool {
-        self.environment == "production"
+        self.environment.is_production()
     }
 
     /// Returns the APNs base URL for the configured environment.
@@ -812,7 +977,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM123".to_string(),
             private_key_path: "/path/to/key.p8".to_string(),
-            environment: "production".to_string(),
+            environment: ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -828,7 +993,7 @@ mod tests {
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
         };
@@ -921,7 +1086,7 @@ mod tests {
         assert_eq!(config.relays.max_reconnect_attempts, 10);
         assert_eq!(config.relays.connection_timeout_secs, 30);
         assert!(!config.apns.enabled);
-        assert_eq!(config.apns.environment, "production");
+        assert_eq!(config.apns.environment, ApnsEnvironment::Production);
         assert!(!config.fcm.enabled);
         assert!(config.health.enabled);
         assert_eq!(config.health.bind_address, "127.0.0.1:8080");
@@ -952,7 +1117,7 @@ mod tests {
         assert_eq!(config.relays.max_reconnect_attempts, 10);
         assert_eq!(config.relays.connection_timeout_secs, 30);
         assert!(!config.apns.enabled);
-        assert_eq!(config.apns.environment, "production");
+        assert_eq!(config.apns.environment, ApnsEnvironment::Production);
         assert!(!config.fcm.enabled);
         assert!(config.health.enabled);
         assert_eq!(config.health.bind_address, "127.0.0.1:8080");
@@ -1054,6 +1219,30 @@ mod tests {
     }
 
     #[test]
+    fn test_from_env_non_unicode_private_key_value_is_not_leaked() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let secret_value = "SECRET-PRIVATE-KEY-DO-NOT-LOG";
+        let mut secret_bytes = secret_value.as_bytes().to_vec();
+        // Add a lone continuation byte so `OsString::into_string` fails after a
+        // recognizable secret prefix.
+        secret_bytes.push(0x80);
+        let env_iter = vec![(
+            OsString::from("TRANSPONDER_SERVER_PRIVATE_KEY"),
+            OsString::from_vec(secret_bytes),
+        )];
+
+        let error = AppConfig::from_env_iter(env_iter).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("TRANSPONDER_SERVER_PRIVATE_KEY"));
+        assert!(message.contains("non-Unicode data"));
+        assert!(!message.contains(secret_value));
+        assert!(!message.contains("SECRET-PRIVATE-KEY"));
+        assert!(!message.contains(r"\x80"));
+    }
+
+    #[test]
     fn test_config_nonexistent_file() {
         let result = load_with_test_env("/nonexistent/path/to/config.toml", &[]);
         assert!(result.is_err());
@@ -1069,7 +1258,7 @@ mod tests {
 
     #[test]
     fn test_apns_config_defaults() {
-        assert_eq!(default_apns_environment(), "production");
+        assert_eq!(default_apns_environment(), ApnsEnvironment::Production);
     }
 
     #[test]
@@ -1113,6 +1302,69 @@ mod tests {
     }
 
     #[test]
+    fn test_apns_environment_display() {
+        assert_eq!(ApnsEnvironment::Production.to_string(), "production");
+        assert_eq!(ApnsEnvironment::Sandbox.to_string(), "sandbox");
+    }
+
+    #[test]
+    fn test_apns_environment_parses_sandbox_from_file() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+
+            [apns]
+            environment = "sandbox"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+
+        assert_eq!(config.apns.environment, ApnsEnvironment::Sandbox);
+        assert!(!config.apns.is_production());
+        assert_eq!(config.apns.base_url(), "https://api.sandbox.push.apple.com");
+    }
+
+    #[test]
+    fn test_apns_environment_parses_sandbox_from_env() {
+        let config = from_test_env(&[("TRANSPONDER_APNS_ENVIRONMENT", "sandbox")]).unwrap();
+
+        assert_eq!(config.apns.environment, ApnsEnvironment::Sandbox);
+        assert!(!config.apns.is_production());
+    }
+
+    #[test]
+    fn test_apns_environment_rejects_unknown_file_value() {
+        for invalid in ["Production", "prod", "production "] {
+            let config_content = format!(
+                r#"
+                [server]
+                private_key = "test"
+
+                [apns]
+                environment = "{invalid}"
+            "#
+            );
+
+            let file = create_temp_config(&config_content);
+            let error = load_with_test_env(file.path(), &[]).unwrap_err();
+            let message = error.to_string();
+
+            assert!(message.contains("environment"), "{message}");
+            assert!(message.contains(invalid), "{message}");
+        }
+    }
+
+    #[test]
+    fn test_apns_environment_rejects_unknown_env_value() {
+        let error = from_test_env(&[("TRANSPONDER_APNS_ENVIRONMENT", "prod")]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("environment"), "{message}");
+        assert!(message.contains("prod"), "{message}");
+    }
+
+    #[test]
     fn test_health_config_defaults() {
         assert!(default_health_enabled());
         assert_eq!(default_health_bind_address(), "127.0.0.1:8080");
@@ -1127,6 +1379,99 @@ mod tests {
     fn test_logging_config_defaults() {
         assert_eq!(default_log_level(), "info");
         assert_eq!(default_log_format(), "json");
+    }
+
+    #[test]
+    fn test_glitchtip_config_debug_redacts_dsn() {
+        let config = GlitchtipConfig {
+            dsn: "https://public@glitch.example/1".to_string(),
+            environment: "production".to_string(),
+            traces_sample_rate: 0.0,
+        };
+
+        let debug_output = format!("{config:?}");
+
+        assert!(!debug_output.contains("public@glitch.example"));
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_glitchtip_config_debug_shows_empty_dsn_as_disabled() {
+        let config = GlitchtipConfig {
+            dsn: String::new(),
+            environment: "production".to_string(),
+            traces_sample_rate: 0.0,
+        };
+
+        // An empty DSN is shown as empty (disabled), not "[REDACTED]", which would
+        // misleadingly imply a secret is present.
+        assert!(!format!("{config:?}").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_glitchtip_defaults_disable_reporting() {
+        let config = from_test_env(&[]).unwrap();
+
+        assert_eq!(config.glitchtip.dsn, "");
+        assert_eq!(config.glitchtip.environment, "production");
+        assert_eq!(config.glitchtip.traces_sample_rate, 0.0);
+    }
+
+    #[test]
+    fn test_glitchtip_env_overrides() {
+        // Also exercises the string -> f32 coercion path: `traces_sample_rate`
+        // is the only floating-point config field, so this locks it in.
+        let config = from_test_env(&[
+            ("TRANSPONDER_GLITCHTIP_DSN", "https://key@glitch.example/1"),
+            ("TRANSPONDER_GLITCHTIP_ENVIRONMENT", "staging"),
+            ("TRANSPONDER_GLITCHTIP_TRACES_SAMPLE_RATE", "0.25"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.glitchtip.dsn, "https://key@glitch.example/1");
+        assert_eq!(config.glitchtip.environment, "staging");
+        assert_eq!(config.glitchtip.traces_sample_rate, 0.25);
+    }
+
+    #[test]
+    fn test_glitchtip_traces_sample_rate_above_one_rejected() {
+        let error = from_test_env(&[("TRANSPONDER_GLITCHTIP_TRACES_SAMPLE_RATE", "1.5")])
+            .expect_err("a sample rate above 1.0 should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("glitchtip.traces_sample_rate must be between 0.0 and 1.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_glitchtip_traces_sample_rate_negative_rejected() {
+        let error = from_test_env(&[("TRANSPONDER_GLITCHTIP_TRACES_SAMPLE_RATE", "-0.1")])
+            .expect_err("a negative sample rate should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("glitchtip.traces_sample_rate must be between 0.0 and 1.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_glitchtip_traces_sample_rate_nan_rejected() {
+        // `RangeInclusive::contains` compares with `PartialOrd`, so NaN is not
+        // contained and is rejected rather than silently accepted.
+        let error = from_test_env(&[("TRANSPONDER_GLITCHTIP_TRACES_SAMPLE_RATE", "nan")])
+            .expect_err("a NaN sample rate should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("glitchtip.traces_sample_rate must be between 0.0 and 1.0"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1149,7 +1494,7 @@ mod tests {
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: ApnsEnvironment::Production,
             bundle_id: String::new(),
             payload_mode: Default::default(),
         };
@@ -1163,7 +1508,7 @@ mod tests {
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            environment: "development".to_string(),
+            environment: ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
         };
@@ -1192,7 +1537,7 @@ mod tests {
         assert_eq!(config.server.private_key.as_str(), "test-key");
         assert!(config.apns.enabled);
         assert_eq!(config.apns.key_id, "MYKEY");
-        assert_eq!(config.apns.environment, "production"); // default
+        assert_eq!(config.apns.environment, ApnsEnvironment::Production); // default
         assert!(!config.fcm.enabled); // default
     }
 
@@ -1316,5 +1661,96 @@ mod tests {
         assert_eq!(config.server.max_concurrent_event_processing, 16);
         assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 120);
         assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 7200);
+    }
+
+    /// Config fields that must reject a `0` value at load time, paired with the
+    /// TOML key used to set them.
+    const ZERO_REJECTED_FIELDS: &[&str] = &[
+        "encrypted_token_rate_limit_per_minute",
+        "encrypted_token_rate_limit_per_hour",
+        "device_token_rate_limit_per_minute",
+        "device_token_rate_limit_per_hour",
+        "global_unwrap_rate_limit_per_minute",
+        "global_unwrap_rate_limit_per_hour",
+        "max_rate_limit_cache_size",
+    ];
+
+    #[test]
+    fn test_zero_rate_limit_count_fields_rejected_from_file() {
+        for field in ZERO_REJECTED_FIELDS {
+            let config_content = format!(
+                r#"
+                [server]
+                private_key = "test"
+                {field} = 0
+            "#
+            );
+
+            let file = create_temp_config(&config_content);
+            let error = load_with_test_env(file.path(), &[]).unwrap_err();
+            let message = error.to_string();
+
+            assert!(
+                message.contains(&format!("server.{field}")),
+                "expected error to name `server.{field}`, got: {message}"
+            );
+            assert!(
+                message.contains("must be greater than 0"),
+                "expected `must be greater than 0` for `{field}`, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_rate_limit_count_fields_rejected_from_env() {
+        for field in ZERO_REJECTED_FIELDS {
+            let env_key = format!("TRANSPONDER_SERVER_{}", field.to_ascii_uppercase());
+            let error = from_test_env(&[(env_key.as_str(), "0")]).unwrap_err();
+            let message = error.to_string();
+
+            assert!(
+                message.contains(&format!("server.{field}")),
+                "expected error to name `server.{field}`, got: {message}"
+            );
+            assert!(
+                message.contains("must be greater than 0"),
+                "expected `must be greater than 0` for `{field}`, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nonzero_rate_limit_count_fields_accepted() {
+        // Defaults (no overrides) plus a minimal `1` for every guarded field
+        // must both pass validation, so valid custom values keep working.
+        assert!(from_test_env(&[]).is_ok());
+
+        let config = from_test_env(&[
+            (
+                "TRANSPONDER_SERVER_ENCRYPTED_TOKEN_RATE_LIMIT_PER_MINUTE",
+                "1",
+            ),
+            (
+                "TRANSPONDER_SERVER_ENCRYPTED_TOKEN_RATE_LIMIT_PER_HOUR",
+                "1",
+            ),
+            ("TRANSPONDER_SERVER_DEVICE_TOKEN_RATE_LIMIT_PER_MINUTE", "1"),
+            ("TRANSPONDER_SERVER_DEVICE_TOKEN_RATE_LIMIT_PER_HOUR", "1"),
+            (
+                "TRANSPONDER_SERVER_GLOBAL_UNWRAP_RATE_LIMIT_PER_MINUTE",
+                "1",
+            ),
+            ("TRANSPONDER_SERVER_GLOBAL_UNWRAP_RATE_LIMIT_PER_HOUR", "1"),
+            ("TRANSPONDER_SERVER_MAX_RATE_LIMIT_CACHE_SIZE", "1"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 1);
+        assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 1);
+        assert_eq!(config.server.device_token_rate_limit_per_minute, 1);
+        assert_eq!(config.server.device_token_rate_limit_per_hour, 1);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 1);
+        assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 1);
+        assert_eq!(config.server.max_rate_limit_cache_size, 1);
     }
 }

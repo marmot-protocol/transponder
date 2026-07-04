@@ -223,7 +223,11 @@ impl EventProcessor {
             m.record_event_received();
         }
 
-        info!(event_id = %event.id, "Received Nostr notification event");
+        // Logged at trace, not info: the kind:1059 event ID is a stable,
+        // public correlation handle. Emitting it per-event at info would
+        // persist delivery-timing metadata in logs (and downstream log
+        // shipping) — exactly what this privacy-preserving server avoids.
+        trace!(event_id = %event.id, "Received Nostr notification event");
 
         // Check for duplicates and atomically reserve the event ID.
         //
@@ -366,7 +370,7 @@ impl EventProcessor {
             }
         };
 
-        info!("Unwrapped notification request");
+        debug!("Unwrapped notification request");
 
         // Parse the encrypted tokens from the content
         let parse_started_at = StageTimer::start();
@@ -399,7 +403,7 @@ impl EventProcessor {
             return Ok(0);
         }
 
-        info!(token_count = token_bytes.len(), "Decrypting tokens");
+        debug!(token_count = token_bytes.len(), "Decrypting tokens");
 
         // Decrypt each token and dispatch notifications, with rate limiting.
         //
@@ -748,7 +752,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -795,7 +799,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };

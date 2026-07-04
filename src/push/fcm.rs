@@ -24,6 +24,12 @@ const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 /// FCM OAuth2 scope.
 const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 
+/// Type URL used by FCM v1 to carry provider-specific error codes.
+const FCM_ERROR_DETAIL_TYPE: &str = "type.googleapis.com/google.firebase.fcm.v1.FcmError";
+
+/// FCM provider-specific error code for an unregistered/dead device token.
+const FCM_ERROR_UNREGISTERED: &str = "UNREGISTERED";
+
 /// Access token lifetime (50 minutes).
 const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
 
@@ -126,6 +132,57 @@ struct FcmError {
     code: u32,
     message: String,
     status: String,
+    #[serde(default)]
+    details: Vec<FcmErrorDetail>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FcmErrorDetail {
+    #[serde(rename = "@type")]
+    type_url: Option<String>,
+    #[serde(rename = "errorCode")]
+    error_code: Option<String>,
+}
+
+/// Classification of an FCM error response.
+///
+/// FCM returns `400 INVALID_ARGUMENT` both for a genuinely malformed/expired
+/// token and for malformed payloads or other request-construction errors, and
+/// returns `404 NOT_FOUND` both for an unregistered token *and* for a
+/// wrong/typoed `project_id` in the `/v1/projects/{project_id}/messages:send`
+/// path. Collapsing those into "token dead" would silently drop every
+/// notification on a single config mistake *and* unregister healthy device
+/// tokens, so token death must be signalled explicitly. See issue #111.
+#[derive(Debug, PartialEq, Eq)]
+enum FcmClassification {
+    /// The provider explicitly reported the token as unregistered; the token
+    /// should be treated as dead (`Success(false)`).
+    TokenDead,
+    /// A configuration, payload, or path error that is permanent for this
+    /// provider but unrelated to the device token; must surface as an error
+    /// rather than evicting the token.
+    Permanent,
+}
+
+/// Classify an FCM error response as either an unregistered (dead) token or a
+/// permanent provider/configuration error.
+///
+/// The provider-specific `google.firebase.fcm.v1.FcmError.errorCode` detail is
+/// the discriminator for token death. The generic top-level status can be
+/// `NOT_FOUND` for both unregistered tokens and wrong-project misconfiguration,
+/// so it is not enough by itself.
+#[must_use]
+fn classify_fcm_error(error: &FcmError) -> FcmClassification {
+    let token_unregistered = error.details.iter().any(|detail| {
+        detail.type_url.as_deref() == Some(FCM_ERROR_DETAIL_TYPE)
+            && detail.error_code.as_deref() == Some(FCM_ERROR_UNREGISTERED)
+    });
+
+    if token_unregistered {
+        FcmClassification::TokenDead
+    } else {
+        FcmClassification::Permanent
+    }
 }
 
 /// FCM client for sending push notifications.
@@ -256,10 +313,7 @@ impl FcmClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(Error::Fcm(format!(
-                "OAuth token request failed: {status} - {body}"
-            )));
+            return Err(Error::Fcm(oauth_failure_message(status)));
         }
 
         let token_response: TokenResponse = response.json().await?;
@@ -303,7 +357,15 @@ impl FcmClient {
     ///
     /// This method automatically retries transient failures (429, 5xx) with
     /// exponential backoff.
-    pub async fn send(&self, device_token: &str) -> Result<bool> {
+    ///
+    /// When `backoff_permit` is `Some`, the dispatcher concurrency permit is
+    /// released during backoff sleeps and re-acquired before each retry, so a
+    /// sleeping retry does not occupy an in-flight concurrency slot.
+    pub async fn send(
+        &self,
+        device_token: &str,
+        backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
+    ) -> Result<bool> {
         // Validate token format before spending an OAuth-authenticated round-trip
         // and FCM quota on a clearly-malformed token (mirrors APNs).
         if !is_valid_fcm_token(device_token) {
@@ -319,6 +381,7 @@ impl FcmClient {
             &retry_config,
             "FCM",
             || self.send_once(device_token),
+            backoff_permit,
             self.metrics.as_ref(),
         )
         .await
@@ -349,10 +412,66 @@ impl FcmClient {
             .json(&request)
     }
 
-    async fn invalidate_cached_token(&self) {
+    /// Invalidate the cached token only if it still matches the one the failing
+    /// request used.
+    ///
+    /// Under concurrency another task may have already refreshed the cache with
+    /// a fresh token between the time this request read its token and the time
+    /// the authentication rejection came back. Evicting unconditionally would
+    /// discard that valid token and force a redundant OAuth round-trip, so the
+    /// eviction is gated on the cached entry still being the failing token.
+    async fn invalidate_cached_token(&self, failing_token: &str) {
         let mut cached = self.cached_token.write().await;
-        if cached.take().is_some() {
+        if cached
+            .as_ref()
+            .is_some_and(|token| token.token.as_str() == failing_token)
+        {
+            *cached = None;
             debug!("Invalidated cached FCM OAuth token after authentication rejection");
+        }
+    }
+
+    /// Parse an FCM error response and classify it as a dead token or a
+    /// permanent error.
+    ///
+    /// `default_status` is used when the body cannot be parsed (e.g. an empty
+    /// or non-JSON body), preserving the provider's HTTP-status-implied default
+    /// classification. Only a provider-specific FCM detail with
+    /// `errorCode: "UNREGISTERED"` is treated as a dead device token; every
+    /// other response — including `INVALID_ARGUMENT` and `NOT_FOUND` (which can
+    /// mean a misconfigured project ID) — is surfaced as a permanent error so a
+    /// healthy token is not evicted. See issue #111.
+    async fn classify_error_response(
+        &self,
+        response: reqwest::Response,
+        default_code: u32,
+        default_status: &str,
+    ) -> SendAttemptResult {
+        let error: FcmErrorResponse = response.json().await.unwrap_or(FcmErrorResponse {
+            error: FcmError {
+                code: default_code,
+                message: "Unknown".to_string(),
+                status: default_status.to_string(),
+                details: Vec::new(),
+            },
+        });
+
+        match classify_fcm_error(&error.error) {
+            FcmClassification::TokenDead => {
+                info!(status = %error.error.status, "FCM token unregistered");
+                SendAttemptResult::Success(false)
+            }
+            FcmClassification::Permanent => {
+                warn!(
+                    status = %error.error.status,
+                    message = %error.error.message,
+                    "FCM rejected request (configuration or request error)"
+                );
+                SendAttemptResult::Permanent(Error::Fcm(format!(
+                    "Bad request: {} - {}",
+                    error.error.status, error.error.message
+                )))
+            }
         }
     }
 
@@ -360,6 +479,7 @@ impl FcmClient {
         &self,
         start: Instant,
         response: reqwest::Response,
+        access_token: &str,
     ) -> SendAttemptResult {
         let status = response.status();
 
@@ -374,30 +494,18 @@ impl FcmClient {
                 SendAttemptResult::Success(true)
             }
             400 => {
-                let error: FcmErrorResponse = response.json().await.unwrap_or(FcmErrorResponse {
-                    error: FcmError {
-                        code: 400,
-                        message: "Unknown".to_string(),
-                        status: "INVALID_ARGUMENT".to_string(),
-                    },
-                });
-                warn!(
-                    status = %error.error.status,
-                    message = %error.error.message,
-                    "FCM bad request"
-                );
-                SendAttemptResult::Success(false)
+                self.classify_error_response(response, 400, "INVALID_ARGUMENT")
+                    .await
             }
             401 => {
                 // Auth error - permanent for this request, refresh on the next one.
-                self.invalidate_cached_token().await;
+                self.invalidate_cached_token(access_token).await;
                 error!("FCM authentication error");
                 SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
             }
             404 => {
-                // Token not found (device unregistered)
-                info!("FCM token not found");
-                SendAttemptResult::Success(false)
+                self.classify_error_response(response, 404, "NOT_FOUND")
+                    .await
             }
             429 => {
                 // Rate limited - retriable
@@ -463,7 +571,8 @@ impl FcmClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(start, response).await
+        self.handle_response(start, response, access_token.as_str())
+            .await
     }
 
     /// Check if the client is properly configured.
@@ -492,6 +601,16 @@ fn is_valid_fcm_token(token: &str) -> bool {
         && token
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+}
+
+/// Build the bounded, non-sensitive error message for a failed OAuth token
+/// request.
+///
+/// Only the HTTP status is included. The raw provider body is intentionally
+/// omitted because Google OAuth error responses can echo assertion/JWT-related
+/// material, and embedding it verbatim risks leaking auth context into logs.
+fn oauth_failure_message(status: reqwest::StatusCode) -> String {
+    format!("OAuth token request failed: {status}")
 }
 
 fn validate_project_id(project_id: &str) -> Result<&str> {
@@ -587,6 +706,61 @@ mod tests {
 
         assert_eq!(response.access_token.as_str(), "provider-access-token");
         assert_zeroizing_string(&response.access_token);
+    }
+
+    #[test]
+    fn test_oauth_failure_message_omits_body_and_stays_bounded() {
+        // A hostile/buggy token endpoint could echo a huge body containing
+        // assertion/JWT material. The propagated error must contain only the
+        // status, never the body, and must not grow with the body size.
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let message = oauth_failure_message(status);
+
+        assert_eq!(message, "OAuth token request failed: 400 Bad Request");
+
+        // Independent of any provider body, the message length is a
+        // small constant bounded by the status text.
+        let secret = "leaked-assertion-jwt-".repeat(100_000);
+        assert!(!message.contains(&secret));
+        assert!(!message.contains("leaked-assertion-jwt"));
+        assert!(message.len() < 128);
+    }
+
+    #[tokio::test]
+    async fn test_oauth_failure_does_not_propagate_or_buffer_raw_body() {
+        // Regression: the OAuth failure path must not read the body nor embed
+        // raw provider content into the error. Drive a real response with an
+        // oversized, secret-bearing body through the same status-only error
+        // construction the failure path uses, then drop the response body
+        // unread.
+        let mock_server = MockServer::start().await;
+
+        let secret = "assertion-jwt-secret-".repeat(100_000);
+        let huge_body =
+            format!("{{\"error\":\"invalid_grant\",\"error_description\":\"{secret}\"}}");
+        assert!(huge_body.len() > 1_000_000);
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(huge_body.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let response = Client::new().post(mock_server.uri()).send().await.unwrap();
+
+        let status = response.status();
+        drop(response);
+        let error = Error::Fcm(oauth_failure_message(status));
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("OAuth token request failed"));
+        assert!(rendered.contains("400"));
+        // No raw provider body leaks into the error, and it stays bounded
+        // regardless of the (huge) upstream body.
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains("assertion-jwt-secret"));
+        assert!(!rendered.contains("invalid_grant"));
+        assert!(rendered.len() < 128);
     }
 
     #[test]
@@ -789,6 +963,185 @@ mod tests {
         assert_eq!(response.status(), 404);
     }
 
+    #[test]
+    fn test_classify_fcm_error_unregistered_detail_is_token_dead() {
+        let error = FcmError {
+            code: 404,
+            message: "Requested entity was not found.".to_string(),
+            status: "NOT_FOUND".to_string(),
+            details: vec![FcmErrorDetail {
+                type_url: Some(FCM_ERROR_DETAIL_TYPE.to_string()),
+                error_code: Some(FCM_ERROR_UNREGISTERED.to_string()),
+            }],
+        };
+
+        assert_eq!(classify_fcm_error(&error), FcmClassification::TokenDead);
+    }
+
+    #[test]
+    fn test_classify_fcm_error_other_statuses_are_permanent() {
+        // INVALID_ARGUMENT, NOT_FOUND (wrong project), and unknown statuses must
+        // NOT evict the token unless FCM supplies the provider-specific
+        // UNREGISTERED detail.
+        for status in [
+            "INVALID_ARGUMENT",
+            "NOT_FOUND",
+            "PERMISSION_DENIED",
+            "SENDER_ID_MISMATCH",
+            "Unknown",
+            "SOME_FUTURE_STATUS",
+        ] {
+            let error = FcmError {
+                code: 400,
+                message: "test error message".to_string(),
+                status: status.to_string(),
+                details: Vec::new(),
+            };
+
+            assert_eq!(
+                classify_fcm_error(&error),
+                FcmClassification::Permanent,
+                "status {status} should be classified as a permanent error"
+            );
+        }
+
+        let wrong_detail_type = FcmError {
+            code: 404,
+            message: "Requested entity was not found.".to_string(),
+            status: "NOT_FOUND".to_string(),
+            details: vec![FcmErrorDetail {
+                type_url: Some("type.googleapis.com/google.rpc.BadRequest".to_string()),
+                error_code: Some(FCM_ERROR_UNREGISTERED.to_string()),
+            }],
+        };
+        assert_eq!(
+            classify_fcm_error(&wrong_detail_type),
+            FcmClassification::Permanent
+        );
+
+        let different_fcm_error_code = FcmError {
+            code: 403,
+            message: "Sender ID mismatch".to_string(),
+            status: "PERMISSION_DENIED".to_string(),
+            details: vec![FcmErrorDetail {
+                type_url: Some(FCM_ERROR_DETAIL_TYPE.to_string()),
+                error_code: Some("SENDER_ID_MISMATCH".to_string()),
+            }],
+        };
+        assert_eq!(
+            classify_fcm_error(&different_fcm_error_code),
+            FcmClassification::Permanent
+        );
+    }
+
+    /// Drive `handle_response` against a mock server returning `status_code`
+    /// with the given FCM error body, returning the classified result.
+    async fn fcm_error_result_with_body(
+        status_code: u16,
+        body: serde_json::Value,
+    ) -> SendAttemptResult {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(status_code).set_body_json(body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let client = FcmClient::mock(config, false);
+
+        let response = Client::new()
+            .post(format!(
+                "{}/v1/projects/test-project/messages:send",
+                mock_server.uri()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .handle_response(Instant::now(), response, "test-access-token")
+            .await
+    }
+
+    /// Drive `handle_response` against a mock server returning `status_code`
+    /// with the given FCM error `status`, returning the classified result.
+    async fn fcm_error_result(status_code: u16, status: &str) -> SendAttemptResult {
+        fcm_error_result_with_body(
+            status_code,
+            serde_json::json!({
+                "error": {
+                    "code": status_code,
+                    "message": "test error message",
+                    "status": status
+                }
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_invalid_argument_is_permanent_error() {
+        // INVALID_ARGUMENT is a malformed-payload/config error, not token death.
+        let result = fcm_error_result(400, "INVALID_ARGUMENT").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("INVALID_ARGUMENT")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_404_unregistered_detail_is_token_dead() {
+        let result = fcm_error_result_with_body(
+            404,
+            serde_json::json!({
+                "error": {
+                    "code": 404,
+                    "message": "Requested entity was not found.",
+                    "status": "NOT_FOUND",
+                    "details": [
+                        {
+                            "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+                            "errorCode": "UNREGISTERED"
+                        }
+                    ]
+                }
+            }),
+        )
+        .await;
+        assert!(matches!(result, SendAttemptResult::Success(false)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_404_unregistered_status_without_detail_is_permanent_error() {
+        // The generic top-level status is not the FCM provider-specific token
+        // death discriminator; a 404 needs the FcmError detail to evict.
+        let result = fcm_error_result(404, "UNREGISTERED").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("UNREGISTERED")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_404_not_found_is_permanent_error() {
+        // A 404 without an explicit UNREGISTERED status (e.g. wrong project ID)
+        // must be a permanent error, not token death.
+        let result = fcm_error_result(404, "NOT_FOUND").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("NOT_FOUND")
+        ));
+    }
+
     #[tokio::test]
     async fn test_send_auth_error() {
         let mock_server = MockServer::start().await;
@@ -875,7 +1228,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client.handle_response(Instant::now(), response).await;
+        let result = client
+            .handle_response(Instant::now(), response, "poisoned-access-token")
+            .await;
 
         assert!(matches!(
             result,
@@ -883,6 +1238,68 @@ mod tests {
                 if message.contains("Authentication error")
         ));
         assert!(client.cached_token.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auth_error_keeps_token_refreshed_by_concurrent_task() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 401,
+                    "message": "Request had invalid authentication credentials.",
+                    "status": "UNAUTHENTICATED"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let client = FcmClient::mock(config, false);
+
+        // Simulate a concurrent task having already refreshed the cache to a
+        // newer token after the failing request read its (now stale) token.
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("fresh-access-token".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let response = Client::new()
+            .post(format!(
+                "{}/v1/projects/test-project/messages:send",
+                mock_server.uri()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        // The failing request used the older, now-replaced token.
+        let result = client
+            .handle_response(Instant::now(), response, "stale-access-token")
+            .await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("Authentication error")
+        ));
+
+        // The freshly refreshed token must survive the stale rejection.
+        let cached = client.cached_token.read().await;
+        assert_eq!(
+            cached.as_ref().map(|token| token.token.as_str()),
+            Some("fresh-access-token")
+        );
     }
 
     #[tokio::test]
@@ -1278,7 +1695,7 @@ mod tests {
             });
         }
 
-        let result = client.send("test-device-token").await;
+        let result = client.send("test-device-token", None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No project ID"));
     }
@@ -1293,7 +1710,7 @@ mod tests {
 
         let client = FcmClient::mock(config, false);
 
-        let result = client.send("test-device-token").await;
+        let result = client.send("test-device-token", None).await;
         assert!(result.is_err());
         assert!(
             result
@@ -1314,7 +1731,7 @@ mod tests {
         let mut client = FcmClient::mock(config, true);
         client.service_account.as_mut().unwrap().project_id = "x/../../admin/v1".to_string();
 
-        let result = client.send("test-device-token").await;
+        let result = client.send("test-device-token", None).await;
         assert!(result.is_err());
         assert!(
             result
@@ -1335,7 +1752,7 @@ mod tests {
         // Client without service account - will fail to get access token
         let client = FcmClient::mock(config, false);
 
-        let result = client.send("test-device-token").await;
+        let result = client.send("test-device-token", None).await;
         assert!(result.is_err());
         assert!(
             result
@@ -1628,18 +2045,18 @@ mod tests {
         };
         let client = FcmClient::mock(config, false);
 
-        assert!(!client.send("").await.unwrap(), "empty token");
+        assert!(!client.send("", None).await.unwrap(), "empty token");
         assert!(
-            !client.send("token with space").await.unwrap(),
+            !client.send("token with space", None).await.unwrap(),
             "whitespace token"
         );
         assert!(
-            !client.send("tokén-with-unicode").await.unwrap(),
+            !client.send("tokén-with-unicode", None).await.unwrap(),
             "unicode token"
         );
         assert!(
             !client
-                .send(&"a".repeat(MAX_FCM_TOKEN_LEN + 1))
+                .send(&"a".repeat(MAX_FCM_TOKEN_LEN + 1), None)
                 .await
                 .unwrap(),
             "overlong token"
