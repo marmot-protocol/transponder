@@ -480,22 +480,21 @@ async fn run(mut config: AppConfig) -> Result<()> {
 
     info!("Initiating graceful shutdown");
 
-    // Wait for in-flight push notifications
+    // Wait for the full shutdown sequence: push drain, relay disconnect,
+    // and long-lived task completion all share the configured deadline.
     shutdown::graceful_shutdown(
-        || async {
+        || async move {
             push_dispatcher.wait_for_completion().await;
+
+            if let Err(e) = relay_client.disconnect().await {
+                warn!(error = %e, "Error disconnecting from relays");
+            }
+
+            let _ = tokio::join!(event_handle, health_handle, cleanup_handle);
         },
         config.server.shutdown_timeout_secs,
     )
     .await;
-
-    // Disconnect from relays
-    if let Err(e) = relay_client.disconnect().await {
-        warn!(error = %e, "Error disconnecting from relays");
-    }
-
-    // Wait for tasks to complete
-    let _ = tokio::join!(event_handle, health_handle, cleanup_handle);
 
     info!("Transponder stopped");
     Ok(())
