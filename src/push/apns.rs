@@ -406,9 +406,11 @@ impl ApnsClient {
                 SendAttemptResult::Success(true)
             }
             400 => {
-                let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
-                    reason: "Unknown".to_string(),
-                });
+                let error = crate::push::parse_bounded_error_body::<ApnsErrorResponse>(response)
+                    .await
+                    .unwrap_or(ApnsErrorResponse {
+                        reason: "Unknown".to_string(),
+                    });
                 match classify_apns_400(&error.reason) {
                     Apns400Classification::TokenDead => {
                         debug!(
@@ -436,9 +438,11 @@ impl ApnsClient {
             }
             403 => {
                 self.invalidate_cached_token(auth_token).await;
-                let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
-                    reason: "Unknown".to_string(),
-                });
+                let error = crate::push::parse_bounded_error_body::<ApnsErrorResponse>(response)
+                    .await
+                    .unwrap_or(ApnsErrorResponse {
+                        reason: "Unknown".to_string(),
+                    });
                 debug!(
                     payload_mode = %self.config.payload_mode,
                     reason = %error.reason,
@@ -1063,6 +1067,81 @@ mod tests {
             SendAttemptResult::Permanent(Error::Apns(ref message))
                 if message.contains("MissingTopic")
         ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_oversized_body_falls_back_without_whole_body_parse() {
+        // A hostile/buggy endpoint returns a 400 with a multi-megabyte body.
+        // The bounded read must refuse to buffer/parse the whole body and fall
+        // back to the "Unknown" reason (a permanent error), never treating the
+        // token as dead based on attacker-controlled content.
+        let padding = "A".repeat(4 * 1024 * 1024);
+        let huge_body = format!(r#"{{"reason":"{padding}"}}"#);
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(huge_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .handle_response(Instant::now(), response, "test-token")
+            .await;
+
+        let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
+            panic!("expected a permanent APNs error, got {result:?}");
+        };
+        assert!(message.contains("Unknown"));
+        // The oversized provider body must not leak into the error message,
+        // which stays bounded regardless of the (huge) upstream body.
+        assert!(!message.contains(&padding));
+        assert!(message.len() < 128);
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_403_oversized_body_falls_back_to_unknown_reason() {
+        // The 403 auth-error path must likewise cap the body it reads and fall
+        // back to the "Unknown" reason instead of embedding the huge body.
+        let padding = "A".repeat(4 * 1024 * 1024);
+        let huge_body = format!(r#"{{"reason":"{padding}"}}"#);
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(huge_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .handle_response(Instant::now(), response, "test-token")
+            .await;
+
+        let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
+            panic!("expected a permanent APNs error, got {result:?}");
+        };
+        assert!(message.contains("Authentication error"));
+        assert!(message.contains("Unknown"));
+        // The oversized provider body must not leak into the error message,
+        // which stays bounded regardless of the (huge) upstream body.
+        assert!(!message.contains(&padding));
+        assert!(message.len() < 128);
     }
 
     #[tokio::test]

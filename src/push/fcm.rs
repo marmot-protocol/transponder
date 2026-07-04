@@ -435,8 +435,9 @@ impl FcmClient {
     /// permanent error.
     ///
     /// `default_status` is used when the body cannot be parsed (e.g. an empty
-    /// or non-JSON body), preserving the provider's HTTP-status-implied default
-    /// classification. Only a provider-specific FCM detail with
+    /// or non-JSON body, or a body exceeding the bounded read limit), preserving
+    /// the provider's HTTP-status-implied default classification. Only a
+    /// provider-specific FCM detail with
     /// `errorCode: "UNREGISTERED"` is treated as a dead device token; every
     /// other response — including `INVALID_ARGUMENT` and `NOT_FOUND` (which can
     /// mean a misconfigured project ID) — is surfaced as a permanent error so a
@@ -447,14 +448,16 @@ impl FcmClient {
         default_code: u32,
         default_status: &str,
     ) -> SendAttemptResult {
-        let error: FcmErrorResponse = response.json().await.unwrap_or(FcmErrorResponse {
-            error: FcmError {
-                code: default_code,
-                message: "Unknown".to_string(),
-                status: default_status.to_string(),
-                details: Vec::new(),
-            },
-        });
+        let error = crate::push::parse_bounded_error_body::<FcmErrorResponse>(response)
+            .await
+            .unwrap_or(FcmErrorResponse {
+                error: FcmError {
+                    code: default_code,
+                    message: "Unknown".to_string(),
+                    status: default_status.to_string(),
+                    details: Vec::new(),
+                },
+            });
 
         match classify_fcm_error(&error.error) {
             FcmClassification::TokenDead => {
@@ -1140,6 +1143,65 @@ mod tests {
             SendAttemptResult::Permanent(Error::Fcm(ref message))
                 if message.contains("NOT_FOUND")
         ));
+    }
+
+    /// Drive `handle_response` against a mock server returning `status_code`
+    /// with a raw (potentially oversized) string body.
+    async fn fcm_error_result_with_string_body(
+        status_code: u16,
+        body: String,
+    ) -> SendAttemptResult {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(status_code).set_body_string(body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let client = FcmClient::mock(config, false);
+
+        let response = Client::new()
+            .post(format!(
+                "{}/v1/projects/test-project/messages:send",
+                mock_server.uri()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .handle_response(Instant::now(), response, "test-access-token")
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_oversized_body_falls_back_without_whole_body_parse() {
+        // A hostile/buggy endpoint returns a 400 whose body is far larger than
+        // any legitimate FCM error payload but contains an UNREGISTERED detail.
+        // The bounded read must refuse to buffer/parse the whole body and fall
+        // back to the default INVALID_ARGUMENT classification (a permanent
+        // error), never evicting the token based on attacker-controlled content.
+        let padding = "A".repeat(4 * 1024 * 1024);
+        let huge_body = format!(
+            r#"{{"error":{{"code":400,"message":"{padding}","status":"NOT_FOUND","details":[{{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}}]}}}}"#
+        );
+
+        let result = fcm_error_result_with_string_body(400, huge_body).await;
+
+        let SendAttemptResult::Permanent(Error::Fcm(message)) = result else {
+            panic!("expected a permanent FCM error, got {result:?}");
+        };
+        assert!(message.contains("INVALID_ARGUMENT"));
+        // The oversized provider body must not leak into the error message,
+        // which stays bounded regardless of the (huge) upstream body.
+        assert!(!message.contains(&padding));
+        assert!(message.len() < 128);
     }
 
     #[tokio::test]
