@@ -159,7 +159,7 @@ where
                 }
 
                 // Exponential backoff for next iteration (if not using Retry-After)
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                backoff = next_fallback_backoff(backoff, retry_after);
             }
             SendAttemptResult::Retriable { status_code, .. } => {
                 warn!(
@@ -172,6 +172,14 @@ where
             }
             SendAttemptResult::Permanent(e) => return Err(e),
         }
+    }
+}
+
+fn next_fallback_backoff(backoff: Duration, retry_after: Option<Duration>) -> Duration {
+    if retry_after.is_some() {
+        backoff
+    } else {
+        (backoff * 2).min(MAX_BACKOFF)
     }
 }
 
@@ -492,6 +500,68 @@ mod tests {
         let elapsed = start.elapsed();
         // Should have used the short retry-after, not the long initial_backoff
         assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_retry_after_does_not_advance_fallback_backoff() {
+        let initial_backoff = Duration::from_millis(200);
+
+        let backoff_after_retry_after_retries = (0..3).fold(initial_backoff, |backoff, _| {
+            next_fallback_backoff(backoff, Some(Duration::from_millis(1)))
+        });
+
+        assert_eq!(backoff_after_retry_after_retries, initial_backoff);
+        assert_eq!(
+            next_fallback_backoff(backoff_after_retry_after_retries, None),
+            Duration::from_millis(400)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_with_retry_does_not_advance_backoff_while_retry_after_is_used() {
+        let config = RetryConfig {
+            max_retries: 4,
+            initial_backoff: Duration::from_millis(200),
+        };
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            with_retry(
+                &config,
+                "test",
+                || {
+                    let count = attempt_count_clone.clone();
+                    async move {
+                        let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempts <= 3 {
+                            SendAttemptResult::Retriable {
+                                status_code: 429,
+                                retry_after: Some(Duration::from_millis(1)),
+                            }
+                        } else if attempts == 4 {
+                            SendAttemptResult::Retriable {
+                                status_code: 503,
+                                retry_after: None,
+                            }
+                        } else {
+                            SendAttemptResult::Success(true)
+                        }
+                    }
+                },
+                None,
+                None,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "fallback backoff was advanced by Retry-After retries"
+        );
+        assert!(result.unwrap().unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
