@@ -550,10 +550,7 @@ impl FcmClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        let transport_retry = RetryConfig {
-            max_retries: 1,
-            ..RetryConfig::default()
-        };
+        let transport_retry = RetryConfig::transport();
         let response = match retry::with_transport_retry(
             &transport_retry,
             "FCM",

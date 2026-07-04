@@ -52,6 +52,16 @@ impl BackoffPermit {
 /// Default maximum number of retry attempts.
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
 
+/// Maximum number of transport (connect-error) retry attempts.
+///
+/// Transport retries only cover pre-delivery `reqwest` connect failures (see
+/// [`with_transport_retry`]), so a single extra attempt is enough to ride out a
+/// transient connection blip without meaningfully extending worst-case
+/// permit-hold time. Kept intentionally smaller than [`DEFAULT_MAX_RETRIES`]
+/// and shared by every push provider so their connect-retry budgets stay
+/// consistent (see issue #99).
+pub const TRANSPORT_MAX_RETRIES: u32 = 1;
+
 /// Default initial backoff duration.
 pub const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -71,6 +81,21 @@ impl Default for RetryConfig {
     fn default() -> Self {
         Self {
             max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Shared retry budget for transport (connect-error) retries.
+    ///
+    /// Every push provider uses this for [`with_transport_retry`] so their
+    /// pre-delivery connect-retry budgets stay consistent and permit-hold time
+    /// is bounded uniformly (see issue #99).
+    #[must_use]
+    pub const fn transport() -> Self {
+        Self {
+            max_retries: TRANSPORT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
         }
     }
@@ -302,6 +327,18 @@ mod tests {
     fn test_default_config() {
         let config = RetryConfig::default();
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(config.initial_backoff, DEFAULT_INITIAL_BACKOFF);
+    }
+
+    #[test]
+    fn test_transport_config_is_shared_and_bounded() {
+        // Every push provider must share the same transport connect-retry
+        // budget so APNs and FCM stay consistent (issue #99). It is a single,
+        // small extra attempt and intentionally tighter than the default.
+        let config = RetryConfig::transport();
+        assert_eq!(config.max_retries, TRANSPORT_MAX_RETRIES);
+        assert_eq!(config.max_retries, 1);
+        assert!(config.max_retries < DEFAULT_MAX_RETRIES);
         assert_eq!(config.initial_backoff, DEFAULT_INITIAL_BACKOFF);
     }
 
