@@ -9,7 +9,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::{ApnsConfig, ApnsPayloadMode};
@@ -149,6 +149,41 @@ impl ApnsRequestParts {
 #[derive(Debug, Deserialize)]
 struct ApnsErrorResponse {
     reason: String,
+}
+
+/// Classification of an APNs `400 Bad Request` `reason`.
+///
+/// APNs returns `400` both for a genuinely dead device token and for
+/// server-side misconfiguration (bad topic, bad priority, malformed payload,
+/// etc.). Collapsing every `400` into "token dead" would silently drop every
+/// notification on a single config mistake *and* unregister healthy device
+/// tokens, so the two cases must be distinguished. See issue #111.
+#[derive(Debug, PartialEq, Eq)]
+enum Apns400Classification {
+    /// The provider explicitly identified the device token as invalid for this
+    /// app; the token should be treated as dead (`Success(false)`).
+    TokenDead,
+    /// A configuration or request-construction error that is permanent for this
+    /// provider but unrelated to the device token; must surface as an error
+    /// rather than evicting the token.
+    Permanent,
+}
+
+/// Classify an APNs `400` `reason` as either a dead device token or a
+/// permanent provider/configuration error.
+///
+/// Only `BadDeviceToken`, `DeviceTokenNotForTopic`, and `Unregistered` indicate
+/// that the device token itself is invalid. Every other reason (and any
+/// unrecognised reason) is a permanent error so callers do not evict an
+/// otherwise-healthy token.
+#[must_use]
+fn classify_apns_400(reason: &str) -> Apns400Classification {
+    match reason {
+        "BadDeviceToken" | "DeviceTokenNotForTopic" | "Unregistered" => {
+            Apns400Classification::TokenDead
+        }
+        _ => Apns400Classification::Permanent,
+    }
 }
 
 /// Validate an APNs device token format.
@@ -374,12 +409,30 @@ impl ApnsClient {
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
-                debug!(
-                    payload_mode = %self.config.payload_mode,
-                    reason = %error.reason,
-                    "APNs bad request"
-                );
-                SendAttemptResult::Success(false)
+                match classify_apns_400(&error.reason) {
+                    Apns400Classification::TokenDead => {
+                        debug!(
+                            payload_mode = %self.config.payload_mode,
+                            reason = %error.reason,
+                            "APNs bad device token"
+                        );
+                        SendAttemptResult::Success(false)
+                    }
+                    Apns400Classification::Permanent => {
+                        // Configuration/request error (e.g. BadTopic, MissingTopic,
+                        // BadPriority): surface as a permanent error instead of
+                        // silently dropping the notification and evicting the token.
+                        warn!(
+                            payload_mode = %self.config.payload_mode,
+                            reason = %error.reason,
+                            "APNs rejected request (configuration or request error)"
+                        );
+                        SendAttemptResult::Permanent(Error::Apns(format!(
+                            "Bad request: {}",
+                            error.reason
+                        )))
+                    }
+                }
             }
             403 => {
                 self.invalidate_cached_token(auth_token).await;
@@ -914,6 +967,102 @@ mod tests {
         assert_eq!(response.status(), 400);
         let body: ApnsErrorResponse = response.json().await.unwrap();
         assert_eq!(body.reason, "BadDeviceToken");
+    }
+
+    #[test]
+    fn test_classify_apns_400_token_dead_reasons() {
+        // Only genuine device-token rejections should evict the token.
+        assert_eq!(
+            classify_apns_400("BadDeviceToken"),
+            Apns400Classification::TokenDead
+        );
+        assert_eq!(
+            classify_apns_400("DeviceTokenNotForTopic"),
+            Apns400Classification::TokenDead
+        );
+        assert_eq!(
+            classify_apns_400("Unregistered"),
+            Apns400Classification::TokenDead
+        );
+    }
+
+    #[test]
+    fn test_classify_apns_400_configuration_reasons_are_permanent() {
+        // Configuration / request-construction errors must NOT evict the token.
+        for reason in [
+            "BadTopic",
+            "MissingTopic",
+            "TopicDisallowed",
+            "BadPriority",
+            "BadExpirationDate",
+            "PayloadEmpty",
+            "BadMessageId",
+            "Unknown",
+            "SomeFutureReason",
+        ] {
+            assert_eq!(
+                classify_apns_400(reason),
+                Apns400Classification::Permanent,
+                "reason {reason} should be classified as a permanent error"
+            );
+        }
+    }
+
+    async fn apns_400_result(reason: &str) -> SendAttemptResult {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "reason": reason
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .handle_response(Instant::now(), response, "test-token")
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_bad_device_token_is_token_dead() {
+        // BadDeviceToken must continue to signal token death (Ok(false)).
+        let result = apns_400_result("BadDeviceToken").await;
+        assert!(matches!(result, SendAttemptResult::Success(false)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_device_token_not_for_topic_is_token_dead() {
+        let result = apns_400_result("DeviceTokenNotForTopic").await;
+        assert!(matches!(result, SendAttemptResult::Success(false)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_bad_topic_is_permanent_error() {
+        // Server-side misconfiguration must be a permanent error, not token death.
+        let result = apns_400_result("BadTopic").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Apns(ref message))
+                if message.contains("BadTopic")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_missing_topic_is_permanent_error() {
+        let result = apns_400_result("MissingTopic").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Apns(ref message))
+                if message.contains("MissingTopic")
+        ));
     }
 
     #[tokio::test]
