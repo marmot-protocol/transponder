@@ -480,8 +480,9 @@ async fn run(mut config: AppConfig) -> Result<()> {
 
     info!("Initiating graceful shutdown");
 
-    // Wait for the full shutdown sequence: push drain, relay disconnect,
-    // and long-lived task completion all share the configured deadline.
+    // Wait for the full shutdown sequence under one deadline. If an early step
+    // consumes the budget, `graceful_shutdown` drops the future and later cleanup
+    // steps are skipped rather than extending the configured shutdown bound.
     shutdown::graceful_shutdown(
         || async move {
             push_dispatcher.wait_for_completion().await;

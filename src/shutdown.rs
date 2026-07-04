@@ -134,6 +134,9 @@ async fn wait_forever_after_signal_install_error(signal_name: &'static str, erro
 }
 
 fn spawn_force_quit_on_second_signal() {
+    // Detached by design: once graceful shutdown starts, a repeated signal must
+    // force the process out even if cleanup is still running. Tests inject a
+    // capturing closure, but production uses `std::process::exit` directly.
     let handle = tokio::spawn(force_quit_after_second_signal(
         wait_for_shutdown_signal(),
         std::process::exit,
@@ -266,6 +269,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn wait_for_shutdown_signal_receives_sigterm() {
+        // Exercises Tokio's process-wide SIGTERM handler registration. Keep the
+        // guard alive so the test signal is consumed instead of terminating the
+        // test binary.
         let _sigterm_guard = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
         let waiter = tokio::spawn(wait_for_shutdown_signal());
         tokio::task::yield_now().await;
