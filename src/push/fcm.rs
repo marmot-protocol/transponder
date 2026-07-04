@@ -509,22 +509,21 @@ impl FcmClient {
             }
             429 => {
                 // Rate limited - retriable
-                let retry_after = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| retry::parse_retry_after(Some(v)));
+                let retry_after = retry::retry_after_from_headers(response.headers());
                 SendAttemptResult::Retriable {
                     status_code: 429,
                     retry_after,
                 }
             }
             500..=599 => {
-                // Server error - retriable
+                // Server error - retriable. FCM documents that
+                // 503 SERVICE_UNAVAILABLE responses include a Retry-After the
+                // caller is expected to honor, so reuse the same extraction.
+                let retry_after = retry::retry_after_from_headers(response.headers());
                 debug!(status = %status, "FCM server error (retriable)");
                 SendAttemptResult::Retriable {
                     status_code: status.as_u16(),
-                    retry_after: None,
+                    retry_after,
                 }
             }
             _ => {
@@ -1083,6 +1082,71 @@ mod tests {
             }),
         )
         .await
+    }
+
+    /// Drive `handle_response` against a mock server returning `status_code`
+    /// with an optional `retry-after` header, returning the classified result.
+    async fn fcm_status_result(status_code: u16, retry_after: Option<&str>) -> SendAttemptResult {
+        let mock_server = MockServer::start().await;
+        let mut template =
+            ResponseTemplate::new(status_code).set_body_string("Service Unavailable");
+        if let Some(value) = retry_after {
+            template = template.insert_header("retry-after", value);
+        }
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(template)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let client = FcmClient::mock(config, false);
+
+        let response = Client::new()
+            .post(format!(
+                "{}/v1/projects/test-project/messages:send",
+                mock_server.uri()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .handle_response(Instant::now(), response, "test-access-token")
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_503_honors_retry_after_header() {
+        // FCM documents that 503 SERVICE_UNAVAILABLE responses include a
+        // Retry-After the caller is expected to honor.
+        let result = fcm_status_result(503, Some("120")).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Retriable {
+                status_code: 503,
+                retry_after: Some(delay),
+            } if delay == Duration::from_secs(120)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_500_without_retry_after_is_retriable_without_hint() {
+        // A 5xx without a Retry-After stays retriable but carries no hint,
+        // preserving the default exponential-backoff behavior.
+        let result = fcm_status_result(500, None).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Retriable {
+                status_code: 500,
+                retry_after: None,
+            }
+        ));
     }
 
     #[tokio::test]

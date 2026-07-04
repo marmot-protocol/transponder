@@ -459,11 +459,7 @@ impl ApnsClient {
             }
             429 => {
                 // Rate limited - retriable
-                let retry_after = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| retry::parse_retry_after(Some(v)));
+                let retry_after = retry::retry_after_from_headers(response.headers());
                 debug!(
                     payload_mode = %self.config.payload_mode,
                     "APNs rate limited request"
@@ -474,7 +470,9 @@ impl ApnsClient {
                 }
             }
             500..=599 => {
-                // Server error - retriable
+                // Server error - retriable. Honor an explicit Retry-After
+                // backpressure hint when the provider supplies one.
+                let retry_after = retry::retry_after_from_headers(response.headers());
                 debug!(
                     payload_mode = %self.config.payload_mode,
                     status = %status,
@@ -482,7 +480,7 @@ impl ApnsClient {
                 );
                 SendAttemptResult::Retriable {
                     status_code: status.as_u16(),
-                    retry_after: None,
+                    retry_after,
                 }
             }
             _ => {
@@ -1062,6 +1060,73 @@ mod tests {
             result,
             SendAttemptResult::Permanent(Error::Apns(ref message))
                 if message.contains("MissingTopic")
+        ));
+    }
+
+    /// Drive `handle_response` against a mock server returning `status_code`
+    /// with an optional `retry-after` header, returning the classified result.
+    async fn apns_status_result(status_code: u16, retry_after: Option<&str>) -> SendAttemptResult {
+        let mock_server = MockServer::start().await;
+        let mut template = ResponseTemplate::new(status_code);
+        if let Some(value) = retry_after {
+            template = template.insert_header("retry-after", value);
+        }
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(template)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .handle_response(Instant::now(), response, "test-token")
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_503_honors_retry_after_header() {
+        // A 503 with an explicit Retry-After must surface the provider's
+        // backpressure hint, not fall back to the default backoff.
+        let result = apns_status_result(503, Some("120")).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Retriable {
+                status_code: 503,
+                retry_after: Some(delay),
+            } if delay == Duration::from_secs(120)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_500_without_retry_after_is_retriable_without_hint() {
+        // A 5xx without a Retry-After stays retriable but carries no hint,
+        // preserving the default exponential-backoff behavior.
+        let result = apns_status_result(500, None).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Retriable {
+                status_code: 500,
+                retry_after: None,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_429_honors_retry_after_header() {
+        let result = apns_status_result(429, Some("30")).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Retriable {
+                status_code: 429,
+                retry_after: Some(delay),
+            } if delay == Duration::from_secs(30)
         ));
     }
 

@@ -291,6 +291,21 @@ pub fn parse_retry_after(header_value: Option<&str>) -> Option<Duration> {
     None
 }
 
+/// Extract and parse a `Retry-After` header from a response's headers.
+///
+/// Returns the parsed backpressure hint when the provider supplied a
+/// `Retry-After` value understood by [`parse_retry_after`], and `None`
+/// otherwise. Shared by the `429` and `5xx` handling arms of the push clients
+/// so a `503 SERVICE_UNAVAILABLE` with an explicit `Retry-After` is honored,
+/// not just a `429`.
+#[must_use]
+pub(crate) fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_retry_after(Some(v)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +339,21 @@ mod tests {
     fn test_parse_retry_after_invalid() {
         assert_eq!(parse_retry_after(Some("invalid")), None);
         assert_eq!(parse_retry_after(Some("not-a-number")), None);
+    }
+
+    #[test]
+    fn test_retry_after_from_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_from_headers(&headers), None);
+
+        headers.insert("retry-after", "120".parse().unwrap());
+        assert_eq!(
+            retry_after_from_headers(&headers),
+            Some(Duration::from_secs(120))
+        );
+
+        headers.insert("retry-after", "not-a-number".parse().unwrap());
+        assert_eq!(retry_after_from_headers(&headers), None);
     }
 
     #[test]
