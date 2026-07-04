@@ -1218,7 +1218,7 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Instant::now(), response, "test-token")
+            .handle_response(Duration::ZERO, response, "test-token")
             .await;
 
         let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
@@ -1254,7 +1254,7 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Instant::now(), response, "test-token")
+            .handle_response(Duration::ZERO, response, "test-token")
             .await;
 
         let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
