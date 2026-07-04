@@ -3,6 +3,7 @@
 //! Handles deduplication and processing of gift-wrapped notification requests,
 //! including rate limiting to prevent spam and replay attacks.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions as StdOpenOptions};
 use std::num::NonZeroUsize;
 #[cfg(unix)]
@@ -58,10 +59,13 @@ pub const DEFAULT_DEDUP_RETENTION_SECS: u64 =
 /// window expires.
 const DEDUP_WINDOW: Duration = Duration::from_secs(DEFAULT_DEDUP_RETENTION_SECS);
 
-/// Maximum number of entries to scan per cleanup cycle.
+/// Maximum number of volatile LRU entries to scan per cleanup cycle.
+///
+/// Durable replay state scans the retained set so retention, not LRU capacity,
+/// remains the source of truth for restart/reconnect duplicate suppression.
 const CLEANUP_BATCH_SIZE: usize = 1000;
 
-/// Default maximum size for the deduplication cache.
+/// Default maximum size for the volatile deduplication cache.
 pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
 
 #[derive(Clone, Copy)]
@@ -82,6 +86,105 @@ impl SeenEvent {
         Self {
             seen_at,
             terminal: true,
+        }
+    }
+}
+
+enum SeenEventStore {
+    Bounded(LruCache<EventId, SeenEvent>),
+    Retained(HashMap<EventId, SeenEvent>),
+}
+
+impl SeenEventStore {
+    fn bounded(cache_size: NonZeroUsize) -> Self {
+        Self::Bounded(LruCache::new(cache_size))
+    }
+
+    fn retained() -> Self {
+        Self::Retained(HashMap::new())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Bounded(seen) => seen.len(),
+            Self::Retained(seen) => seen.len(),
+        }
+    }
+
+    fn contains(&self, event_id: &EventId) -> bool {
+        match self {
+            Self::Bounded(seen) => seen.contains(event_id),
+            Self::Retained(seen) => seen.contains_key(event_id),
+        }
+    }
+
+    fn put(&mut self, event_id: EventId, seen_event: SeenEvent) {
+        match self {
+            Self::Bounded(seen) => {
+                seen.put(event_id, seen_event);
+            }
+            Self::Retained(seen) => {
+                seen.insert(event_id, seen_event);
+            }
+        }
+    }
+
+    fn pop(&mut self, event_id: &EventId) {
+        match self {
+            Self::Bounded(seen) => {
+                seen.pop(event_id);
+            }
+            Self::Retained(seen) => {
+                seen.remove(event_id);
+            }
+        }
+    }
+
+    fn expired_keys(&self, now: Instant, retention: Duration) -> Vec<EventId> {
+        match self {
+            Self::Bounded(seen) => seen
+                .iter()
+                .rev()
+                .take(CLEANUP_BATCH_SIZE)
+                .filter(|(_, seen_event)| now.duration_since(seen_event.seen_at) >= retention)
+                .map(|(id, _)| *id)
+                .collect(),
+            Self::Retained(seen) => seen
+                .iter()
+                .filter(|(_, seen_event)| now.duration_since(seen_event.seen_at) >= retention)
+                .map(|(id, _)| *id)
+                .collect(),
+        }
+    }
+
+    fn terminal_entries(&self, now_wall: u64, now_instant: Instant) -> Vec<(EventId, u64)> {
+        match self {
+            Self::Bounded(seen) => seen
+                .iter()
+                .filter_map(|(event_id, seen_event)| {
+                    if seen_event.terminal {
+                        Some((
+                            *event_id,
+                            instant_to_unix_secs(seen_event.seen_at, now_wall, now_instant),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Self::Retained(seen) => seen
+                .iter()
+                .filter_map(|(event_id, seen_event)| {
+                    if seen_event.terminal {
+                        Some((
+                            *event_id,
+                            instant_to_unix_secs(seen_event.seen_at, now_wall, now_instant),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -118,16 +221,12 @@ impl PersistentDedupState {
         Ok(())
     }
 
-    fn load_seen_events(
-        path: &Path,
-        cache_size: NonZeroUsize,
-        retention: Duration,
-    ) -> Result<LruCache<EventId, SeenEvent>> {
+    fn load_seen_events(path: &Path, retention: Duration) -> Result<SeenEventStore> {
         Self::prepare_path(path)?;
 
         let now_wall = Timestamp::now().as_secs();
         let now_instant = Instant::now();
-        let mut seen = LruCache::new(cache_size);
+        let mut seen = SeenEventStore::retained();
         let contents = fs::read_to_string(path)?;
 
         for line in contents.lines() {
@@ -235,8 +334,8 @@ pub struct EventProcessor {
     nip59_handler: Nip59Handler,
     token_decryptor: TokenDecryptor,
     push_dispatcher: Arc<PushDispatcher>,
-    /// Event ID deduplication cache.
-    seen_events: Arc<RwLock<LruCache<EventId, SeenEvent>>>,
+    /// Event ID replay-protection state.
+    seen_events: Arc<RwLock<SeenEventStore>>,
     /// Optional durable event-ID replay state.
     dedup_persistence: Option<Arc<PersistentDedupState>>,
     /// How long event IDs remain in replay state.
@@ -300,7 +399,12 @@ impl Default for TokenRateLimitConfig {
 /// Replay-protection configuration for event IDs and notification freshness.
 #[derive(Debug, Clone)]
 pub struct ReplayProtectionConfig {
-    /// Maximum in-memory event IDs retained for duplicate suppression.
+    /// Maximum in-memory event IDs retained for duplicate suppression when
+    /// durable replay state is disabled.
+    ///
+    /// When `dedup_state_path` is set, all terminal event IDs inside
+    /// `dedup_retention` are kept so durable replay state covers the full relay
+    /// lookback window instead of being capped by this LRU size.
     pub max_dedup_cache_size: usize,
     /// Optional durable replay-state path.
     ///
@@ -410,17 +514,17 @@ impl EventProcessor {
         );
 
         let (seen_events, dedup_persistence) = if let Some(path) = replay_config.dedup_state_path {
-            let seen = PersistentDedupState::load_seen_events(
-                &path,
-                cache_size,
-                replay_config.dedup_retention,
-            )?;
+            let seen =
+                PersistentDedupState::load_seen_events(&path, replay_config.dedup_retention)?;
             (
                 Arc::new(RwLock::new(seen)),
                 Some(Arc::new(PersistentDedupState::new(path)?)),
             )
         } else {
-            (Arc::new(RwLock::new(LruCache::new(cache_size))), None)
+            (
+                Arc::new(RwLock::new(SeenEventStore::bounded(cache_size))),
+                None,
+            )
         };
 
         Ok(Self {
@@ -898,8 +1002,10 @@ impl EventProcessor {
 
     /// Clean up all caches by removing expired entries.
     ///
-    /// Uses incremental cleanup to avoid holding write locks for extended
-    /// periods. Call periodically for full cleanup of all expired entries.
+    /// Uses incremental cleanup for volatile LRU state to avoid holding write
+    /// locks for extended periods. Durable replay state scans all retained IDs
+    /// so the persisted set stays bounded by retention rather than cache size.
+    /// Call periodically for full cleanup of all expired entries.
     pub async fn cleanup(&self) {
         // Clean event deduplication cache
         let persistence = self.dedup_persistence.clone();
@@ -914,33 +1020,14 @@ impl EventProcessor {
             let now = Instant::now();
             let now_wall = Timestamp::now().as_secs();
 
-            let expired_keys: Vec<_> = seen
-                .iter()
-                .rev()
-                .take(CLEANUP_BATCH_SIZE)
-                .filter(|(_, seen_event)| {
-                    now.duration_since(seen_event.seen_at) >= self.dedup_retention
-                })
-                .map(|(id, _)| *id)
-                .collect();
+            let expired_keys = seen.expired_keys(now, self.dedup_retention);
 
             for key in &expired_keys {
                 seen.pop(key);
             }
 
             let retained_entries = if persistence.is_some() {
-                seen.iter()
-                    .filter_map(|(event_id, seen_event)| {
-                        if seen_event.terminal {
-                            Some((
-                                *event_id,
-                                instant_to_unix_secs(seen_event.seen_at, now_wall, now),
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+                seen.terminal_entries(now_wall, now)
             } else {
                 Vec::new()
             };
@@ -1447,6 +1534,42 @@ mod tests {
         assert!(restarted.is_duplicate(&event.id).await);
     }
 
+    #[tokio::test]
+    async fn test_durable_dedup_state_is_not_capped_by_lru_size() {
+        let server_keys = Keys::generate();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("dedup-state.tsv");
+        let replay_config = ReplayProtectionConfig {
+            max_dedup_cache_size: 2,
+            dedup_state_path: Some(state_path.clone()),
+            ..ReplayProtectionConfig::default()
+        };
+        let processor = create_processor_with_replay_config(&server_keys, replay_config.clone());
+        let event_ids: Vec<_> = (0..5)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = i;
+                EventId::from_byte_array(bytes)
+            })
+            .collect();
+
+        for event_id in &event_ids {
+            processor.mark_seen(*event_id).await;
+        }
+
+        assert_eq!(processor.cache_len(), event_ids.len());
+        assert!(processor.is_duplicate(&event_ids[0]).await);
+
+        let restarted = create_processor_with_replay_config(&server_keys, replay_config);
+        assert_eq!(restarted.cache_len(), event_ids.len());
+        for event_id in event_ids {
+            assert!(
+                restarted.is_duplicate(&event_id).await,
+                "durable replay state must retain every ID inside retention, even past max_dedup_cache_size"
+            );
+        }
+    }
+
     #[test]
     fn test_dedup_state_loader_ignores_malformed_and_expired_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1468,12 +1591,8 @@ mod tests {
         std::fs::create_dir_all(state_path.parent().expect("state parent")).expect("mkdir");
         std::fs::write(&state_path, state).expect("write state");
 
-        let seen = PersistentDedupState::load_seen_events(
-            &state_path,
-            NonZeroUsize::new(10).expect("non-zero cache"),
-            Duration::from_secs(60),
-        )
-        .expect("load state");
+        let seen = PersistentDedupState::load_seen_events(&state_path, Duration::from_secs(60))
+            .expect("load state");
 
         assert!(seen.contains(&retained_id));
         assert!(!seen.contains(&expired_id));

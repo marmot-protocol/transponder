@@ -134,9 +134,13 @@ pub struct ServerConfig {
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
 
-    /// Maximum size for the event deduplication cache.
+    /// Maximum size for the volatile event deduplication cache.
     ///
-    /// The cache uses LRU eviction to prevent unbounded memory growth.
+    /// Applies when durable replay state is disabled. When `dedup_state_path`
+    /// is configured, Transponder retains all terminal event IDs inside
+    /// `dedup_retention_secs` so restart/reconnect replay suppression covers the
+    /// full NIP-59 subscription lookback window instead of being capped by this
+    /// LRU size.
     /// Default: 100,000 entries.
     #[serde(default = "default_max_dedup_cache_size")]
     pub max_dedup_cache_size: usize,

@@ -12,6 +12,8 @@ shutdown_timeout_secs = 20
 
 # These defaults are reasonable for small to medium deployments.
 # Reduce them if you are running on a very small VM.
+# Only applies if dedup_state_path is unset; durable replay state below retains
+# all terminal IDs inside dedup_retention_secs.
 # max_dedup_cache_size = 100000
 # Durable replay state for processed gift-wrap event IDs. The systemd example
 # and compose.prod.yml make /var/lib/transponder writable. This stores only

@@ -60,7 +60,9 @@ private_key = ""
 # Graceful shutdown timeout in seconds
 shutdown_timeout_secs = 10
 
-# Event deduplication cache size (default: 100000)
+# Volatile event deduplication cache size when durable replay state is disabled
+# (default: 100000). With dedup_state_path set, all terminal event IDs inside
+# dedup_retention_secs are retained for the full NIP-59 subscription lookback.
 # max_dedup_cache_size = 100000
 
 # Optional durable replay state for processed gift-wrap event IDs.
