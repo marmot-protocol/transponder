@@ -559,9 +559,9 @@ where
             continue;
         };
 
-        let value = value.into_string().map_err(|os_string| {
+        let value = value.into_string().map_err(|_| {
             config::ConfigError::Message(format!(
-                "env variable {env_key:?} contains non-Unicode data: {os_string:?}"
+                "env variable {env_key} contains non-Unicode data"
             ))
         })?;
 
@@ -1189,6 +1189,30 @@ mod tests {
     fn test_from_env_rejects_unknown_prefixed_variable() {
         let error = from_test_env(&[("TRANSPONDER_SERVER_PRVATE_KEY", "value")]).unwrap_err();
         assert!(error.to_string().contains("unsupported config key"));
+    }
+
+    #[test]
+    fn test_from_env_non_unicode_private_key_value_is_not_leaked() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let secret_value = "SECRET-PRIVATE-KEY-DO-NOT-LOG";
+        let mut secret_bytes = secret_value.as_bytes().to_vec();
+        // Add a lone continuation byte so `OsString::into_string` fails after a
+        // recognizable secret prefix.
+        secret_bytes.push(0x80);
+        let env_iter = vec![(
+            OsString::from("TRANSPONDER_SERVER_PRIVATE_KEY"),
+            OsString::from_vec(secret_bytes),
+        )];
+
+        let error = AppConfig::from_env_iter(env_iter).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("TRANSPONDER_SERVER_PRIVATE_KEY"));
+        assert!(message.contains("non-Unicode data"));
+        assert!(!message.contains(secret_value));
+        assert!(!message.contains("SECRET-PRIVATE-KEY"));
+        assert!(!message.contains(r"\x80"));
     }
 
     #[test]
