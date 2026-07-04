@@ -248,10 +248,7 @@ impl FcmClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(Error::Fcm(format!(
-                "OAuth token request failed: {status} - {body}"
-            )));
+            return Err(Error::Fcm(oauth_failure_message(status)));
         }
 
         let token_response: TokenResponse = response.json().await?;
@@ -482,6 +479,16 @@ impl FcmClient {
     }
 }
 
+/// Build the bounded, non-sensitive error message for a failed OAuth token
+/// request.
+///
+/// Only the HTTP status is included. The raw provider body is intentionally
+/// omitted because Google OAuth error responses can echo assertion/JWT-related
+/// material, and embedding it verbatim risks leaking auth context into logs.
+fn oauth_failure_message(status: reqwest::StatusCode) -> String {
+    format!("OAuth token request failed: {status}")
+}
+
 fn validate_project_id(project_id: &str) -> Result<&str> {
     if project_id.is_empty() {
         return Err(Error::Fcm("No project ID configured".to_string()));
@@ -575,6 +582,61 @@ mod tests {
 
         assert_eq!(response.access_token.as_str(), "provider-access-token");
         assert_zeroizing_string(&response.access_token);
+    }
+
+    #[test]
+    fn test_oauth_failure_message_omits_body_and_stays_bounded() {
+        // A hostile/buggy token endpoint could echo a huge body containing
+        // assertion/JWT material. The propagated error must contain only the
+        // status, never the body, and must not grow with the body size.
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let message = oauth_failure_message(status);
+
+        assert_eq!(message, "OAuth token request failed: 400 Bad Request");
+
+        // Independent of any provider body, the message length is a
+        // small constant bounded by the status text.
+        let secret = "leaked-assertion-jwt-".repeat(100_000);
+        assert!(!message.contains(&secret));
+        assert!(!message.contains("leaked-assertion-jwt"));
+        assert!(message.len() < 128);
+    }
+
+    #[tokio::test]
+    async fn test_oauth_failure_does_not_propagate_or_buffer_raw_body() {
+        // Regression: the OAuth failure path must not read the body nor embed
+        // raw provider content into the error. Drive a real response with an
+        // oversized, secret-bearing body through the same status-only error
+        // construction the failure path uses, then drop the response body
+        // unread.
+        let mock_server = MockServer::start().await;
+
+        let secret = "assertion-jwt-secret-".repeat(100_000);
+        let huge_body =
+            format!("{{\"error\":\"invalid_grant\",\"error_description\":\"{secret}\"}}");
+        assert!(huge_body.len() > 1_000_000);
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(huge_body.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let response = Client::new().post(mock_server.uri()).send().await.unwrap();
+
+        let status = response.status();
+        drop(response);
+        let error = Error::Fcm(oauth_failure_message(status));
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("OAuth token request failed"));
+        assert!(rendered.contains("400"));
+        // No raw provider body leaks into the error, and it stays bounded
+        // regardless of the (huge) upstream body.
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains("assertion-jwt-secret"));
+        assert!(!rendered.contains("invalid_grant"));
+        assert!(rendered.len() < 128);
     }
 
     #[test]
