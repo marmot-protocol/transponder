@@ -506,6 +506,15 @@ impl FcmClient {
                 error!("FCM authentication error");
                 SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
             }
+            403 => {
+                // Project or service-account authorization failure. This is a
+                // provider-wide configuration outage, not a dead device token.
+                error!("FCM permission denied");
+                SendAttemptResult::Permanent(Error::Fcm(
+                    "FCM permission denied (check Cloud Messaging API enablement / service-account IAM)"
+                        .to_string(),
+                ))
+            }
             404 => {
                 self.classify_error_response(response, 404, "NOT_FOUND")
                     .await
@@ -531,7 +540,9 @@ impl FcmClient {
             }
             _ => {
                 warn!(status = %status, "FCM unexpected response");
-                SendAttemptResult::Success(false)
+                SendAttemptResult::Permanent(Error::Fcm(format!(
+                    "Unexpected FCM response status: {status}"
+                )))
             }
         }
     }
@@ -1329,6 +1340,32 @@ mod tests {
         // which stays bounded regardless of the (huge) upstream body.
         assert!(!message.contains(&padding));
         assert!(message.len() < 128);
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_403_permission_denied_is_permanent_error() {
+        // PERMISSION_DENIED is a project/service-account configuration outage,
+        // not a dead device token.
+        let result = fcm_error_result(403, "PERMISSION_DENIED").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("permission denied")
+                    && message.contains("Cloud Messaging API")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_unexpected_status_is_permanent_error() {
+        // Unknown statuses should surface as provider errors rather than being
+        // counted as invalid device tokens.
+        let result = fcm_status_result(418, None).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("Unexpected FCM response status")
+                    && message.contains("418")
+        ));
     }
 
     #[tokio::test]
