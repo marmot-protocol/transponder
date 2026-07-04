@@ -217,6 +217,21 @@ impl PushDispatcher {
         });
     }
 
+    fn update_semaphore_available_metric(metrics: &Option<Metrics>, semaphore: &Semaphore) {
+        if let Some(metrics) = metrics {
+            metrics.set_push_semaphore_available(semaphore.available_permits());
+        }
+    }
+
+    async fn acquire_push_permit(
+        semaphore: Arc<Semaphore>,
+        metrics: &Option<Metrics>,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        let permit = semaphore.clone().acquire_owned().await?;
+        Self::update_semaphore_available_metric(metrics, &semaphore);
+        Ok(permit)
+    }
+
     async fn send_push(
         platform: Platform,
         token: Zeroizing<String>,
@@ -302,16 +317,17 @@ impl PushDispatcher {
 
                         // Acquire a permit before spawning the send task. The semaphore,
                         // not a worker pool, is the outbound concurrency limit.
-                        let permit = match semaphore.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => {
-                                // The dispatcher never closes this semaphore today; if a
-                                // future change does, the dequeued token is zeroed as this
-                                // loop scope unwinds.
-                                debug!("Push semaphore closed, dispatcher exiting");
-                                break;
-                            }
-                        };
+                        let permit =
+                            match Self::acquire_push_permit(semaphore.clone(), &metrics).await {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    // The dispatcher never closes this semaphore today; if a
+                                    // future change does, the dequeued token is zeroed as this
+                                    // loop scope unwinds.
+                                    debug!("Push semaphore closed, dispatcher exiting");
+                                    break;
+                                }
+                            };
 
                         let apns_client = apns_client.clone();
                         let fcm_client = fcm_client.clone();
@@ -351,9 +367,7 @@ impl PushDispatcher {
                             // before reading available permits for the metric.
                             drop(backoff_permit);
 
-                            if let Some(ref m) = metrics {
-                                m.set_push_semaphore_available(semaphore.available_permits());
-                            }
+                            Self::update_semaphore_available_metric(&metrics, &semaphore);
                         });
                     }
                     Some(PushMessage::Shutdown) => {
@@ -1015,6 +1029,34 @@ mod tests {
         );
         assert_eq!(
             gauge_metric_value(&metrics, "transponder_push_concurrency_limit"),
+            MAX_CONCURRENT_PUSHES as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_semaphore_available_metric_updates_on_permit_acquire() {
+        use crate::metrics::Metrics;
+
+        let metrics = Metrics::default();
+        let metrics_opt = Some(metrics.clone());
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSHES));
+
+        metrics.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
+
+        let permit = PushDispatcher::acquire_push_permit(semaphore.clone(), &metrics_opt)
+            .await
+            .expect("permit should be acquired");
+
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_semaphore_available"),
+            (MAX_CONCURRENT_PUSHES - 1) as i64
+        );
+
+        drop(permit);
+        PushDispatcher::update_semaphore_available_metric(&metrics_opt, &semaphore);
+
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_semaphore_available"),
             MAX_CONCURRENT_PUSHES as i64
         );
     }
