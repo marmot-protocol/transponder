@@ -3,14 +3,19 @@
 //! Handles deduplication and processing of gift-wrapped notification requests,
 //! including rate limiting to prevent spam and replay attacks.
 
+use std::fs::{self, OpenOptions as StdOpenOptions};
 use std::num::NonZeroUsize;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, info, trace, warn};
 
@@ -25,14 +30,170 @@ use crate::rate_limiter::{
     DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig, RateLimiter,
 };
 
-/// Duration to keep event IDs for deduplication (5 minutes).
-const DEDUP_WINDOW: Duration = Duration::from_secs(300);
+/// Maximum NIP-59 timestamp randomization window for gift wraps.
+///
+/// Relays must still be queried with this full lookback because compliant gift
+/// wraps randomize their outer `created_at`; durable replay state and inner
+/// rumor freshness bound what we will actually dispatch from that backlog.
+const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end;
+
+/// Default maximum age for the unwrapped kind:446 notification request rumor.
+///
+/// Outer gift-wrap timestamps are deliberately randomized by NIP-59 and are not
+/// freshness signals. The inner notification rumor timestamp is the only
+/// stateless bound available before dispatching a replayed backlog event.
+pub const DEFAULT_MAX_NOTIFICATION_AGE_SECS: u64 = 3_600;
+
+/// Default tolerated clock skew for future-dated notification rumors.
+pub const DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS: u64 = 300;
+
+/// Default duration to keep processed gift-wrap event IDs in replay state.
+pub const DEFAULT_DEDUP_RETENTION_SECS: u64 =
+    NIP59_TIMESTAMP_TWEAK_WINDOW_SECS + DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS;
+
+/// Duration to keep event IDs for deduplication.
+///
+/// The cache must cover the relay subscription lookback; otherwise a restart or
+/// reconnect can re-deliver backlog entries after the old 5-minute in-memory
+/// window expires.
+const DEDUP_WINDOW: Duration = Duration::from_secs(DEFAULT_DEDUP_RETENTION_SECS);
 
 /// Maximum number of entries to scan per cleanup cycle.
 const CLEANUP_BATCH_SIZE: usize = 1000;
 
 /// Default maximum size for the deduplication cache.
 pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
+
+#[derive(Clone, Copy)]
+struct SeenEvent {
+    seen_at: Instant,
+    terminal: bool,
+}
+
+impl SeenEvent {
+    fn reservation(seen_at: Instant) -> Self {
+        Self {
+            seen_at,
+            terminal: false,
+        }
+    }
+
+    fn terminal(seen_at: Instant) -> Self {
+        Self {
+            seen_at,
+            terminal: true,
+        }
+    }
+}
+
+struct PersistentDedupState {
+    path: PathBuf,
+    write_lock: Mutex<()>,
+}
+
+impl PersistentDedupState {
+    fn new(path: PathBuf) -> Result<Self> {
+        Self::prepare_path(&path)?;
+        Ok(Self {
+            path,
+            write_lock: Mutex::new(()),
+        })
+    }
+
+    fn prepare_path(path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut options = StdOpenOptions::new();
+        options.create(true).append(true).read(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let _file = options.open(path)?;
+
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    fn load_seen_events(
+        path: &Path,
+        cache_size: NonZeroUsize,
+        retention: Duration,
+    ) -> Result<LruCache<EventId, SeenEvent>> {
+        Self::prepare_path(path)?;
+
+        let now_wall = Timestamp::now().as_secs();
+        let now_instant = Instant::now();
+        let mut seen = LruCache::new(cache_size);
+        let contents = fs::read_to_string(path)?;
+
+        for line in contents.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(event_id_hex), Some(seen_at_secs), None) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let Ok(event_id) = EventId::from_hex(event_id_hex) else {
+                continue;
+            };
+            let Ok(seen_at_secs) = seen_at_secs.parse::<u64>() else {
+                continue;
+            };
+            let age = now_wall.saturating_sub(seen_at_secs);
+            if age > retention.as_secs() {
+                continue;
+            }
+            let seen_at = now_instant
+                .checked_sub(Duration::from_secs(age))
+                .unwrap_or(now_instant);
+            seen.put(event_id, SeenEvent::terminal(seen_at));
+        }
+
+        Ok(seen)
+    }
+
+    async fn append_seen_locked(
+        &self,
+        event_id: EventId,
+        seen_at_secs: u64,
+    ) -> std::io::Result<()> {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await?;
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).await?;
+        file.write_all(format!("{} {}\n", event_id.to_hex(), seen_at_secs).as_bytes())
+            .await?;
+        file.flush().await
+    }
+
+    async fn rewrite_locked(&self, entries: &[(EventId, u64)]) -> std::io::Result<()> {
+        let tmp_path = self.path.with_extension("tmp");
+        let mut contents = String::new();
+        for (event_id, seen_at_secs) in entries {
+            use std::fmt::Write as _;
+            let _ = writeln!(&mut contents, "{} {}", event_id.to_hex(), seen_at_secs);
+        }
+        tokio::fs::write(&tmp_path, contents).await?;
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).await?;
+        tokio::fs::rename(&tmp_path, &self.path).await
+    }
+}
+
+fn instant_to_unix_secs(seen_at: Instant, now_wall: u64, now_instant: Instant) -> u64 {
+    let age = now_instant
+        .checked_duration_since(seen_at)
+        .unwrap_or_default()
+        .as_secs();
+    now_wall.saturating_sub(age)
+}
 
 #[must_use]
 struct InFlightEventGuard<'a> {
@@ -75,7 +236,15 @@ pub struct EventProcessor {
     token_decryptor: TokenDecryptor,
     push_dispatcher: Arc<PushDispatcher>,
     /// Event ID deduplication cache.
-    seen_events: Arc<RwLock<LruCache<EventId, Instant>>>,
+    seen_events: Arc<RwLock<LruCache<EventId, SeenEvent>>>,
+    /// Optional durable event-ID replay state.
+    dedup_persistence: Option<Arc<PersistentDedupState>>,
+    /// How long event IDs remain in replay state.
+    dedup_retention: Duration,
+    /// Maximum accepted age for the unwrapped notification rumor.
+    max_notification_age: Duration,
+    /// Tolerated sender/server clock skew for future-dated notification rumors.
+    max_notification_future_skew: Duration,
     /// Global pre-unwrap admission limiter.
     ///
     /// Checked BEFORE the gift-wrap unwrap (ECDH + seal decryption) using a
@@ -128,6 +297,41 @@ impl Default for TokenRateLimitConfig {
     }
 }
 
+/// Replay-protection configuration for event IDs and notification freshness.
+#[derive(Debug, Clone)]
+pub struct ReplayProtectionConfig {
+    /// Maximum in-memory event IDs retained for duplicate suppression.
+    pub max_dedup_cache_size: usize,
+    /// Optional durable replay-state path.
+    ///
+    /// The file stores only public Nostr gift-wrap event IDs and the time they
+    /// reached a terminal state. It does not store tokens, payloads, sender
+    /// identities, device identifiers, or relay URLs.
+    pub dedup_state_path: Option<PathBuf>,
+    /// How long event IDs remain eligible for duplicate suppression.
+    pub dedup_retention: Duration,
+    /// Maximum accepted age for the unwrapped kind:446 notification rumor.
+    ///
+    /// Set to zero to disable the freshness bound.
+    pub max_notification_age: Duration,
+    /// Tolerated future clock skew for the unwrapped notification rumor.
+    pub max_notification_future_skew: Duration,
+}
+
+impl Default for ReplayProtectionConfig {
+    fn default() -> Self {
+        Self {
+            max_dedup_cache_size: DEFAULT_MAX_DEDUP_CACHE_SIZE,
+            dedup_state_path: None,
+            dedup_retention: DEDUP_WINDOW,
+            max_notification_age: Duration::from_secs(DEFAULT_MAX_NOTIFICATION_AGE_SECS),
+            max_notification_future_skew: Duration::from_secs(
+                DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+            ),
+        }
+    }
+}
+
 impl EventProcessor {
     /// Create a new event processor with default settings.
     ///
@@ -168,6 +372,7 @@ impl EventProcessor {
     }
 
     /// Create a new event processor with full configuration.
+    #[cfg(test)]
     pub fn with_full_config(
         nip59_handler: Nip59Handler,
         token_decryptor: TokenDecryptor,
@@ -176,16 +381,57 @@ impl EventProcessor {
         rate_limit_config: TokenRateLimitConfig,
         metrics: Option<Metrics>,
     ) -> Self {
-        let cache_size = NonZeroUsize::new(max_dedup_cache_size).unwrap_or(
+        Self::with_replay_config(
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+            rate_limit_config,
+            ReplayProtectionConfig {
+                max_dedup_cache_size,
+                ..ReplayProtectionConfig::default()
+            },
+            metrics,
+        )
+        .expect("in-memory replay protection config cannot fail")
+    }
+
+    /// Create a new event processor with full replay-protection configuration.
+    pub fn with_replay_config(
+        nip59_handler: Nip59Handler,
+        token_decryptor: TokenDecryptor,
+        push_dispatcher: Arc<PushDispatcher>,
+        rate_limit_config: TokenRateLimitConfig,
+        replay_config: ReplayProtectionConfig,
+        metrics: Option<Metrics>,
+    ) -> Result<Self> {
+        let cache_size = NonZeroUsize::new(replay_config.max_dedup_cache_size).unwrap_or(
             NonZeroUsize::new(DEFAULT_MAX_DEDUP_CACHE_SIZE)
                 .expect("DEFAULT_MAX_DEDUP_CACHE_SIZE is non-zero"),
         );
 
-        Self {
+        let (seen_events, dedup_persistence) = if let Some(path) = replay_config.dedup_state_path {
+            let seen = PersistentDedupState::load_seen_events(
+                &path,
+                cache_size,
+                replay_config.dedup_retention,
+            )?;
+            (
+                Arc::new(RwLock::new(seen)),
+                Some(Arc::new(PersistentDedupState::new(path)?)),
+            )
+        } else {
+            (Arc::new(RwLock::new(LruCache::new(cache_size))), None)
+        };
+
+        Ok(Self {
             nip59_handler,
             token_decryptor,
             push_dispatcher,
-            seen_events: Arc::new(RwLock::new(LruCache::new(cache_size))),
+            seen_events,
+            dedup_persistence,
+            dedup_retention: replay_config.dedup_retention,
+            max_notification_age: replay_config.max_notification_age,
+            max_notification_future_skew: replay_config.max_notification_future_skew,
             // A single fixed `()` key, so capacity of 1 entry is sufficient.
             global_unwrap_limiter: RateLimiter::new(RateLimitConfig {
                 max_per_minute: rate_limit_config.global_unwrap_per_minute,
@@ -204,7 +450,7 @@ impl EventProcessor {
             }),
             max_tokens_per_event: rate_limit_config.max_tokens_per_event,
             metrics,
-        }
+        })
     }
 
     /// Process an incoming event.
@@ -345,6 +591,28 @@ impl EventProcessor {
         }
     }
 
+    fn validate_notification_freshness(&self, created_at: Timestamp) -> Result<()> {
+        if self.max_notification_age.is_zero() {
+            return Ok(());
+        }
+
+        let now = Timestamp::now().as_secs();
+        let created_at = created_at.as_secs();
+        if created_at > now.saturating_add(self.max_notification_future_skew.as_secs()) {
+            return Err(Error::InvalidToken(
+                "Notification request timestamp is too far in the future".to_string(),
+            ));
+        }
+
+        if now.saturating_sub(created_at) > self.max_notification_age.as_secs() {
+            return Err(Error::InvalidToken(
+                "Notification request timestamp is stale".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Inner processing logic for an event.
     async fn process_inner(&self, event: &Event) -> Result<usize> {
         // Unwrap the gift wrap to get the notification request
@@ -369,6 +637,8 @@ impl EventProcessor {
                 return Err(e);
             }
         };
+
+        self.validate_notification_freshness(notification.created_at)?;
 
         debug!("Unwrapped notification request");
 
@@ -567,7 +837,7 @@ impl EventProcessor {
         if seen.contains(&event_id) {
             return false;
         }
-        seen.put(event_id, Instant::now());
+        seen.put(event_id, SeenEvent::reservation(Instant::now()));
 
         // Update cache size metric
         if let Some(ref m) = self.metrics {
@@ -601,12 +871,28 @@ impl EventProcessor {
     /// measured from completion. Kept distinct from `try_reserve` for clarity
     /// at the call sites.
     async fn mark_seen(&self, event_id: EventId) {
-        let mut seen = self.seen_events.write().await;
-        seen.put(event_id, Instant::now());
+        let now = Instant::now();
+        {
+            let mut seen = self.seen_events.write().await;
+            seen.put(event_id, SeenEvent::terminal(now));
 
-        // Update cache size metric
-        if let Some(ref m) = self.metrics {
-            m.set_dedup_cache_size(seen.len());
+            // Update cache size metric
+            if let Some(ref m) = self.metrics {
+                m.set_dedup_cache_size(seen.len());
+            }
+        }
+
+        if let Some(ref state) = self.dedup_persistence {
+            let _guard = state.write_lock.lock().await;
+            if let Err(e) = state
+                .append_seen_locked(event_id, Timestamp::now().as_secs())
+                .await
+            {
+                warn!(
+                    error = %e,
+                    "Failed to persist event deduplication state"
+                );
+            }
         }
     }
 
@@ -616,15 +902,25 @@ impl EventProcessor {
     /// periods. Call periodically for full cleanup of all expired entries.
     pub async fn cleanup(&self) {
         // Clean event deduplication cache
-        let (evicted, remaining) = {
+        let persistence = self.dedup_persistence.clone();
+        let _persistence_guard = if let Some(ref state) = persistence {
+            Some(state.write_lock.lock().await)
+        } else {
+            None
+        };
+
+        let (evicted, remaining, retained_entries) = {
             let mut seen = self.seen_events.write().await;
             let now = Instant::now();
+            let now_wall = Timestamp::now().as_secs();
 
             let expired_keys: Vec<_> = seen
                 .iter()
                 .rev()
                 .take(CLEANUP_BATCH_SIZE)
-                .filter(|(_, seen_at)| now.duration_since(**seen_at) >= DEDUP_WINDOW)
+                .filter(|(_, seen_event)| {
+                    now.duration_since(seen_event.seen_at) >= self.dedup_retention
+                })
                 .map(|(id, _)| *id)
                 .collect();
 
@@ -632,8 +928,38 @@ impl EventProcessor {
                 seen.pop(key);
             }
 
-            (expired_keys.len(), seen.len())
+            let retained_entries = if persistence.is_some() {
+                seen.iter()
+                    .filter_map(|(event_id, seen_event)| {
+                        if seen_event.terminal {
+                            Some((
+                                *event_id,
+                                instant_to_unix_secs(seen_event.seen_at, now_wall, now),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            (expired_keys.len(), seen.len(), retained_entries)
         };
+
+        if evicted > 0 {
+            let rewrite_result = match persistence.as_ref() {
+                Some(state) => state.rewrite_locked(&retained_entries).await,
+                None => Ok(()),
+            };
+            if let Err(e) = rewrite_result {
+                warn!(
+                    error = %e,
+                    "Failed to compact event deduplication state"
+                );
+            }
+        }
 
         if let Some(ref m) = self.metrics {
             m.set_dedup_cache_size(remaining);
@@ -732,6 +1058,27 @@ mod tests {
         let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
         EventProcessor::with_cache_size(nip59_handler, token_decryptor, push_dispatcher, cache_size)
+    }
+
+    fn create_processor_with_replay_config(
+        server_keys: &Keys,
+        replay_config: ReplayProtectionConfig,
+    ) -> EventProcessor {
+        let nip59_handler = Nip59Handler::new(server_keys.clone());
+        let mut secp_secret_key =
+            secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        EventProcessor::with_replay_config(
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+            TokenRateLimitConfig::default(),
+            replay_config,
+            None,
+        )
+        .expect("replay-protected processor")
     }
 
     fn create_processor_with_metrics(server_keys: &Keys) -> (EventProcessor, Metrics) {
@@ -979,6 +1326,234 @@ mod tests {
                 &[("outcome", EventOutcome::Duplicate.as_str())],
             ),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_rejects_stale_notification_rumor() {
+        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_apns_token("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678")
+            .build();
+        let stale_created_at = Timestamp::from_secs(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(DEFAULT_MAX_NOTIFICATION_AGE_SECS + 1),
+        );
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build_with_created_at(&content, stale_created_at)
+            .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+        let result = processor.process(&event).await;
+
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "stale notification must not dispatch");
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            0.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(processor.cache_len(), 1, "stale replays are terminal");
+    }
+
+    #[tokio::test]
+    async fn test_process_rejects_future_notification_rumor() {
+        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_apns_token("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678")
+            .build();
+        let future_created_at = Timestamp::from_secs(
+            Timestamp::now()
+                .as_secs()
+                .saturating_add(DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS + 1),
+        );
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build_with_created_at(&content, future_created_at)
+            .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+        let result = processor.process(&event).await;
+
+        assert!(result.is_ok());
+        assert!(
+            !result.unwrap(),
+            "future-dated notification must not dispatch"
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            0.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            processor.cache_len(),
+            1,
+            "future-dated replays are terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_state_persists_processed_event_across_processors() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let event = scenarios::single_apns_notification(
+            &server_keys,
+            &sender_keys,
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("dedup-state.tsv");
+
+        let processor = create_processor_with_replay_config(
+            &server_keys,
+            ReplayProtectionConfig {
+                dedup_state_path: Some(state_path.clone()),
+                ..ReplayProtectionConfig::default()
+            },
+        );
+        assert!(processor.process(&event).await.unwrap());
+
+        let state = std::fs::read_to_string(&state_path).expect("dedup state written");
+        assert!(
+            state.contains(&event.id.to_hex()),
+            "state file must record processed event IDs"
+        );
+
+        let restarted = create_processor_with_replay_config(
+            &server_keys,
+            ReplayProtectionConfig {
+                dedup_state_path: Some(state_path),
+                ..ReplayProtectionConfig::default()
+            },
+        );
+
+        assert!(
+            !restarted.process(&event).await.unwrap(),
+            "a restarted processor must not re-dispatch an event already in durable dedup state"
+        );
+        assert!(restarted.is_duplicate(&event.id).await);
+    }
+
+    #[test]
+    fn test_dedup_state_loader_ignores_malformed_and_expired_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("nested").join("dedup-state.tsv");
+        let now = Timestamp::now().as_secs();
+        let retained_id = EventId::from_byte_array([1u8; 32]);
+        let expired_id = EventId::from_byte_array([2u8; 32]);
+        let state = format!(
+            "malformed\nnot-an-event-id {}\n{} not-a-timestamp\n{} {}\n{} {} extra\n{} {}\n",
+            now,
+            retained_id.to_hex(),
+            expired_id.to_hex(),
+            now.saturating_sub(61),
+            EventId::from_byte_array([3u8; 32]).to_hex(),
+            now,
+            retained_id.to_hex(),
+            now
+        );
+        std::fs::create_dir_all(state_path.parent().expect("state parent")).expect("mkdir");
+        std::fs::write(&state_path, state).expect("write state");
+
+        let seen = PersistentDedupState::load_seen_events(
+            &state_path,
+            NonZeroUsize::new(10).expect("non-zero cache"),
+            Duration::from_secs(60),
+        )
+        .expect("load state");
+
+        assert!(seen.contains(&retained_id));
+        assert!(!seen.contains(&expired_id));
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dedup_state_cleanup_compacts_terminal_entries_only() {
+        let server_keys = Keys::generate();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("dedup-state.tsv");
+        let processor = create_processor_with_replay_config(
+            &server_keys,
+            ReplayProtectionConfig {
+                dedup_state_path: Some(state_path.clone()),
+                dedup_retention: Duration::from_secs(1),
+                ..ReplayProtectionConfig::default()
+            },
+        );
+        let expired_id = EventId::from_byte_array([4u8; 32]);
+        let retained_id = EventId::from_byte_array([5u8; 32]);
+        let reserved_id = EventId::from_byte_array([6u8; 32]);
+
+        {
+            let mut seen = processor.seen_events.write().await;
+            seen.put(
+                expired_id,
+                SeenEvent::terminal(Instant::now() - Duration::from_secs(2)),
+            );
+            seen.put(retained_id, SeenEvent::terminal(Instant::now()));
+            seen.put(reserved_id, SeenEvent::reservation(Instant::now()));
+        }
+
+        processor.cleanup().await;
+
+        let state = std::fs::read_to_string(&state_path).expect("compacted state");
+        assert!(state.contains(&retained_id.to_hex()));
+        assert!(!state.contains(&expired_id.to_hex()));
+        assert!(!state.contains(&reserved_id.to_hex()));
+        assert!(processor.is_duplicate(&retained_id).await);
+        assert!(!processor.is_duplicate(&expired_id).await);
+        assert!(processor.is_duplicate(&reserved_id).await);
+    }
+
+    #[tokio::test]
+    async fn test_notification_freshness_can_be_disabled() {
+        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_apns_token("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678")
+            .build();
+        let stale_created_at = Timestamp::from_secs(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(DEFAULT_MAX_NOTIFICATION_AGE_SECS + 1),
+        );
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build_with_created_at(&content, stale_created_at)
+            .await;
+        let processor = create_processor_with_replay_config(
+            &server_keys,
+            ReplayProtectionConfig {
+                max_notification_age: Duration::ZERO,
+                ..ReplayProtectionConfig::default()
+            },
+        );
+
+        assert!(processor.process(&event).await.unwrap());
+    }
+
+    #[test]
+    fn test_instant_to_unix_secs_saturates_future_seen_at() {
+        let now_instant = Instant::now();
+        let now_wall = 123_456;
+
+        assert_eq!(
+            instant_to_unix_secs(now_instant + Duration::from_secs(1), now_wall, now_instant),
+            now_wall
         );
     }
 
@@ -1591,7 +2166,7 @@ mod tests {
                 let mut bytes = [0u8; 32];
                 bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
                 let event_id = EventId::from_byte_array(bytes);
-                seen.put(event_id, old_time);
+                seen.put(event_id, SeenEvent::terminal(old_time));
             }
         }
 
@@ -1642,10 +2217,10 @@ mod tests {
         {
             let mut seen = processor.seen_events.write().await;
             for event_id in &stale_ids {
-                seen.put(*event_id, old_time);
+                seen.put(*event_id, SeenEvent::terminal(old_time));
             }
             for event_id in &recent_ids {
-                seen.put(*event_id, recent_time);
+                seen.put(*event_id, SeenEvent::terminal(recent_time));
             }
         }
 
@@ -1684,7 +2259,7 @@ mod tests {
                 let mut bytes = [0u8; 32];
                 bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
                 let event_id = EventId::from_byte_array(bytes);
-                seen.put(event_id, old_time);
+                seen.put(event_id, SeenEvent::terminal(old_time));
             }
 
             // Add some recent entries
@@ -1692,7 +2267,7 @@ mod tests {
                 let mut bytes = [0u8; 32];
                 bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
                 let event_id = EventId::from_byte_array(bytes);
-                seen.put(event_id, recent_time);
+                seen.put(event_id, SeenEvent::terminal(recent_time));
             }
         }
 

@@ -8,7 +8,7 @@ Transponder enables push notifications for Marmot-compatible messaging apps whil
 
 ### Privacy Properties
 
-- **Stateless**: No persistent storage of tokens or user data
+- **No stored tokens or user data**: Durable replay state stores only public gift-wrap event IDs and processing timestamps
 - **Cannot learn**: Message content, sender/recipient identities, or group membership
 - **Minimal metadata**: Only knows that a notification event occurred
 
@@ -62,6 +62,16 @@ shutdown_timeout_secs = 10
 
 # Event deduplication cache size (default: 100000)
 # max_dedup_cache_size = 100000
+
+# Optional durable replay state for processed gift-wrap event IDs.
+# Production deployments should set this to a writable path so restarts do not
+# re-dispatch the NIP-59 2-day subscription backlog.
+# Stores only public event IDs and timestamps; no tokens, keys, payloads,
+# identities, or relay URLs.
+# dedup_state_path = "/var/lib/transponder/dedup-events.log"
+# dedup_retention_secs = 173100
+# max_notification_age_secs = 3600
+# max_notification_future_skew_secs = 300
 
 # Rate limiting to prevent spam and replay attacks
 # max_rate_limit_cache_size = 100000           # Tracked keys per limiter, not total timestamps
@@ -256,12 +266,20 @@ docker run -d \
   -p 127.0.0.1:8080:8080 \
   -v /path/to/config.toml:/etc/transponder/config.toml:ro \
   -v /path/to/credentials:/credentials:ro \
+  -v /path/to/state:/var/lib/transponder:rw \
   -e TRANSPONDER_SERVER_PRIVATE_KEY="your-hex-key" \
+  -e TRANSPONDER_SERVER_DEDUP_STATE_PATH="/var/lib/transponder/dedup-events.log" \
   -e TRANSPONDER_HEALTH_BIND_ADDRESS="0.0.0.0:8080" \
   transponder
 ```
 
 Docker port publishing needs the service to listen on the container interface. The command above still binds the host side to `127.0.0.1`, keeping the endpoints local to the host by default.
+
+The container runs as UID/GID `65532`. If you bind-mount a host state directory, create it so that user can write the replay log:
+
+```bash
+sudo install -d -m 0700 -o 65532 -g 65532 /path/to/state
+```
 
 ### Docker Compose
 
@@ -282,7 +300,8 @@ Services and ports:
 - The production image now uses Docker Hardened Images for both build and runtime stages.
 - Base images are pinned by digest for reproducible deploys.
 - Docker health checks use `transponder healthcheck`, so the container does not need `wget` or `curl`.
-- The build context intentionally excludes local configs and credentials via `.dockerignore`.
+- The build context intentionally excludes local configs, credentials, and state via `.dockerignore`.
+- Mount `/var/lib/transponder` persistently in production so processed gift-wrap event IDs survive restarts and reconnects.
 - Tor relay support is disabled in the default build and must be enabled explicitly with `--features tor`.
 
 ## Production Deployment
@@ -302,6 +321,7 @@ cp config/production.toml.example config/production.toml
 cp deploy/production.env.example deploy/production.env
 mkdir -p credentials secrets
 chmod 700 credentials secrets
+sudo install -d -m 0700 -o 65532 -g 65532 state
 
 ./target/release/transponder generate-keys --output secrets/server_private_key
 
@@ -310,7 +330,7 @@ docker build -t transponder:local .
 docker compose -f compose.prod.yml --env-file deploy/production.env up -d
 ```
 
-The production bundle uses `TRANSPONDER_SERVER_PRIVATE_KEY_FILE` so the server private key can be mounted as a file instead of injected directly as an environment variable.
+The production bundle uses `TRANSPONDER_SERVER_PRIVATE_KEY_FILE` so the server private key can be mounted as a file instead of injected directly as an environment variable. It also mounts `./state` at `/var/lib/transponder` for durable replay suppression state.
 
 If you plan to configure onion relays, build the image with `--build-arg CARGO_FEATURES='--features tor'` first and point `TRANSPONDER_IMAGE` at that Tor-enabled image tag.
 

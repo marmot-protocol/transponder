@@ -18,9 +18,12 @@ services:
       - ./config/local.toml:/etc/transponder/config.toml:ro
       # Mount credentials directory
       - ./credentials:/credentials:ro
+      # Persist processed gift-wrap event IDs across restarts/reconnects.
+      - ./state:/var/lib/transponder:rw
     environment:
       # Override config values via environment variables
       # TRANSPONDER_SERVER_PRIVATE_KEY: "your-hex-private-key"
+      TRANSPONDER_SERVER_DEDUP_STATE_PATH: /var/lib/transponder/dedup-events.log
       # TRANSPONDER_APNS_ENABLED: "true"
       # TRANSPONDER_FCM_ENABLED: "true"
       # The host port is bound to 127.0.0.1 above; this keeps Docker port

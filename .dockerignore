@@ -4,6 +4,7 @@ target
 trees
 credentials
 secrets
+state
 deploy/*.env
 .env
 .env.*
