@@ -11,7 +11,8 @@ private_key = ""
 # Generate with: transponder generate-keys --output /run/secrets/transponder_private_key
 # private_key_file = "/run/secrets/transponder_private_key"
 
-# Graceful shutdown timeout in seconds
+# Graceful shutdown timeout in seconds. Must be >= 1; a value of 0 makes the
+# drain time out immediately and abandon in-flight push notifications.
 # Increase this for environments with slow networks or high in-flight notification counts
 shutdown_timeout_secs = 10
 
@@ -86,11 +87,13 @@ allow_unencrypted_clearnet_relays = false
 # Requires a binary built with: cargo build --features tor
 onion = []
 
-# Reconnection settings
+# Reconnection settings. reconnect_interval_secs must be between 1 and 300 seconds.
 reconnect_interval_secs = 5
 max_reconnect_attempts = 10
 
 # Timeout in seconds to wait for at least one relay to connect during startup.
+# Must be between 1 and 300 seconds: 0 times out immediately and never
+# connects, and an unbounded value would hang startup when relays are down.
 # Increase this for environments with slow networks or when using Tor relays.
 # Default: 30
 connection_timeout_secs = 30

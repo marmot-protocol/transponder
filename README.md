@@ -57,7 +57,7 @@ private_key = ""
 # Generate with: transponder generate-keys --output /path/to/server.key
 # private_key_file = "/run/secrets/transponder_private_key"
 
-# Graceful shutdown timeout in seconds
+# Graceful shutdown timeout in seconds (must be >= 1; 0 skips the drain)
 shutdown_timeout_secs = 10
 
 # Event deduplication cache size (default: 100000)
@@ -92,8 +92,12 @@ allow_unencrypted_clearnet_relays = false
 onion = []
 
 # Reconnection settings (reserved for future use)
+# reconnect_interval_secs must be between 1 and 300 seconds
 reconnect_interval_secs = 5
 max_reconnect_attempts = 10
+
+# Startup wait for the first relay to connect (must be between 1 and 300 seconds)
+# connection_timeout_secs = 30
 
 [apns]
 # Enable APNs for iOS push notifications
