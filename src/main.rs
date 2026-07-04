@@ -16,10 +16,10 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use nostr_sdk::prelude::*;
-use tokio::sync::Semaphore;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 use zeroize::Zeroizing;
 
 mod config;
@@ -31,6 +31,7 @@ mod push;
 mod rate_limiter;
 mod server;
 mod shutdown;
+mod telemetry;
 
 #[cfg(test)]
 mod test_metrics;
@@ -148,6 +149,23 @@ fn event_processing_permits(max_concurrent_event_processing: usize) -> usize {
     max_concurrent_event_processing.max(1)
 }
 
+async fn acquire_event_processing_permit_or_shutdown(
+    semaphore: Arc<Semaphore>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<OwnedSemaphorePermit> {
+    // Prefer shutdown over newly available capacity so teardown does not admit
+    // more event-processing work after a shutdown signal is visible.
+    tokio::select! {
+        biased;
+
+        _ = shutdown.changed() => {
+            debug!("Event processor shutting down before permit acquisition");
+            None
+        },
+        permit = semaphore.acquire_owned() => permit.ok(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -164,12 +182,41 @@ async fn main() -> Result<()> {
     }
 
     // Load configuration
-    let mut config = AppConfig::load(&args.config)
+    let config = AppConfig::load(&args.config)
         .with_context(|| format!("Failed to load config from {}", args.config))?;
+
+    // Initialize error reporting before logging so a GlitchTip client exists for
+    // the first captured event. The guard is held for the whole process and
+    // dropped last, flushing buffered events — including any fatal error captured
+    // below. It must stay in `main` rather than move into `run`, or it would drop
+    // before that error is recorded.
+    let _glitchtip_guard = telemetry::init(&config.glitchtip)?;
 
     // Initialize logging
     init_logging(&config.logging)?;
 
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        config_path = %args.config,
+        "Starting Transponder"
+    );
+
+    let result = run(config).await;
+    if let Err(error) = &result {
+        error!(error = %error, "Fatal error, shutting down");
+    }
+    result
+}
+
+/// Bring the server up and run until shutdown.
+///
+/// Split from `main` so a failure during startup or the run loop is logged at
+/// `ERROR` — and therefore reported to GlitchTip — instead of only surfacing on
+/// process exit. The GlitchTip guard stays in `main` so it outlives this call
+/// and flushes the captured event. Failures *before* this point (config load,
+/// `telemetry::init`, `init_logging`) occur before the subscriber and client
+/// exist, so they surface only on stderr, not in GlitchTip.
+async fn run(mut config: AppConfig) -> Result<()> {
     // Initialize metrics
     let metrics = if config.metrics.enabled {
         match Metrics::new() {
@@ -187,12 +234,6 @@ async fn main() -> Result<()> {
         info!("Metrics disabled");
         None
     };
-
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        config_path = %args.config,
-        "Starting Transponder"
-    );
 
     let server_private_key = resolve_server_private_key(&mut config.server)?;
 
@@ -351,8 +392,8 @@ async fn main() -> Result<()> {
     // caps total in-flight gift-wrap unwrap (ECDH) work so a flood cannot spawn
     // unbounded crypto tasks. An owned permit is acquired BEFORE spawning and
     // dropped when the spawned task finishes; when the budget is exhausted the
-    // loop awaits a free permit (applying back-pressure) but still consumes
-    // events promptly once a slot frees.
+    // loop awaits a free permit (applying back-pressure) while still remaining
+    // responsive to shutdown signals.
     let event_permits = event_processing_permits(config.server.max_concurrent_event_processing);
     let event_semaphore = Arc::new(Semaphore::new(event_permits));
     let event_processor_loop = event_processor.clone();
@@ -372,10 +413,14 @@ async fn main() -> Result<()> {
                             };
 
                             // Acquire a permit before spawning so total in-flight
-                            // unwrap work stays bounded. `acquire_owned` only errors
-                            // if the semaphore is closed, which never happens here.
-                            let Ok(permit) =
-                                Arc::clone(&event_semaphore).acquire_owned().await
+                            // unwrap work stays bounded. `None` means shutdown won
+                            // while waiting (or the semaphore closed, which never
+                            // happens here), so intentionally drop this event.
+                            let Some(permit) = acquire_event_processing_permit_or_shutdown(
+                                Arc::clone(&event_semaphore),
+                                &mut event_shutdown,
+                            )
+                            .await
                             else {
                                 break;
                             };
@@ -575,34 +620,47 @@ async fn run_healthcheck(url: &str) -> Result<()> {
     anyhow::bail!("Healthcheck failed with status {}", response.status())
 }
 
+fn configured_logging_filter(level: &str) -> Result<EnvFilter> {
+    EnvFilter::try_new(level).with_context(|| format!("invalid logging.level filter: {level}"))
+}
+
+fn logging_filter(config: &config::LoggingConfig) -> Result<EnvFilter> {
+    logging_filter_from_env(config, std::env::var(EnvFilter::DEFAULT_ENV))
+}
+
+fn logging_filter_from_env(
+    config: &config::LoggingConfig,
+    env_filter: std::result::Result<String, std::env::VarError>,
+) -> Result<EnvFilter> {
+    match env_filter {
+        Ok(env_filter) => EnvFilter::try_new(&env_filter)
+            .with_context(|| format!("invalid RUST_LOG filter: {env_filter}")),
+        Err(std::env::VarError::NotPresent) => configured_logging_filter(&config.level),
+        Err(error) => Err(error).context("invalid RUST_LOG environment variable"),
+    }
+}
+
 /// Initialize the tracing subscriber based on configuration.
 fn init_logging(config: &config::LoggingConfig) -> Result<()> {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
+    let filter = logging_filter(config)?;
 
-    match config.format.as_str() {
-        "json" => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer().json())
-                .init();
-        }
-        "pretty" => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer().pretty())
-                .init();
-        }
-        "off" => {
-            // No logging
-        }
-        _ => {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer())
-                .init();
-        }
-    }
+    // Build the console layer for the configured format (`None` disables console
+    // logging). The `EnvFilter` is attached per-layer to the fmt layer only, so it
+    // never gates the GlitchTip layer: error reporting stays independent of console
+    // verbosity — a tightened `RUST_LOG`, or `format = "off"`, does not silence it.
+    // The GlitchTip layer carries its own ERROR-level filter (see `telemetry`).
+    let console_layer: Option<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+        match config.format.as_str() {
+            "json" => Some(fmt::layer().json().with_filter(filter).boxed()),
+            "pretty" => Some(fmt::layer().pretty().with_filter(filter).boxed()),
+            "off" => None,
+            _ => Some(fmt::layer().with_filter(filter).boxed()),
+        };
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(telemetry::glitchtip_layer())
+        .init();
 
     Ok(())
 }
@@ -647,6 +705,45 @@ mod tests {
         assert!(Arc::clone(&semaphore).try_acquire_owned().is_ok());
     }
 
+    #[tokio::test]
+    async fn event_permit_wait_acquires_available_permit() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let permit =
+            acquire_event_processing_permit_or_shutdown(Arc::clone(&semaphore), &mut shutdown_rx)
+                .await
+                .expect("available permit should be acquired");
+
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn event_permit_wait_exits_when_shutdown_arrives() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let _held_permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let permit_wait =
+            acquire_event_processing_permit_or_shutdown(Arc::clone(&semaphore), &mut shutdown_rx);
+        tokio::pin!(permit_wait);
+
+        let pending_before_shutdown =
+            tokio::time::timeout(Duration::from_millis(10), &mut permit_wait).await;
+        assert!(pending_before_shutdown.is_err());
+
+        shutdown_tx.send(true).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut permit_wait)
+            .await
+            .expect("shutdown should interrupt a saturated permit wait");
+
+        assert!(result.is_none());
+        assert_eq!(semaphore.available_permits(), 0);
+    }
+
     #[test]
     fn notification_receive_lag_is_recoverable() {
         let action = classify_notification_receive_error(&RecvError::Lagged(3));
@@ -679,6 +776,63 @@ mod tests {
 
         assert_eq!(metrics.relay_notifications_lagged_total.get(), 0);
         assert_eq!(metrics.relay_notifications_dropped_total.get(), 0);
+    }
+
+    fn test_logging_config(level: &str) -> config::LoggingConfig {
+        config::LoggingConfig {
+            level: level.to_string(),
+            format: "json".to_string(),
+        }
+    }
+
+    #[test]
+    fn logging_filter_uses_configured_filter_without_env_filter() {
+        assert!(
+            logging_filter_from_env(
+                &test_logging_config("info"),
+                Err(std::env::VarError::NotPresent)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn logging_filter_rejects_invalid_configured_filter_without_panic() {
+        let config = test_logging_config("target=lvl");
+        let result = std::panic::catch_unwind(|| {
+            logging_filter_from_env(&config, Err(std::env::VarError::NotPresent))
+        });
+        let error = match result.expect("invalid logging.level should not panic") {
+            Ok(_) => panic!("invalid logging.level should return an error"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid logging.level filter: target=lvl")
+        );
+    }
+
+    #[test]
+    fn logging_filter_prefers_env_filter_over_invalid_configured_filter() {
+        assert!(
+            logging_filter_from_env(&test_logging_config("target=lvl"), Ok("warn".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn logging_filter_rejects_invalid_env_filter_without_using_config() {
+        let error =
+            logging_filter_from_env(&test_logging_config("info"), Ok("target=lvl".to_string()))
+                .expect_err("invalid RUST_LOG should return an error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid RUST_LOG filter: target=lvl")
+        );
     }
 
     #[tokio::test]

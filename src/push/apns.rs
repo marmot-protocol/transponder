@@ -9,7 +9,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::{ApnsConfig, ApnsPayloadMode};
@@ -151,6 +151,41 @@ struct ApnsErrorResponse {
     reason: String,
 }
 
+/// Classification of an APNs `400 Bad Request` `reason`.
+///
+/// APNs returns `400` both for a genuinely dead device token and for
+/// server-side misconfiguration (bad topic, bad priority, malformed payload,
+/// etc.). Collapsing every `400` into "token dead" would silently drop every
+/// notification on a single config mistake *and* unregister healthy device
+/// tokens, so the two cases must be distinguished. See issue #111.
+#[derive(Debug, PartialEq, Eq)]
+enum Apns400Classification {
+    /// The provider explicitly identified the device token as invalid for this
+    /// app; the token should be treated as dead (`Success(false)`).
+    TokenDead,
+    /// A configuration or request-construction error that is permanent for this
+    /// provider but unrelated to the device token; must surface as an error
+    /// rather than evicting the token.
+    Permanent,
+}
+
+/// Classify an APNs `400` `reason` as either a dead device token or a
+/// permanent provider/configuration error.
+///
+/// Only `BadDeviceToken`, `DeviceTokenNotForTopic`, and `Unregistered` indicate
+/// that the device token itself is invalid. Every other reason (and any
+/// unrecognised reason) is a permanent error so callers do not evict an
+/// otherwise-healthy token.
+#[must_use]
+fn classify_apns_400(reason: &str) -> Apns400Classification {
+    match reason {
+        "BadDeviceToken" | "DeviceTokenNotForTopic" | "Unregistered" => {
+            Apns400Classification::TokenDead
+        }
+        _ => Apns400Classification::Permanent,
+    }
+}
+
 /// Validate an APNs device token format.
 ///
 /// MIP-05 treats APNs tokens as variable-length opaque bytes. Transponder
@@ -285,7 +320,15 @@ impl ApnsClient {
     ///
     /// This method automatically retries transient failures (429, 5xx) with
     /// exponential backoff.
-    pub async fn send(&self, device_token: &str) -> Result<bool> {
+    ///
+    /// When `backoff_permit` is `Some`, the dispatcher concurrency permit is
+    /// released during backoff sleeps and re-acquired before each retry, so a
+    /// sleeping retry does not occupy an in-flight concurrency slot.
+    pub async fn send(
+        &self,
+        device_token: &str,
+        backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
+    ) -> Result<bool> {
         // Validate token format before sending
         if !is_valid_device_token(device_token) {
             trace!(
@@ -300,14 +343,18 @@ impl ApnsClient {
             &retry_config,
             "APNs",
             || self.send_once(device_token),
+            backoff_permit,
             self.metrics.as_ref(),
         )
         .await
     }
 
-    fn build_request(&self, url: &str, auth_token: &str) -> reqwest::RequestBuilder {
-        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
-
+    fn build_request(
+        &self,
+        url: &str,
+        auth_token: &str,
+        request_parts: &ApnsRequestParts,
+    ) -> reqwest::RequestBuilder {
         self.http_client
             .post(url)
             .header("apns-push-type", request_parts.push_type)
@@ -317,9 +364,21 @@ impl ApnsClient {
             .json(&request_parts.payload)
     }
 
-    async fn invalidate_cached_token(&self) {
+    /// Invalidate the cached token only if it still matches the one the failing
+    /// request used.
+    ///
+    /// Under concurrency another task may have already refreshed the cache with
+    /// a fresh token between the time this request read its token and the time
+    /// the authentication rejection came back. Evicting unconditionally would
+    /// discard that valid token and force redundant JWT regeneration, so the
+    /// eviction is gated on the cached entry still being the failing token.
+    async fn invalidate_cached_token(&self, failing_token: &str) {
         let mut cached = self.cached_token.write().await;
-        if cached.take().is_some() {
+        if cached
+            .as_ref()
+            .is_some_and(|token| token.token.as_str() == failing_token)
+        {
+            *cached = None;
             debug!("Invalidated cached APNs JWT after authentication rejection");
         }
     }
@@ -328,6 +387,7 @@ impl ApnsClient {
         &self,
         start: Instant,
         response: reqwest::Response,
+        auth_token: &str,
     ) -> SendAttemptResult {
         let status = response.status();
 
@@ -349,15 +409,33 @@ impl ApnsClient {
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
-                debug!(
-                    payload_mode = %self.config.payload_mode,
-                    reason = %error.reason,
-                    "APNs bad request"
-                );
-                SendAttemptResult::Success(false)
+                match classify_apns_400(&error.reason) {
+                    Apns400Classification::TokenDead => {
+                        debug!(
+                            payload_mode = %self.config.payload_mode,
+                            reason = %error.reason,
+                            "APNs bad device token"
+                        );
+                        SendAttemptResult::Success(false)
+                    }
+                    Apns400Classification::Permanent => {
+                        // Configuration/request error (e.g. BadTopic, MissingTopic,
+                        // BadPriority): surface as a permanent error instead of
+                        // silently dropping the notification and evicting the token.
+                        warn!(
+                            payload_mode = %self.config.payload_mode,
+                            reason = %error.reason,
+                            "APNs rejected request (configuration or request error)"
+                        );
+                        SendAttemptResult::Permanent(Error::Apns(format!(
+                            "Bad request: {}",
+                            error.reason
+                        )))
+                    }
+                }
             }
             403 => {
-                self.invalidate_cached_token().await;
+                self.invalidate_cached_token(auth_token).await;
                 let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse {
                     reason: "Unknown".to_string(),
                 });
@@ -422,14 +500,22 @@ impl ApnsClient {
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
     async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+        self.send_once_with_transport_retry_config(device_token, &RetryConfig::default())
+            .await
+    }
+
+    async fn send_once_with_transport_retry_config(
+        &self,
+        device_token: &str,
+        transport_retry: &RetryConfig,
+    ) -> SendAttemptResult {
         let start = Instant::now();
         let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
-        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
 
         debug!(
             payload_mode = %self.config.payload_mode,
-            push_type = request_parts.push_type,
-            priority = request_parts.priority,
+            push_type = self.config.payload_mode.push_type(),
+            priority = self.config.payload_mode.priority(),
             topic = %self.config.bundle_id,
             device_token = redacted_device_token_id(device_token),
             "Sending APNs notification"
@@ -441,12 +527,12 @@ impl ApnsClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        let transport_retry = RetryConfig::default();
+        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
         let response = match retry::with_transport_retry(
-            &transport_retry,
+            transport_retry,
             "APNs",
             || async {
-                self.build_request(&url, token.as_str())
+                self.build_request(&url, token.as_str(), &request_parts)
                     .send()
                     .await
                     .map_err(Error::from)
@@ -459,7 +545,7 @@ impl ApnsClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(start, response).await
+        self.handle_response(start, response, token.as_str()).await
     }
 
     /// Check if the client is properly configured.
@@ -508,7 +594,7 @@ mod tests {
             key_id: "KEYID123".to_string(),
             team_id: "TEAMID456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         }
@@ -549,11 +635,13 @@ mod tests {
         config.payload_mode = ApnsPayloadMode::Silent;
         config.bundle_id = "dev.ipf.whitenoise.staging".to_string();
         let client = ApnsClient::mock(config, false);
+        let request_parts = ApnsRequestParts::for_mode(client.config.payload_mode);
 
         let request = client
             .build_request(
                 "https://api.push.apple.com/3/device/aabbccdd11223344",
                 "test-token",
+                &request_parts,
             )
             .build()
             .unwrap();
@@ -580,11 +668,13 @@ mod tests {
         config.payload_mode = ApnsPayloadMode::NsePrototypeAlert;
         config.bundle_id = "dev.ipf.whitenoise.staging".to_string();
         let client = ApnsClient::mock(config, false);
+        let request_parts = ApnsRequestParts::for_mode(client.config.payload_mode);
 
         let request = client
             .build_request(
                 "https://api.push.apple.com/3/device/aabbccdd11223344",
                 "test-token",
+                &request_parts,
             )
             .build()
             .unwrap();
@@ -685,7 +775,7 @@ mod tests {
             key_id: "KEYID123".to_string(),
             team_id: "TEAMID456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -702,7 +792,7 @@ mod tests {
         };
 
         // Test with a token that contains non-hex characters
-        let result = client.send("tooshort").await.unwrap();
+        let result = client.send("tooshort", None).await.unwrap();
         assert!(
             !result,
             "Should return false for token with non-hex characters"
@@ -710,7 +800,10 @@ mod tests {
 
         // Test with token that has invalid characters
         let result = client
-            .send("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg")
+            .send(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -719,8 +812,47 @@ mod tests {
         );
 
         // Test with empty token
-        let result = client.send("").await.unwrap();
+        let result = client.send("", None).await.unwrap();
         assert!(!result, "Should return false for empty token");
+    }
+
+    #[tokio::test]
+    async fn test_send_once_returns_transport_error_after_connect_retries() {
+        let proxy_addr = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+        let http_client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+            .connect_timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let client = ApnsClient {
+            http_client,
+            config: test_config(),
+            encoding_key: None,
+            cached_token: Arc::new(RwLock::new(Some(CachedToken {
+                token: Zeroizing::new("cached-token".to_string()),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            }))),
+            metrics: None,
+        };
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(1),
+        };
+
+        let result = client
+            .send_once_with_transport_retry_config("aabbccdd11223344", &retry_config)
+            .await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Http(_))
+        ));
     }
 
     #[tokio::test]
@@ -730,7 +862,7 @@ mod tests {
             key_id: String::new(),
             team_id: String::new(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
         };
@@ -755,7 +887,7 @@ mod tests {
 
         let mut config = test_config();
         // Override the environment to use the mock server
-        config.environment = "sandbox".to_string();
+        config.environment = crate::config::ApnsEnvironment::Sandbox;
 
         let http_client = Client::builder()
             .timeout(Duration::from_secs(5))
@@ -770,7 +902,7 @@ mod tests {
                 key_id: "KEYID123".to_string(),
                 team_id: "TEAMID456".to_string(),
                 private_key_path: String::new(),
-                environment: "sandbox".to_string(),
+                environment: crate::config::ApnsEnvironment::Sandbox,
                 bundle_id: "com.example.app".to_string(),
                 payload_mode: Default::default(),
             },
@@ -835,6 +967,102 @@ mod tests {
         assert_eq!(response.status(), 400);
         let body: ApnsErrorResponse = response.json().await.unwrap();
         assert_eq!(body.reason, "BadDeviceToken");
+    }
+
+    #[test]
+    fn test_classify_apns_400_token_dead_reasons() {
+        // Only genuine device-token rejections should evict the token.
+        assert_eq!(
+            classify_apns_400("BadDeviceToken"),
+            Apns400Classification::TokenDead
+        );
+        assert_eq!(
+            classify_apns_400("DeviceTokenNotForTopic"),
+            Apns400Classification::TokenDead
+        );
+        assert_eq!(
+            classify_apns_400("Unregistered"),
+            Apns400Classification::TokenDead
+        );
+    }
+
+    #[test]
+    fn test_classify_apns_400_configuration_reasons_are_permanent() {
+        // Configuration / request-construction errors must NOT evict the token.
+        for reason in [
+            "BadTopic",
+            "MissingTopic",
+            "TopicDisallowed",
+            "BadPriority",
+            "BadExpirationDate",
+            "PayloadEmpty",
+            "BadMessageId",
+            "Unknown",
+            "SomeFutureReason",
+        ] {
+            assert_eq!(
+                classify_apns_400(reason),
+                Apns400Classification::Permanent,
+                "reason {reason} should be classified as a permanent error"
+            );
+        }
+    }
+
+    async fn apns_400_result(reason: &str) -> SendAttemptResult {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "reason": reason
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .handle_response(Instant::now(), response, "test-token")
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_bad_device_token_is_token_dead() {
+        // BadDeviceToken must continue to signal token death (Ok(false)).
+        let result = apns_400_result("BadDeviceToken").await;
+        assert!(matches!(result, SendAttemptResult::Success(false)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_device_token_not_for_topic_is_token_dead() {
+        let result = apns_400_result("DeviceTokenNotForTopic").await;
+        assert!(matches!(result, SendAttemptResult::Success(false)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_bad_topic_is_permanent_error() {
+        // Server-side misconfiguration must be a permanent error, not token death.
+        let result = apns_400_result("BadTopic").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Apns(ref message))
+                if message.contains("BadTopic")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_400_missing_topic_is_permanent_error() {
+        let result = apns_400_result("MissingTopic").await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Apns(ref message))
+                if message.contains("MissingTopic")
+        ));
     }
 
     #[tokio::test]
@@ -963,7 +1191,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client.handle_response(Instant::now(), response).await;
+        let result = client
+            .handle_response(Instant::now(), response, "poisoned-jwt")
+            .await;
 
         assert!(matches!(
             result,
@@ -973,6 +1203,56 @@ mod tests {
         assert!(client.cached_token.read().await.is_none());
     }
 
+    #[tokio::test]
+    async fn test_auth_error_keeps_token_refreshed_by_concurrent_task() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "reason": "InvalidProviderToken"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+
+        // Simulate a concurrent task having already refreshed the cache to a
+        // newer token after the failing request read its (now stale) token.
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("fresh-jwt".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        // The failing request used the older, now-replaced token.
+        let result = client
+            .handle_response(Instant::now(), response, "stale-jwt")
+            .await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Apns(ref message))
+                if message.contains("InvalidProviderToken")
+        ));
+
+        // The freshly refreshed token must survive the stale rejection.
+        let cached = client.cached_token.read().await;
+        assert_eq!(
+            cached.as_ref().map(|token| token.token.as_str()),
+            Some("fresh-jwt")
+        );
+    }
+
     #[test]
     fn test_is_configured_with_all_fields() {
         let config = ApnsConfig {
@@ -980,7 +1260,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -996,7 +1276,7 @@ mod tests {
             key_id: String::new(), // Missing
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1012,7 +1292,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: String::new(), // Missing
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1028,7 +1308,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: String::new(), // Missing
             payload_mode: Default::default(),
         };
@@ -1044,7 +1324,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1092,7 +1372,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1111,7 +1391,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1139,7 +1419,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1168,7 +1448,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1196,7 +1476,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(), // Empty path
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1212,7 +1492,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: "/nonexistent/key.p8".to_string(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1253,7 +1533,7 @@ mod tests {
             key_id: "KEYID123".to_string(),
             team_id: "TEAMID456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1301,7 +1581,7 @@ mod tests {
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: String::new(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1336,7 +1616,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: file.path().to_string_lossy().to_string(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1367,7 +1647,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: file.path().to_string_lossy().to_string(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1459,7 +1739,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             key_id: "KEY123".to_string(),
             team_id: "TEAM456".to_string(),
             private_key_path: file.path().to_string_lossy().to_string(),
-            environment: "production".to_string(),
+            environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
@@ -1510,7 +1790,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             key_id: "KEYID123".to_string(),
             team_id: "TEAMID456".to_string(),
             private_key_path: String::new(),
-            environment: "sandbox".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };

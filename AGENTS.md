@@ -133,6 +133,7 @@ src/
 ## Security Considerations
 
 - **Never log device tokens or private keys** - these are sensitive
+- **`ERROR` logs and panics are forwarded to GlitchTip.** Transponder-target `error!` events, plus any panic, are sent to the error reporter (see `src/telemetry.rs`; panics go through Sentry's global hook and are *not* target-scoped, so they can originate anywhere). Never interpolate a device token, encrypted blob, private key, recipient identity, or a raw `reqwest::Error` (whose APNs URL contains the device token) into an `error!`, `panic!`, `expect`, or `unwrap` message - fail or log with a redacted id or status instead. The same rule already governs `warn!`/`debug!`, but for anything reportable it is a hard privacy boundary, not just hygiene.
 - **No persistent storage** - the spec requires stateless operation for privacy
 - **Silently ignore invalid/expired tokens** (per MIP-05 spec)
 - Use `tracing` at debug level for push results, never include user-identifying info
@@ -154,6 +155,8 @@ src/
 | `tracing` | Structured logging |
 | `config` | Configuration loading with env overrides |
 | `prometheus` | Prometheus metrics collection |
+| `sentry` | GlitchTip/Sentry error and panic reporting |
+| `rustls` | Installs the `ring` crypto provider for sentry's `rustls-no-provider` transport (keeps the build off `aws-lc-rs`) |
 
 ## Configuration
 
