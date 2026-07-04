@@ -286,13 +286,16 @@ impl FcmClient {
             .map_err(|e| Error::Fcm(format!("System time error: {e}")))?
             .as_secs();
 
-        let exp = now + 3600; // 1 hour
+        // Backdate `iat` by the clock-skew leeway so a fast host clock does not
+        // produce an assertion Google sees as issued in the future; `exp` stays
+        // within Google's 1-hour max measured from the backdated `iat`.
+        let (iat, exp) = crate::push::auth_jwt_iat_exp(now, 3600);
 
         let claims = OAuthClaims {
             iss: sa.client_email.clone(),
             scope: FCM_SCOPE.to_string(),
             aud: sa.token_uri.clone(),
-            iat: now,
+            iat,
             exp,
         };
 
@@ -1303,7 +1306,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Instant::now(), response, "test-access-token")
+            .handle_response(Duration::ZERO, response, "test-access-token")
             .await
     }
 
