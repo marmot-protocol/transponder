@@ -7,10 +7,16 @@
 //! Relay lists must use comma-separated strings such as
 //! `TRANSPONDER_RELAYS_CLEARNET="a,b,c"`; bracketed syntax like `"[a, b, c]"`
 //! is rejected.
+//!
+//! Prefixed variables that are malformed or map to an unknown config key are
+//! ignored rather than treated as errors, so ambient service-discovery
+//! variables injected by Kubernetes and Docker (e.g. `TRANSPONDER_SERVICE_HOST`,
+//! `TRANSPONDER_PORT_8080_TCP`) do not abort startup.
 
 use config::{Config, ConfigBuilder, File, builder::DefaultState};
 use serde::{Deserialize, Deserializer};
 use std::{env, ffi::OsString, path::Path};
+use tracing::debug;
 use zeroize::Zeroizing;
 
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
@@ -603,6 +609,16 @@ where
 }
 
 // Preserve underscores in field names by splitting only once after the section.
+//
+// Prefixed variables that are malformed (no second underscore, empty section or
+// field) or map to an unsupported config key are ambient rather than genuine
+// overrides: Kubernetes and Docker auto-inject service-discovery variables such
+// as `TRANSPONDER_SERVICE_HOST`, `TRANSPONDER_PORT`, and
+// `TRANSPONDER_PORT_8080_TCP` that share the service-name prefix. Skipping them
+// (returning `Ok(None)`) keeps those deployments from aborting startup, while a
+// typo in a real override key just falls back to its default instead of failing
+// loudly. The variable name is logged at debug for troubleshooting; the value is
+// never logged because an override value can be a secret (e.g. the private key).
 fn env_var_to_config_key(
     key: OsString,
 ) -> std::result::Result<Option<(String, String)>, config::ConfigError> {
@@ -615,14 +631,12 @@ fn env_var_to_config_key(
         return Ok(None);
     };
     let Some((section, field)) = remainder.split_once('_') else {
-        return Err(config::ConfigError::Message(format!(
-            "env variable {key} must follow {ENV_PREFIX}<SECTION>_<KEY>"
-        )));
+        debug!("ignoring ambient prefixed env variable {key}: no {ENV_PREFIX}<SECTION>_<KEY> form");
+        return Ok(None);
     };
     if section.is_empty() || field.is_empty() {
-        return Err(config::ConfigError::Message(format!(
-            "env variable {key} must follow {ENV_PREFIX}<SECTION>_<KEY>"
-        )));
+        debug!("ignoring ambient prefixed env variable {key}: empty section or field");
+        return Ok(None);
     }
 
     let config_key = format!(
@@ -632,9 +646,10 @@ fn env_var_to_config_key(
     );
 
     if !is_supported_config_key(&config_key) {
-        return Err(config::ConfigError::Message(format!(
-            "env variable {key} maps to unsupported config key `{config_key}`"
-        )));
+        debug!(
+            "ignoring ambient prefixed env variable {key}: unsupported config key `{config_key}`"
+        );
+        return Ok(None);
     }
 
     Ok(Some((key, config_key)))
@@ -1207,15 +1222,43 @@ mod tests {
     }
 
     #[test]
-    fn test_from_env_rejects_malformed_prefixed_variable() {
-        let error = from_test_env(&[("TRANSPONDER_SERVER", "value")]).unwrap_err();
-        assert!(error.to_string().contains("must follow"));
+    fn test_from_env_ignores_malformed_prefixed_variable() {
+        // A prefixed variable with no second underscore is ambient (e.g. Docker's
+        // `TRANSPONDER_PORT`), not a genuine override, so it is skipped rather
+        // than aborting startup.
+        let config = from_test_env(&[("TRANSPONDER_SERVER", "value")]).unwrap();
+        assert_eq!(config.server.private_key.as_str(), "");
     }
 
     #[test]
-    fn test_from_env_rejects_unknown_prefixed_variable() {
-        let error = from_test_env(&[("TRANSPONDER_SERVER_PRVATE_KEY", "value")]).unwrap_err();
-        assert!(error.to_string().contains("unsupported config key"));
+    fn test_from_env_ignores_unknown_prefixed_variable() {
+        // A typo like `PRVATE` maps to an unsupported config key; it is skipped
+        // (falling back to defaults) instead of failing to load.
+        let config = from_test_env(&[("TRANSPONDER_SERVER_PRVATE_KEY", "value")]).unwrap();
+        assert_eq!(config.server.private_key.as_str(), "");
+    }
+
+    #[test]
+    fn test_from_env_ignores_ambient_service_discovery_variables() {
+        // Kubernetes and Docker auto-inject service-discovery variables that
+        // share the `TRANSPONDER_` prefix. They must be ignored, while a genuine
+        // override in the same env set still applies.
+        let config = from_test_env(&[
+            ("TRANSPONDER_SERVICE_HOST", "10.0.0.1"),
+            ("TRANSPONDER_SERVICE_PORT", "8080"),
+            ("TRANSPONDER_PORT", "tcp://10.0.0.1:8080"),
+            ("TRANSPONDER_PORT_8080_TCP", "tcp://10.0.0.1:8080"),
+            ("TRANSPONDER_PORT_8080_TCP_PROTO", "tcp"),
+            ("TRANSPONDER_PORT_8080_TCP_ADDR", "10.0.0.1"),
+            ("TRANSPONDER_SERVER_PRVATE_KEY", "typo-should-be-ignored"),
+            ("TRANSPONDER_SERVER_PRIVATE_KEY", "real-private-key"),
+        ])
+        .unwrap();
+
+        // The genuine override still applies.
+        assert_eq!(config.server.private_key.as_str(), "real-private-key");
+        // Ambient variables did not bleed into unrelated config.
+        assert_eq!(config.health.bind_address, "127.0.0.1:8080");
     }
 
     #[test]
