@@ -500,7 +500,7 @@ impl ApnsClient {
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
     async fn send_once(&self, device_token: &str) -> SendAttemptResult {
-        self.send_once_with_transport_retry_config(device_token, &RetryConfig::default())
+        self.send_once_with_transport_retry_config(device_token, &RetryConfig::transport())
             .await
     }
 
