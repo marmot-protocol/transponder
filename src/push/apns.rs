@@ -15,7 +15,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::config::{ApnsConfig, ApnsPayloadMode};
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
-use crate::push::retry::{self, RetryConfig, SendAttemptResult};
+use crate::push::retry::{self, PushSendOutcome, RetryConfig, SendAttemptResult};
 
 /// APNs JWT token lifetime (50 minutes, less than the 1 hour max).
 const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
@@ -161,7 +161,7 @@ struct ApnsErrorResponse {
 #[derive(Debug, PartialEq, Eq)]
 enum Apns400Classification {
     /// The provider explicitly identified the device token as invalid for this
-    /// app; the token should be treated as dead (`Success(false)`).
+    /// app; the token should be treated as dead.
     TokenDead,
     /// A configuration or request-construction error that is permanent for this
     /// provider but unrelated to the device token; must surface as an error
@@ -320,11 +320,12 @@ impl ApnsClient {
 
     /// Send a silent push notification to a device.
     ///
-    /// Returns `Ok(true)` if successful, `Ok(false)` if the token is invalid/expired,
+    /// Returns [`PushSendOutcome::Sent`] if APNs accepted the notification,
+    /// [`PushSendOutcome::InvalidToken`] if the token is invalid/expired,
     /// or `Err` for other failures.
     ///
-    /// This method automatically retries transient failures (429, 5xx) with
-    /// exponential backoff.
+    /// This method automatically retries transient failures (408, 429, 5xx)
+    /// with exponential backoff.
     ///
     /// When `backoff_permit` is `Some`, the dispatcher concurrency permit is
     /// released during backoff sleeps and re-acquired before each retry, so a
@@ -333,14 +334,14 @@ impl ApnsClient {
         &self,
         device_token: &str,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
-    ) -> Result<bool> {
+    ) -> Result<PushSendOutcome> {
         // Validate token format before sending
         if !is_valid_device_token(device_token) {
             trace!(
                 token_len = device_token.len(),
                 "Invalid APNs device token format"
             );
-            return Ok(false);
+            return Ok(PushSendOutcome::InvalidToken);
         }
 
         let retry_config = RetryConfig::default();
@@ -458,6 +459,19 @@ impl ApnsClient {
                     error.reason
                 )))
             }
+            408 => {
+                // Request timeout - retriable. Honor Retry-After if present.
+                let retry_after = retry::retry_after_from_headers(response.headers());
+                debug!(
+                    payload_mode = %self.config.payload_mode,
+                    status = %status,
+                    "APNs request timeout (retriable)"
+                );
+                SendAttemptResult::Retriable {
+                    status_code: 408,
+                    retry_after,
+                }
+            }
             410 => {
                 // Token is no longer valid (device unregistered)
                 debug!(
@@ -493,12 +507,14 @@ impl ApnsClient {
                 }
             }
             _ => {
-                debug!(
+                warn!(
                     payload_mode = %self.config.payload_mode,
                     status = %status,
                     "APNs unexpected response"
                 );
-                SendAttemptResult::Success(false)
+                SendAttemptResult::Permanent(Error::Apns(format!(
+                    "Unexpected APNs response status: {status}"
+                )))
             }
         }
     }
@@ -807,9 +823,10 @@ mod tests {
 
         // Test with a token that contains non-hex characters
         let result = client.send("tooshort", None).await.unwrap();
-        assert!(
-            !result,
-            "Should return false for token with non-hex characters"
+        assert_eq!(
+            result,
+            PushSendOutcome::InvalidToken,
+            "Should return invalid-token outcome for token with non-hex characters"
         );
 
         // Test with token that has invalid characters
@@ -820,14 +837,19 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            !result,
-            "Should return false for token with invalid characters"
+        assert_eq!(
+            result,
+            PushSendOutcome::InvalidToken,
+            "Should return invalid-token outcome for token with invalid characters"
         );
 
         // Test with empty token
         let result = client.send("", None).await.unwrap();
-        assert!(!result, "Should return false for empty token");
+        assert_eq!(
+            result,
+            PushSendOutcome::InvalidToken,
+            "Should return invalid-token outcome for empty token"
+        );
     }
 
     #[tokio::test]
@@ -1099,7 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_response_400_bad_device_token_is_token_dead() {
-        // BadDeviceToken must continue to signal token death (Ok(false)).
+        // BadDeviceToken must continue to signal token death.
         let result = apns_400_result("BadDeviceToken").await;
         assert!(matches!(result, SendAttemptResult::Success(false)));
     }
@@ -1195,6 +1217,29 @@ mod tests {
                 status_code: 429,
                 retry_after: Some(delay),
             } if delay == Duration::from_secs(30)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_408_is_retriable() {
+        let result = apns_status_result(408, None).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Retriable {
+                status_code: 408,
+                retry_after: None,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_unexpected_status_is_permanent_error() {
+        let result = apns_status_result(404, None).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Apns(ref message))
+                if message.contains("Unexpected APNs response status")
+                    && message.contains("404")
         ));
     }
 

@@ -28,6 +28,7 @@ use zeroize::Zeroizing;
 use crate::crypto::{Platform, TokenPayload};
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
+use crate::push::retry::PushSendOutcome;
 use crate::push::{ApnsClient, FcmClient};
 
 /// Maximum concurrent outbound push requests.
@@ -232,6 +233,40 @@ impl PushDispatcher {
         Ok(permit)
     }
 
+    fn record_send_outcome(
+        service_name: &str,
+        platform_str: &str,
+        outcome: PushSendOutcome,
+        metrics: &Option<Metrics>,
+    ) {
+        match outcome {
+            PushSendOutcome::Sent => {
+                trace!(service = service_name, "push notification sent");
+                if let Some(m) = metrics {
+                    m.record_push_success(platform_str);
+                }
+            }
+            PushSendOutcome::InvalidToken => {
+                trace!(
+                    service = service_name,
+                    "push notification failed (invalid token)"
+                );
+                if let Some(m) = metrics {
+                    m.record_push_failed(platform_str, "invalid_token");
+                }
+            }
+            PushSendOutcome::RetriesExhausted => {
+                trace!(
+                    service = service_name,
+                    "push notification failed (retries exhausted)"
+                );
+                if let Some(m) = metrics {
+                    m.record_push_failed(platform_str, "retries_exhausted");
+                }
+            }
+        }
+    }
+
     async fn send_push(
         platform: Platform,
         token: Zeroizing<String>,
@@ -249,17 +284,8 @@ impl PushDispatcher {
             Platform::Apns => {
                 if let Some(client) = apns_client {
                     match client.send(token.as_str(), backoff_permit).await {
-                        Ok(true) => {
-                            trace!("APNs notification sent");
-                            if let Some(ref m) = metrics {
-                                m.record_push_success(platform_str);
-                            }
-                        }
-                        Ok(false) => {
-                            trace!("APNs notification failed (invalid token)");
-                            if let Some(ref m) = metrics {
-                                m.record_push_failed(platform_str, "invalid_token");
-                            }
+                        Ok(outcome) => {
+                            Self::record_send_outcome("APNs", platform_str, outcome, &metrics);
                         }
                         Err(e) => {
                             debug!(error = %e, "APNs send error");
@@ -273,17 +299,8 @@ impl PushDispatcher {
             Platform::Fcm => {
                 if let Some(client) = fcm_client {
                     match client.send(token.as_str(), backoff_permit).await {
-                        Ok(true) => {
-                            trace!("FCM notification sent");
-                            if let Some(ref m) = metrics {
-                                m.record_push_success(platform_str);
-                            }
-                        }
-                        Ok(false) => {
-                            trace!("FCM notification failed (invalid token)");
-                            if let Some(ref m) = metrics {
-                                m.record_push_failed(platform_str, "invalid_token");
-                            }
+                        Ok(outcome) => {
+                            Self::record_send_outcome("FCM", platform_str, outcome, &metrics);
                         }
                         Err(e) => {
                             debug!(error = %e, "FCM send error");
@@ -621,6 +638,18 @@ mod tests {
         (0..count).map(|_| apns_test_payload()).collect()
     }
 
+    fn push_failed_metric_value(
+        metrics: &crate::metrics::Metrics,
+        platform: &str,
+        reason: &str,
+    ) -> u64 {
+        metric_counter_value(
+            metrics,
+            "transponder_push_failed_total",
+            &[("platform", platform), ("reason", reason)],
+        ) as u64
+    }
+
     #[tokio::test]
     async fn send_push_records_invalid_token_metrics() {
         use crate::config::{ApnsConfig, FcmConfig};
@@ -663,20 +692,40 @@ mod tests {
         .await;
 
         assert_eq!(
-            metric_counter_value(
-                &metrics,
-                "transponder_push_failed_total",
-                &[("platform", "apns"), ("reason", "invalid_token")]
-            ),
-            1.0
+            push_failed_metric_value(&metrics, "apns", "invalid_token"),
+            1
         );
         assert_eq!(
-            metric_counter_value(
-                &metrics,
-                "transponder_push_failed_total",
-                &[("platform", "fcm"), ("reason", "invalid_token")]
-            ),
-            1.0
+            push_failed_metric_value(&metrics, "fcm", "invalid_token"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_send_outcome_metrics_distinguish_invalid_token_and_retries_exhausted() {
+        let metrics = crate::metrics::Metrics::default();
+        let metrics_opt = Some(metrics.clone());
+
+        PushDispatcher::record_send_outcome(
+            "APNs",
+            "apns",
+            PushSendOutcome::InvalidToken,
+            &metrics_opt,
+        );
+        PushDispatcher::record_send_outcome(
+            "APNs",
+            "apns",
+            PushSendOutcome::RetriesExhausted,
+            &metrics_opt,
+        );
+
+        assert_eq!(
+            push_failed_metric_value(&metrics, "apns", "invalid_token"),
+            1
+        );
+        assert_eq!(
+            push_failed_metric_value(&metrics, "apns", "retries_exhausted"),
+            1
         );
     }
 
@@ -1553,7 +1602,7 @@ mod tests {
                 None,
             )
             .await;
-            assert!(matches!(result, Ok(true)));
+            assert!(matches!(result, Ok(PushSendOutcome::Sent)));
         });
 
         // Let the task reach its backoff sleep (first attempt + release of permit).
