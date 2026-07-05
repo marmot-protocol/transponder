@@ -74,6 +74,12 @@ pub const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum backoff duration cap.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
+/// Minimum server-requested backoff duration.
+const MIN_RETRY_BACKOFF: Duration = DEFAULT_INITIAL_BACKOFF;
+
+/// Maximum randomized jitter applied to a retry sleep.
+const MAX_RETRY_JITTER: Duration = Duration::from_secs(1);
+
 /// Configuration for retry behavior.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -163,9 +169,14 @@ where
                     metrics.record_push_retry(service_name.to_lowercase().as_str());
                 }
 
-                // Honor Retry-After exactly when the provider supplies one. Only cap
-                // locally-computed exponential backoff to avoid runaway delays.
-                let wait_duration = retry_wait_duration(retry_after, backoff);
+                // Honor provider-supplied Retry-After values, but floor zero
+                // or tiny values and jitter every sleep so concurrent failures
+                // do not retry in synchronized waves. Only cap locally-computed
+                // exponential backoff to avoid runaway delays.
+                let wait_duration = retry_sleep_duration(
+                    retry_wait_duration(retry_after, backoff),
+                    retry_after.is_some(),
+                );
 
                 warn!(
                     service = service_name,
@@ -191,8 +202,9 @@ where
                     sleep(wait_duration).await;
                 }
 
-                // Exponential backoff for next iteration (if not using Retry-After)
-                backoff = next_fallback_backoff(backoff, retry_after);
+                // Advance the fallback backoff every time so repeated tiny
+                // Retry-After values degrade gracefully once the header stops.
+                backoff = next_fallback_backoff(backoff);
             }
             SendAttemptResult::Retriable { status_code, .. } => {
                 warn!(
@@ -208,19 +220,51 @@ where
     }
 }
 
-fn next_fallback_backoff(backoff: Duration, retry_after: Option<Duration>) -> Duration {
-    if retry_after.is_some() {
-        backoff
-    } else {
-        (backoff * 2).min(MAX_BACKOFF)
-    }
+fn next_fallback_backoff(backoff: Duration) -> Duration {
+    (backoff * 2).min(MAX_BACKOFF)
 }
 
 fn retry_wait_duration(retry_after: Option<Duration>, backoff: Duration) -> Duration {
+    let fallback = backoff.min(MAX_BACKOFF);
     match retry_after {
-        Some(server_delay) => server_delay,
-        None => backoff.min(MAX_BACKOFF),
+        Some(Duration::ZERO) => MIN_RETRY_BACKOFF.max(fallback),
+        Some(server_delay) => server_delay.max(MIN_RETRY_BACKOFF),
+        None => fallback,
     }
+}
+
+fn retry_sleep_duration(base: Duration, retry_after_supplied: bool) -> Duration {
+    let jitter = random_retry_jitter(base);
+    if retry_after_supplied {
+        delay_retry_jitter(base, jitter)
+    } else {
+        apply_retry_jitter(base, jitter)
+    }
+}
+
+fn random_retry_jitter(base: Duration) -> Duration {
+    let max_jitter_micros = max_retry_jitter(base).as_micros() as u64;
+    if max_jitter_micros == 0 {
+        return Duration::ZERO;
+    }
+
+    Duration::from_micros(rand::random_range(0..=max_jitter_micros))
+}
+
+fn max_retry_jitter(base: Duration) -> Duration {
+    let max_jitter_micros = (base.as_micros() / 2)
+        .min(MAX_RETRY_JITTER.as_micros())
+        .min(u128::from(u64::MAX)) as u64;
+
+    Duration::from_micros(max_jitter_micros)
+}
+
+fn apply_retry_jitter(base: Duration, jitter: Duration) -> Duration {
+    base.saturating_sub(jitter.min(max_retry_jitter(base)))
+}
+
+fn delay_retry_jitter(base: Duration, jitter: Duration) -> Duration {
+    base.saturating_add(jitter.min(max_retry_jitter(base)))
 }
 
 /// Decide whether a transport (`reqwest`) error is safe to retry.
@@ -474,6 +518,73 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_wait_duration_floors_zero_retry_after() {
+        assert_eq!(
+            retry_wait_duration(Some(Duration::ZERO), Duration::from_millis(1)),
+            MIN_RETRY_BACKOFF
+        );
+    }
+
+    #[test]
+    fn test_retry_wait_duration_uses_fallback_backoff_when_retry_after_is_zero() {
+        assert_eq!(
+            retry_wait_duration(Some(Duration::ZERO), Duration::from_millis(400)),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            retry_wait_duration(Some(Duration::ZERO), Duration::from_secs(60)),
+            MAX_BACKOFF
+        );
+    }
+
+    #[test]
+    fn test_retry_wait_duration_floors_tiny_nonzero_retry_after_without_fallback() {
+        assert_eq!(
+            retry_wait_duration(Some(Duration::from_millis(1)), Duration::from_secs(60)),
+            MIN_RETRY_BACKOFF
+        );
+    }
+
+    #[test]
+    fn test_retry_jitter_bounds_delay_between_half_and_full() {
+        let base = Duration::from_millis(100);
+
+        assert_eq!(apply_retry_jitter(base, Duration::ZERO), base);
+        assert_eq!(
+            apply_retry_jitter(base, Duration::from_millis(25)),
+            Duration::from_millis(75)
+        );
+        assert_eq!(
+            apply_retry_jitter(base, Duration::from_millis(500)),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn test_retry_after_jitter_never_retries_before_server_delay() {
+        let base = Duration::from_millis(100);
+
+        assert_eq!(delay_retry_jitter(base, Duration::ZERO), base);
+        assert_eq!(
+            delay_retry_jitter(base, Duration::from_millis(25)),
+            Duration::from_millis(125)
+        );
+        assert_eq!(
+            delay_retry_jitter(base, Duration::from_millis(500)),
+            Duration::from_millis(150)
+        );
+    }
+
+    #[test]
+    fn test_retry_jitter_is_capped() {
+        assert_eq!(
+            max_retry_jitter(Duration::from_millis(100)),
+            Duration::from_millis(50)
+        );
+        assert_eq!(max_retry_jitter(Duration::from_secs(10)), MAX_RETRY_JITTER);
+    }
+
+    #[test]
     fn test_retry_wait_duration_caps_exponential_backoff() {
         assert_eq!(
             retry_wait_duration(None, Duration::from_secs(60)),
@@ -642,65 +753,29 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_after_does_not_advance_fallback_backoff() {
+    fn test_retry_after_still_advances_fallback_backoff() {
         let initial_backoff = Duration::from_millis(200);
 
-        let backoff_after_retry_after_retries = (0..3).fold(initial_backoff, |backoff, _| {
-            next_fallback_backoff(backoff, Some(Duration::from_millis(1)))
-        });
+        let backoff_after_retry_after_retries =
+            (0..3).fold(initial_backoff, |backoff, _| next_fallback_backoff(backoff));
 
-        assert_eq!(backoff_after_retry_after_retries, initial_backoff);
         assert_eq!(
-            next_fallback_backoff(backoff_after_retry_after_retries, None),
-            Duration::from_millis(400)
+            backoff_after_retry_after_retries,
+            Duration::from_millis(1600)
+        );
+        assert_eq!(
+            next_fallback_backoff(backoff_after_retry_after_retries),
+            Duration::from_millis(3200)
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_with_retry_does_not_advance_backoff_while_retry_after_is_used() {
-        let config = RetryConfig {
-            max_retries: 4,
-            initial_backoff: Duration::from_millis(200),
-        };
-        let attempt_count = Arc::new(AtomicU32::new(0));
-        let attempt_count_clone = attempt_count.clone();
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(250),
-            with_retry(
-                &config,
-                "test",
-                || {
-                    let count = attempt_count_clone.clone();
-                    async move {
-                        let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
-                        if attempts <= 3 {
-                            SendAttemptResult::Retriable {
-                                status_code: 429,
-                                retry_after: Some(Duration::from_millis(1)),
-                            }
-                        } else if attempts == 4 {
-                            SendAttemptResult::Retriable {
-                                status_code: 503,
-                                retry_after: None,
-                            }
-                        } else {
-                            SendAttemptResult::Success(true)
-                        }
-                    }
-                },
-                None,
-                None,
-            ),
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "fallback backoff was advanced by Retry-After retries"
+    #[test]
+    fn test_next_fallback_backoff_caps_at_max_backoff() {
+        assert_eq!(next_fallback_backoff(MAX_BACKOFF), MAX_BACKOFF);
+        assert_eq!(
+            next_fallback_backoff(MAX_BACKOFF + Duration::from_secs(1)),
+            MAX_BACKOFF
         );
-        assert!(result.unwrap().unwrap());
-        assert_eq!(attempt_count.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
