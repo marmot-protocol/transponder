@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
@@ -632,16 +632,18 @@ impl EventProcessor {
 
         // Process the event
         match self.process_inner(event).await {
-            Ok(count) => {
+            Ok(_) => {
                 // Refresh the seen timestamp now that processing succeeded, so
                 // the dedup window is measured from completion. The reservation
                 // taken above already keeps the event marked seen.
                 self.mark_seen(event.id).await;
 
-                info!(
-                    notifications_admitted = count,
-                    "Processed notification event"
-                );
+                // Logged at trace, not info: emitting a per-event success line
+                // at the default level persists delivery-timing metadata in
+                // logs (and downstream log shipping). The recipient fan-out
+                // count is intentionally omitted — it is already captured in
+                // Prometheus via `observe_notifications_admitted_per_event`.
+                trace!("Processed notification event");
 
                 if let Some(ref m) = self.metrics {
                     m.record_event_processed();
