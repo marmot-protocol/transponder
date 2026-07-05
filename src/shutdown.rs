@@ -316,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_signal_or_trigger_returns_on_internal_trigger() {
         use std::future::Future;
-        use std::task::{Context, Poll, Waker};
+        use std::task::{Context, Waker};
 
         let handler = ShutdownHandler::new();
         let trigger = handler.trigger_handle();
@@ -330,7 +330,7 @@ mod tests {
         // and with neither fired the future is deterministically `Pending`.
         let mut cx = Context::from_waker(Waker::noop());
         assert!(
-            matches!(wait.as_mut().poll(&mut cx), Poll::Pending),
+            wait.as_mut().poll(&mut cx).is_pending(),
             "wait must be pending before any signal or trigger"
         );
 
