@@ -86,6 +86,12 @@ impl RateLimitCheck {
     pub fn admission_evicted(self) -> bool {
         self.admission_evicted
     }
+
+    /// Returns the reservation for an allowed request.
+    #[must_use]
+    pub fn reservation(self) -> Option<RateLimitReservation> {
+        self.result.reservation()
+    }
 }
 
 impl PartialEq<RateLimitResult> for RateLimitCheck {
@@ -728,12 +734,12 @@ mod tests {
 
         for key in 1..=3 {
             let check = limiter.check_and_increment(&key).await;
-            assert_eq!(check, RateLimitResult::Allowed);
+            assert!(check.is_allowed());
             assert!(!check.admission_evicted());
         }
 
         let check = limiter.check_and_increment(&4u64).await;
-        assert_eq!(check, RateLimitResult::Allowed);
+        assert!(check.is_allowed());
         assert!(check.admission_evicted());
     }
 
@@ -746,10 +752,7 @@ mod tests {
         });
 
         for key in 1..=3 {
-            assert_eq!(
-                limiter.check_and_increment(&key).await,
-                RateLimitResult::Allowed
-            );
+            assert!(limiter.check_and_increment(&key).await.is_allowed());
         }
 
         let check = limiter.check_and_increment(&4u64).await;

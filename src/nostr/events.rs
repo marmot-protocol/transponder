@@ -3164,9 +3164,11 @@ mod tests {
             assert!(processor.process(&event).await.unwrap());
         }
 
+        // The sole token is shed by the capacity limit, so the event is a
+        // retryable rate-limit shed (returns false, not marked seen).
         let event =
             scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
-        assert!(processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
 
         assert_eq!(
             counter_value(
