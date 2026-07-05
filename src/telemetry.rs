@@ -3,8 +3,10 @@
 //! Reporting is opt-in: it activates only when a DSN is configured. Transponder's
 //! own `ERROR` events are forwarded — first-party only, see [`glitchtip_layer`] —
 //! together with panics, which Sentry's global hook captures from anywhere in the
-//! process (not just first-party code). Message content is kept clean by the
-//! "never log secrets" invariant in AGENTS.md, not by mechanical scrubbing.
+//! process (not just first-party code). First-party message content is kept clean
+//! by the "never log secrets" invariant in AGENTS.md; because the panic hook is
+//! not target-scoped, every outgoing event additionally passes through the
+//! mechanical redaction backstop in [`scrub_event`] (see [`crate::redaction`]).
 
 use std::sync::Arc;
 
@@ -17,6 +19,7 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::GlitchtipConfig;
+use crate::redaction;
 
 /// Initialize GlitchTip reporting from configuration.
 ///
@@ -147,14 +150,39 @@ fn is_first_party_target(target: &str) -> bool {
 ///
 /// This runs for both tracing-captured errors and panic events, so it is the one
 /// choke point that sees everything leaving the process. It drops the hostname
-/// (which can reveal deployment topology). It does NOT redact message or panic
-/// bodies: the guarantee that no secret material leaves rests on the invariant
-/// that transponder never puts secrets in `error!`/`panic!`/`expect`/`unwrap`
-/// messages (see AGENTS.md) — the same discipline that governs all logging.
+/// (which can reveal deployment topology) and mechanically redacts secret-shaped
+/// substrings (see [`crate::redaction`]) from the fields panics populate: the
+/// message, the log-entry message and string params, and each exception value.
+///
+/// The redaction is a backstop, not the primary guarantee: first-party sites
+/// still must never put secrets in `error!`/`panic!`/`expect`/`unwrap` messages
+/// (see AGENTS.md). The backstop exists for the one path that discipline cannot
+/// reach — panics raised inside dependencies, which the global panic hook
+/// forwards without target scoping.
 fn scrub_event(
     mut event: sentry::protocol::Event<'static>,
 ) -> Option<sentry::protocol::Event<'static>> {
     event.server_name = None;
+
+    if let Some(message) = event.message.as_mut() {
+        redaction::redact_in_place(message);
+    }
+
+    if let Some(logentry) = event.logentry.as_mut() {
+        redaction::redact_in_place(&mut logentry.message);
+        for param in &mut logentry.params {
+            if let sentry::protocol::Value::String(text) = param {
+                redaction::redact_in_place(text);
+            }
+        }
+    }
+
+    for exception in &mut event.exception.values {
+        if let Some(value) = exception.value.as_mut() {
+            redaction::redact_in_place(value);
+        }
+    }
+
     Some(event)
 }
 
@@ -256,5 +284,92 @@ mod tests {
         let scrubbed = scrub_event(event).expect("the scrubber keeps the event");
 
         assert!(scrubbed.server_name.is_none());
+    }
+
+    #[test]
+    fn scrub_event_redacts_a_device_token_url_in_the_message() {
+        // The shape of a dependency panic that embeds an APNs request URL.
+        let event = sentry::protocol::Event {
+            message: Some(
+                "request to https://api.push.apple.com/3/device/0a1b2c3d4e5f60718293a4b5c6d7e8f9 \
+                 failed"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+
+        let scrubbed = scrub_event(event).expect("the scrubber keeps the event");
+
+        let message = scrubbed.message.expect("the message is kept");
+        assert!(!message.contains("0a1b2c3d4e5f60718293a4b5c6d7e8f9"));
+        assert!(message.contains("/3/device/[REDACTED]"));
+    }
+
+    #[test]
+    fn scrub_event_redacts_exception_values_and_log_entries() {
+        let hex_token = "ab".repeat(32); // 64 hex chars
+        let event = sentry::protocol::Event {
+            logentry: Some(sentry::protocol::LogEntry {
+                message: format!("relay wss://relay.example.com/ws dropped; token {hex_token}"),
+                params: vec![
+                    sentry::protocol::Value::String("key nsec1qs0v6yz2mwqzzz9".into()),
+                    sentry::protocol::Value::from(42),
+                ],
+            }),
+            exception: sentry::protocol::Values {
+                values: vec![sentry::protocol::Exception {
+                    ty: "panic".into(),
+                    value: Some(format!("connect to abcdefgh23456789.onion: {hex_token}")),
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        };
+
+        let scrubbed = scrub_event(event).expect("the scrubber keeps the event");
+
+        let logentry = scrubbed.logentry.expect("the log entry is kept");
+        assert!(!logentry.message.contains("relay.example.com"));
+        assert!(!logentry.message.contains(&hex_token));
+        assert!(logentry.message.contains("wss://[REDACTED]"));
+        assert_eq!(
+            logentry.params[0],
+            sentry::protocol::Value::String("key [REDACTED-NSEC]".into())
+        );
+        // Non-string params pass through untouched.
+        assert_eq!(logentry.params[1], sentry::protocol::Value::from(42));
+
+        let exception = &scrubbed.exception.values[0];
+        let value = exception.value.as_deref().expect("the value is kept");
+        assert!(!value.contains("abcdefgh23456789"));
+        assert!(!value.contains(&hex_token));
+        assert!(value.contains("[REDACTED].onion"));
+        assert!(value.contains("[REDACTED-HEX]"));
+    }
+
+    #[test]
+    fn scrub_event_leaves_clean_messages_untouched() {
+        let event = sentry::protocol::Event {
+            message: Some("push dispatch failed with status 503".into()),
+            exception: sentry::protocol::Values {
+                values: vec![sentry::protocol::Exception {
+                    ty: "panic".into(),
+                    value: Some("index out of bounds: the len is 3".into()),
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        };
+
+        let scrubbed = scrub_event(event).expect("the scrubber keeps the event");
+
+        assert_eq!(
+            scrubbed.message.as_deref(),
+            Some("push dispatch failed with status 503")
+        );
+        assert_eq!(
+            scrubbed.exception.values[0].value.as_deref(),
+            Some("index out of bounds: the len is 3")
+        );
     }
 }

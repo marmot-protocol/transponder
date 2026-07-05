@@ -17,7 +17,7 @@
 //! request serialization.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
@@ -62,6 +62,81 @@ const MAX_LIVE_SEND_TASKS: usize = MAX_CONCURRENT_PUSHES * LIVE_TASK_MULTIPLIER;
 /// This bounds the memory used by waiting tasks. When this limit is reached,
 /// new notification batches are rejected to protect against DoS attacks.
 const MAX_PENDING_QUEUE_SIZE: usize = 10_000;
+
+/// Number of consecutive hard delivery failures after which a provider is
+/// reported as not delivering (see [`DeliveryHealth`]).
+///
+/// "Hard" failures are outcomes indicating the provider itself is refusing or
+/// failing requests: permanent send errors (which include authentication
+/// rejections such as a revoked APNs signing key or an expired FCM service
+/// account) and exhausted retry budgets. Invalid device tokens do NOT count —
+/// a definitive invalid-token verdict proves the provider authenticated and
+/// processed the request. The threshold trades detection speed against
+/// flapping: five hard failures in a row with no intervening success is a
+/// sustained outage signal, not an isolated transient blip.
+pub const DELIVERY_FAILURE_STREAK_THRESHOLD: u32 = 5;
+
+/// Passive per-provider delivery-health signal derived from real send
+/// outcomes.
+///
+/// Tracks, for each push provider, the current streak of *consecutive* hard
+/// send failures. The streak grows on permanent errors and exhausted retries,
+/// and resets to zero whenever the provider demonstrably processes a request
+/// (successful send or a definitive invalid-token verdict). The readiness
+/// endpoint uses [`DeliveryHealth::is_delivering`] to gate `/ready` on live
+/// delivery capability instead of static configuration alone.
+///
+/// The signal is passive: it observes outcomes of real traffic and never
+/// probes the providers. If push traffic stops entirely, the last observed
+/// state is retained until the next send.
+#[derive(Debug, Default)]
+pub struct DeliveryHealth {
+    apns_hard_failure_streak: AtomicU32,
+    fcm_hard_failure_streak: AtomicU32,
+}
+
+impl DeliveryHealth {
+    fn streak(&self, platform: Platform) -> &AtomicU32 {
+        match platform {
+            Platform::Apns => &self.apns_hard_failure_streak,
+            Platform::Fcm => &self.fcm_hard_failure_streak,
+        }
+    }
+
+    /// Record that the provider processed a request (successful send, or a
+    /// definitive invalid-token verdict), ending any hard-failure streak.
+    pub(crate) fn record_processed(&self, platform: Platform) {
+        self.streak(platform).store(0, Ordering::SeqCst);
+    }
+
+    /// Record a hard send failure (permanent error or exhausted retries).
+    ///
+    /// Saturates instead of wrapping so an arbitrarily long outage can never
+    /// roll the streak back over to "delivering".
+    pub(crate) fn record_hard_failure(&self, platform: Platform) {
+        let _ = self
+            .streak(platform)
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |streak| {
+                Some(streak.saturating_add(1))
+            });
+    }
+
+    /// Whether the provider is currently considered to be delivering: its
+    /// consecutive hard-failure streak is below
+    /// [`DELIVERY_FAILURE_STREAK_THRESHOLD`].
+    #[must_use]
+    pub fn is_delivering(&self, platform: Platform) -> bool {
+        self.streak(platform).load(Ordering::SeqCst) < DELIVERY_FAILURE_STREAK_THRESHOLD
+    }
+}
+
+/// Metrics/logging label for a push platform.
+fn platform_label(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Apns => "apns",
+        Platform::Fcm => "fcm",
+    }
+}
 
 /// Internal message for the push queue.
 ///
@@ -165,6 +240,8 @@ struct DispatchWorkerContext {
     /// Live-task limit (held for a task's whole life; see [`MAX_LIVE_SEND_TASKS`]).
     live_task_semaphore: Arc<Semaphore>,
     inflight: Arc<InFlightTracker>,
+    /// Passive per-provider delivery-health signal (see [`DeliveryHealth`]).
+    delivery_health: Arc<DeliveryHealth>,
     metrics: Option<Metrics>,
 }
 
@@ -187,6 +264,7 @@ pub struct PushDispatcher {
     admission_lock: tokio::sync::Mutex<()>,
     dispatcher_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     inflight: Arc<InFlightTracker>,
+    delivery_health: Arc<DeliveryHealth>,
     metrics: Option<Metrics>,
 }
 
@@ -215,6 +293,7 @@ impl PushDispatcher {
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let inflight = Arc::new(InFlightTracker::new());
+        let delivery_health = Arc::new(DeliveryHealth::default());
 
         // Initialize push capacity metrics
         if let Some(ref m) = metrics {
@@ -231,6 +310,7 @@ impl PushDispatcher {
             semaphore: semaphore.clone(),
             live_task_semaphore: live_task_semaphore.clone(),
             inflight: inflight.clone(),
+            delivery_health: delivery_health.clone(),
             metrics: metrics.clone(),
         };
         let dispatcher_handle =
@@ -247,6 +327,7 @@ impl PushDispatcher {
             admission_lock: tokio::sync::Mutex::new(()),
             dispatcher_handle: tokio::sync::Mutex::new(Some(dispatcher_handle)),
             inflight,
+            delivery_health,
             metrics,
         }
     }
@@ -284,18 +365,25 @@ impl PushDispatcher {
 
     fn record_send_outcome(
         service_name: &str,
-        platform_str: &str,
+        platform: Platform,
         outcome: PushSendOutcome,
         metrics: &Option<Metrics>,
+        delivery_health: &DeliveryHealth,
     ) {
+        let platform_str = platform_label(platform);
         match outcome {
             PushSendOutcome::Sent => {
+                delivery_health.record_processed(platform);
                 trace!(service = service_name, "push notification sent");
                 if let Some(m) = metrics {
                     m.record_push_success(platform_str);
                 }
             }
             PushSendOutcome::InvalidToken => {
+                // A definitive invalid-token verdict proves the provider
+                // authenticated and processed the request, so it ends any
+                // hard-failure streak.
+                delivery_health.record_processed(platform);
                 trace!(
                     service = service_name,
                     "push notification failed (invalid token)"
@@ -305,6 +393,7 @@ impl PushDispatcher {
                 }
             }
             PushSendOutcome::RetriesExhausted => {
+                delivery_health.record_hard_failure(platform);
                 trace!(
                     service = service_name,
                     "push notification failed (retries exhausted)"
@@ -322,21 +411,29 @@ impl PushDispatcher {
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
         metrics: Option<Metrics>,
+        delivery_health: &DeliveryHealth,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) {
-        let platform_str = match platform {
-            Platform::Apns => "apns",
-            Platform::Fcm => "fcm",
-        };
+        let platform_str = platform_label(platform);
 
         match platform {
             Platform::Apns => {
                 if let Some(client) = apns_client {
                     match client.send(token, backoff_permit).await {
                         Ok(outcome) => {
-                            Self::record_send_outcome("APNs", platform_str, outcome, &metrics);
+                            Self::record_send_outcome(
+                                "APNs",
+                                platform,
+                                outcome,
+                                &metrics,
+                                delivery_health,
+                            );
                         }
                         Err(e) => {
+                            // Permanent send errors include provider auth
+                            // rejections (revoked key, expired credentials),
+                            // so they count toward the hard-failure streak.
+                            delivery_health.record_hard_failure(platform);
                             // Redact any embedded URL before logging: the APNs
                             // URL carries the device token (#172). The send
                             // path already strips it, but redact again here so
@@ -353,9 +450,19 @@ impl PushDispatcher {
                 if let Some(client) = fcm_client {
                     match client.send(token, backoff_permit).await {
                         Ok(outcome) => {
-                            Self::record_send_outcome("FCM", platform_str, outcome, &metrics);
+                            Self::record_send_outcome(
+                                "FCM",
+                                platform,
+                                outcome,
+                                &metrics,
+                                delivery_health,
+                            );
                         }
                         Err(e) => {
+                            // Permanent send errors include provider auth
+                            // rejections (revoked key, expired credentials),
+                            // so they count toward the hard-failure streak.
+                            delivery_health.record_hard_failure(platform);
                             // Uniform with APNs: strip any embedded URL before
                             // logging (#172). FCM's URL carries no token, but
                             // keeping the redaction uniform is defense-in-depth.
@@ -427,6 +534,7 @@ impl PushDispatcher {
                         let fcm_client = ctx.fcm_client.clone();
                         let task_metrics = metrics.clone();
                         let semaphore = ctx.semaphore.clone();
+                        let delivery_health = ctx.delivery_health.clone();
 
                         // Register the send task as in-flight BEFORE spawning
                         // so graceful shutdown can never observe a window where
@@ -457,6 +565,7 @@ impl PushDispatcher {
                                 apns_client,
                                 fcm_client,
                                 task_metrics.clone(),
+                                &delivery_health,
                                 Some(&mut backoff_permit),
                             )
                             .await;
@@ -576,10 +685,7 @@ impl PushDispatcher {
         Self::update_queue_size_metric(&self.metrics, &self.queue_depth);
 
         for message in messages {
-            let platform_str = match message.platform {
-                Platform::Apns => "apns",
-                Platform::Fcm => "fcm",
-            };
+            let platform_str = platform_label(message.platform);
 
             let permit = permits
                 .next()
@@ -619,6 +725,33 @@ impl PushDispatcher {
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.has_apns() || self.has_fcm()
+    }
+
+    /// Passive per-provider delivery-health signal (see [`DeliveryHealth`]).
+    ///
+    /// Test-only: production readers go through [`Self::is_apns_delivering`]
+    /// and [`Self::is_fcm_delivering`]; tests use this to simulate observed
+    /// send outcomes.
+    #[cfg(test)]
+    #[must_use]
+    pub fn delivery_health(&self) -> &DeliveryHealth {
+        &self.delivery_health
+    }
+
+    /// Whether APNs is currently delivering: it is not in a sustained streak
+    /// of consecutive hard send failures (auth rejections, permanent errors,
+    /// exhausted retries). Always `true` until failures are observed.
+    #[must_use]
+    pub fn is_apns_delivering(&self) -> bool {
+        self.delivery_health.is_delivering(Platform::Apns)
+    }
+
+    /// Whether FCM is currently delivering: it is not in a sustained streak
+    /// of consecutive hard send failures (auth rejections, permanent errors,
+    /// exhausted retries). Always `true` until failures are observed.
+    #[must_use]
+    pub fn is_fcm_delivering(&self) -> bool {
+        self.delivery_health.is_delivering(Platform::Fcm)
     }
 
     /// Wait for all in-flight push notifications to complete.
@@ -765,12 +898,15 @@ mod tests {
         };
         let metrics = Metrics::default();
 
+        let delivery_health = DeliveryHealth::default();
+
         PushDispatcher::send_push(
             Platform::Fcm,
             Zeroizing::new("".to_string()),
             None,
             Some(Arc::new(FcmClient::mock(fcm_config, true))),
             Some(metrics.clone()),
+            &delivery_health,
             None,
         )
         .await;
@@ -785,20 +921,29 @@ mod tests {
     fn test_send_outcome_metrics_distinguish_invalid_token_and_retries_exhausted() {
         let metrics = crate::metrics::Metrics::default();
         let metrics_opt = Some(metrics.clone());
+        let delivery_health = DeliveryHealth::default();
 
         PushDispatcher::record_send_outcome(
             "APNs",
-            "apns",
+            Platform::Apns,
             PushSendOutcome::InvalidToken,
             &metrics_opt,
+            &delivery_health,
         );
         PushDispatcher::record_send_outcome(
             "APNs",
-            "apns",
+            Platform::Apns,
             PushSendOutcome::RetriesExhausted,
             &metrics_opt,
+            &delivery_health,
         );
-        PushDispatcher::record_send_outcome("FCM", "fcm", PushSendOutcome::Sent, &metrics_opt);
+        PushDispatcher::record_send_outcome(
+            "FCM",
+            Platform::Fcm,
+            PushSendOutcome::Sent,
+            &metrics_opt,
+            &delivery_health,
+        );
 
         assert_eq!(
             push_failed_metric_value(&metrics, "apns", "invalid_token"),
@@ -809,6 +954,101 @@ mod tests {
             1
         );
         assert_eq!(push_success_metric_value(&metrics, "fcm"), 1);
+    }
+
+    #[test]
+    fn delivery_health_defaults_to_delivering() {
+        let health = DeliveryHealth::default();
+
+        assert!(health.is_delivering(Platform::Apns));
+        assert!(health.is_delivering(Platform::Fcm));
+    }
+
+    #[test]
+    fn delivery_health_flags_provider_after_sustained_hard_failure_streak() {
+        let health = DeliveryHealth::default();
+
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD - 1 {
+            health.record_hard_failure(Platform::Apns);
+        }
+        assert!(
+            health.is_delivering(Platform::Apns),
+            "a streak below the threshold must not flag the provider"
+        );
+
+        health.record_hard_failure(Platform::Apns);
+        assert!(
+            !health.is_delivering(Platform::Apns),
+            "reaching the threshold must flag the provider as not delivering"
+        );
+        assert!(
+            health.is_delivering(Platform::Fcm),
+            "platforms must be tracked independently"
+        );
+    }
+
+    #[test]
+    fn delivery_health_processed_request_ends_streak() {
+        let health = DeliveryHealth::default();
+
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+            health.record_hard_failure(Platform::Fcm);
+        }
+        assert!(!health.is_delivering(Platform::Fcm));
+
+        health.record_processed(Platform::Fcm);
+        assert!(
+            health.is_delivering(Platform::Fcm),
+            "any processed request must reset the consecutive-failure streak"
+        );
+    }
+
+    #[test]
+    fn record_send_outcome_updates_delivery_health() {
+        let metrics_opt = None;
+        let delivery_health = DeliveryHealth::default();
+
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+            PushDispatcher::record_send_outcome(
+                "APNs",
+                Platform::Apns,
+                PushSendOutcome::RetriesExhausted,
+                &metrics_opt,
+                &delivery_health,
+            );
+        }
+        assert!(
+            !delivery_health.is_delivering(Platform::Apns),
+            "consecutive exhausted-retry outcomes must flag the provider"
+        );
+
+        // An invalid-token verdict proves the provider processed the request,
+        // so it ends the streak just like a successful send.
+        PushDispatcher::record_send_outcome(
+            "APNs",
+            Platform::Apns,
+            PushSendOutcome::InvalidToken,
+            &metrics_opt,
+            &delivery_health,
+        );
+        assert!(delivery_health.is_delivering(Platform::Apns));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_reports_delivering_by_default() {
+        let dispatcher = PushDispatcher::new(None, None);
+
+        assert!(dispatcher.is_apns_delivering());
+        assert!(dispatcher.is_fcm_delivering());
+
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+            dispatcher
+                .delivery_health()
+                .record_hard_failure(Platform::Apns);
+        }
+
+        assert!(!dispatcher.is_apns_delivering());
+        assert!(dispatcher.is_fcm_delivering());
     }
 
     #[tokio::test]
