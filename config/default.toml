@@ -108,6 +108,7 @@ allow_unencrypted_clearnet_relays = false
 onion = []
 
 # Reconnection settings. reconnect_interval_secs must be between 1 and 300 seconds.
+# max_reconnect_attempts caps retries after the initial failed attempt; 0 disables retries.
 reconnect_interval_secs = 5
 max_reconnect_attempts = 10
 

@@ -103,8 +103,9 @@ allow_unencrypted_clearnet_relays = false
 # Requires a build with `--features tor` and a host that can support Tor traffic
 onion = []
 
-# Reconnection settings (reserved for future use)
-# reconnect_interval_secs must be between 1 and 300 seconds
+# Reconnection settings
+# reconnect_interval_secs is the base retry interval and must be between 1 and 300 seconds
+# max_reconnect_attempts caps retries after the initial failed attempt; 0 disables retries
 reconnect_interval_secs = 5
 max_reconnect_attempts = 10
 

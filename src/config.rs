@@ -328,11 +328,14 @@ pub struct RelayConfig {
     #[serde(default)]
     pub onion: Vec<String>,
 
-    /// Reconnection interval in seconds (reserved for future use).
+    /// Base relay reconnection interval in seconds.
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval_secs: u64,
 
-    /// Maximum reconnection attempts (reserved for future use).
+    /// Maximum reconnect attempts after the initial connection attempt.
+    ///
+    /// A value of `0` disables automatic retries after the first failed attempt.
+    /// The counter resets after a successful relay connection.
     #[serde(default = "default_max_reconnect_attempts")]
     pub max_reconnect_attempts: u32,
 

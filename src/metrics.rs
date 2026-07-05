@@ -177,6 +177,10 @@ pub enum EventOutcome {
     /// Every token the event carried was shed by the per-token rate limiters,
     /// so no notification was admitted. Transient: the event stays retryable.
     RateLimited,
+    /// Event was shed by the global pre-unwrap admission limiter. Transient
+    /// back-pressure, not a failure: the event stays retryable and must not
+    /// inflate the `failed` bucket.
+    Shed,
 }
 
 impl EventOutcome {
@@ -187,6 +191,7 @@ impl EventOutcome {
             Self::Processed => "processed",
             Self::Duplicate => "duplicate",
             Self::RateLimited => "rate_limited",
+            Self::Shed => "shed",
         }
     }
 }

@@ -113,10 +113,22 @@ impl RetryConfig {
     }
 }
 
+/// Final outcome of a push send operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushSendOutcome {
+    /// The push provider accepted the notification.
+    Sent,
+    /// The provider or local validation identified a dead/invalid device token.
+    InvalidToken,
+    /// A transient provider failure consumed the bounded retry budget.
+    RetriesExhausted,
+}
+
 /// Result of a single send attempt.
 #[derive(Debug)]
 pub enum SendAttemptResult {
-    /// Request succeeded.
+    /// Request reached a terminal non-error state (`true` = sent,
+    /// `false` = invalid token).
     Success(bool),
     /// Transient error that should be retried (429, 5xx).
     Retriable {
@@ -138,7 +150,8 @@ pub enum SendAttemptResult {
 /// for the duration of each backoff sleep and re-acquired before the next
 /// attempt. This keeps sleeping retries from occupying in-flight concurrency
 /// slots. If re-acquisition fails because the semaphore was closed (shutdown),
-/// the retry loop is aborted and `Ok(false)` is returned (the request is shed).
+/// the retry loop is aborted and returns [`PushSendOutcome::RetriesExhausted`]
+/// so the request is not mislabeled as an invalid token.
 #[must_use = "retry result indicates success/failure and should not be ignored"]
 pub async fn with_retry<F, Fut>(
     config: &RetryConfig,
@@ -146,7 +159,7 @@ pub async fn with_retry<F, Fut>(
     mut operation: F,
     backoff_permit: Option<&mut BackoffPermit>,
     metrics: Option<&Metrics>,
-) -> crate::error::Result<bool>
+) -> crate::error::Result<PushSendOutcome>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = SendAttemptResult>,
@@ -158,7 +171,8 @@ where
 
     loop {
         match operation().await {
-            SendAttemptResult::Success(result) => return Ok(result),
+            SendAttemptResult::Success(true) => return Ok(PushSendOutcome::Sent),
+            SendAttemptResult::Success(false) => return Ok(PushSendOutcome::InvalidToken),
             SendAttemptResult::Retriable {
                 status_code,
                 retry_after,
@@ -191,8 +205,9 @@ where
                     permit.update_available_metric(metrics);
                     sleep(wait_duration).await;
                     if permit.reacquire().await.is_err() {
-                        // Semaphore closed (shutdown): shed this request.
-                        return Ok(false);
+                        // Semaphore closed (shutdown): shed this request without
+                        // classifying it as a dead device token.
+                        return Ok(PushSendOutcome::RetriesExhausted);
                     }
                     permit.update_available_metric(metrics);
                 } else {
@@ -210,7 +225,7 @@ where
                     retries = retries,
                     "Max retries exceeded for push notification"
                 );
-                return Ok(false);
+                return Ok(PushSendOutcome::RetriesExhausted);
             }
             SendAttemptResult::Permanent(e) => return Err(e),
         }
@@ -597,7 +612,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
         assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
     }
 
@@ -633,7 +648,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
         assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
     }
 
@@ -665,7 +680,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert!(!result.unwrap()); // Returns false when max retries exceeded
+        assert_eq!(result.unwrap(), PushSendOutcome::RetriesExhausted);
         // Initial attempt + max_retries = 1 + 2 = 3
         assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
     }
@@ -802,7 +817,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(201)).await;
         let result = task.await.unwrap();
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
         assert_eq!(attempt_count.load(Ordering::SeqCst), 4);
     }
 
@@ -820,7 +835,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert!(!result.unwrap());
+        assert_eq!(result.unwrap(), PushSendOutcome::InvalidToken);
     }
 
     #[tokio::test]
@@ -858,7 +873,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
         assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
 
         // Verify metrics were recorded - gather metrics and check they're non-empty
@@ -919,7 +934,7 @@ mod tests {
 
         let result = task.await.unwrap();
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
         assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
     }
 
@@ -1012,7 +1027,7 @@ mod tests {
             .expect("second attempt should still be waiting for test assertion");
         let result = task.await.unwrap();
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
         assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
     }
 

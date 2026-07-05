@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
@@ -336,10 +336,12 @@ impl StageTimer {
 /// rate-limit shed, which must be treated like the global-limiter shed:
 /// retryable, not marked terminally seen, and not counted as processed.
 enum ProcessOutcome {
-    /// The event reached a terminal state: `count` notifications were admitted
-    /// to the dispatcher (possibly zero when every token was invalid or targeted
-    /// an unconfigured platform). Replays should short-circuit as duplicates.
-    Admitted(usize),
+    /// The event reached a terminal state: its admitted notifications (possibly
+    /// zero when every token was invalid or targeted an unconfigured platform)
+    /// were handed to the dispatcher; the per-event count is recorded via
+    /// `observe_notifications_admitted_per_event`. Replays should
+    /// short-circuit as duplicates.
+    Admitted,
     /// Every token the event carried was shed purely by the per-token rate
     /// limiters, admitting zero notifications and dropping nothing terminally.
     /// This is transient back-pressure: the event stays retryable once budget
@@ -640,26 +642,25 @@ impl EventProcessor {
             );
             if let Some(ref m) = self.metrics {
                 m.record_event_shed();
-                m.observe_event_processing_duration(
-                    EventOutcome::Failed,
-                    started_at.elapsed_secs(),
-                );
+                m.observe_event_processing_duration(EventOutcome::Shed, started_at.elapsed_secs());
             }
             return Ok(false);
         }
 
         // Process the event
         match self.process_inner(event).await {
-            Ok(ProcessOutcome::Admitted(count)) => {
+            Ok(ProcessOutcome::Admitted) => {
                 // Refresh the seen timestamp now that processing succeeded, so
                 // the dedup window is measured from completion. The reservation
                 // taken above already keeps the event marked seen.
                 self.mark_seen(event.id).await;
 
-                info!(
-                    notifications_admitted = count,
-                    "Processed notification event"
-                );
+                // Logged at trace, not info: emitting a per-event success line
+                // at the default level persists delivery-timing metadata in
+                // logs (and downstream log shipping). The recipient fan-out
+                // count is intentionally omitted — it is already captured in
+                // Prometheus via `observe_notifications_admitted_per_event`.
+                trace!("Processed notification event");
 
                 if let Some(ref m) = self.metrics {
                     m.record_event_processed();
@@ -934,7 +935,7 @@ impl EventProcessor {
             if rate_limited_any && !terminally_dropped_any {
                 return Ok(ProcessOutcome::RateLimitedShed);
             }
-            return Ok(ProcessOutcome::Admitted(0));
+            return Ok(ProcessOutcome::Admitted);
         }
 
         // Dispatch notifications
@@ -948,7 +949,7 @@ impl EventProcessor {
                     );
                     m.observe_notifications_admitted_per_event(count);
                 }
-                Ok(ProcessOutcome::Admitted(count))
+                Ok(ProcessOutcome::Admitted)
             }
             Err(e) => {
                 for (encrypted_key, encrypted_reservation, device_key, device_reservation) in
@@ -3005,6 +3006,25 @@ mod tests {
         assert_eq!(
             counter_value(&metrics, "transponder_events_shed_total", &[]),
             1.0
+        );
+
+        // The shed is recorded under its own duration-histogram outcome, not
+        // as a failure: back-pressure must not inflate the failed bucket.
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_event_processing_duration_seconds",
+                &[("outcome", EventOutcome::Shed.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_event_processing_duration_seconds",
+                &[("outcome", EventOutcome::Failed.as_str())],
+            ),
+            0
         );
 
         // The shed event was NOT unwrapped: only `limit` unwraps were observed.

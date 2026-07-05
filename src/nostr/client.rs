@@ -3,8 +3,9 @@
 //! Handles connections to ClearNet relays, optional Tor relays, subscription
 //! management, and automatic reconnection.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::future;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
@@ -30,6 +31,116 @@ const INBOX_RELAY_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 const TOR_FEATURE_ENABLED: bool = true;
 #[cfg(not(feature = "tor"))]
 const TOR_FEATURE_ENABLED: bool = false;
+const RELAY_MONITOR_CHANNEL_SIZE: usize = 64;
+
+#[derive(Debug, Clone)]
+struct ReconnectAttemptLimiter {
+    max_reconnect_attempts: u32,
+    attempts_since_connection: Arc<Mutex<BTreeMap<RelayUrl, u32>>>,
+}
+
+impl ReconnectAttemptLimiter {
+    fn new(max_reconnect_attempts: u32) -> Self {
+        Self {
+            max_reconnect_attempts,
+            attempts_since_connection: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn attempts_since_connection(&self) -> MutexGuard<'_, BTreeMap<RelayUrl, u32>> {
+        self.attempts_since_connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn admit_relay_connection(&self, relay_url: &RelayUrl) -> AdmitStatus {
+        let mut attempts_since_connection = self.attempts_since_connection();
+        let attempts = attempts_since_connection
+            .entry(relay_url.clone())
+            .or_default();
+
+        if *attempts > self.max_reconnect_attempts {
+            return AdmitStatus::rejected(format!(
+                "relays.max_reconnect_attempts ({}) exceeded",
+                self.max_reconnect_attempts
+            ));
+        }
+
+        *attempts = attempts.saturating_add(1);
+        AdmitStatus::success()
+    }
+
+    fn reset(&self, relay_url: &RelayUrl) {
+        self.attempts_since_connection()
+            .insert(relay_url.clone(), 0);
+    }
+
+    fn remove(&self, relay_url: &RelayUrl) {
+        self.attempts_since_connection().remove(relay_url);
+    }
+}
+
+impl AdmitPolicy for ReconnectAttemptLimiter {
+    fn admit_connection<'a>(
+        &'a self,
+        relay_url: &'a RelayUrl,
+    ) -> BoxedFuture<'a, std::result::Result<AdmitStatus, PolicyError>> {
+        Box::pin(future::ready(Ok(self.admit_relay_connection(relay_url))))
+    }
+}
+
+fn spawn_reconnect_attempt_monitor(monitor: Monitor, limiter: ReconnectAttemptLimiter) {
+    let notifications = monitor.subscribe();
+    std::mem::drop(tokio::spawn(run_reconnect_attempt_monitor(
+        notifications,
+        limiter,
+    )));
+}
+
+async fn run_reconnect_attempt_monitor(
+    mut notifications: broadcast::Receiver<MonitorNotification>,
+    limiter: ReconnectAttemptLimiter,
+) {
+    loop {
+        match notifications.recv().await {
+            Ok(MonitorNotification::StatusChanged { relay_url, status }) => match status {
+                NostrRelayStatus::Connected => limiter.reset(&relay_url),
+                NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
+                    limiter.remove(&relay_url);
+                }
+                NostrRelayStatus::Initialized
+                | NostrRelayStatus::Pending
+                | NostrRelayStatus::Connecting
+                | NostrRelayStatus::Disconnected
+                | NostrRelayStatus::Sleeping => {}
+            },
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "Relay reconnect attempt monitor lagged; attempt counters may reset late"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+fn relay_options_for_config(config: &RelayConfig, relay_url: &str) -> RelayOptions {
+    #[cfg(not(feature = "tor"))]
+    let _ = relay_url;
+
+    let opts =
+        RelayOptions::default().retry_interval(Duration::from_secs(config.reconnect_interval_secs));
+
+    #[cfg(feature = "tor")]
+    {
+        if relay_url.contains(".onion") {
+            return opts.connection_mode(ConnectionMode::tor());
+        }
+    }
+
+    opts
+}
 
 /// Status of relay connections.
 #[derive(Debug, Clone, Default)]
@@ -65,7 +176,15 @@ impl RelayClient {
     ) -> Result<Self> {
         validate_relay_config(&config)?;
 
-        let client = Client::builder().signer(keys).build();
+        let reconnect_attempt_limiter = ReconnectAttemptLimiter::new(config.max_reconnect_attempts);
+        let relay_monitor = Monitor::new(RELAY_MONITOR_CHANNEL_SIZE);
+        spawn_reconnect_attempt_monitor(relay_monitor.clone(), reconnect_attempt_limiter.clone());
+
+        let client = Client::builder()
+            .signer(keys)
+            .admit_policy(reconnect_attempt_limiter)
+            .monitor(relay_monitor)
+            .build();
 
         let total = config.clearnet.len() + config.onion.len();
 
@@ -94,7 +213,7 @@ impl RelayClient {
     pub async fn connect(&self) -> Result<()> {
         // Add ClearNet relays
         for url in &self.config.clearnet {
-            match self.client.add_relay(url).await {
+            match self.add_configured_relay(url).await {
                 Ok(_) => {
                     debug!(relay = %url, "Added ClearNet relay");
                 }
@@ -106,7 +225,7 @@ impl RelayClient {
 
         // Add Tor relays (nostr-sdk handles Tor via arti automatically)
         for url in &self.config.onion {
-            match self.client.add_relay(url).await {
+            match self.add_configured_relay(url).await {
                 Ok(_) => {
                     debug!(relay = %url, "Added Tor relay");
                 }
@@ -249,6 +368,14 @@ impl RelayClient {
         info!("Disconnecting from all relays");
         self.client.disconnect().await;
         Ok(())
+    }
+
+    async fn add_configured_relay(&self, url: &str) -> std::result::Result<bool, String> {
+        self.client
+            .pool()
+            .add_relay(url, relay_options_for_config(&self.config, url))
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Get the underlying nostr-sdk client.
@@ -542,6 +669,175 @@ mod tests {
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5, // Short timeout for tests
         }
+    }
+
+    #[test]
+    fn test_relay_options_use_configured_reconnect_interval() {
+        let mut config = test_relay_config(vec![]);
+        config.reconnect_interval_secs = 17;
+
+        let opts = relay_options_for_config(&config, "ws://127.0.0.1:12345");
+        let debug = format!("{opts:?}");
+
+        assert!(
+            debug.contains("retry_interval: 17s"),
+            "relay options must use configured retry interval, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn test_reconnect_attempt_limiter_allows_initial_attempt_plus_configured_retries() {
+        let limiter = ReconnectAttemptLimiter::new(1);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        assert_eq!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Success
+        );
+        assert_eq!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Success
+        );
+        assert!(matches!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Rejected { .. }
+        ));
+
+        limiter.reset(&relay_url);
+        assert_eq!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Success,
+            "successful relay connection should reset the reconnect-attempt counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admit_policy_rejects_after_exhausting_attempts() {
+        let limiter = ReconnectAttemptLimiter::new(0);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        // Exercise the AdmitPolicy trait entry point the relay pool calls.
+        let first = AdmitPolicy::admit_connection(&limiter, &relay_url)
+            .await
+            .unwrap();
+        assert_eq!(first, AdmitStatus::Success);
+
+        let second = AdmitPolicy::admit_connection(&limiter, &relay_url)
+            .await
+            .unwrap();
+        assert!(
+            matches!(second, AdmitStatus::Rejected { .. }),
+            "attempt beyond the initial connection must be rejected at max_reconnect_attempts = 0"
+        );
+    }
+
+    #[test]
+    fn test_reconnect_attempt_limiter_remove_clears_tracked_state() {
+        let limiter = ReconnectAttemptLimiter::new(0);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        assert_eq!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Success
+        );
+        assert!(matches!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Rejected { .. }
+        ));
+
+        limiter.remove(&relay_url);
+        assert!(
+            !limiter.attempts_since_connection().contains_key(&relay_url),
+            "remove must drop the relay's entry so the map cannot grow unbounded"
+        );
+        assert_eq!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Success,
+            "a removed relay starts over with a fresh attempt budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_attempt_monitor_resets_and_removes_counters() {
+        let limiter = ReconnectAttemptLimiter::new(0);
+        let connected_url = RelayUrl::parse("wss://connected.example.com").unwrap();
+        let terminated_url = RelayUrl::parse("wss://terminated.example.com").unwrap();
+
+        // Exhaust both relays' budgets so the monitor's effect is observable.
+        for url in [&connected_url, &terminated_url] {
+            assert_eq!(limiter.admit_relay_connection(url), AdmitStatus::Success);
+            assert!(matches!(
+                limiter.admit_relay_connection(url),
+                AdmitStatus::Rejected { .. }
+            ));
+        }
+
+        let (sender, receiver) = broadcast::channel(8);
+        let monitor_task = tokio::spawn(run_reconnect_attempt_monitor(receiver, limiter.clone()));
+
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: connected_url.clone(),
+                status: NostrRelayStatus::Connected,
+            })
+            .unwrap();
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: terminated_url.clone(),
+                status: NostrRelayStatus::Terminated,
+            })
+            .unwrap();
+        // Ignored transitions must not disturb the counters.
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: connected_url.clone(),
+                status: NostrRelayStatus::Connecting,
+            })
+            .unwrap();
+        drop(sender);
+
+        // Channel closed -> the monitor loop exits; all sends were processed.
+        tokio::time::timeout(Duration::from_secs(5), monitor_task)
+            .await
+            .expect("monitor task must exit when the channel closes")
+            .unwrap();
+
+        assert_eq!(
+            limiter.attempts_since_connection().get(&connected_url),
+            Some(&0),
+            "Connected must reset the counter to zero"
+        );
+        assert!(
+            !limiter
+                .attempts_since_connection()
+                .contains_key(&terminated_url),
+            "Terminated must remove the relay's entry"
+        );
+        assert_eq!(
+            limiter.admit_relay_connection(&connected_url),
+            AdmitStatus::Success
+        );
+        assert_eq!(
+            limiter.admit_relay_connection(&terminated_url),
+            AdmitStatus::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_adds_relays_with_configured_options() {
+        let relay_url = "ws://127.0.0.1:12345";
+        let mut config = test_relay_config(vec![relay_url.to_string()]);
+        config.reconnect_interval_secs = 23;
+
+        let client = RelayClient::new(Keys::generate(), config).await.unwrap();
+        client.add_configured_relay(relay_url).await.unwrap();
+
+        let relay = client.client.relay(relay_url).await.unwrap();
+        let debug = format!("{:?}", relay.opts());
+        assert!(
+            debug.contains("retry_interval: 23s"),
+            "configured relays must inherit reconnect_interval_secs, got: {debug}"
+        );
     }
 
     #[tokio::test]

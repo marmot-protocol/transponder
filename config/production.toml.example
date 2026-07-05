@@ -53,6 +53,8 @@ allow_unencrypted_clearnet_relays = false
 # Build with: docker build --build-arg CARGO_FEATURES='--features tor' -t transponder:local .
 onion = []
 
+# Base retry interval and retry cap for relay reconnection.
+# max_reconnect_attempts caps retries after the initial failed attempt; 0 disables retries.
 reconnect_interval_secs = 5
 max_reconnect_attempts = 10
 connection_timeout_secs = 30
