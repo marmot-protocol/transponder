@@ -1003,30 +1003,23 @@ mod tests {
         counter_value, gauge_value as metric_gauge_value,
         histogram_sample_count as histogram_count, histogram_sample_sum,
     };
+    use crate::test_support::{default_server_config, server_config_with};
     use crate::test_vectors::scenarios;
     use zeroize::Zeroizing;
 
     #[test]
     fn token_rate_limit_config_from_server_config_matches_settings() {
-        let server = crate::config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: String::new(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs: DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 1234,
-            max_tokens_per_event: 25,
-            encrypted_token_rate_limit_per_minute: 111,
-            encrypted_token_rate_limit_per_hour: 2222,
-            device_token_rate_limit_per_minute: 333,
-            device_token_rate_limit_per_hour: 4444,
-            max_concurrent_event_processing: 7,
-            global_unwrap_rate_limit_per_minute: 555,
-            global_unwrap_rate_limit_per_hour: 6666,
-        };
+        let server = server_config_with(default_server_config(), |server| {
+            server.max_rate_limit_cache_size = 1234;
+            server.max_tokens_per_event = 25;
+            server.encrypted_token_rate_limit_per_minute = 111;
+            server.encrypted_token_rate_limit_per_hour = 2222;
+            server.device_token_rate_limit_per_minute = 333;
+            server.device_token_rate_limit_per_hour = 4444;
+            server.max_concurrent_event_processing = 7;
+            server.global_unwrap_rate_limit_per_minute = 555;
+            server.global_unwrap_rate_limit_per_hour = 6666;
+        });
 
         let rate_limit_config = TokenRateLimitConfig::from_server_config(&server);
 
@@ -1043,25 +1036,13 @@ mod tests {
     #[test]
     fn replay_protection_config_from_server_config_matches_settings() {
         let state_path = PathBuf::from("/var/lib/transponder/dedup-events.log");
-        let server = crate::config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: String::new(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 77,
-            dedup_state_path: state_path.clone(),
-            dedup_retention_secs: 88,
-            max_notification_age_secs: 99,
-            max_notification_future_skew_secs: 11,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let server = server_config_with(default_server_config(), |server| {
+            server.max_dedup_cache_size = 77;
+            server.dedup_state_path = state_path.clone();
+            server.dedup_retention_secs = 88;
+            server.max_notification_age_secs = 99;
+            server.max_notification_future_skew_secs = 11;
+        });
 
         let replay_config = ReplayProtectionConfig::from_server_config(&server);
 
@@ -1077,25 +1058,12 @@ mod tests {
 
     #[test]
     fn replay_protection_config_from_server_config_disables_empty_state_path() {
-        let server = crate::config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: String::new(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 77,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: 88,
-            max_notification_age_secs: 99,
-            max_notification_future_skew_secs: 11,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let server = server_config_with(default_server_config(), |server| {
+            server.max_dedup_cache_size = 77;
+            server.dedup_retention_secs = 88;
+            server.max_notification_age_secs = 99;
+            server.max_notification_future_skew_secs = 11;
+        });
 
         let replay_config = ReplayProtectionConfig::from_server_config(&server);
 

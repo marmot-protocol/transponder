@@ -20,6 +20,8 @@ pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_metrics;
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 pub(crate) mod test_vectors;
 
 pub use app::run;

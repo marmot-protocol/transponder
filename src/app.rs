@@ -853,6 +853,7 @@ pub fn init_logging(config: &crate::config::LoggingConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{default_server_config, server_config_with};
     use axum::{Router, http::StatusCode, routing::get};
     use std::io::Write;
     use std::path::PathBuf;
@@ -1485,26 +1486,10 @@ mod tests {
 
     #[test]
     fn resolve_server_private_key_prefers_inline_value() {
-        let mut config = crate::config::ServerConfig {
-            private_key: Zeroizing::new("abc123".to_string()),
-            private_key_file: "/tmp/ignored".to_string(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs:
-                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let mut config = server_config_with(default_server_config(), |config| {
+            config.private_key = Zeroizing::new("abc123".to_string());
+            config.private_key_file = "/tmp/ignored".to_string();
+        });
 
         assert_eq!(
             resolve_server_private_key(&mut config).unwrap().as_str(),
@@ -1518,26 +1503,9 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "abc123").unwrap();
 
-        let mut config = crate::config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: file.path().display().to_string(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs:
-                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let mut config = server_config_with(default_server_config(), |config| {
+            config.private_key_file = file.path().display().to_string();
+        });
 
         assert_eq!(
             resolve_server_private_key(&mut config).unwrap().as_str(),
@@ -1550,26 +1518,10 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "abc123").unwrap();
 
-        let mut config = crate::config::ServerConfig {
-            private_key: Zeroizing::new("   \n\t  ".to_string()),
-            private_key_file: format!("  {}  ", file.path().display()),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs:
-                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let mut config = server_config_with(default_server_config(), |config| {
+            config.private_key = Zeroizing::new("   \n\t  ".to_string());
+            config.private_key_file = format!("  {}  ", file.path().display());
+        });
 
         assert_eq!(
             resolve_server_private_key(&mut config).unwrap().as_str(),
@@ -1579,26 +1531,7 @@ mod tests {
 
     #[test]
     fn resolve_server_private_key_returns_empty_when_unset() {
-        let mut config = crate::config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: String::new(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs:
-                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let mut config = default_server_config();
 
         assert_eq!(
             resolve_server_private_key(&mut config).unwrap().as_str(),
@@ -1608,26 +1541,9 @@ mod tests {
 
     #[test]
     fn resolve_server_private_key_reports_missing_secret_file() {
-        let mut config = crate::config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: "/tmp/definitely-missing-transponder-key".to_string(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs:
-                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let mut config = server_config_with(default_server_config(), |config| {
+            config.private_key_file = "/tmp/definitely-missing-transponder-key".to_string();
+        });
 
         let error = resolve_server_private_key(&mut config)
             .expect_err("missing secret file should return an error");
@@ -1717,26 +1633,9 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "  {secret_key}  ").unwrap();
 
-        let mut config = crate::config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: file.path().display().to_string(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs:
-                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let mut config = server_config_with(default_server_config(), |config| {
+            config.private_key_file = file.path().display().to_string();
+        });
 
         let resolved_key = resolve_server_private_key(&mut config).unwrap();
         let parsed_key = parse_server_secret_key(resolved_key.as_str()).unwrap();
@@ -1788,26 +1687,9 @@ mod tests {
         // End-to-end: a permissive key file must fail the whole resolve path,
         // not just the standalone permission check.
         let file = write_key_file_with_mode(0o644);
-        let mut config = crate::config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: file.path().display().to_string(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs:
-                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let mut config = server_config_with(default_server_config(), |config| {
+            config.private_key_file = file.path().display().to_string();
+        });
 
         let error = resolve_server_private_key(&mut config)
             .expect_err("a group/world-readable key file must refuse to load");
@@ -1818,26 +1700,9 @@ mod tests {
     #[test]
     fn resolve_server_private_key_reads_0600_key_file() {
         let file = write_key_file_with_mode(0o600);
-        let mut config = crate::config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: file.path().display().to_string(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs:
-                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
+        let mut config = server_config_with(default_server_config(), |config| {
+            config.private_key_file = file.path().display().to_string();
+        });
 
         assert_eq!(
             resolve_server_private_key(&mut config).unwrap().as_str(),
