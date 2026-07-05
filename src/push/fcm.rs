@@ -3,19 +3,18 @@
 //! Uses service account credentials for OAuth2 authentication.
 
 use std::fmt;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tracing::{debug, error, trace, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::FcmConfig;
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
+use crate::push::auth::{AuthTokenGenerator, MintedToken, TokenAcquisitionError, TokenCache};
 use crate::push::retry::{self, PushSendOutcome, RetryConfig, SendAttemptResult};
 
 /// FCM OAuth2 token endpoint.
@@ -109,14 +108,6 @@ fn token_cache_lifetime(expires_in: Option<u64>) -> Duration {
             Duration::from_secs(seconds.saturating_sub(TOKEN_REFRESH_SAFETY_MARGIN_SECS))
         })
         .unwrap_or(TOKEN_LIFETIME)
-}
-
-/// Cached access token.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub(crate) struct CachedToken {
-    token: Zeroizing<String>,
-    #[zeroize(skip)]
-    expires_at: SystemTime,
 }
 
 /// FCM message payload.
@@ -222,171 +213,90 @@ fn fcm_error_summary(error: &FcmError) -> String {
     summary
 }
 
-/// Outcome of an OAuth token refresh attempt for push retry classification.
-#[derive(Debug)]
-enum TokenAcquisitionError {
-    /// Configuration, credential, or non-retriable OAuth rejection.
-    Permanent(Error),
-    /// Transient OAuth endpoint or transport failure.
-    Retriable {
-        status_code: u16,
-        retry_after: Option<Duration>,
-    },
-}
-
-impl TokenAcquisitionError {
-    fn permanent(err: Error) -> Self {
-        Self::Permanent(err)
-    }
-
-    fn from_http_status(status: reqwest::StatusCode, retry_after: Option<Duration>) -> Self {
-        let status_code = status.as_u16();
-        if status == 429 || status.is_server_error() {
-            Self::Retriable {
-                status_code,
-                retry_after,
-            }
-        } else {
-            Self::Permanent(Error::Fcm(oauth_failure_message(status)))
+/// Classify an OAuth token HTTP-error response for retry handling.
+///
+/// A `429` or `5xx` from the token endpoint is transient (retriable); every
+/// other status is a permanent OAuth rejection carrying only the status text
+/// (never the body — see [`oauth_failure_message`]).
+fn oauth_error_from_status(
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+) -> TokenAcquisitionError {
+    if status == 429 || status.is_server_error() {
+        TokenAcquisitionError::Retriable {
+            status_code: status.as_u16(),
+            retry_after,
         }
-    }
-
-    fn from_transport(err: reqwest::Error) -> Self {
-        debug!(error = %err, "FCM OAuth token transport error");
-        Self::Retriable {
-            status_code: 0,
-            retry_after: None,
-        }
-    }
-
-    fn into_send_attempt(self) -> SendAttemptResult {
-        match self {
-            Self::Permanent(error) => SendAttemptResult::Permanent(error),
-            Self::Retriable {
-                status_code,
-                retry_after,
-            } => SendAttemptResult::Retriable {
-                status_code,
-                retry_after,
-            },
-        }
+    } else {
+        TokenAcquisitionError::permanent(Error::Fcm(oauth_failure_message(status)))
     }
 }
 
-/// FCM client for sending push notifications.
-pub struct FcmClient {
-    pub(crate) http_client: Client,
-    pub(crate) config: FcmConfig,
-    pub(crate) service_account: Option<ServiceAccount>,
-    pub(crate) encoding_key: Option<EncodingKey>,
-    pub(crate) cached_token: Arc<RwLock<Option<CachedToken>>>,
-    pub(crate) metrics: Option<Metrics>,
+/// Classify an OAuth token transport failure as a retriable acquisition error.
+///
+/// The URL is stripped before logging: while the OAuth endpoint URL carries no
+/// device token, keeping the redaction uniform avoids leaking a hijacked
+/// `token_uri` and mirrors the send-path posture (issue #172).
+fn oauth_error_from_transport(err: reqwest::Error) -> TokenAcquisitionError {
+    debug!(error = %err.without_url(), "FCM OAuth token transport error");
+    TokenAcquisitionError::Retriable {
+        status_code: 0,
+        retry_after: None,
+    }
+}
+
+/// Maximum bytes read from the OAuth token success body before parsing.
+///
+/// An OAuth token response is a small JSON object (an access token plus expiry
+/// metadata); a few KiB is ample. Bounding the read keeps a hijacked or
+/// misconfigured `token_uri` from streaming an unbounded `200` body into
+/// memory (issue #154). Reused via [`crate::push::parse_bounded_json_body`],
+/// whose intermediate buffer is zeroized on drop since this body carries a
+/// bearer credential.
+const MAX_OAUTH_BODY_BYTES: usize = 8 * 1024;
+
+/// FCM credential generator: mints an OAuth2 access token from the service
+/// account via a JWT-bearer grant.
+pub(crate) struct FcmTokenGenerator {
+    http_client: Client,
+    service_account: Option<ServiceAccount>,
+    encoding_key: Option<EncodingKey>,
+    metrics: Option<Metrics>,
     /// Test-only override for the OAuth token endpoint URL.
     #[cfg(test)]
-    pub(crate) test_oauth_token_url: Option<String>,
-    /// Test-only override for the FCM v1 API base URL (scheme + host + port).
-    #[cfg(test)]
-    pub(crate) test_fcm_api_base_url: Option<String>,
+    test_oauth_token_url: Option<String>,
 }
 
-impl FcmClient {
-    /// Create a new FCM client.
-    #[allow(dead_code)]
-    pub async fn new(config: FcmConfig) -> Result<Self> {
-        Self::with_metrics(config, None).await
+impl FcmTokenGenerator {
+    fn service_account(&self) -> Option<&ServiceAccount> {
+        self.service_account.as_ref()
     }
 
-    /// Create a new FCM client with metrics.
-    pub async fn with_metrics(config: FcmConfig, metrics: Option<Metrics>) -> Result<Self> {
-        let http_client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-
-        // Load service account if configured
-        let (service_account, encoding_key) = if !config.service_account_path.is_empty() {
-            let data = Zeroizing::new(
-                tokio::fs::read_to_string(&config.service_account_path)
-                    .await
-                    .map_err(|e| {
-                        Error::Fcm(format!(
-                            "Failed to read service account file '{}': {e}",
-                            config.service_account_path
-                        ))
-                    })?,
-            );
-
-            let sa: ServiceAccount = serde_json::from_str(data.as_str())
-                .map_err(|e| Error::Fcm(format!("Failed to parse service account JSON: {e}")))?;
-
-            let key = EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
-                .map_err(|e| Error::Fcm(format!("Failed to parse service account key: {e}")))?;
-
-            (Some(sa), Some(key))
-        } else {
-            (None, None)
-        };
-
-        Ok(Self {
-            http_client,
-            config,
-            service_account,
-            encoding_key,
-            cached_token: Arc::new(RwLock::new(None)),
-            metrics,
-            #[cfg(test)]
-            test_oauth_token_url: None,
-            #[cfg(test)]
-            test_fcm_api_base_url: None,
-        })
+    fn is_configured(&self) -> bool {
+        self.service_account.is_some() && self.encoding_key.is_some()
     }
 
-    fn oauth_token_url(&self) -> &str {
+    /// The OAuth token endpoint the request is POSTed to.
+    ///
+    /// Uses the service account's `token_uri` so the signed assertion `aud`
+    /// and the request target always agree (issue #153), falling back to the
+    /// well-known constant only when `token_uri` is empty. A test override
+    /// takes precedence.
+    fn oauth_token_url<'a>(&'a self, sa: &'a ServiceAccount) -> &'a str {
         #[cfg(test)]
         if let Some(url) = self.test_oauth_token_url.as_deref() {
             return url;
         }
-        OAUTH_TOKEN_URL
-    }
-
-    fn fcm_messages_send_url(&self, project_id: &str) -> String {
-        #[cfg(test)]
-        if let Some(base) = self.test_fcm_api_base_url.as_deref() {
-            return format!("{base}/v1/projects/{project_id}/messages:send");
+        if sa.token_uri.is_empty() {
+            OAUTH_TOKEN_URL
+        } else {
+            sa.token_uri.as_str()
         }
-        format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send")
     }
+}
 
-    /// Get a valid access token, refreshing if necessary.
-    async fn get_access_token(
-        &self,
-    ) -> std::result::Result<Zeroizing<String>, TokenAcquisitionError> {
-        // First check with read lock (fast path)
-        {
-            let cached = self.cached_token.read().await;
-            if let Some(ref token) = *cached
-                && token.expires_at > SystemTime::now()
-            {
-                return Ok(token.token.clone());
-            }
-        }
-
-        // Acquire write lock and double-check to avoid TOCTOU race
-        let mut cached = self.cached_token.write().await;
-        if let Some(ref token) = *cached
-            && token.expires_at > SystemTime::now()
-        {
-            return Ok(token.token.clone());
-        }
-
-        // Generate new token while holding write lock
-        let token = self.refresh_token_inner(&mut cached).await?;
-
-        Ok(token)
-    }
-
-    /// Refresh the OAuth2 access token, caching it in the provided guard.
-    async fn refresh_token_inner(
-        &self,
-        cached: &mut tokio::sync::RwLockWriteGuard<'_, Option<CachedToken>>,
-    ) -> std::result::Result<Zeroizing<String>, TokenAcquisitionError> {
+impl AuthTokenGenerator for FcmTokenGenerator {
+    async fn mint(&self) -> std::result::Result<MintedToken, TokenAcquisitionError> {
         let sa = self.service_account.as_ref().ok_or_else(|| {
             TokenAcquisitionError::permanent(Error::Fcm(
                 "No service account configured".to_string(),
@@ -428,43 +338,125 @@ impl FcmClient {
             assertion: jwt,
         };
 
+        // POST to the signed audience (token_uri) so aud and endpoint agree
+        // (issue #153).
         let response = self
             .http_client
-            .post(self.oauth_token_url())
+            .post(self.oauth_token_url(sa))
             .form(&request)
             .send()
             .await
-            .map_err(TokenAcquisitionError::from_transport)?;
+            .map_err(oauth_error_from_transport)?;
 
         if !response.status().is_success() {
             let status = response.status();
             let retry_after = retry::retry_after_from_headers(response.headers());
             debug!(status = %status, "FCM OAuth token request failed");
-            return Err(TokenAcquisitionError::from_http_status(status, retry_after));
+            return Err(oauth_error_from_status(status, retry_after));
         }
 
-        let token_response: TokenResponse = response
-            .json()
-            .await
-            .map_err(|e| TokenAcquisitionError::permanent(Error::from(e)))?;
+        // Bounded, zeroizing read of the success body (issue #154).
+        let token_response: TokenResponse =
+            crate::push::parse_bounded_json_body(response, MAX_OAUTH_BODY_BYTES)
+                .await
+                .ok_or_else(|| {
+                    TokenAcquisitionError::permanent(Error::Fcm(
+                        "OAuth token response was unreadable or exceeded the size cap".to_string(),
+                    ))
+                })?;
 
-        // Cache the token while still holding the write lock. The caller gets a
-        // short-lived zeroizing clone for request construction while the cache
-        // owns the reusable copy.
         let ttl = token_cache_lifetime(token_response.expires_in);
-        let cached_token = CachedToken {
-            token: token_response.access_token,
-            expires_at: SystemTime::now() + ttl,
-        };
-        let outbound_token = cached_token.token.clone();
-        **cached = Some(cached_token);
 
         if let Some(metrics) = &self.metrics {
             metrics.record_auth_token_refresh("fcm_oauth");
         }
 
         trace!("Refreshed FCM access token");
-        Ok(outbound_token)
+        Ok(MintedToken {
+            token: token_response.access_token,
+            expires_at: SystemTime::now() + ttl,
+        })
+    }
+}
+
+/// FCM client for sending push notifications.
+pub struct FcmClient {
+    pub(crate) config: FcmConfig,
+    pub(crate) http_client: Client,
+    pub(crate) token_cache: TokenCache<FcmTokenGenerator>,
+    pub(crate) metrics: Option<Metrics>,
+    /// Test-only override for the FCM v1 API base URL (scheme + host + port).
+    #[cfg(test)]
+    pub(crate) test_fcm_api_base_url: Option<String>,
+}
+
+impl FcmClient {
+    /// Create a new FCM client.
+    #[allow(dead_code)]
+    pub async fn new(config: FcmConfig) -> Result<Self> {
+        Self::with_metrics(config, None).await
+    }
+
+    /// Create a new FCM client with metrics.
+    pub async fn with_metrics(config: FcmConfig, metrics: Option<Metrics>) -> Result<Self> {
+        let http_client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+
+        // Load service account if configured
+        let (service_account, encoding_key) = if !config.service_account_path.is_empty() {
+            let data = Zeroizing::new(
+                tokio::fs::read_to_string(&config.service_account_path)
+                    .await
+                    .map_err(|e| {
+                        Error::Fcm(format!(
+                            "Failed to read service account file '{}': {e}",
+                            config.service_account_path
+                        ))
+                    })?,
+            );
+
+            let sa: ServiceAccount = serde_json::from_str(data.as_str())
+                .map_err(|e| Error::Fcm(format!("Failed to parse service account JSON: {e}")))?;
+
+            let key = EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
+                .map_err(|e| Error::Fcm(format!("Failed to parse service account key: {e}")))?;
+
+            (Some(sa), Some(key))
+        } else {
+            (None, None)
+        };
+
+        let token_cache = TokenCache::new(FcmTokenGenerator {
+            http_client: http_client.clone(),
+            service_account,
+            encoding_key,
+            metrics: metrics.clone(),
+            #[cfg(test)]
+            test_oauth_token_url: None,
+        });
+
+        Ok(Self {
+            config,
+            http_client,
+            token_cache,
+            metrics,
+            #[cfg(test)]
+            test_fcm_api_base_url: None,
+        })
+    }
+
+    fn fcm_messages_send_url(&self, project_id: &str) -> String {
+        #[cfg(test)]
+        if let Some(base) = self.test_fcm_api_base_url.as_deref() {
+            return format!("{base}/v1/projects/{project_id}/messages:send");
+        }
+        format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send")
+    }
+
+    /// Get a valid access token via the shared cache, refreshing if necessary.
+    async fn get_access_token(
+        &self,
+    ) -> std::result::Result<Zeroizing<String>, TokenAcquisitionError> {
+        self.token_cache.get().await
     }
 
     /// Get the project ID, from config or service account.
@@ -472,8 +464,9 @@ impl FcmClient {
         let project_id = if !self.config.project_id.is_empty() {
             self.config.project_id.as_str()
         } else {
-            self.service_account
-                .as_ref()
+            self.token_cache
+                .generator()
+                .service_account()
                 .map(|sa| sa.project_id.as_str())
                 .ok_or_else(|| Error::Fcm("No project ID configured".to_string()))?
         };
@@ -508,27 +501,53 @@ impl FcmClient {
             return Ok(PushSendOutcome::InvalidToken);
         }
 
+        // Record one duration sample per logical push, across all retries, so
+        // push_request_duration_seconds counts notifications rather than HTTP
+        // attempts (issue #168). Per-attempt HTTP status stays in
+        // handle_response.
         let retry_config = RetryConfig::default();
-        retry::with_retry(
+        let start = Instant::now();
+        let result = retry::with_retry(
             &retry_config,
             "FCM",
             || self.send_once(&device_token),
             backoff_permit,
             self.metrics.as_ref(),
         )
-        .await
+        .await;
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_push_duration("fcm", start.elapsed().as_secs_f64());
+        }
+        result
     }
 
+    /// Build the outbound request from a pre-built `FcmRequest` template.
+    ///
+    /// The template (built once in `send_once`, outside the transport-retry
+    /// closure) borrows the device token from its zeroizing buffer via
+    /// `FcmMessage<'a>` rather than copying it into an owned `String`
+    /// (issue #126/#198); a transport retry reuses the same template instead of
+    /// rebuilding the map/struct/token copy per attempt. reqwest still
+    /// serializes the token into a non-zeroized body buffer it owns; that
+    /// residual copy is the accepted #126 posture — the token cannot be
+    /// zeroized in the serialized HTTP body without reimplementing the client.
     fn build_request(
         &self,
         url: &str,
         access_token: &str,
-        device_token: &str,
+        request: &FcmRequest<'_>,
     ) -> reqwest::RequestBuilder {
+        self.http_client
+            .post(url)
+            .header("authorization", format!("Bearer {access_token}"))
+            .json(request)
+    }
+
+    /// Build the FCM request body template.
+    fn build_message(device_token: &str) -> FcmRequest<'_> {
         let mut data = std::collections::HashMap::new();
         data.insert("content_available".to_string(), "true".to_string());
-
-        let request = FcmRequest {
+        FcmRequest {
             message: FcmMessage {
                 token: device_token,
                 android: Some(AndroidConfig {
@@ -536,30 +555,6 @@ impl FcmClient {
                 }),
                 data: Some(data),
             },
-        };
-
-        self.http_client
-            .post(url)
-            .header("authorization", format!("Bearer {access_token}"))
-            .json(&request)
-    }
-
-    /// Invalidate the cached token only if it still matches the one the failing
-    /// request used.
-    ///
-    /// Under concurrency another task may have already refreshed the cache with
-    /// a fresh token between the time this request read its token and the time
-    /// the authentication rejection came back. Evicting unconditionally would
-    /// discard that valid token and force a redundant OAuth round-trip, so the
-    /// eviction is gated on the cached entry still being the failing token.
-    async fn invalidate_cached_token(&self, failing_token: &str) {
-        let mut cached = self.cached_token.write().await;
-        if cached
-            .as_ref()
-            .is_some_and(|token| token.token.as_str() == failing_token)
-        {
-            *cached = None;
-            debug!("Invalidated cached FCM OAuth token after authentication rejection");
         }
     }
 
@@ -622,14 +617,12 @@ impl FcmClient {
 
     async fn handle_response(
         &self,
-        request_duration: Duration,
         response: reqwest::Response,
         access_token: &str,
     ) -> SendAttemptResult {
         let status = response.status();
 
         if let Some(metrics) = &self.metrics {
-            metrics.observe_push_duration("fcm", request_duration.as_secs_f64());
             metrics.record_push_response_status("fcm", status.as_u16());
         }
 
@@ -643,10 +636,13 @@ impl FcmClient {
                     .await
             }
             401 => {
-                // Auth error - permanent for this request, refresh on the next one.
-                self.invalidate_cached_token(access_token).await;
-                debug!("FCM authentication error");
-                SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
+                // Auth error. FCM 401 is unambiguously an auth failure (unlike
+                // APNs 403, which overloads auth and config), so evict the
+                // cached token unconditionally and ask the retry engine to
+                // retry once with a freshly minted token (issue #85).
+                self.token_cache.invalidate_if_matches(access_token).await;
+                debug!("FCM authentication error; will retry once with a fresh token");
+                SendAttemptResult::AuthRejected(Error::Fcm("Authentication error".to_string()))
             }
             403 => {
                 // Project or service-account authorization failure. This is a
@@ -706,9 +702,13 @@ impl FcmClient {
         }
     }
 
-    /// Send a single push notification attempt without retry.
+    /// Send a single push notification attempt (one `with_retry` iteration).
     ///
-    /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
+    /// Builds the request template once, before the transport-retry closure,
+    /// so a transport retry reuses it rather than rebuilding the map/struct and
+    /// re-copying the device token per attempt (issue #198). Returns a
+    /// `SendAttemptResult` indicating success, a retriable error, an auth
+    /// rejection, or a permanent error.
     async fn send_once(&self, device_token: &Zeroizing<String>) -> SendAttemptResult {
         let project_id = match self.project_id() {
             Ok(id) => id,
@@ -721,21 +721,23 @@ impl FcmClient {
             Err(e) => return e.into_send_attempt(),
         };
 
+        // Build the request body template once, outside the transport-retry
+        // closure (issue #198). It borrows the device token from its zeroizing
+        // buffer (issue #126).
+        let request = Self::build_message(device_token.as_str());
+
         let transport_retry = RetryConfig::transport();
-        let (request_duration, response) = match retry::with_transport_retry(
+        let response = match retry::with_transport_retry(
             &transport_retry,
             "FCM",
             || async {
-                // Start timing after OAuth acquisition and per transport
-                // attempt so auth refreshes and prior connect-retry backoff do
-                // not inflate provider latency.
-                let start = Instant::now();
-                let response = self
-                    .build_request(&url, access_token.as_str(), device_token.as_str())
+                self.build_request(&url, access_token.as_str(), &request)
                     .send()
                     .await
-                    .map_err(Error::from)?;
-                Ok((start.elapsed(), response))
+                    // FCM's URL does not embed the device token (it lives in
+                    // the JSON body), but strip any URL uniformly with APNs so
+                    // transport errors never carry a target into logs (#172).
+                    .map_err(|e| Error::from(e).redact_transport_url())
             },
             self.metrics.as_ref(),
         )
@@ -745,8 +747,7 @@ impl FcmClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(request_duration, response, access_token.as_str())
-            .await
+        self.handle_response(response, access_token.as_str()).await
     }
 
     /// Check if the client is properly configured.
@@ -756,7 +757,7 @@ impl FcmClient {
             return false;
         }
 
-        self.service_account.is_some() && self.encoding_key.is_some()
+        self.token_cache.generator().is_configured()
     }
 }
 
@@ -822,23 +823,59 @@ impl FcmClient {
             (None, None)
         };
 
-        Self {
-            http_client: Client::new(),
-            config,
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("http client");
+        let token_cache = TokenCache::new(FcmTokenGenerator {
+            http_client: http_client.clone(),
             service_account,
             encoding_key,
-            cached_token: Arc::new(RwLock::new(None)),
             metrics: None,
             test_oauth_token_url: None,
+        });
+
+        Self {
+            config,
+            http_client,
+            token_cache,
+            metrics: None,
             test_fcm_api_base_url: None,
         }
+    }
+
+    /// Set the mock service account's project id (test setup).
+    pub(crate) fn set_service_account_project_id(&mut self, project_id: &str) {
+        if let Some(sa) = self
+            .token_cache
+            .generator_mut()
+            .service_account
+            .as_mut()
+        {
+            sa.project_id = project_id.to_string();
+        }
+    }
+
+    /// Set the OAuth token endpoint override (test setup).
+    pub(crate) fn set_test_oauth_token_url(&mut self, url: String) {
+        self.token_cache.generator_mut().test_oauth_token_url = Some(url);
+    }
+
+    /// Seed the token cache with a credential (test setup).
+    pub(crate) async fn seed_token(&self, token: &str, expires_at: SystemTime) {
+        self.token_cache.seed(token, expires_at).await;
+    }
+
+    /// The currently cached credential value, if any (test inspection).
+    pub(crate) async fn cached_token_value(&self) -> Option<String> {
+        self.token_cache.cached_token_value().await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_metrics::{counter_value, histogram_sample_count, histogram_sample_sum};
+    use crate::test_metrics::{counter_value, histogram_sample_count};
     use wiremock::matchers::{body_partial_json, header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -847,16 +884,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_token_stores_access_token_in_zeroizing_string() {
-        // Compile-time guard: cached credentials must stay zeroizing.
+    fn test_minted_token_stores_access_token_in_zeroizing_string() {
+        // Compile-time guard: minted credentials handed to the shared cache
+        // must stay zeroizing.
         fn assert_zeroizing_string(_: &Zeroizing<String>) {}
 
-        let cached = CachedToken {
+        let minted = MintedToken {
             token: Zeroizing::new("cached-access-token".to_string()),
             expires_at: SystemTime::now() + Duration::from_secs(60),
         };
 
-        assert_zeroizing_string(&cached.token);
+        assert_zeroizing_string(&minted.token);
     }
 
     #[test]
@@ -1260,7 +1298,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_response_records_supplied_provider_duration() {
+    async fn test_handle_response_records_per_attempt_status_not_duration() {
+        // Metric layering (issue #168): handle_response records only the
+        // per-attempt response-status counter; the per-logical-push duration
+        // is recorded once in send(), so no duration sample comes from here.
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"/v1/projects/.+/messages:send"))
@@ -1287,27 +1328,82 @@ mod tests {
             .await
             .unwrap();
 
-        let provider_duration = Duration::from_millis(123);
-        let result = client
-            .handle_response(provider_duration, response, "test-access-token")
-            .await;
+        let result = client.handle_response(response, "test-access-token").await;
 
         assert!(matches!(result, SendAttemptResult::Success(true)));
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_response_status_total",
+                &[("platform", "fcm"), ("status", "200")]
+            ),
+            1.0
+        );
+        assert!(
+            !metrics
+                .gather()
+                .iter()
+                .any(|family| family.name() == "transponder_push_request_duration_seconds"),
+            "handle_response must not observe the per-push duration histogram"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_records_one_duration_sample_per_logical_push_across_retries() {
+        // A logical push that succeeds after one 429 retry records exactly one
+        // duration sample (issue #168) and two per-attempt status counts.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": { "code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED" }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let metrics = Metrics::new().unwrap();
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let mut client = FcmClient::mock(config, true);
+        client.metrics = Some(metrics.clone());
+        client.test_fcm_api_base_url = Some(mock_server.uri());
+        client
+            .seed_token("cached", SystemTime::now() + Duration::from_secs(3600))
+            .await;
+
+        let outcome = client
+            .send(zeroizing_token("device-token-123"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, PushSendOutcome::Sent);
         assert_eq!(
             histogram_sample_count(
                 &metrics,
                 "transponder_push_request_duration_seconds",
                 &[("platform", "fcm")]
             ),
-            1
+            1,
+            "duration must be sampled once per logical push, not per attempt"
         );
         assert_eq!(
-            histogram_sample_sum(
+            counter_value(
                 &metrics,
-                "transponder_push_request_duration_seconds",
-                &[("platform", "fcm")]
+                "transponder_push_response_status_total",
+                &[("platform", "fcm"), ("status", "429")]
             ),
-            provider_duration.as_secs_f64()
+            1.0
         );
         assert_eq!(
             counter_value(
@@ -1350,7 +1446,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-access-token")
+            .handle_response(response, "test-access-token")
             .await
     }
 
@@ -1403,7 +1499,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-access-token")
+            .handle_response(response, "test-access-token")
             .await
     }
 
@@ -1535,7 +1631,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-access-token")
+            .handle_response(response, "test-access-token")
             .await
     }
 
@@ -1678,13 +1774,9 @@ mod tests {
             project_id: "test-project".to_string(),
         };
         let client = FcmClient::mock(config, false);
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("poisoned-access-token".to_string()),
-                expires_at: SystemTime::now() + TOKEN_LIFETIME,
-            });
-        }
+        client
+            .seed_token("poisoned-access-token", SystemTime::now() + TOKEN_LIFETIME)
+            .await;
 
         let response = Client::new()
             .post(format!(
@@ -1696,15 +1788,17 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Duration::ZERO, response, "poisoned-access-token")
+            .handle_response(response, "poisoned-access-token")
             .await;
 
+        // FCM 401 is unambiguous auth failure: evict the token and ask for a
+        // fresh-token retry (issue #85).
         assert!(matches!(
             result,
-            SendAttemptResult::Permanent(Error::Fcm(ref message))
+            SendAttemptResult::AuthRejected(Error::Fcm(ref message))
                 if message.contains("Authentication error")
         ));
-        assert!(client.cached_token.read().await.is_none());
+        assert_eq!(client.cached_token_value().await, None);
     }
 
     #[tokio::test]
@@ -1733,13 +1827,9 @@ mod tests {
 
         // Simulate a concurrent task having already refreshed the cache to a
         // newer token after the failing request read its (now stale) token.
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("fresh-access-token".to_string()),
-                expires_at: SystemTime::now() + TOKEN_LIFETIME,
-            });
-        }
+        client
+            .seed_token("fresh-access-token", SystemTime::now() + TOKEN_LIFETIME)
+            .await;
 
         let response = Client::new()
             .post(format!(
@@ -1752,19 +1842,18 @@ mod tests {
 
         // The failing request used the older, now-replaced token.
         let result = client
-            .handle_response(Duration::ZERO, response, "stale-access-token")
+            .handle_response(response, "stale-access-token")
             .await;
 
         assert!(matches!(
             result,
-            SendAttemptResult::Permanent(Error::Fcm(ref message))
+            SendAttemptResult::AuthRejected(Error::Fcm(ref message))
                 if message.contains("Authentication error")
         ));
 
         // The freshly refreshed token must survive the stale rejection.
-        let cached = client.cached_token.read().await;
         assert_eq!(
-            cached.as_ref().map(|token| token.token.as_str()),
+            client.cached_token_value().await.as_deref(),
             Some("fresh-access-token")
         );
     }
@@ -1860,7 +1949,7 @@ mod tests {
         };
 
         let mut client = FcmClient::mock(config, true);
-        client.service_account.as_mut().unwrap().project_id = "service-project".to_string();
+        client.set_service_account_project_id("service-project");
 
         assert_eq!(client.project_id().unwrap(), "service-project");
     }
@@ -1926,8 +2015,9 @@ mod tests {
         };
 
         let client = FcmClient::new(config).await.unwrap();
-        assert!(client.service_account.is_none());
-        assert!(client.encoding_key.is_none());
+        // No service account / encoding key loaded means the client is not
+        // configured to send.
+        assert!(!client.is_configured());
     }
 
     #[tokio::test]
@@ -1957,13 +2047,12 @@ mod tests {
         let client = FcmClient::mock(config, true);
 
         // Pre-populate the cache
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("cached-access-token".to_string()),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            });
-        }
+        client
+            .seed_token(
+                "cached-access-token",
+                SystemTime::now() + Duration::from_secs(3600),
+            )
+            .await;
 
         // Should return cached token
         let token = client.get_access_token().await.unwrap();
@@ -2114,13 +2203,9 @@ mod tests {
         let client = FcmClient::mock(config, false);
 
         // Pre-populate with expired token
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("expired-token".to_string()),
-                expires_at: SystemTime::now() - Duration::from_secs(1),
-            });
-        }
+        client
+            .seed_token("expired-token", SystemTime::now() - Duration::from_secs(1))
+            .await;
 
         // Should try to refresh but fail since no service account
         let result = client.get_access_token().await;
@@ -2158,13 +2243,9 @@ mod tests {
         let client = FcmClient::mock(config, false);
 
         // Pre-populate cache so it doesn't fail on get_access_token first
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("test-token".to_string()),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            });
-        }
+        client
+            .seed_token("test-token", SystemTime::now() + Duration::from_secs(3600))
+            .await;
 
         let result = client
             .send(zeroizing_token("test-device-token"), None)
@@ -2204,7 +2285,7 @@ mod tests {
         };
 
         let mut client = FcmClient::mock(config, true);
-        client.service_account.as_mut().unwrap().project_id = "x/../../admin/v1".to_string();
+        client.set_service_account_project_id("x/../../admin/v1");
 
         let result = client
             .send(zeroizing_token("test-device-token"), None)
@@ -2249,17 +2330,8 @@ mod tests {
             project_id: "test-project".to_string(),
         };
 
-        // Create client with no service account and no encoding key
-        let client = FcmClient {
-            http_client: Client::new(),
-            config,
-            service_account: None,
-            encoding_key: None,
-            cached_token: Arc::new(RwLock::new(None)),
-            metrics: None,
-            test_oauth_token_url: None,
-            test_fcm_api_base_url: None,
-        };
+        // Create client with no service account and no encoding key.
+        let client = FcmClient::mock(config, false);
 
         // Should not be configured - no encoding key
         assert!(!client.is_configured());
@@ -2604,17 +2676,23 @@ LTP/MQIxLydQxT4+jx2NBu0=
         let encoding_key =
             EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).expect("test RSA key");
 
-        FcmClient {
-            http_client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("http client"),
-            config,
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("http client");
+        let token_cache = TokenCache::new(FcmTokenGenerator {
+            http_client: http_client.clone(),
             service_account: Some(sa),
             encoding_key: Some(encoding_key),
-            cached_token: Arc::new(RwLock::new(None)),
             metrics: None,
             test_oauth_token_url: None,
+        });
+
+        FcmClient {
+            config,
+            http_client,
+            token_cache,
+            metrics: None,
             test_fcm_api_base_url: None,
         }
     }
@@ -2623,7 +2701,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
     fn test_oauth_token_http_status_classifies_transient_failures_as_retriable() {
         for status_code in [429_u16, 500, 503] {
             let status = reqwest::StatusCode::from_u16(status_code).unwrap();
-            let failure = TokenAcquisitionError::from_http_status(status, None);
+            let failure = oauth_error_from_status(status, None);
             assert!(
                 matches!(
                     failure,
@@ -2640,7 +2718,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
     #[test]
     fn test_oauth_token_http_status_classifies_permanent_oauth_failures() {
         let status = reqwest::StatusCode::BAD_REQUEST;
-        let failure = TokenAcquisitionError::from_http_status(status, None);
+        let failure = oauth_error_from_status(status, None);
         assert!(matches!(
             failure,
             TokenAcquisitionError::Permanent(Error::Fcm(ref message))
@@ -2652,7 +2730,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
     fn test_oauth_token_http_status_honors_retry_after_for_503() {
         let status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
         let failure =
-            TokenAcquisitionError::from_http_status(status, Some(Duration::from_secs(30)));
+            oauth_error_from_status(status, Some(Duration::from_secs(30)));
         assert!(matches!(
             failure,
             TokenAcquisitionError::Retriable {
@@ -2673,7 +2751,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
             .await;
 
         let mut client = mock_client_with_rsa_service_account("test-project");
-        client.test_oauth_token_url = Some(mock_server.uri());
+        client.set_test_oauth_token_url(mock_server.uri());
 
         let result = client.get_access_token().await;
         assert!(matches!(
@@ -2685,6 +2763,115 @@ LTP/MQIxLydQxT4+jx2NBu0=
         ));
     }
 
+    /// Build an FCM token generator whose service-account `token_uri` is
+    /// `token_uri` and with no OAuth-URL test override, so `mint()` POSTs to
+    /// the signed audience (issue #153).
+    fn generator_with_token_uri(token_uri: &str) -> FcmTokenGenerator {
+        let sa = ServiceAccount {
+            account_type: "service_account".to_string(),
+            project_id: "test-project".to_string(),
+            private_key: Zeroizing::new(TEST_RSA_PRIVATE_KEY.to_string()),
+            client_email: "test@test.iam.gserviceaccount.com".to_string(),
+            token_uri: token_uri.to_string(),
+        };
+        let encoding_key =
+            EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).expect("test RSA key");
+        FcmTokenGenerator {
+            http_client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("http client"),
+            service_account: Some(sa),
+            encoding_key: Some(encoding_key),
+            metrics: None,
+            test_oauth_token_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mint_posts_to_service_account_token_uri() {
+        // The OAuth request must target the service-account token_uri so the
+        // signed assertion `aud` and the endpoint agree (issue #153). The mock
+        // only answers on /custom/token; a POST to the constant would 404.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/custom/token$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let generator = generator_with_token_uri(&format!("{}/custom/token", mock_server.uri()));
+        let minted = generator.mint().await.expect("mint should target token_uri");
+        assert_eq!(minted.token.as_str(), "minted-token");
+    }
+
+    #[tokio::test]
+    async fn test_mint_falls_back_to_constant_when_token_uri_empty() {
+        // With an empty token_uri the generator must fall back to the well-known
+        // constant rather than POSTing to an empty URL (issue #153).
+        let generator = generator_with_token_uri("");
+        let sa = generator.service_account().unwrap();
+        assert_eq!(generator.oauth_token_url(sa), OAUTH_TOKEN_URL);
+    }
+
+    #[tokio::test]
+    async fn test_mint_honors_provider_expires_in() {
+        // The cached lifetime must derive from the provider's expires_in (minus
+        // the safety margin), not the hardcoded fallback (issue #88 groundwork,
+        // preserved through the refactor).
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-token",
+                "expires_in": 120
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let generator = generator_with_token_uri(&mock_server.uri());
+        let minted = generator.mint().await.expect("mint");
+        // expires_at is set to now()+ttl inside mint, where ttl is the provider
+        // 120s expiry minus the 60s safety margin (= 60s). Measuring the
+        // remaining lifetime just after mint returns should land near 60s (a
+        // little less, by the elapsed time since expires_at was stamped), and
+        // well under the 120s the provider reported.
+        let remaining = minted
+            .expires_at
+            .duration_since(SystemTime::now())
+            .expect("expiry in the future");
+        assert!(remaining <= Duration::from_secs(60));
+        assert!(remaining >= Duration::from_secs(50));
+    }
+
+    #[tokio::test]
+    async fn test_mint_rejects_oversized_oauth_success_body() {
+        // A hijacked/misconfigured token_uri returning a multi-megabyte 200
+        // body must be refused by the bounded read rather than buffered whole
+        // (issue #154).
+        let mock_server = MockServer::start().await;
+        let padding = "A".repeat(MAX_OAUTH_BODY_BYTES + 1024);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"access_token":"{padding}","expires_in":3600}}"#
+            )))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let generator = generator_with_token_uri(&mock_server.uri());
+        let result = generator.mint().await;
+        let Err(TokenAcquisitionError::Permanent(Error::Fcm(message))) = result else {
+            panic!("expected a permanent OAuth error for the oversized body");
+        };
+        assert!(message.contains("unreadable or exceeded the size cap"));
+        assert!(!message.contains(&padding));
+    }
+
     #[tokio::test]
     async fn test_get_access_token_oauth_transport_error_is_retriable() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2692,7 +2879,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
         drop(listener);
 
         let mut client = mock_client_with_rsa_service_account("test-project");
-        client.test_oauth_token_url = Some(format!("http://{addr}/token"));
+        client.set_test_oauth_token_url(format!("http://{addr}/token"));
 
         let result = client.get_access_token().await;
         assert!(matches!(
@@ -2718,7 +2905,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
             .await;
 
         let mut client = mock_client_with_rsa_service_account("test-project");
-        client.test_oauth_token_url = Some(mock_server.uri());
+        client.set_test_oauth_token_url(mock_server.uri());
 
         let result = client.get_access_token().await;
         let TokenAcquisitionError::Permanent(Error::Fcm(message)) = result.unwrap_err() else {
@@ -2760,7 +2947,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
             .await;
 
         let mut client = mock_client_with_rsa_service_account("test-project");
-        client.test_oauth_token_url = Some(mock_server.uri());
+        client.set_test_oauth_token_url(mock_server.uri());
         client.test_fcm_api_base_url = Some(mock_server.uri());
 
         let result = client.send(zeroizing_token("device-token-123"), None).await;
@@ -2785,7 +2972,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
             .await;
 
         let mut client = mock_client_with_rsa_service_account("test-project");
-        client.test_oauth_token_url = Some(mock_server.uri());
+        client.set_test_oauth_token_url(mock_server.uri());
         client.test_fcm_api_base_url = Some(mock_server.uri());
 
         let result = client.send(zeroizing_token("device-token-123"), None).await;
