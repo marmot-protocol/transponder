@@ -847,6 +847,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "timed out waiting for attempt_count")]
+    async fn wait_for_attempt_count_panics_when_progress_never_happens() {
+        // Guard the bounded-wait helper's timeout path: if the awaited count is
+        // never reached (nothing increments it here), the helper must not spin
+        // forever — it exhausts its iteration cap and panics with a diagnostic.
+        let count = AtomicU32::new(0);
+        wait_for_attempt_count(&count, 1).await;
+    }
+
+    #[tokio::test]
     async fn test_with_retry_success_false() {
         let config = RetryConfig::default();
 
