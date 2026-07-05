@@ -35,6 +35,28 @@ use crate::push::{ApnsClient, FcmClient};
 /// Maximum concurrent outbound push requests.
 const MAX_CONCURRENT_PUSHES: usize = 100;
 
+/// Maximum number of simultaneously *live* send tasks (active plus
+/// sleeping-in-backoff), as a multiple of [`MAX_CONCURRENT_PUSHES`].
+///
+/// A send task releases its concurrency permit during a retry backoff sleep
+/// (see [`crate::push::retry::BackoffPermit`]) so an active HTTP slot is not
+/// wasted while sleeping, but the task stays alive and still holds a decrypted
+/// device token. Under a provider 429/5xx storm every in-flight task can enter
+/// backoff and release its permit at once, letting the recv loop drain the
+/// entire queue and spawn thousands of live token-holding tasks — the
+/// concurrency bound silently balloons to the queue size (#160).
+///
+/// A second semaphore, acquired at task *spawn* and held for the task's whole
+/// life (never released during backoff), caps the live-task count
+/// independently. Sizing it at 2x the active-concurrency limit leaves generous
+/// headroom for tasks legitimately sleeping in backoff while still bounding
+/// decrypted-token residency to a small constant instead of the 10k queue.
+const LIVE_TASK_MULTIPLIER: usize = 2;
+
+/// Maximum number of simultaneously live send tasks. See
+/// [`LIVE_TASK_MULTIPLIER`].
+const MAX_LIVE_SEND_TASKS: usize = MAX_CONCURRENT_PUSHES * LIVE_TASK_MULTIPLIER;
+
 /// Maximum number of pending notifications in the queue.
 ///
 /// This bounds the memory used by waiting tasks. When this limit is reached,
@@ -206,11 +228,36 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Cloneable shared state handed to the queue-draining dispatcher loop and, in
+/// turn, to each spawned send task. Groups the fields so the spawn path stays a
+/// single argument rather than a long positional list.
+#[derive(Clone)]
+struct DispatchWorkerContext {
+    apns_client: Option<Arc<ApnsClient>>,
+    fcm_client: Option<Arc<FcmClient>>,
+    /// Active-HTTP concurrency limit (released during backoff sleeps).
+    semaphore: Arc<Semaphore>,
+    /// Live-task limit (held for a task's whole life; see [`MAX_LIVE_SEND_TASKS`]).
+    live_task_semaphore: Arc<Semaphore>,
+    inflight: Arc<InFlightTracker>,
+    /// Passive per-provider delivery-health signal (see [`DeliveryHealth`]).
+    delivery_health: Arc<DeliveryHealth>,
+    metrics: Option<Metrics>,
+}
+
 /// Push notification dispatcher.
 pub struct PushDispatcher {
     apns_client: Option<Arc<ApnsClient>>,
     fcm_client: Option<Arc<FcmClient>>,
     semaphore: Arc<Semaphore>,
+    /// Caps the number of simultaneously live send tasks (see
+    /// [`MAX_LIVE_SEND_TASKS`]). A permit is acquired at task spawn and held
+    /// for the task's whole life, so a task sleeping in backoff still counts.
+    ///
+    /// The dispatcher loop holds its own clone (via [`DispatchWorkerContext`]);
+    /// this retained handle lets shutdown/tests observe the live-task bound.
+    #[cfg_attr(not(test), allow(dead_code))]
+    live_task_semaphore: Arc<Semaphore>,
     sender: mpsc::Sender<PushMessage>,
     queue_depth: Arc<AtomicUsize>,
     shutting_down: Arc<AtomicBool>,
@@ -241,6 +288,7 @@ impl PushDispatcher {
         let apns_client = apns_client.map(Arc::new);
         let fcm_client = fcm_client.map(Arc::new);
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSHES));
+        let live_task_semaphore = Arc::new(Semaphore::new(MAX_LIVE_SEND_TASKS));
         let (sender, receiver) = mpsc::channel(MAX_PENDING_QUEUE_SIZE);
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -256,21 +304,23 @@ impl PushDispatcher {
         }
 
         // Spawn the queue dispatcher task.
-        let dispatcher_handle = Self::spawn_dispatcher(
-            receiver,
-            queue_depth.clone(),
-            apns_client.clone(),
-            fcm_client.clone(),
-            semaphore.clone(),
-            inflight.clone(),
-            delivery_health.clone(),
-            metrics.clone(),
-        );
+        let worker_context = DispatchWorkerContext {
+            apns_client: apns_client.clone(),
+            fcm_client: fcm_client.clone(),
+            semaphore: semaphore.clone(),
+            live_task_semaphore: live_task_semaphore.clone(),
+            inflight: inflight.clone(),
+            delivery_health: delivery_health.clone(),
+            metrics: metrics.clone(),
+        };
+        let dispatcher_handle =
+            Self::spawn_dispatcher(receiver, queue_depth.clone(), worker_context);
 
         Self {
             apns_client,
             fcm_client,
             semaphore,
+            live_task_semaphore,
             sender,
             queue_depth,
             shutting_down,
@@ -384,7 +434,11 @@ impl PushDispatcher {
                             // rejections (revoked key, expired credentials),
                             // so they count toward the hard-failure streak.
                             delivery_health.record_hard_failure(platform);
-                            debug!(error = %e, "APNs send error");
+                            // Redact any embedded URL before logging: the APNs
+                            // URL carries the device token (#172). The send
+                            // path already strips it, but redact again here so
+                            // this log sink is safe regardless.
+                            debug!(error = %e.redact_transport_url(), "APNs send error");
                             if let Some(ref m) = metrics {
                                 m.record_push_failed(platform_str, "error");
                             }
@@ -409,7 +463,10 @@ impl PushDispatcher {
                             // rejections (revoked key, expired credentials),
                             // so they count toward the hard-failure streak.
                             delivery_health.record_hard_failure(platform);
-                            debug!(error = %e, "FCM send error");
+                            // Uniform with APNs: strip any embedded URL before
+                            // logging (#172). FCM's URL carries no token, but
+                            // keeping the redaction uniform is defense-in-depth.
+                            debug!(error = %e.redact_transport_url(), "FCM send error");
                             if let Some(ref m) = metrics {
                                 m.record_push_failed(platform_str, "error");
                             }
@@ -422,45 +479,62 @@ impl PushDispatcher {
     }
 
     /// Spawn a single dispatcher task that drains the push queue.
-    // The dispatcher task needs each shared handle individually; bundling
-    // them into a context struct would only relocate this list.
-    #[allow(clippy::too_many_arguments)]
     fn spawn_dispatcher(
         mut receiver: mpsc::Receiver<PushMessage>,
         queue_depth: Arc<AtomicUsize>,
-        apns_client: Option<Arc<ApnsClient>>,
-        fcm_client: Option<Arc<FcmClient>>,
-        semaphore: Arc<Semaphore>,
-        inflight: Arc<InFlightTracker>,
-        delivery_health: Arc<DeliveryHealth>,
-        metrics: Option<Metrics>,
+        ctx: DispatchWorkerContext,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let metrics = ctx.metrics.clone();
             loop {
                 match receiver.recv().await {
                     Some(PushMessage::Send { platform, token }) => {
                         Self::decrement_queue_depth(&queue_depth);
                         Self::update_queue_size_metric(&metrics, &queue_depth);
 
-                        // Acquire a permit before spawning the send task. The semaphore,
-                        // not a worker pool, is the outbound concurrency limit.
-                        let permit =
-                            match Self::acquire_push_permit(semaphore.clone(), &metrics).await {
+                        // Bound the number of simultaneously LIVE send tasks
+                        // (active + sleeping-in-backoff) first: this permit is
+                        // held for the task's whole life and is NOT released
+                        // during backoff, so a provider storm can no longer let
+                        // released concurrency permits balloon live
+                        // token-holding tasks to the queue size (#160). The
+                        // recv loop blocks here once MAX_LIVE_SEND_TASKS tasks
+                        // are alive, applying backpressure to the queue instead.
+                        let live_task_permit =
+                            match ctx.live_task_semaphore.clone().acquire_owned().await {
                                 Ok(p) => p,
                                 Err(_) => {
-                                    // The dispatcher never closes this semaphore today; if a
-                                    // future change does, the dequeued token is zeroed as this
-                                    // loop scope unwinds.
-                                    debug!("Push semaphore closed, dispatcher exiting");
+                                    debug!("Live-task semaphore closed, dispatcher exiting");
                                     break;
                                 }
                             };
 
-                        let apns_client = apns_client.clone();
-                        let fcm_client = fcm_client.clone();
-                        let metrics = metrics.clone();
-                        let semaphore = semaphore.clone();
-                        let delivery_health = delivery_health.clone();
+                        // Acquire a concurrency permit before spawning the send
+                        // task. This semaphore, not a worker pool, is the
+                        // outbound *active-HTTP* concurrency limit; the send's
+                        // backoff releases it during sleeps (the live-task
+                        // permit above stays held).
+                        let permit = match Self::acquire_push_permit(
+                            ctx.semaphore.clone(),
+                            &metrics,
+                        )
+                        .await
+                        {
+                            Ok(p) => p,
+                            Err(_) => {
+                                // The dispatcher never closes this semaphore today; if a
+                                // future change does, the dequeued token is zeroed as this
+                                // loop scope unwinds.
+                                debug!("Push semaphore closed, dispatcher exiting");
+                                break;
+                            }
+                        };
+
+                        let apns_client = ctx.apns_client.clone();
+                        let fcm_client = ctx.fcm_client.clone();
+                        let task_metrics = metrics.clone();
+                        let semaphore = ctx.semaphore.clone();
+                        let delivery_health = ctx.delivery_health.clone();
 
                         // Register the send task as in-flight BEFORE spawning
                         // so graceful shutdown can never observe a window where
@@ -468,12 +542,16 @@ impl PushDispatcher {
                         // the task and dropped only when the task body finishes
                         // (after all retries/backoff), independent of whether the
                         // task currently holds a concurrency permit.
-                        let inflight_guard = inflight.enter();
+                        let inflight_guard = ctx.inflight.enter();
 
                         tokio::spawn(async move {
                             // Decrements the in-flight count when this task
                             // completes, signalling idle to any shutdown waiter.
                             let _inflight_guard = inflight_guard;
+                            // Held for the task's whole life (dropped last),
+                            // bounding live token-holding tasks even across
+                            // backoff sleeps (#160).
+                            let _live_task_permit = live_task_permit;
 
                             // Wrap the permit so the send's internal backoff
                             // can release the in-flight slot during sleeps and
@@ -486,7 +564,7 @@ impl PushDispatcher {
                                 token,
                                 apns_client,
                                 fcm_client,
-                                metrics.clone(),
+                                task_metrics.clone(),
                                 &delivery_health,
                                 Some(&mut backoff_permit),
                             )
@@ -496,7 +574,7 @@ impl PushDispatcher {
                             // before reading available permits for the metric.
                             drop(backoff_permit);
 
-                            Self::update_semaphore_available_metric(&metrics, &semaphore);
+                            Self::update_semaphore_available_metric(&task_metrics, &semaphore);
                         });
                     }
                     Some(PushMessage::Shutdown) => {
@@ -782,6 +860,13 @@ impl PushDispatcher {
     pub fn max_queue_size(&self) -> usize {
         MAX_PENDING_QUEUE_SIZE
     }
+
+    /// Available live-task permits (test inspection for the #160 bound).
+    #[cfg(test)]
+    #[must_use]
+    fn available_live_task_permits(&self) -> usize {
+        self.live_task_semaphore.available_permits()
+    }
 }
 
 #[cfg(test)]
@@ -837,19 +922,16 @@ mod tests {
 
     #[tokio::test]
     async fn send_push_records_invalid_token_metrics() {
-        use crate::config::{ApnsConfig, FcmConfig};
+        // FCM still short-circuits a clearly-malformed (here empty) token to
+        // the InvalidToken outcome before spending an OAuth round-trip. The
+        // APNs client no longer re-validates token format (issue #199): the
+        // dispatcher only ever feeds it even-length hex from
+        // `TokenPayload::device_token_hex()`, the single source of truth, so
+        // there is no dispatch-path APNs "invalid_token" case to exercise.
+        use crate::config::FcmConfig;
         use crate::metrics::Metrics;
-        use crate::push::{ApnsClient, FcmClient};
+        use crate::push::FcmClient;
 
-        let apns_config = ApnsConfig {
-            enabled: true,
-            key_id: "KEY123".to_string(),
-            team_id: "TEAM456".to_string(),
-            private_key_path: String::new(),
-            environment: crate::config::ApnsEnvironment::Sandbox,
-            bundle_id: "com.example.app".to_string(),
-            payload_mode: Default::default(),
-        };
         let fcm_config = FcmConfig {
             enabled: true,
             service_account_path: String::new(),
@@ -859,16 +941,6 @@ mod tests {
 
         let delivery_health = DeliveryHealth::default();
 
-        PushDispatcher::send_push(
-            Platform::Apns,
-            Zeroizing::new("not-a-hex-token".to_string()),
-            Some(Arc::new(ApnsClient::mock(apns_config, true))),
-            None,
-            Some(metrics.clone()),
-            &delivery_health,
-            None,
-        )
-        .await;
         PushDispatcher::send_push(
             Platform::Fcm,
             Zeroizing::new("".to_string()),
@@ -880,10 +952,6 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            push_failed_metric_value(&metrics, "apns", "invalid_token"),
-            1
-        );
         assert_eq!(
             push_failed_metric_value(&metrics, "fcm", "invalid_token"),
             1
@@ -1980,5 +2048,95 @@ mod tests {
             .expect("shutdown task should not panic");
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_live_task_bound_is_twice_the_concurrency_limit() {
+        // The live-task ceiling must be a small constant multiple of the
+        // active-concurrency limit, not the queue size (#160).
+        const _: () = assert!(MAX_LIVE_SEND_TASKS == MAX_CONCURRENT_PUSHES * 2);
+        const _: () = assert!(MAX_LIVE_SEND_TASKS < MAX_PENDING_QUEUE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_live_task_semaphore_caps_live_tasks_under_backoff_storm() {
+        // Regression for #160: under a provider 429 storm every in-flight send
+        // enters backoff and RELEASES its concurrency permit while staying
+        // alive (still holding a decrypted token). The recv loop would then
+        // reacquire the freed concurrency permits and drain the whole queue,
+        // ballooning live token-holding tasks to the queue size. The live-task
+        // semaphore (acquired at spawn, held across backoff) must cap live
+        // tasks at MAX_LIVE_SEND_TASKS regardless of how many are queued.
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Every send gets a 429 with a long Retry-After, so tasks stay in
+        // backoff (permit released, live-task permit held) for the whole test.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
+            .mount(&mock_server)
+            .await;
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+        };
+        let mut client = ApnsClient::mock(apns_config, true);
+        client.test_base_url = Some(mock_server.uri());
+        client
+            .seed_token(
+                "cached",
+                std::time::SystemTime::now() + Duration::from_secs(3600),
+            )
+            .await;
+        let dispatcher = Arc::new(PushDispatcher::new(Some(client), None));
+
+        // Queue far more messages than the live-task ceiling.
+        let batch = MAX_LIVE_SEND_TASKS + 300;
+        assert_eq!(
+            dispatcher
+                .dispatch(repeated_apns_payloads(batch))
+                .await
+                .unwrap(),
+            batch
+        );
+
+        // Wait until the live-task semaphore is exhausted (recv loop blocked on
+        // it), i.e. exactly MAX_LIVE_SEND_TASKS tasks are alive.
+        for _ in 0..200 {
+            if dispatcher.available_live_task_permits() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            dispatcher.available_live_task_permits(),
+            0,
+            "live-task semaphore should be fully consumed under the storm"
+        );
+
+        // The cap must hold: even though tasks keep releasing their concurrency
+        // permits during backoff, no more than MAX_LIVE_SEND_TASKS are alive,
+        // so the remaining messages stay queued rather than spawned.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(dispatcher.available_live_task_permits(), 0);
+        assert!(
+            dispatcher.queue_capacity() < MAX_PENDING_QUEUE_SIZE,
+            "messages beyond the live-task ceiling must stay queued, not spawned"
+        );
+
+        // Point the client at nothing further; abandon the storming tasks by
+        // dropping the dispatcher (test process ends). We do not wait_for
+        // completion here because the 30s Retry-After would stall the test;
+        // the invariant under test (bounded live tasks) is already proven.
     }
 }
