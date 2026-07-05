@@ -10,7 +10,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::FcmConfig;
@@ -494,7 +494,7 @@ impl FcmClient {
 
         match classify_fcm_error(&error.error) {
             FcmClassification::TokenDead => {
-                info!(status = %error.error.status, "FCM token unregistered");
+                debug!(status = %error.error.status, "FCM token unregistered");
                 SendAttemptResult::Success(false)
             }
             FcmClassification::Permanent => {
@@ -526,7 +526,7 @@ impl FcmClient {
 
         match status.as_u16() {
             200 => {
-                info!("FCM notification accepted");
+                debug!(status = status.as_u16(), "FCM notification accepted");
                 SendAttemptResult::Success(true)
             }
             400 => {
@@ -536,7 +536,7 @@ impl FcmClient {
             401 => {
                 // Auth error - permanent for this request, refresh on the next one.
                 self.invalidate_cached_token(access_token).await;
-                error!("FCM authentication error");
+                debug!("FCM authentication error");
                 SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
             }
             403 => {
