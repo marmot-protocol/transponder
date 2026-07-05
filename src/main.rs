@@ -29,6 +29,7 @@ mod metrics;
 mod nostr;
 mod push;
 mod rate_limiter;
+mod redaction;
 mod server;
 mod shutdown;
 mod telemetry;

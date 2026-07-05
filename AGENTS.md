@@ -133,7 +133,7 @@ src/
 ## Security Considerations
 
 - **Never log device tokens or private keys** - these are sensitive
-- **`ERROR` logs and panics are forwarded to GlitchTip.** Transponder-target `error!` events, plus any panic, are sent to the error reporter (see `src/telemetry.rs`; panics go through Sentry's global hook and are *not* target-scoped, so they can originate anywhere). Never interpolate a device token, encrypted blob, private key, recipient identity, or a raw `reqwest::Error` (whose APNs URL contains the device token) into an `error!`, `panic!`, `expect`, or `unwrap` message - fail or log with a redacted id or status instead. The same rule already governs `warn!`/`debug!`, but for anything reportable it is a hard privacy boundary, not just hygiene.
+- **`ERROR` logs and panics are forwarded to GlitchTip.** Transponder-target `error!` events, plus any panic, are sent to the error reporter (see `src/telemetry.rs`; panics go through Sentry's global hook and are *not* target-scoped, so they can originate anywhere). Never interpolate a device token, encrypted blob, private key, recipient identity, or a raw `reqwest::Error` (whose APNs URL contains the device token) into an `error!`, `panic!`, `expect`, or `unwrap` message - fail or log with a redacted id or status instead. The same rule already governs `warn!`/`debug!`, but for anything reportable it is a hard privacy boundary, not just hygiene. As a mechanical backstop, `scrub_event` (`src/telemetry.rs` + `src/redaction.rs`) redacts secret-shaped substrings (64+ char hex runs, `/3/device/<hex>` paths, `wss://` URLs, `.onion` hosts, `nsec1` keys) from every outgoing event — this catches dependency panics, which are not target-scoped. The backstop does not relax the no-secrets rule.
 - **No persistent storage** - the spec requires stateless operation for privacy
 - **Silently ignore invalid/expired tokens** (per MIP-05 spec)
 - Use `tracing` at debug level for push results, never include user-identifying info
@@ -146,7 +146,7 @@ src/
 |-------|---------|
 | `nostr-sdk` | Nostr protocol client with built-in Tor support via arti |
 | `chacha20poly1305` | ChaCha20-Poly1305 AEAD encryption |
-| `hkdf`, `sha2` | HKDF key derivation |
+| `hmac`, `sha2` | HKDF-SHA256 key derivation (manual extract/expand so the PRK is zeroizable; `hkdf` remains a dev-dependency for the test-vector encryption side) |
 | `secp256k1` | ECDH key agreement |
 | `reqwest` | HTTP client for APNs/FCM |
 | `jsonwebtoken` | JWT auth for APNs and FCM OAuth |
