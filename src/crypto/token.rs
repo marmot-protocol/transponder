@@ -173,13 +173,10 @@ impl TokenPayload {
             )));
         }
 
+        // The `data.len() == TOKEN_PLAINTEXT_SIZE` and `token_length <= MAX_DEVICE_TOKEN_SIZE`
+        // checks above already guarantee `payload_end <= data.len()`, so the slice is in bounds.
         let payload_end = 3 + token_length;
-        if payload_end > data.len() {
-            return Err(Error::InvalidToken(format!(
-                "Token length {token_length} exceeds plaintext size {}",
-                data.len()
-            )));
-        }
+        debug_assert!(payload_end <= data.len());
 
         let device_token = data[3..payload_end].to_vec();
 
