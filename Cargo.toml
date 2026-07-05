@@ -13,6 +13,9 @@ tor = ["nostr-sdk/tor"]
 [dependencies]
 # Async runtime
 tokio = { version = "1.49", features = ["full", "signal"] }
+# TaskTracker: tracks per-event processing tasks so in-flight gift-wrap unwrap
+# work is joinable during graceful shutdown instead of being aborted.
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Nostr
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip59"] }
