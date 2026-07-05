@@ -90,8 +90,9 @@ impl Platform {
 ///
 /// This struct implements `ZeroizeOnDrop` to ensure all fields are zeroed
 /// when the token goes out of scope, preventing sensitive data from lingering
-/// in memory.
-#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+/// in memory. It intentionally does not implement `Clone` so sensitive buffers
+/// cannot be implicitly duplicated through whole-struct clones.
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptedToken {
     /// X-only ephemeral public key (32 bytes).
     pub ephemeral_pubkey: [u8; PUBKEY_SIZE],
@@ -138,8 +139,9 @@ impl EncryptedToken {
 ///
 /// This struct implements `ZeroizeOnDrop` to ensure the device token is zeroed
 /// when the payload goes out of scope, preventing sensitive data from lingering
-/// in memory.
-#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+/// in memory. It intentionally does not implement `Clone` so sensitive buffers
+/// cannot be implicitly duplicated through whole-struct clones.
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 pub struct TokenPayload {
     /// Target platform (APNs or FCM).
     #[zeroize(skip)]

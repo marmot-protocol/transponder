@@ -610,6 +610,76 @@ mod tests {
         gauge_metric_value(metrics, "transponder_push_queue_size")
     }
 
+    fn apns_test_payload() -> TokenPayload {
+        TokenPayload {
+            platform: Platform::Apns,
+            device_token: vec![0xaa, 0xbb, 0xcc],
+        }
+    }
+
+    fn repeated_apns_payloads(count: usize) -> Vec<TokenPayload> {
+        (0..count).map(|_| apns_test_payload()).collect()
+    }
+
+    #[tokio::test]
+    async fn send_push_records_invalid_token_metrics() {
+        use crate::config::{ApnsConfig, FcmConfig};
+        use crate::metrics::Metrics;
+        use crate::push::{ApnsClient, FcmClient};
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+        };
+        let fcm_config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let metrics = Metrics::default();
+
+        PushDispatcher::send_push(
+            Platform::Apns,
+            Zeroizing::new("not-a-hex-token".to_string()),
+            Some(Arc::new(ApnsClient::mock(apns_config, true))),
+            None,
+            Some(metrics.clone()),
+            None,
+        )
+        .await;
+        PushDispatcher::send_push(
+            Platform::Fcm,
+            Zeroizing::new("".to_string()),
+            None,
+            Some(Arc::new(FcmClient::mock(fcm_config, true))),
+            Some(metrics.clone()),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            metric_counter_value(
+                &metrics,
+                "transponder_push_failed_total",
+                &[("platform", "apns"), ("reason", "invalid_token")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_counter_value(
+                &metrics,
+                "transponder_push_failed_total",
+                &[("platform", "fcm"), ("reason", "invalid_token")]
+            ),
+            1.0
+        );
+    }
+
     #[tokio::test]
     async fn test_dispatcher_no_clients() {
         let dispatcher = PushDispatcher::new(None, None);
@@ -876,13 +946,7 @@ mod tests {
             .await
             .unwrap();
 
-        let payloads = vec![
-            TokenPayload {
-                platform: Platform::Apns,
-                device_token: vec![0xaa, 0xbb, 0xcc],
-            };
-            2
-        ];
+        let payloads = repeated_apns_payloads(2);
 
         assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 2);
 
@@ -1208,13 +1272,7 @@ mod tests {
             .await
             .unwrap();
 
-        let payloads = vec![
-            TokenPayload {
-                platform: Platform::Apns,
-                device_token: vec![0xaa, 0xbb, 0xcc],
-            };
-            MAX_CONCURRENT_PUSHES + 2
-        ];
+        let payloads = repeated_apns_payloads(MAX_CONCURRENT_PUSHES + 2);
         assert_eq!(
             dispatcher.dispatch(payloads).await.unwrap(),
             MAX_CONCURRENT_PUSHES + 2
@@ -1322,13 +1380,7 @@ mod tests {
         let dispatcher =
             PushDispatcher::with_metrics(Some(apns_client), None, Some(metrics.clone()));
 
-        let payloads = vec![
-            TokenPayload {
-                platform: Platform::Apns,
-                device_token: vec![0xaa, 0xbb, 0xcc],
-            };
-            MAX_PENDING_QUEUE_SIZE + 1
-        ];
+        let payloads = repeated_apns_payloads(MAX_PENDING_QUEUE_SIZE + 1);
 
         let error = dispatcher.dispatch(payloads).await.unwrap_err();
 
@@ -1392,13 +1444,7 @@ mod tests {
         // to dequeue (and decrement) before the batch increment would have run
         // under the old ordering.
         for _ in 0..50 {
-            let payloads = vec![
-                TokenPayload {
-                    platform: Platform::Apns,
-                    device_token: vec![0xaa, 0xbb, 0xcc],
-                };
-                4
-            ];
+            let payloads = repeated_apns_payloads(4);
             assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 4);
 
             // Let the worker pool fully drain the batch.
