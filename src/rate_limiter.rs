@@ -4,7 +4,8 @@
 //! to prevent spam and replay attacks.
 
 use std::collections::VecDeque;
-use std::hash::Hash;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -41,6 +42,45 @@ pub const DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR: u32 = 30_000;
 /// Maximum entries to scan per cleanup cycle.
 const CLEANUP_BATCH_SIZE: usize = 1000;
 
+/// Maximum entries scanned by the admission-path eviction probe.
+///
+/// Distinct from [`CLEANUP_BATCH_SIZE`]: admission runs under the hot per-check
+/// write lock, so it must cost bounded, small work even when a stripe is at
+/// capacity under a cardinality flood (see #123). The periodic [`cleanup`]
+/// path — which runs on a timer, not the hot path — keeps the larger
+/// [`CLEANUP_BATCH_SIZE`] sweep. A stale or below-limit victim is almost always
+/// found near the LRU tail within this window; if none is, the unknown key is
+/// rejected with `ExceededCapacityLimit` exactly as before, just after scanning
+/// far fewer entries.
+///
+/// [`cleanup`]: RateLimiter::cleanup
+const ADMISSION_SCAN_LIMIT: usize = 32;
+
+/// Number of entries below which the limiter uses a single stripe.
+///
+/// Sharding a tiny cache would make per-stripe capacity zero or one, changing
+/// the LRU admission-eviction semantics that callers (and tests) rely on for
+/// small `max_entries`. Below this threshold the limiter keeps a single stripe
+/// so its behavior is byte-for-byte identical to the pre-sharding limiter;
+/// above it, entries are striped for lock locality under cardinality pressure.
+const MIN_ENTRIES_PER_SHARD: usize = 256;
+
+/// Maximum number of stripes a sharded limiter uses.
+///
+/// Bounds lock/allocation overhead; production caches (100k keys) land here,
+/// giving 32-way lock locality so a cardinality flood contends 1/32 of the
+/// admission checks per lock instead of serializing them all (see #123).
+const MAX_SHARDS: usize = 32;
+
+/// Sampling divisor for the opportunistic live cache-size gauge.
+///
+/// The gauge is refreshed on roughly one in `GAUGE_SAMPLE_INTERVAL` admissions
+/// that mutate a stripe, so cache-saturation onset is visible within a few
+/// dozen admissions instead of only at the 60s cleanup tick (#125), without
+/// paying a metric write on every hot-path check. Must be a power of two so the
+/// sampling test is a cheap bit-mask.
+const GAUGE_SAMPLE_INTERVAL: u64 = 64;
+
 /// Token identifying one admitted hit for identity-aware rollback.
 ///
 /// IDs are unique within a limiter instance, including across entry eviction and
@@ -66,6 +106,12 @@ pub enum RateLimitResult {
 pub struct RateLimitCheck {
     result: RateLimitResult,
     admission_evicted: bool,
+    /// A sampled snapshot of the limiter's total entry count, present only on
+    /// the roughly one-in-[`GAUGE_SAMPLE_INTERVAL`] admissions selected for an
+    /// opportunistic live cache-size gauge update (#125). `None` on the calls
+    /// that were not sampled, so the caller updates the gauge cheaply and
+    /// rarely rather than on every hot-path check.
+    sampled_cache_len: Option<usize>,
 }
 
 impl RateLimitCheck {
@@ -91,6 +137,17 @@ impl RateLimitCheck {
     #[must_use]
     pub fn reservation(self) -> Option<RateLimitReservation> {
         self.result.reservation()
+    }
+
+    /// Returns a sampled total-entry count for opportunistic gauge updates.
+    ///
+    /// `Some(len)` on the sampled fraction of admissions (see
+    /// [`GAUGE_SAMPLE_INTERVAL`]); `None` otherwise. Lets the caller keep the
+    /// `transponder_rate_limit_cache_size` gauge fresh as the cache grows
+    /// toward capacity without a metric write per check.
+    #[must_use]
+    pub fn sampled_cache_len(self) -> Option<usize> {
+        self.sampled_cache_len
     }
 }
 
@@ -243,21 +300,64 @@ impl Default for RateLimitConfig {
 /// per-key precision but does not bypass limits because the global unwrap
 /// limiter still bounds total admission.
 pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
-    entries: RwLock<LruCache<K, RateLimitEntry>>,
+    /// Independent LRU stripes, each behind its own `RwLock`. A key is routed
+    /// to `stripes[hash(key) % stripes.len()]`, so admission checks for keys in
+    /// different stripes never contend on the same lock — localizing both the
+    /// bounded admission scan and lock waits under a cardinality flood (#123).
+    stripes: Vec<RwLock<LruCache<K, RateLimitEntry>>>,
+    /// Stable per-limiter hasher so a key always routes to the same stripe.
+    hasher: RandomState,
     max_per_minute: u32,
     max_per_hour: u32,
+    /// Process-wide monotonic reservation-id source. Shared across ALL stripes
+    /// so a [`RateLimitReservation`] is unique within the limiter regardless of
+    /// which stripe holds the key — preserving the #206 identity guarantee that
+    /// a delayed rollback cannot remove a newer hit for the same key.
     next_hit_id: AtomicU64,
+    /// Counts stripe-mutating admissions to drive the sampled gauge (#125).
+    gauge_sample_counter: AtomicU64,
 }
 
 impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// Creates a new rate limiter with the given configuration.
     pub fn new(config: RateLimitConfig) -> Self {
+        let max_entries = config.max_entries.get();
+        // Keep tiny caches single-stripe so small-`max_entries` LRU eviction
+        // semantics are byte-for-byte identical to the pre-sharding limiter;
+        // only stripe larger caches, and divide capacity evenly across stripes.
+        let shard_count = (max_entries / MIN_ENTRIES_PER_SHARD)
+            .clamp(1, MAX_SHARDS)
+            .max(1);
+        let base = max_entries / shard_count;
+        let remainder = max_entries % shard_count;
+
+        let stripes = (0..shard_count)
+            .map(|i| {
+                // Distribute the remainder so the summed stripe capacity equals
+                // the configured `max_entries` exactly.
+                let cap = base + usize::from(i < remainder);
+                let cap = NonZeroUsize::new(cap).expect("per-stripe capacity is non-zero");
+                RwLock::new(LruCache::new(cap))
+            })
+            .collect();
+
         Self {
-            entries: RwLock::new(LruCache::new(config.max_entries)),
+            stripes,
+            hasher: RandomState::new(),
             max_per_minute: config.max_per_minute,
             max_per_hour: config.max_per_hour,
             next_hit_id: AtomicU64::new(0),
+            gauge_sample_counter: AtomicU64::new(0),
         }
+    }
+
+    /// Routes a key to its stripe by stable hash.
+    fn stripe_for(&self, key: &K) -> &RwLock<LruCache<K, RateLimitEntry>> {
+        if self.stripes.len() == 1 {
+            return &self.stripes[0];
+        }
+        let idx = (self.hasher.hash_one(key) as usize) % self.stripes.len();
+        &self.stripes[idx]
     }
 
     fn evict_lru_admission_candidate(
@@ -269,7 +369,10 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         let mut stale_candidate = None;
         let mut below_limit_candidate = None;
 
-        for (key, entry) in entries.iter_mut().rev().take(CLEANUP_BATCH_SIZE) {
+        // Bounded, small scan: unlike the periodic cleanup sweep this runs on
+        // the admission hot path under the stripe write lock, so it must be O(K)
+        // with a small K even when the stripe is full (#123).
+        for (key, entry) in entries.iter_mut().rev().take(ADMISSION_SCAN_LIMIT) {
             entry.prune(now);
             if entry.is_empty() {
                 stale_candidate = Some(key.clone());
@@ -291,6 +394,31 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         false
     }
 
+    /// Samples the total entry count for the live gauge (#125).
+    ///
+    /// Returns `Some(total_len)` roughly once per [`GAUGE_SAMPLE_INTERVAL`]
+    /// stripe-mutating admissions, and `None` otherwise, so the caller refreshes
+    /// the cache-size gauge frequently enough to catch saturation onset without
+    /// a metric write on every check. The total is summed across stripes to keep
+    /// the metric's existing per-`cache_type` label shape (one value per
+    /// limiter, not per stripe).
+    async fn sampled_total_len(&self) -> Option<usize> {
+        let n = self.gauge_sample_counter.fetch_add(1, Ordering::Relaxed);
+        if !n.is_multiple_of(GAUGE_SAMPLE_INTERVAL) {
+            return None;
+        }
+        Some(self.total_len().await)
+    }
+
+    /// Sums the entry count across all stripes.
+    async fn total_len(&self) -> usize {
+        let mut total = 0;
+        for stripe in &self.stripes {
+            total += stripe.read().await.len();
+        }
+        total
+    }
+
     /// Checks if a request is allowed and increments counters if so.
     ///
     /// Returns:
@@ -301,61 +429,83 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     ///   victim for the unknown key
     pub async fn check_and_increment(&self, key: &K) -> RateLimitCheck {
         let now = Instant::now();
-        let mut entries = self.entries.write().await;
-        let mut admission_evicted = false;
+        let mutated;
+        let (result, admission_evicted) = {
+            let mut entries = self.stripe_for(key).write().await;
+            let mut admission_evicted = false;
 
-        // Get or create entry (updates access position). At capacity, admit an
-        // unknown key by evicting an old stale or still-unlimited entry. Entries
-        // already sitting at their rate limit are protected so cache pressure
-        // cannot reset a limited key's counters.
-        let entry = if let Some(entry) = entries.get_mut(key) {
-            entry
-        } else {
-            if entries.len() >= entries.cap().get() {
-                if Self::evict_lru_admission_candidate(
-                    &mut entries,
-                    now,
-                    self.max_per_minute,
-                    self.max_per_hour,
-                ) {
-                    admission_evicted = true;
-                } else {
-                    return RateLimitCheck {
-                        result: RateLimitResult::ExceededCapacityLimit,
-                        admission_evicted: false,
-                    };
+            // Get or create entry (updates access position). At capacity, admit
+            // an unknown key by evicting an old stale or still-unlimited entry.
+            // Entries already sitting at their rate limit are protected so cache
+            // pressure cannot reset a limited key's counters.
+            let entry = if let Some(entry) = entries.get_mut(key) {
+                entry
+            } else {
+                if entries.len() >= entries.cap().get() {
+                    if Self::evict_lru_admission_candidate(
+                        &mut entries,
+                        now,
+                        self.max_per_minute,
+                        self.max_per_hour,
+                    ) {
+                        admission_evicted = true;
+                    } else {
+                        return RateLimitCheck {
+                            result: RateLimitResult::ExceededCapacityLimit,
+                            admission_evicted: false,
+                            sampled_cache_len: None,
+                        };
+                    }
                 }
+                entries.put(key.clone(), RateLimitEntry::new());
+                entries.get_mut(key).expect("just inserted")
+            };
+
+            entry.prune(now);
+
+            // Check minute limit first (more likely to be hit)
+            if entry.minute_hits.len() >= self.max_per_minute as usize {
+                return RateLimitCheck {
+                    result: RateLimitResult::ExceededMinuteLimit,
+                    admission_evicted,
+                    sampled_cache_len: None,
+                };
             }
-            entries.put(key.clone(), RateLimitEntry::new());
-            entries.get_mut(key).expect("just inserted")
+
+            // Check hour limit
+            if entry.hour_hits.len() >= self.max_per_hour as usize {
+                return RateLimitCheck {
+                    result: RateLimitResult::ExceededHourLimit,
+                    admission_evicted,
+                    sampled_cache_len: None,
+                };
+            }
+
+            // Increment counters
+            let hit_id = self.next_hit_id.fetch_add(1, Ordering::Relaxed);
+            entry.minute_hits.push_back((now, hit_id));
+            entry.hour_hits.push_back((now, hit_id));
+            mutated = true;
+
+            (
+                RateLimitResult::Allowed(RateLimitReservation(hit_id)),
+                admission_evicted,
+            )
         };
 
-        entry.prune(now);
-
-        // Check minute limit first (more likely to be hit)
-        if entry.minute_hits.len() >= self.max_per_minute as usize {
-            return RateLimitCheck {
-                result: RateLimitResult::ExceededMinuteLimit,
-                admission_evicted,
-            };
-        }
-
-        // Check hour limit
-        if entry.hour_hits.len() >= self.max_per_hour as usize {
-            return RateLimitCheck {
-                result: RateLimitResult::ExceededHourLimit,
-                admission_evicted,
-            };
-        }
-
-        // Increment counters
-        let hit_id = self.next_hit_id.fetch_add(1, Ordering::Relaxed);
-        entry.minute_hits.push_back((now, hit_id));
-        entry.hour_hits.push_back((now, hit_id));
+        // Opportunistically refresh the live size gauge outside the stripe lock
+        // just taken. Only sampled admissions read the (cross-stripe) length so
+        // the hot path stays cheap (#125).
+        let sampled_cache_len = if mutated {
+            self.sampled_total_len().await
+        } else {
+            None
+        };
 
         RateLimitCheck {
-            result: RateLimitResult::Allowed(RateLimitReservation(hit_id)),
+            result,
             admission_evicted,
+            sampled_cache_len,
         }
     }
 
@@ -369,7 +519,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// failed admission leaves no window-start trace for the next real request.
     pub async fn rollback_increment(&self, key: &K, reservation: RateLimitReservation) {
         let hit_id = reservation.0;
-        let mut entries = self.entries.write().await;
+        let mut entries = self.stripe_for(key).write().await;
         let should_remove = if let Some(entry) = entries.get_mut(key) {
             remove_hit(&mut entry.minute_hits, hit_id);
             remove_hit(&mut entry.hour_hits, hit_id);
@@ -387,45 +537,50 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     ///
     /// Entries are considered stale if both windows have expired
     /// (no activity in the last hour). Processes up to `CLEANUP_BATCH_SIZE`
-    /// entries per call.
+    /// entries per stripe per call.
     pub async fn cleanup(&self) -> CleanupStats {
-        let mut entries = self.entries.write().await;
         let now = Instant::now();
-        let before = entries.len();
         let hour = Duration::from_secs(3600);
+        let mut evicted = 0;
+        let mut remaining = 0;
 
-        // Collect stale keys (hour window expired)
-        let stale: Vec<K> = entries
-            .iter()
-            .rev()
-            .take(CLEANUP_BATCH_SIZE)
-            .filter(|(_, entry)| match entry.hour_hits.back() {
-                Some((hit, _)) => now.duration_since(*hit) >= hour,
-                None => true,
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
+        for stripe in &self.stripes {
+            let mut entries = stripe.write().await;
+            let before = entries.len();
 
-        for key in &stale {
-            entries.pop(key);
+            // Collect stale keys (hour window expired)
+            let stale: Vec<K> = entries
+                .iter()
+                .rev()
+                .take(CLEANUP_BATCH_SIZE)
+                .filter(|(_, entry)| match entry.hour_hits.back() {
+                    Some((hit, _)) => now.duration_since(*hit) >= hour,
+                    None => true,
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+
+            for key in &stale {
+                entries.pop(key);
+            }
+
+            evicted += stale.len();
+            remaining += before - stale.len();
         }
 
-        CleanupStats {
-            evicted: stale.len(),
-            remaining: before - stale.len(),
-        }
+        CleanupStats { evicted, remaining }
     }
 
     /// Returns the current number of entries in the rate limiter.
     #[cfg(test)]
     pub async fn len(&self) -> usize {
-        self.entries.read().await.len()
+        self.total_len().await
     }
 
     /// Checks the current count without incrementing.
     #[cfg(test)]
     pub async fn peek_counts(&self, key: &K) -> Option<(u32, u32)> {
-        let entries = self.entries.read().await;
+        let entries = self.stripe_for(key).read().await;
         entries
             .peek(key)
             .map(|entry| (entry.minute_hits.len() as u32, entry.hour_hits.len() as u32))
@@ -711,13 +866,19 @@ mod tests {
     async fn test_cleanup_scans_stale_lru_entries_first() {
         tokio::time::pause();
 
+        // Single-stripe capacity (below MIN_ENTRIES_PER_SHARD) but larger than
+        // ADMISSION_SCAN_LIMIT, so the fill never triggers admission eviction
+        // and cleanup's per-stripe CLEANUP_BATCH_SIZE scan reclaims every stale
+        // entry while the recently-touched key survives. Sharding-aware variant
+        // lives in test_cleanup_reclaims_stale_entries_across_stripes.
+        let capacity = MIN_ENTRIES_PER_SHARD - 1;
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: entries(CLEANUP_BATCH_SIZE + 1),
+            max_entries: entries(capacity),
         });
 
-        for key in 0..=CLEANUP_BATCH_SIZE as u64 {
+        for key in 0..capacity as u64 {
             assert!(limiter.check_and_increment(&key).await.is_allowed());
         }
 
@@ -726,8 +887,47 @@ mod tests {
         assert!(limiter.check_and_increment(&0u64).await.is_allowed());
 
         let stats = limiter.cleanup().await;
-        assert_eq!(stats.evicted, CLEANUP_BATCH_SIZE);
+        assert_eq!(stats.evicted, capacity - 1);
         assert_eq!(stats.remaining, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_reclaims_stale_entries_across_stripes() {
+        tokio::time::pause();
+
+        // A cache large enough to shard: cleanup must reclaim stale entries in
+        // every stripe (each stripe scans up to CLEANUP_BATCH_SIZE, far more
+        // than any single stripe holds here) and keep the recently-touched key.
+        let capacity = MIN_ENTRIES_PER_SHARD * MAX_SHARDS;
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: entries(capacity),
+        });
+
+        for key in 0..capacity as u64 {
+            assert!(limiter.check_and_increment(&key).await.is_allowed());
+        }
+        // Uneven hash routing can evict a few below-limit keys during the fill,
+        // so occupancy may be at or just below the aggregate capacity.
+        let filled = limiter.len().await;
+        assert!(filled <= capacity && filled >= capacity * 9 / 10);
+
+        tokio::time::advance(Duration::from_secs(3601)).await;
+
+        // Refresh one key so it is no longer stale; its stripe still holds it.
+        assert!(limiter.check_and_increment(&0u64).await.is_allowed());
+        let refreshed = limiter.peek_counts(&0u64).await;
+
+        let stats = limiter.cleanup().await;
+        // Every stale entry across every stripe is reclaimed; only the refreshed
+        // key (if it survived the fill) remains.
+        let survivors = usize::from(refreshed.is_some());
+        assert_eq!(stats.remaining, survivors);
+        assert_eq!(limiter.len().await, survivors);
+        if survivors == 1 {
+            assert_eq!(limiter.peek_counts(&0u64).await, Some((1, 1)));
+        }
     }
 
     #[tokio::test]
@@ -817,32 +1017,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_admission_scan_prunes_stale_candidate_when_cache_exceeds_batch_size() {
+    async fn test_admission_scan_prunes_stale_candidate_within_bounded_window() {
         tokio::time::pause();
 
+        // Single-stripe capacity larger than the bounded admission scan window
+        // but below MIN_ENTRIES_PER_SHARD. When the whole stripe is stale, the
+        // admission scan (capped at ADMISSION_SCAN_LIMIT from the LRU tail) still
+        // finds a stale victim near the tail, prunes it, evicts it, and admits
+        // the new key — the previously-hit entries stay untouched and total size
+        // is unchanged.
+        let capacity = MIN_ENTRIES_PER_SHARD - 1;
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: entries(CLEANUP_BATCH_SIZE + 1),
+            max_entries: entries(capacity),
         });
 
-        for key in 0..=CLEANUP_BATCH_SIZE as u64 {
+        for key in 0..capacity as u64 {
             assert!(limiter.check_and_increment(&key).await.is_allowed());
         }
-        assert_eq!(limiter.len().await, CLEANUP_BATCH_SIZE + 1);
+        assert_eq!(limiter.len().await, capacity);
 
         tokio::time::advance(Duration::from_secs(3601)).await;
 
-        let new_key = CLEANUP_BATCH_SIZE as u64 + 1;
-        assert!(limiter.check_and_increment(&new_key).await.is_allowed());
+        let new_key = capacity as u64;
+        let check = limiter.check_and_increment(&new_key).await;
+        assert!(check.is_allowed());
+        assert!(check.admission_evicted());
 
-        assert_eq!(limiter.len().await, CLEANUP_BATCH_SIZE + 1);
+        // Total capacity is unchanged: a stale LRU-tail victim (key 0) was
+        // evicted to admit the new key, and the most-recently-inserted prior key
+        // is retained.
+        assert_eq!(limiter.len().await, capacity);
         assert_eq!(limiter.peek_counts(&0u64).await, None);
         assert_eq!(
-            limiter.peek_counts(&(CLEANUP_BATCH_SIZE as u64)).await,
+            limiter.peek_counts(&(capacity as u64 - 1)).await,
             Some((1, 1))
         );
         assert_eq!(limiter.peek_counts(&new_key).await, Some((1, 1)));
+    }
+
+    #[test]
+    fn test_admission_scan_bound_is_small_relative_to_cleanup_batch() {
+        // The admission-path scan must be far smaller than the periodic-cleanup
+        // batch so a full stripe costs bounded, small work per check under a
+        // cardinality flood (#123), rather than reusing the 1000-entry sweep.
+        const {
+            assert!(ADMISSION_SCAN_LIMIT < CLEANUP_BATCH_SIZE);
+            assert!(ADMISSION_SCAN_LIMIT <= 32);
+        }
     }
 
     #[tokio::test]
@@ -934,5 +1157,193 @@ mod tests {
 
         // Key 2 is independent
         assert!(limiter.check_and_increment(&key2).await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_small_cache_uses_single_stripe() {
+        // Caches below MIN_ENTRIES_PER_SHARD keep a single stripe so their LRU
+        // admission-eviction semantics are identical to the pre-sharding limiter.
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: entries(MIN_ENTRIES_PER_SHARD - 1),
+        });
+        assert_eq!(limiter.stripes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_large_cache_is_sharded_and_capacity_sums_to_max_entries() {
+        // A large cache is striped, and the summed per-stripe capacity equals
+        // the configured max_entries exactly (remainder distributed), so the
+        // aggregate key bound is preserved.
+        let max = MIN_ENTRIES_PER_SHARD * MAX_SHARDS + 7;
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: entries(max),
+        });
+        assert_eq!(limiter.stripes.len(), MAX_SHARDS);
+
+        let mut summed = 0usize;
+        for stripe in &limiter.stripes {
+            summed += stripe.read().await.cap().get();
+        }
+        assert_eq!(summed, max);
+    }
+
+    #[tokio::test]
+    async fn test_sharded_limiter_tracks_distinct_keys_and_limits_repeats() {
+        // Distinct keys spread across stripes. Sharding routes keys by hash, so
+        // stripe occupancy is uneven and the aggregate tracked-key count can sit
+        // slightly below max_entries once some stripe fills and rejects its
+        // overflow — an inherent, documented property of a sharded LRU. What
+        // must hold: every admitted key is independently rate-limited on repeat.
+        let max = MIN_ENTRIES_PER_SHARD * 2;
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1,
+            max_per_hour: 100,
+            max_entries: entries(max),
+        });
+
+        let mut admitted = Vec::new();
+        for key in 0..max as u64 {
+            if limiter.check_and_increment(&key).await.is_allowed() {
+                admitted.push(key);
+            }
+        }
+        // The vast majority of distinct keys are admitted (uneven hashing costs
+        // only a small tail to per-stripe capacity rejection).
+        assert!(
+            admitted.len() >= max * 9 / 10,
+            "expected most distinct keys admitted, got {}/{max}",
+            admitted.len()
+        );
+        // Every admitted key is at its per-minute limit of 1; a repeat is
+        // rejected by the minute limit, proving per-key accounting survives.
+        for key in &admitted {
+            assert_eq!(
+                limiter.check_and_increment(key).await,
+                RateLimitResult::ExceededMinuteLimit
+            );
+        }
+        assert!(limiter.len().await <= max);
+    }
+
+    #[tokio::test]
+    async fn test_reservation_ids_unique_across_stripes() {
+        // The reservation-id source is shared process-wide, so a rollback with a
+        // reservation from one stripe never removes a hit in another stripe even
+        // when ids would collide under per-stripe counters (#206 identity).
+        let max = MIN_ENTRIES_PER_SHARD * 4;
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: entries(max),
+        });
+
+        let mut reservations = Vec::new();
+        for key in 0..max as u64 {
+            let reservation = limiter
+                .check_and_increment(&key)
+                .await
+                .reservation()
+                .expect("admit");
+            reservations.push(reservation);
+        }
+        let unique: std::collections::HashSet<u64> = reservations.iter().map(|r| r.0).collect();
+        assert_eq!(
+            unique.len(),
+            reservations.len(),
+            "reservation ids must be globally unique across stripes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_and_increment_samples_live_cache_size() {
+        // The very first admission is sampled (counter starts at 0), so the
+        // caller can seed the live gauge immediately; subsequent admissions are
+        // sampled about once per GAUGE_SAMPLE_INTERVAL.
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1_000,
+            max_per_hour: 100_000,
+            max_entries: entries(1),
+        });
+
+        let first = limiter.check_and_increment(&0u64).await;
+        assert_eq!(
+            first.sampled_cache_len(),
+            Some(1),
+            "first admission must publish a live size sample"
+        );
+
+        // The next GAUGE_SAMPLE_INTERVAL-1 admissions are not sampled.
+        let mut sampled = 0usize;
+        for _ in 1..GAUGE_SAMPLE_INTERVAL {
+            if limiter
+                .check_and_increment(&0u64)
+                .await
+                .sampled_cache_len()
+                .is_some()
+            {
+                sampled += 1;
+            }
+        }
+        assert_eq!(sampled, 0, "only 1-in-interval admissions are sampled");
+
+        // The interval-th admission after the first is sampled again.
+        assert!(
+            limiter
+                .check_and_increment(&0u64)
+                .await
+                .sampled_cache_len()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rejected_admission_carries_no_gauge_sample() {
+        // A capacity/limit rejection must not publish a size sample: it neither
+        // mutated a stripe nor advanced growth.
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1,
+            max_per_hour: 100,
+            max_entries: entries(1),
+        });
+
+        assert!(limiter.check_and_increment(&0u64).await.is_allowed());
+        let rejected = limiter.check_and_increment(&0u64).await;
+        assert_eq!(rejected, RateLimitResult::ExceededMinuteLimit);
+        assert_eq!(rejected.sampled_cache_len(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_admissions_across_stripes_do_not_deadlock() {
+        use std::sync::Arc;
+
+        // A cardinality flood of distinct keys hammering a sharded limiter
+        // concurrently must make progress (stripes lock independently) and admit
+        // every distinct key within aggregate capacity.
+        let max = MIN_ENTRIES_PER_SHARD * MAX_SHARDS;
+        let limiter: Arc<RateLimiter<u64>> = Arc::new(RateLimiter::new(RateLimitConfig {
+            max_per_minute: 5,
+            max_per_hour: 1_000,
+            max_entries: entries(max),
+        }));
+
+        let mut handles = Vec::new();
+        for shard in 0..8u64 {
+            let limiter = Arc::clone(&limiter);
+            handles.push(tokio::spawn(async move {
+                for i in 0..500u64 {
+                    let key = shard * 1_000 + i;
+                    let _ = limiter.check_and_increment(&key).await;
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task panicked");
+        }
+        // No panic/deadlock; the limiter stays within its aggregate bound.
+        assert!(limiter.len().await <= max);
     }
 }
