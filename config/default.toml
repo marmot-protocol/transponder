@@ -45,7 +45,8 @@ shutdown_timeout_secs = 10
 # are max_rate_limit_cache_size * (per_minute + per_hour), or ~524M Instant
 # values with the defaults (~8.4 GB at 16 B/timestamp before overhead).
 # Transponder has two such limiters.
-# Unknown keys are rate limited at capacity until cleanup removes stale entries.
+# At capacity, new keys evict stale or below-limit entries when possible.
+# If no safe eviction candidate exists, the new key is rate limited.
 # Default: 100000 entries per cache
 # max_rate_limit_cache_size = 100000
 
