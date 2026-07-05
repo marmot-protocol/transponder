@@ -153,11 +153,39 @@ pub struct RelayStatus {
     pub total_configured: usize,
 }
 
+/// Provenance of a relay: which configured list (`relays.clearnet` vs
+/// `relays.onion`) it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayKind {
+    Clearnet,
+    Onion,
+}
+
+/// Classify a relay by the configured list it came from (its provenance).
+///
+/// Membership in the configured lists is authoritative: a clearnet relay whose
+/// URL merely contains `.onion` somewhere (subdomain, path) must not be counted
+/// as Tor, and an onion-list relay is Tor regardless of its URL shape. Relays
+/// absent from both lists (possible only when relays are added outside
+/// `connect()`, e.g. in tests) fall back to a lexical check anchored to the
+/// host suffix via [`RelayUrl::is_onion`], never a substring scan.
+fn classify_relay_kind(url: &RelayUrl, origins: &BTreeMap<RelayUrl, RelayKind>) -> RelayKind {
+    match origins.get(url) {
+        Some(kind) => *kind,
+        None if url.is_onion() => RelayKind::Onion,
+        None => RelayKind::Clearnet,
+    }
+}
+
 /// Nostr relay client with support for ClearNet and optional Tor relays.
 pub struct RelayClient {
     client: Client,
     config: RelayConfig,
     status: Arc<RwLock<RelayStatus>>,
+    /// Provenance of each configured relay, recorded when the relay is added
+    /// in [`RelayClient::connect`]. Used by [`RelayClient::refresh_status`] to
+    /// classify connected relays by origin list instead of URL shape.
+    origins: Mutex<BTreeMap<RelayUrl, RelayKind>>,
     metrics: Option<Metrics>,
 }
 
@@ -201,8 +229,15 @@ impl RelayClient {
                 tor_connected: 0,
                 total_configured: total,
             })),
+            origins: Mutex::new(BTreeMap::new()),
             metrics,
         })
+    }
+
+    fn origins(&self) -> MutexGuard<'_, BTreeMap<RelayUrl, RelayKind>> {
+        self.origins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Connect to all configured relays.
@@ -213,7 +248,7 @@ impl RelayClient {
     pub async fn connect(&self) -> Result<()> {
         // Add ClearNet relays
         for url in &self.config.clearnet {
-            match self.add_configured_relay(url).await {
+            match self.add_configured_relay(url, RelayKind::Clearnet).await {
                 Ok(_) => {
                     debug!(relay = %url, "Added ClearNet relay");
                 }
@@ -225,7 +260,7 @@ impl RelayClient {
 
         // Add Tor relays (nostr-sdk handles Tor via arti automatically)
         for url in &self.config.onion {
-            match self.add_configured_relay(url).await {
+            match self.add_configured_relay(url, RelayKind::Onion).await {
                 Ok(_) => {
                     debug!(relay = %url, "Added Tor relay");
                 }
@@ -255,7 +290,7 @@ impl RelayClient {
         );
 
         loop {
-            self.update_status().await;
+            self.refresh_status().await;
             let status = self.status.read().await;
             let connected = status.clearnet_connected + status.tor_connected;
 
@@ -324,19 +359,31 @@ impl RelayClient {
         self.client.notifications()
     }
 
-    /// Update the connection status.
-    async fn update_status(&self) {
+    /// Recompute the relay connection status and publish it.
+    ///
+    /// This is the only place the cached [`RelayStatus`] and the
+    /// `transponder_relays_connected` gauges are written: it enumerates the
+    /// relay pool, classifies each connected relay by the configured list it
+    /// came from (see [`classify_relay_kind`]), and stores the result. It is
+    /// driven by `connect()` while polling for the first connection and by
+    /// the periodic status-refresher task in `main` — never by the read paths
+    /// ([`Self::get_status`]/[`Self::is_connected`]), so readiness probes are
+    /// side-effect-free and the gauges update on refresh cadence, not probe
+    /// cadence.
+    pub async fn refresh_status(&self) {
         let relays = self.client.relays().await;
 
         let mut clearnet = 0;
         let mut tor = 0;
 
-        for (url, relay) in &relays {
-            if relay.status() == NostrRelayStatus::Connected {
-                if url.as_str().contains(".onion") {
-                    tor += 1;
-                } else {
-                    clearnet += 1;
+        {
+            let origins = self.origins();
+            for (url, relay) in &relays {
+                if relay.status() == NostrRelayStatus::Connected {
+                    match classify_relay_kind(url, &origins) {
+                        RelayKind::Clearnet => clearnet += 1,
+                        RelayKind::Onion => tor += 1,
+                    }
                 }
             }
         }
@@ -352,12 +399,17 @@ impl RelayClient {
     }
 
     /// Get the current relay connection status.
+    ///
+    /// Pure read of the cached status snapshot: no relay-pool enumeration, no
+    /// gauge writes, no write-lock acquisition. The snapshot is kept fresh by
+    /// [`Self::refresh_status`].
     pub async fn get_status(&self) -> RelayStatus {
-        self.update_status().await;
         self.status.read().await.clone()
     }
 
     /// Check if at least one relay is connected.
+    ///
+    /// Pure read of the cached status snapshot (see [`Self::get_status`]).
     pub async fn is_connected(&self) -> bool {
         let status = self.get_status().await;
         status.clearnet_connected + status.tor_connected > 0
@@ -370,12 +422,28 @@ impl RelayClient {
         Ok(())
     }
 
-    async fn add_configured_relay(&self, url: &str) -> std::result::Result<bool, String> {
-        self.client
+    async fn add_configured_relay(
+        &self,
+        url: &str,
+        kind: RelayKind,
+    ) -> std::result::Result<bool, String> {
+        let added = self
+            .client
             .pool()
             .add_relay(url, relay_options_for_config(&self.config, url))
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+
+        // Record which configured list the relay came from so status
+        // refreshes classify it by provenance instead of guessing from the
+        // URL string. Parsing cannot realistically fail here (the pool just
+        // accepted the same string), but a parse failure only means the relay
+        // falls back to the lexical classification.
+        if let Ok(relay_url) = RelayUrl::parse(url) {
+            self.origins().insert(relay_url, kind);
+        }
+
+        Ok(added)
     }
 
     /// Get the underlying nostr-sdk client.
@@ -659,6 +727,116 @@ mod tests {
         assert_eq!(status.total_configured, 0);
     }
 
+    #[test]
+    fn test_classify_relay_kind_prefers_provenance_over_url_shape() {
+        let onion_by_provenance = RelayUrl::parse("wss://127.0.0.1:2121").unwrap();
+        let clearnet_with_onion_label =
+            RelayUrl::parse("wss://relay.onionmail.example.com").unwrap();
+
+        let mut origins = BTreeMap::new();
+        origins.insert(onion_by_provenance.clone(), RelayKind::Onion);
+        origins.insert(clearnet_with_onion_label.clone(), RelayKind::Clearnet);
+
+        // Membership in the configured lists is authoritative: an onion-list
+        // relay counts as Tor even without a .onion host...
+        assert_eq!(
+            classify_relay_kind(&onion_by_provenance, &origins),
+            RelayKind::Onion
+        );
+        // ...and a clearnet relay whose host merely contains ".onion" is not
+        // misreported as Tor.
+        assert_eq!(
+            classify_relay_kind(&clearnet_with_onion_label, &origins),
+            RelayKind::Clearnet
+        );
+    }
+
+    #[test]
+    fn test_classify_relay_kind_fallback_anchors_to_onion_host_suffix() {
+        let origins = BTreeMap::new();
+        let onion = RelayUrl::parse("wss://example.onion").unwrap();
+        let clearnet = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let onion_substring = RelayUrl::parse("wss://relay.onionmail.example.com").unwrap();
+
+        // Unknown relays fall back to the host-suffix check.
+        assert_eq!(classify_relay_kind(&onion, &origins), RelayKind::Onion);
+        assert_eq!(
+            classify_relay_kind(&clearnet, &origins),
+            RelayKind::Clearnet
+        );
+        // The fallback must not degrade to a substring scan over the URL.
+        assert_eq!(
+            classify_relay_kind(&onion_substring, &origins),
+            RelayKind::Clearnet
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_records_clearnet_provenance() {
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let config = test_relay_config(vec![relay_url.to_string()]);
+        let client = RelayClient::new(Keys::generate(), config).await.unwrap();
+        client.connect().await.unwrap();
+
+        let parsed = RelayUrl::parse(&relay_url.to_string()).unwrap();
+        assert_eq!(
+            client.origins().get(&parsed).copied(),
+            Some(RelayKind::Clearnet),
+            "connect() must record which configured list each relay came from"
+        );
+
+        client.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_refresh_status_updates_gauges_on_refresh_not_on_reads() {
+        use crate::test_metrics::gauge_value;
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let keys = Keys::generate();
+        let config = test_relay_config(vec![relay_url.to_string()]);
+        let metrics = Metrics::new().unwrap();
+
+        let client = RelayClient::with_metrics(keys, config, Some(metrics.clone()))
+            .await
+            .unwrap();
+        client.client.add_relay(&relay_url).await.unwrap();
+        client.client.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Reads never touch the gauges: despite the live connection, nothing
+        // has refreshed yet, so the gauge family has not even been written.
+        let _ = client.get_status().await;
+        let _ = client.is_connected().await;
+        assert!(
+            !metrics
+                .gather()
+                .iter()
+                .any(|family| family.name() == "transponder_relays_connected"),
+            "pure reads must not write the relays_connected gauges"
+        );
+
+        client.refresh_status().await;
+        assert_eq!(
+            gauge_value(
+                &metrics,
+                "transponder_relays_connected",
+                &[("type", "clearnet")]
+            ),
+            1.0,
+            "an explicit refresh must publish the recomputed gauge"
+        );
+
+        client.disconnect().await.unwrap();
+    }
+
     /// Helper to create a test RelayConfig with default settings
     fn test_relay_config(clearnet: Vec<String>) -> RelayConfig {
         RelayConfig {
@@ -830,7 +1008,10 @@ mod tests {
         config.reconnect_interval_secs = 23;
 
         let client = RelayClient::new(Keys::generate(), config).await.unwrap();
-        client.add_configured_relay(relay_url).await.unwrap();
+        client
+            .add_configured_relay(relay_url, RelayKind::Clearnet)
+            .await
+            .unwrap();
 
         let relay = client.client.relay(relay_url).await.unwrap();
         let debug = format!("{:?}", relay.opts());
@@ -907,7 +1088,15 @@ mod tests {
         // Wait for connection to establish
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Verify we're connected
+        // get_status()/is_connected() are pure reads of the cached snapshot;
+        // nothing has refreshed it yet, so they still report zero connections
+        // even though the relay is connected.
+        let status = client.get_status().await;
+        assert_eq!(status.clearnet_connected, 0);
+        assert!(!client.is_connected().await);
+
+        // An explicit refresh recomputes the snapshot from the relay pool.
+        client.refresh_status().await;
         let status = client.get_status().await;
         assert_eq!(status.clearnet_connected, 1);
         assert_eq!(status.tor_connected, 0);
@@ -1050,6 +1239,7 @@ mod tests {
         client.client.connect().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        client.refresh_status().await;
         let status = client.get_status().await;
         assert_eq!(status.clearnet_connected, 2);
         assert_eq!(status.total_configured, 2);

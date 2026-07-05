@@ -106,6 +106,16 @@ const TOR_FEATURE_ENABLED: bool = true;
 #[cfg(not(feature = "tor"))]
 const TOR_FEATURE_ENABLED: bool = false;
 
+/// Cadence of the background relay-status refresh.
+///
+/// The refresher recomputes the cached relay connection status (and the
+/// `relays_connected` gauges) on this fixed interval, so readiness probes can
+/// be pure reads of the snapshot and gauge updates track connection state
+/// rather than probe traffic. Five seconds keeps `/ready` at most one probe
+/// interval behind real connection changes for typical orchestrator probe
+/// periods (10s+) while enumerating the relay pool rarely.
+const RELAY_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
 fn validate_startup_config(server_private_key: &str, relays: &config::RelayConfig) -> Result<()> {
     if server_private_key.is_empty() {
         anyhow::bail!("Server private key is required");
@@ -447,6 +457,29 @@ async fn run(mut config: AppConfig) -> Result<()> {
         }
     });
 
+    // Start the background relay-status refresher. It is the only writer of
+    // the cached relay status (and the relays_connected gauges) after startup:
+    // `/ready` and other readers consume the snapshot without recomputing it,
+    // so unauthenticated probes cannot drive lock or gauge churn (see
+    // RelayClient::refresh_status).
+    let mut status_refresh_shutdown = shutdown.subscribe();
+    let status_refresh_client = relay_client.clone();
+    let status_refresh_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RELAY_STATUS_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = status_refresh_shutdown.changed() => {
+                    break;
+                }
+                _ = interval.tick() => {
+                    status_refresh_client.refresh_status().await;
+                }
+            }
+        }
+    });
+
     // Start event processing loop
     let mut event_shutdown = shutdown.subscribe();
     let event_metrics = metrics.clone();
@@ -558,7 +591,12 @@ async fn run(mut config: AppConfig) -> Result<()> {
                 warn!(error = %e, "Error disconnecting from relays");
             }
 
-            let _ = tokio::join!(event_handle, health_handle, cleanup_handle);
+            let _ = tokio::join!(
+                event_handle,
+                health_handle,
+                cleanup_handle,
+                status_refresh_handle
+            );
         },
         config.server.shutdown_timeout_secs,
     )
