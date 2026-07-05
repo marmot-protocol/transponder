@@ -1764,10 +1764,16 @@ mod tests {
         let content = NotificationContentBuilder::new(&server_keys)
             .with_apns_token("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678")
             .build();
+        // One hour beyond the skew tolerance, not +1s: `process()` re-reads
+        // `Timestamp::now()` (1-second granularity) when it validates freshness,
+        // so a whole-second wall-clock tick between here and that read would
+        // collapse a +1s margin onto the exact threshold (`>` becomes `==`) and
+        // spuriously accept the event under load. A large margin exercises the
+        // same "created_at exceeds now + skew" rejection path, drift-proof.
         let future_created_at = Timestamp::from_secs(
             Timestamp::now()
                 .as_secs()
-                .saturating_add(DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS + 1),
+                .saturating_add(DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS + 3600),
         );
         let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
             .build_with_created_at(&content, future_created_at)

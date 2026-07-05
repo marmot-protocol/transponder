@@ -315,21 +315,31 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_signal_or_trigger_returns_on_internal_trigger() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
         let handler = ShutdownHandler::new();
         let trigger = handler.trigger_handle();
 
         let wait = handler.wait_for_signal_or_trigger();
         tokio::pin!(wait);
 
-        // No signal and no trigger yet: the wait must still be pending.
-        let pending = timeout(Duration::from_millis(10), &mut wait).await;
-        assert!(pending.is_err());
+        // No signal and no trigger yet: the wait must still be pending. Poll
+        // once with a no-op waker instead of racing a wall-clock timeout — the
+        // first poll subscribes the receiver and registers the signal handlers,
+        // and with neither fired the future is deterministically `Pending`.
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            matches!(wait.as_mut().poll(&mut cx), Poll::Pending),
+            "wait must be pending before any signal or trigger"
+        );
 
         trigger.trigger();
 
-        let reason = timeout(Duration::from_secs(1), &mut wait)
-            .await
-            .expect("internal trigger must complete the shutdown wait");
+        // The trigger set the watch to `true`; awaiting the same future now
+        // resolves deterministically (a hang here would be a real bug the outer
+        // test harness surfaces, not a timing flake).
+        let reason = wait.await;
         assert_eq!(reason, ShutdownReason::InternalTrigger);
     }
 
