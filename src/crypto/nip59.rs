@@ -16,8 +16,7 @@ const TAG_ENCODING: &str = "encoding";
 const VERSION_MIP05_V1: &str = "mip05-v1";
 const ENCODING_BASE64: &str = "base64";
 
-/// Default maximum number of encrypted tokens accepted in one notification event.
-pub const DEFAULT_MAX_TOKENS_PER_EVENT: usize = 100;
+pub use crate::defaults::DEFAULT_MAX_TOKENS_PER_EVENT;
 
 /// Maximum number of characters of attacker-controlled tag content included in
 /// error messages.

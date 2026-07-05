@@ -20,37 +20,20 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
-use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
 use crate::crypto::{Nip59Handler, Platform, TokenDecryptor, TokenPayload};
+use crate::defaults::{
+    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
+    DEFAULT_MAX_TOKENS_PER_EVENT, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
+};
 use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
-use crate::rate_limiter::{
-    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
-    DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig,
-    RateLimitReservation, RateLimiter,
+use crate::rate_limiter::{RateLimitConfig, RateLimitReservation, RateLimiter};
+
+pub use crate::defaults::{
+    DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+    DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
 };
-
-/// Maximum NIP-59 timestamp randomization window for gift wraps.
-///
-/// Relays must still be queried with this full lookback because compliant gift
-/// wraps randomize their outer `created_at`; durable replay state and inner
-/// rumor freshness bound what we will actually dispatch from that backlog.
-const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end;
-
-/// Default maximum age for the unwrapped kind:446 notification request rumor.
-///
-/// Outer gift-wrap timestamps are deliberately randomized by NIP-59 and are not
-/// freshness signals. The inner notification rumor timestamp is the only
-/// stateless bound available before dispatching a replayed backlog event.
-pub const DEFAULT_MAX_NOTIFICATION_AGE_SECS: u64 = 3_600;
-
-/// Default tolerated clock skew for future-dated notification rumors.
-pub const DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS: u64 = 300;
-
-/// Default duration to keep processed gift-wrap event IDs in replay state.
-pub const DEFAULT_DEDUP_RETENTION_SECS: u64 =
-    NIP59_TIMESTAMP_TWEAK_WINDOW_SECS + DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS;
 
 /// Duration to keep event IDs for deduplication.
 ///
@@ -64,9 +47,6 @@ const DEDUP_WINDOW: Duration = Duration::from_secs(DEFAULT_DEDUP_RETENTION_SECS)
 /// Durable replay state scans the retained set so retention, not LRU capacity,
 /// remains the source of truth for restart/reconnect duplicate suppression.
 const CLEANUP_BATCH_SIZE: usize = 1000;
-
-/// Default maximum size for the volatile deduplication cache.
-pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
 
 #[derive(Clone, Copy)]
 struct SeenEvent {
@@ -576,6 +556,27 @@ impl Default for TokenRateLimitConfig {
     }
 }
 
+impl TokenRateLimitConfig {
+    /// Build from a validated [`crate::config::ServerConfig`].
+    ///
+    /// Size fields are validated as non-zero at config load time.
+    #[must_use]
+    pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
+        Self {
+            max_cache_size: NonZeroUsize::new(server.max_rate_limit_cache_size)
+                .expect("server.max_rate_limit_cache_size validated non-zero"),
+            max_tokens_per_event: NonZeroUsize::new(server.max_tokens_per_event)
+                .expect("server.max_tokens_per_event validated non-zero"),
+            encrypted_token_per_minute: server.encrypted_token_rate_limit_per_minute,
+            encrypted_token_per_hour: server.encrypted_token_rate_limit_per_hour,
+            device_token_per_minute: server.device_token_rate_limit_per_minute,
+            device_token_per_hour: server.device_token_rate_limit_per_hour,
+            global_unwrap_per_minute: server.global_unwrap_rate_limit_per_minute,
+            global_unwrap_per_hour: server.global_unwrap_rate_limit_per_hour,
+        }
+    }
+}
+
 /// Replay-protection configuration for event IDs and notification freshness.
 #[derive(Debug, Clone)]
 pub struct ReplayProtectionConfig {
@@ -617,6 +618,29 @@ impl Default for ReplayProtectionConfig {
             max_notification_age: Duration::from_secs(DEFAULT_MAX_NOTIFICATION_AGE_SECS),
             max_notification_future_skew: Duration::from_secs(
                 DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+            ),
+        }
+    }
+}
+
+impl ReplayProtectionConfig {
+    /// Build from a validated [`crate::config::ServerConfig`].
+    #[must_use]
+    pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
+        let dedup_state_path = if server.dedup_state_path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(server.dedup_state_path.clone())
+        };
+
+        Self {
+            max_dedup_cache_size: NonZeroUsize::new(server.max_dedup_cache_size)
+                .expect("server.max_dedup_cache_size validated non-zero"),
+            dedup_state_path,
+            dedup_retention: Duration::from_secs(server.dedup_retention_secs),
+            max_notification_age: Duration::from_secs(server.max_notification_age_secs),
+            max_notification_future_skew: Duration::from_secs(
+                server.max_notification_future_skew_secs,
             ),
         }
     }
@@ -1418,6 +1442,7 @@ mod tests {
     use super::*;
     use crate::config::ApnsConfig;
     use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
+    use crate::defaults::DEFAULT_MAX_TOKENS_PER_EVENT;
     use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
     use crate::push::{ApnsClient, PushDispatcher};
     use crate::test_metrics::{
@@ -1425,6 +1450,103 @@ mod tests {
         histogram_sample_count as histogram_count, histogram_sample_sum,
     };
     use crate::test_vectors::scenarios;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn token_rate_limit_config_from_server_config_matches_settings() {
+        let server = crate::config::ServerConfig {
+            private_key: Zeroizing::new(String::new()),
+            private_key_file: String::new(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 100_000,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: DEFAULT_DEDUP_RETENTION_SECS,
+            max_notification_age_secs: DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+            max_notification_future_skew_secs: DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+            max_rate_limit_cache_size: 1234,
+            max_tokens_per_event: 25,
+            encrypted_token_rate_limit_per_minute: 111,
+            encrypted_token_rate_limit_per_hour: 2222,
+            device_token_rate_limit_per_minute: 333,
+            device_token_rate_limit_per_hour: 4444,
+            max_concurrent_event_processing: 7,
+            global_unwrap_rate_limit_per_minute: 555,
+            global_unwrap_rate_limit_per_hour: 6666,
+        };
+
+        let rate_limit_config = TokenRateLimitConfig::from_server_config(&server);
+
+        assert_eq!(rate_limit_config.max_cache_size.get(), 1234);
+        assert_eq!(rate_limit_config.max_tokens_per_event.get(), 25);
+        assert_eq!(rate_limit_config.encrypted_token_per_minute, 111);
+        assert_eq!(rate_limit_config.encrypted_token_per_hour, 2222);
+        assert_eq!(rate_limit_config.device_token_per_minute, 333);
+        assert_eq!(rate_limit_config.device_token_per_hour, 4444);
+        assert_eq!(rate_limit_config.global_unwrap_per_minute, 555);
+        assert_eq!(rate_limit_config.global_unwrap_per_hour, 6666);
+    }
+
+    #[test]
+    fn replay_protection_config_from_server_config_matches_settings() {
+        let state_path = PathBuf::from("/var/lib/transponder/dedup-events.log");
+        let server = crate::config::ServerConfig {
+            private_key: Zeroizing::new(String::new()),
+            private_key_file: String::new(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 77,
+            dedup_state_path: state_path.clone(),
+            dedup_retention_secs: 88,
+            max_notification_age_secs: 99,
+            max_notification_future_skew_secs: 11,
+            max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
+        };
+
+        let replay_config = ReplayProtectionConfig::from_server_config(&server);
+
+        assert_eq!(replay_config.max_dedup_cache_size.get(), 77);
+        assert_eq!(replay_config.dedup_state_path, Some(state_path));
+        assert_eq!(replay_config.dedup_retention, Duration::from_secs(88));
+        assert_eq!(replay_config.max_notification_age, Duration::from_secs(99));
+        assert_eq!(
+            replay_config.max_notification_future_skew,
+            Duration::from_secs(11)
+        );
+    }
+
+    #[test]
+    fn replay_protection_config_from_server_config_disables_empty_state_path() {
+        let server = crate::config::ServerConfig {
+            private_key: Zeroizing::new(String::new()),
+            private_key_file: String::new(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 77,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: 88,
+            max_notification_age_secs: 99,
+            max_notification_future_skew_secs: 11,
+            max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
+        };
+
+        let replay_config = ReplayProtectionConfig::from_server_config(&server);
+
+        assert_eq!(replay_config.dedup_state_path, None);
+    }
 
     fn gauge_value(metrics: &Metrics, name: &str) -> f64 {
         metric_gauge_value(metrics, name, &[])

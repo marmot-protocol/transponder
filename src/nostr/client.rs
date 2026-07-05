@@ -13,18 +13,13 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::config::RelayConfig;
+use crate::defaults::NIP59_TIMESTAMP_TWEAK_WINDOW_SECS;
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 
 // Type alias to avoid confusion with our RelayStatus
 use nostr_sdk::RelayStatus as NostrRelayStatus;
 
-/// Maximum NIP-59 timestamp randomization window for gift wraps.
-///
-/// NIP-59 gift wraps intentionally randomize `created_at` into the past to
-/// reduce timing correlation. Relay subscriptions must look back by the same
-/// window or relays will filter out compliant gift wraps before delivery.
-const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end;
 const INBOX_RELAY_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(feature = "tor")]

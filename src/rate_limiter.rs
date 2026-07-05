@@ -14,31 +14,9 @@ use lru::LruCache;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-/// Default maximum cache size (100,000 entries).
-pub const DEFAULT_MAX_SIZE: usize = 100_000;
-
-/// Default rate limit per minute (240 = 4 per second).
-pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 240;
-
-/// Default rate limit per hour.
-pub const DEFAULT_RATE_LIMIT_PER_HOUR: u32 = 5000;
-
-/// Default global pre-unwrap admission limit per minute.
-///
-/// This caps how many gift wraps the server is willing to unwrap (ECDH + seal
-/// decryption) per minute across all senders. The server pubkey is public, so
-/// anyone can flood it with valid kind-1059 gift wraps; this budget sheds that
-/// traffic before spending asymmetric-crypto cycles. 600/minute (10/second) is
-/// far above any legitimate single-server load while still bounding attacker
-/// CPU cost.
-pub const DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE: u32 = 600;
-
-/// Default global pre-unwrap admission limit per hour.
-///
-/// Companion to [`DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE`]; bounds sustained
-/// flooding over a longer window.
-pub const DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR: u32 = 30_000;
-
+pub use crate::defaults::{
+    DEFAULT_MAX_SIZE, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
+};
 /// Maximum entries to scan per cleanup cycle.
 const CLEANUP_BATCH_SIZE: usize = 1000;
 

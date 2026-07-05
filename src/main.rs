@@ -6,7 +6,6 @@
 //! to APNs and FCM.
 
 use std::io::Write;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{
@@ -26,6 +25,7 @@ use zeroize::Zeroizing;
 
 mod config;
 mod crypto;
+mod defaults;
 mod error;
 mod metrics;
 mod nostr;
@@ -133,56 +133,6 @@ fn validate_startup_config(server_private_key: &str, relays: &config::RelayConfi
     }
 
     Ok(())
-}
-
-/// Convert a size field that `AppConfig::validate` already rejected as zero.
-///
-/// The downstream cache/limiter configs take [`NonZeroUsize`] so the old
-/// silent zero-to-default constructor coercions are unrepresentable; this is
-/// the single, loud conversion point from the load-validated `usize` fields.
-fn validated_non_zero(value: usize, field: &str) -> NonZeroUsize {
-    NonZeroUsize::new(value)
-        .unwrap_or_else(|| panic!("{field} is validated as non-zero at config load"))
-}
-
-fn build_rate_limit_config(server: &config::ServerConfig) -> nostr::events::TokenRateLimitConfig {
-    nostr::events::TokenRateLimitConfig {
-        max_cache_size: validated_non_zero(
-            server.max_rate_limit_cache_size,
-            "server.max_rate_limit_cache_size",
-        ),
-        max_tokens_per_event: validated_non_zero(
-            server.max_tokens_per_event,
-            "server.max_tokens_per_event",
-        ),
-        encrypted_token_per_minute: server.encrypted_token_rate_limit_per_minute,
-        encrypted_token_per_hour: server.encrypted_token_rate_limit_per_hour,
-        device_token_per_minute: server.device_token_rate_limit_per_minute,
-        device_token_per_hour: server.device_token_rate_limit_per_hour,
-        global_unwrap_per_minute: server.global_unwrap_rate_limit_per_minute,
-        global_unwrap_per_hour: server.global_unwrap_rate_limit_per_hour,
-    }
-}
-
-fn build_replay_protection_config(
-    server: &config::ServerConfig,
-) -> nostr::events::ReplayProtectionConfig {
-    let dedup_state_path = if server.dedup_state_path.as_os_str().is_empty() {
-        None
-    } else {
-        Some(server.dedup_state_path.clone())
-    };
-
-    nostr::events::ReplayProtectionConfig {
-        max_dedup_cache_size: validated_non_zero(
-            server.max_dedup_cache_size,
-            "server.max_dedup_cache_size",
-        ),
-        dedup_state_path,
-        dedup_retention: Duration::from_secs(server.dedup_retention_secs),
-        max_notification_age: Duration::from_secs(server.max_notification_age_secs),
-        max_notification_future_skew: Duration::from_secs(server.max_notification_future_skew_secs),
-    }
 }
 
 fn parse_server_secret_key(server_private_key: &str) -> Result<SecretKey> {
@@ -587,8 +537,8 @@ async fn run(mut config: AppConfig) -> Result<()> {
     // limiting. Constructed before any relay network work so the event
     // consumer can start polling the moment the notification receiver exists
     // (see below).
-    let rate_limit_config = build_rate_limit_config(&config.server);
-    let replay_config = build_replay_protection_config(&config.server);
+    let rate_limit_config = nostr::events::TokenRateLimitConfig::from_server_config(&config.server);
+    let replay_config = nostr::events::ReplayProtectionConfig::from_server_config(&config.server);
     let event_processor = Arc::new(
         EventProcessor::with_replay_config(
             nip59_handler,
@@ -1884,103 +1834,6 @@ mod tests {
         let parsed_key = parse_server_secret_key(resolved_key.as_str()).unwrap();
 
         assert_eq!(parsed_key.to_bech32().unwrap(), secret_key);
-    }
-
-    #[test]
-    fn build_rate_limit_config_matches_server_settings() {
-        let server = config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: String::new(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs:
-                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            max_rate_limit_cache_size: 1234,
-            max_tokens_per_event: 25,
-            encrypted_token_rate_limit_per_minute: 111,
-            encrypted_token_rate_limit_per_hour: 2222,
-            device_token_rate_limit_per_minute: 333,
-            device_token_rate_limit_per_hour: 4444,
-            max_concurrent_event_processing: 7,
-            global_unwrap_rate_limit_per_minute: 555,
-            global_unwrap_rate_limit_per_hour: 6666,
-        };
-
-        let rate_limit_config = build_rate_limit_config(&server);
-
-        assert_eq!(rate_limit_config.max_cache_size.get(), 1234);
-        assert_eq!(rate_limit_config.max_tokens_per_event.get(), 25);
-        assert_eq!(rate_limit_config.encrypted_token_per_minute, 111);
-        assert_eq!(rate_limit_config.encrypted_token_per_hour, 2222);
-        assert_eq!(rate_limit_config.device_token_per_minute, 333);
-        assert_eq!(rate_limit_config.device_token_per_hour, 4444);
-        assert_eq!(rate_limit_config.global_unwrap_per_minute, 555);
-        assert_eq!(rate_limit_config.global_unwrap_per_hour, 6666);
-    }
-
-    #[test]
-    fn build_replay_protection_config_matches_server_settings() {
-        let state_path = PathBuf::from("/var/lib/transponder/dedup-events.log");
-        let server = config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: String::new(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 77,
-            dedup_state_path: state_path.clone(),
-            dedup_retention_secs: 88,
-            max_notification_age_secs: 99,
-            max_notification_future_skew_secs: 11,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
-
-        let replay_config = build_replay_protection_config(&server);
-
-        assert_eq!(replay_config.max_dedup_cache_size.get(), 77);
-        assert_eq!(replay_config.dedup_state_path, Some(state_path));
-        assert_eq!(replay_config.dedup_retention, Duration::from_secs(88));
-        assert_eq!(replay_config.max_notification_age, Duration::from_secs(99));
-        assert_eq!(
-            replay_config.max_notification_future_skew,
-            Duration::from_secs(11)
-        );
-    }
-
-    #[test]
-    fn build_replay_protection_config_disables_empty_state_path() {
-        let server = config::ServerConfig {
-            private_key: Zeroizing::new(String::new()),
-            private_key_file: String::new(),
-            shutdown_timeout_secs: 10,
-            max_dedup_cache_size: 77,
-            dedup_state_path: PathBuf::new(),
-            dedup_retention_secs: 88,
-            max_notification_age_secs: 99,
-            max_notification_future_skew_secs: 11,
-            max_rate_limit_cache_size: 100_000,
-            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
-            encrypted_token_rate_limit_per_minute: 240,
-            encrypted_token_rate_limit_per_hour: 5000,
-            device_token_rate_limit_per_minute: 240,
-            device_token_rate_limit_per_hour: 5000,
-            max_concurrent_event_processing: 64,
-            global_unwrap_rate_limit_per_minute: 600,
-            global_unwrap_rate_limit_per_hour: 30_000,
-        };
-
-        let replay_config = build_replay_protection_config(&server);
-
-        assert_eq!(replay_config.dedup_state_path, None);
     }
 
     // ---- #146: private key file permission check (unix) ----
