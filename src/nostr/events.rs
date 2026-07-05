@@ -640,10 +640,7 @@ impl EventProcessor {
             );
             if let Some(ref m) = self.metrics {
                 m.record_event_shed();
-                m.observe_event_processing_duration(
-                    EventOutcome::Failed,
-                    started_at.elapsed_secs(),
-                );
+                m.observe_event_processing_duration(EventOutcome::Shed, started_at.elapsed_secs());
             }
             return Ok(false);
         }
@@ -3006,6 +3003,25 @@ mod tests {
         assert_eq!(
             counter_value(&metrics, "transponder_events_shed_total", &[]),
             1.0
+        );
+
+        // The shed is recorded under its own duration-histogram outcome, not
+        // as a failure: back-pressure must not inflate the failed bucket.
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_event_processing_duration_seconds",
+                &[("outcome", EventOutcome::Shed.as_str())],
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_count(
+                &metrics,
+                "transponder_event_processing_duration_seconds",
+                &[("outcome", EventOutcome::Failed.as_str())],
+            ),
+            0
         );
 
         // The shed event was NOT unwrapped: only `limit` unwraps were observed.
