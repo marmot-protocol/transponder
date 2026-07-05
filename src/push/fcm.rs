@@ -102,6 +102,7 @@ struct TokenResponse {
 ///
 /// Google is authoritative for issued token lifetimes; keep a small local
 /// safety margin so Transponder refreshes before the provider-side expiry.
+#[must_use]
 fn token_cache_lifetime(expires_in: Option<u64>) -> Duration {
     expires_in
         .map(|seconds| {
