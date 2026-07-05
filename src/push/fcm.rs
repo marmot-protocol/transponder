@@ -2574,6 +2574,25 @@ LTP/MQIxLydQxT4+jx2NBu0=
     }
 
     #[tokio::test]
+    async fn test_get_access_token_oauth_transport_error_is_retriable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut client = mock_client_with_rsa_service_account("test-project");
+        client.test_oauth_token_url = Some(format!("http://{addr}/token"));
+
+        let result = client.get_access_token().await;
+        assert!(matches!(
+            result,
+            Err(TokenAcquisitionError::Retriable {
+                status_code: 0,
+                retry_after: None,
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn test_get_access_token_oauth_400_is_permanent() {
         let mock_server = MockServer::start().await;
 
