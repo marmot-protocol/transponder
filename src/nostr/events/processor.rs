@@ -1,485 +1,34 @@
-//! Event processing for incoming Nostr events.
-//!
-//! Handles deduplication and processing of gift-wrapped notification requests,
-//! including rate limiting to prevent spam and replay attacks.
+//! Gift-wrapped notification event processing.
 
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions as StdOpenOptions};
 use std::num::NonZeroUsize;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Duration;
 
-use lru::LruCache;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
-use crate::crypto::{Nip59Handler, Platform, TokenDecryptor, TokenPayload};
+use super::admission::{
+    AdmissionGuard, AdmittedCharges, InFlightEventGuard, ProcessOutcome, StageTimer,
+    platform_metric_label,
+};
+use super::dedup::{DEDUP_WINDOW, PersistentDedupState, SeenEvent, SeenEventStore};
+use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
 use crate::defaults::{
     DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
     DEFAULT_MAX_TOKENS_PER_EVENT, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
 };
+use crate::defaults::{
+    DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+    DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+};
 use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
-use crate::rate_limiter::{RateLimitConfig, RateLimitReservation, RateLimiter};
-
-pub use crate::defaults::{
-    DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-    DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-};
-
-/// Duration to keep event IDs for deduplication.
-///
-/// The cache must cover the relay subscription lookback; otherwise a restart or
-/// reconnect can re-deliver backlog entries after the old 5-minute in-memory
-/// window expires.
-const DEDUP_WINDOW: Duration = Duration::from_secs(DEFAULT_DEDUP_RETENTION_SECS);
-
-/// Maximum number of volatile LRU entries to scan per cleanup cycle.
-///
-/// Durable replay state scans the retained set so retention, not LRU capacity,
-/// remains the source of truth for restart/reconnect duplicate suppression.
-const CLEANUP_BATCH_SIZE: usize = 1000;
-
-#[derive(Clone, Copy)]
-struct SeenEvent {
-    seen_at: Instant,
-    terminal: bool,
-}
-
-impl SeenEvent {
-    fn reservation(seen_at: Instant) -> Self {
-        Self {
-            seen_at,
-            terminal: false,
-        }
-    }
-
-    fn terminal(seen_at: Instant) -> Self {
-        Self {
-            seen_at,
-            terminal: true,
-        }
-    }
-}
-
-enum SeenEventStore {
-    Bounded(LruCache<EventId, SeenEvent>),
-    Retained(HashMap<EventId, SeenEvent>),
-}
-
-impl SeenEventStore {
-    fn bounded(cache_size: NonZeroUsize) -> Self {
-        Self::Bounded(LruCache::new(cache_size))
-    }
-
-    fn retained() -> Self {
-        Self::Retained(HashMap::new())
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::Bounded(seen) => seen.len(),
-            Self::Retained(seen) => seen.len(),
-        }
-    }
-
-    fn contains(&self, event_id: &EventId) -> bool {
-        match self {
-            Self::Bounded(seen) => seen.contains(event_id),
-            Self::Retained(seen) => seen.contains_key(event_id),
-        }
-    }
-
-    fn put(&mut self, event_id: EventId, seen_event: SeenEvent) {
-        match self {
-            Self::Bounded(seen) => {
-                seen.put(event_id, seen_event);
-            }
-            Self::Retained(seen) => {
-                seen.insert(event_id, seen_event);
-            }
-        }
-    }
-
-    fn pop(&mut self, event_id: &EventId) {
-        match self {
-            Self::Bounded(seen) => {
-                seen.pop(event_id);
-            }
-            Self::Retained(seen) => {
-                seen.remove(event_id);
-            }
-        }
-    }
-
-    /// Refresh an existing reservation into a terminal entry in place.
-    ///
-    /// On the success hot path the ID is already present from `try_reserve`, so
-    /// this mutates its `SeenEvent` (new `seen_at`, `terminal = true`) instead of
-    /// re-inserting a fresh value. Returns `true` when the set size changed
-    /// (i.e. the entry was absent and had to be inserted — e.g. an entry evicted
-    /// by LRU pressure between reservation and completion), so the caller only
-    /// pays a `dedup_cache_size` gauge write when the length actually moved. This
-    /// removes the redundant second gauge update the double-lock success path
-    /// carried (#197) while preserving the completion-timestamp-refresh and
-    /// terminal-flip semantics `mark_seen` provided.
-    fn mark_terminal(&mut self, event_id: EventId, seen_at: Instant) -> bool {
-        match self {
-            Self::Bounded(seen) => {
-                if let Some(existing) = seen.peek_mut(&event_id) {
-                    *existing = SeenEvent::terminal(seen_at);
-                    // Promote to most-recently-used to match the prior `put`
-                    // behavior, which refreshed LRU position on completion.
-                    seen.promote(&event_id);
-                    false
-                } else {
-                    seen.put(event_id, SeenEvent::terminal(seen_at));
-                    true
-                }
-            }
-            Self::Retained(seen) => seen
-                .insert(event_id, SeenEvent::terminal(seen_at))
-                .is_none(),
-        }
-    }
-
-    fn expired_keys(&self, now: Instant, retention: Duration) -> Vec<EventId> {
-        match self {
-            Self::Bounded(seen) => seen
-                .iter()
-                .rev()
-                .take(CLEANUP_BATCH_SIZE)
-                .filter(|(_, seen_event)| now.duration_since(seen_event.seen_at) >= retention)
-                .map(|(id, _)| *id)
-                .collect(),
-            Self::Retained(seen) => seen
-                .iter()
-                .filter(|(_, seen_event)| now.duration_since(seen_event.seen_at) >= retention)
-                .map(|(id, _)| *id)
-                .collect(),
-        }
-    }
-
-    fn terminal_entries(&self, now_wall: u64, now_instant: Instant) -> Vec<(EventId, u64)> {
-        match self {
-            Self::Bounded(seen) => seen
-                .iter()
-                .filter_map(|(event_id, seen_event)| {
-                    if seen_event.terminal {
-                        Some((
-                            *event_id,
-                            instant_to_unix_secs(seen_event.seen_at, now_wall, now_instant),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            Self::Retained(seen) => seen
-                .iter()
-                .filter_map(|(event_id, seen_event)| {
-                    if seen_event.terminal {
-                        Some((
-                            *event_id,
-                            instant_to_unix_secs(seen_event.seen_at, now_wall, now_instant),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-        }
-    }
-}
-
-struct PersistentDedupState {
-    path: PathBuf,
-    write_lock: Mutex<()>,
-}
-
-impl PersistentDedupState {
-    fn new(path: PathBuf) -> Result<Self> {
-        Self::prepare_path(&path)?;
-        Ok(Self {
-            path,
-            write_lock: Mutex::new(()),
-        })
-    }
-
-    fn prepare_path(path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut options = StdOpenOptions::new();
-        options.create(true).append(true).read(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let _file = options.open(path)?;
-
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-
-    fn load_seen_events(path: &Path, retention: Duration) -> Result<SeenEventStore> {
-        Self::prepare_path(path)?;
-
-        let now_wall = Timestamp::now().as_secs();
-        let now_instant = Instant::now();
-        let mut seen = SeenEventStore::retained();
-        let contents = fs::read_to_string(path)?;
-
-        for line in contents.lines() {
-            let mut fields = line.split_whitespace();
-            let (Some(event_id_hex), Some(seen_at_secs), None) =
-                (fields.next(), fields.next(), fields.next())
-            else {
-                continue;
-            };
-            let Ok(event_id) = EventId::from_hex(event_id_hex) else {
-                continue;
-            };
-            let Ok(seen_at_secs) = seen_at_secs.parse::<u64>() else {
-                continue;
-            };
-            let age = now_wall.saturating_sub(seen_at_secs);
-            if age > retention.as_secs() {
-                continue;
-            }
-            let seen_at = now_instant
-                .checked_sub(Duration::from_secs(age))
-                .unwrap_or(now_instant);
-            seen.put(event_id, SeenEvent::terminal(seen_at));
-        }
-
-        Ok(seen)
-    }
-
-    async fn append_seen_locked(
-        &self,
-        event_id: EventId,
-        seen_at_secs: u64,
-    ) -> std::io::Result<()> {
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
-        #[cfg(unix)]
-        tokio::fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).await?;
-        file.write_all(format!("{} {}\n", event_id.to_hex(), seen_at_secs).as_bytes())
-            .await?;
-        file.flush().await
-    }
-
-    async fn rewrite_locked(&self, entries: &[(EventId, u64)]) -> std::io::Result<()> {
-        let tmp_path = self.path.with_extension("tmp");
-        let mut contents = String::new();
-        for (event_id, seen_at_secs) in entries {
-            use std::fmt::Write as _;
-            let _ = writeln!(&mut contents, "{} {}", event_id.to_hex(), seen_at_secs);
-        }
-        tokio::fs::write(&tmp_path, contents).await?;
-        #[cfg(unix)]
-        tokio::fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).await?;
-        tokio::fs::rename(&tmp_path, &self.path).await
-    }
-}
-
-fn instant_to_unix_secs(seen_at: Instant, now_wall: u64, now_instant: Instant) -> u64 {
-    let age = now_instant
-        .checked_duration_since(seen_at)
-        .unwrap_or_default()
-        .as_secs();
-    now_wall.saturating_sub(age)
-}
-
-#[must_use]
-struct InFlightEventGuard<'a> {
-    metrics: Option<&'a Metrics>,
-}
-
-impl<'a> InFlightEventGuard<'a> {
-    fn new(metrics: Option<&'a Metrics>) -> Self {
-        if let Some(m) = metrics {
-            m.inc_events_in_flight();
-        }
-
-        Self { metrics }
-    }
-}
-
-impl Drop for InFlightEventGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(m) = self.metrics {
-            m.dec_events_in_flight();
-        }
-    }
-}
-
-struct StageTimer(StdInstant);
-
-impl StageTimer {
-    fn start() -> Self {
-        Self(StdInstant::now())
-    }
-
-    fn elapsed_secs(&self) -> f64 {
-        self.0.elapsed().as_secs_f64()
-    }
-}
-
-/// Outcome of [`EventProcessor::process_inner`].
-///
-/// Distinguishes a terminal result (notifications admitted, or the event
-/// genuinely carried nothing dispatchable) from a purely transient per-token
-/// rate-limit shed, which must be treated like the global-limiter shed:
-/// retryable, not marked terminally seen, and not counted as processed.
-enum ProcessOutcome {
-    /// The event reached a terminal state: its admitted notifications (possibly
-    /// zero when every token was invalid or targeted an unconfigured platform)
-    /// were handed to the dispatcher; the per-event count is recorded via
-    /// `observe_notifications_admitted_per_event`. Replays should
-    /// short-circuit as duplicates.
-    Admitted,
-    /// Every token the event carried was shed purely by the per-token rate
-    /// limiters, admitting zero notifications and dropping nothing terminally.
-    /// This is transient back-pressure: the event stays retryable once budget
-    /// recovers.
-    RateLimitedShed,
-}
-
-/// A per-token admission charge that must be explicitly resolved.
-///
-/// Created after the encrypted-token limiter admits a token, and (once the
-/// device-token limiter also admits) after that charge too. It makes the
-/// charge/refund lifecycle transactional so no admission path can silently
-/// strand a spent rate-limit increment (the class of bug behind #170 and #177):
-///
-/// - [`commit`](AdmissionGuard::commit) — the token was fully admitted and
-///   handed toward the dispatcher; the charges are handed off to the caller's
-///   dispatch-failure rollback ledger. Returns the keys and reservations.
-/// - [`refund`](AdmissionGuard::refund) — the token is being dropped *after*
-///   being charged (device-limiter reject per #170, or an undispatchable
-///   platform / non-UTF-8 token discovered post-decrypt per #177). Every charge
-///   the guard holds is rolled back so the drop leaves no spent budget.
-/// - [`keep_charge`](AdmissionGuard::keep_charge) — the token is dropped but its
-///   charge is *intentionally retained* (decrypt failure: an invalid encrypted
-///   blob must still spend replay/spam budget, documented in #170).
-///
-/// The `Drop` impl asserts the guard was resolved. Because the limiter refund is
-/// `async` (the stripe lock is a tokio `RwLock`), a `Drop`-time auto-refund
-/// would have to block; the guard is therefore an explicit-consume guard rather
-/// than a fire-and-forget RAII one. This keeps the refund decision in exactly
-/// one place per exit path while remaining `async`-correct — the trade the
-/// tracker calls out as acceptable when a blocking Drop is not.
-#[must_use = "an AdmissionGuard must be committed, refunded, or explicitly kept"]
-struct AdmissionGuard<'a> {
-    encrypted_limiter: &'a RateLimiter<[u8; 32]>,
-    device_limiter: &'a RateLimiter<[u8; 32]>,
-    encrypted_key: [u8; 32],
-    encrypted_reservation: RateLimitReservation,
-    /// Present once the device-token limiter has also admitted the token.
-    device: Option<([u8; 32], RateLimitReservation)>,
-    resolved: bool,
-}
-
-impl<'a> AdmissionGuard<'a> {
-    /// Record the encrypted-token charge just made for a token.
-    fn new(
-        encrypted_limiter: &'a RateLimiter<[u8; 32]>,
-        device_limiter: &'a RateLimiter<[u8; 32]>,
-        encrypted_key: [u8; 32],
-        encrypted_reservation: RateLimitReservation,
-    ) -> Self {
-        Self {
-            encrypted_limiter,
-            device_limiter,
-            encrypted_key,
-            encrypted_reservation,
-            device: None,
-            resolved: false,
-        }
-    }
-
-    /// Record the device-token charge for the same token.
-    fn add_device_charge(&mut self, device_key: [u8; 32], reservation: RateLimitReservation) {
-        self.device = Some((device_key, reservation));
-    }
-
-    /// Roll back every charge this guard holds (encrypted, and device if any).
-    ///
-    /// Used on every drop-after-charge path: a device-limiter reject (#170) and
-    /// a post-decrypt undispatchable/non-UTF-8 drop (#177).
-    async fn refund(mut self) {
-        self.encrypted_limiter
-            .rollback_increment(&self.encrypted_key, self.encrypted_reservation)
-            .await;
-        if let Some((device_key, reservation)) = self.device {
-            self.device_limiter
-                .rollback_increment(&device_key, reservation)
-                .await;
-        }
-        self.resolved = true;
-    }
-
-    /// Intentionally keep the charge(s) — the drop is a deliberate budget spend.
-    fn keep_charge(mut self) {
-        self.resolved = true;
-    }
-
-    /// Hand off the fully-admitted charges to the caller's rollback ledger.
-    fn commit(mut self) -> AdmittedCharges {
-        self.resolved = true;
-        let (device_key, device_reservation) = self
-            .device
-            .expect("commit requires a device-token charge to have been recorded");
-        AdmittedCharges {
-            encrypted_key: self.encrypted_key,
-            encrypted_reservation: self.encrypted_reservation,
-            device_key,
-            device_reservation,
-        }
-    }
-}
-
-impl Drop for AdmissionGuard<'_> {
-    fn drop(&mut self) {
-        debug_assert!(
-            self.resolved,
-            "AdmissionGuard dropped without commit/refund/keep_charge — a rate-limit charge would be stranded"
-        );
-    }
-}
-
-/// Fully-admitted rate-limit charges for one token, recorded so a later
-/// dispatch-admission failure can roll back exactly the increments it spent.
-struct AdmittedCharges {
-    encrypted_key: [u8; 32],
-    encrypted_reservation: RateLimitReservation,
-    device_key: [u8; 32],
-    device_reservation: RateLimitReservation,
-}
-
-/// Metrics label for a push platform (matches the dispatcher's `platform`
-/// label values so drop counters aggregate with send counters).
-fn platform_metric_label(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Apns => "apns",
-        Platform::Fcm => "fcm",
-    }
-}
+use crate::rate_limiter::{RateLimitConfig, RateLimiter};
 
 /// Event processor for handling incoming gift-wrapped notifications.
 pub struct EventProcessor {
@@ -1436,14 +985,19 @@ impl EventProcessor {
             .unwrap_or(0)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ApnsConfig;
+    use crate::crypto::Platform;
     use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
-    use crate::defaults::DEFAULT_MAX_TOKENS_PER_EVENT;
+    use crate::defaults::{
+        DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_MAX_DEDUP_CACHE_SIZE,
+        DEFAULT_MAX_NOTIFICATION_AGE_SECS, DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+        DEFAULT_MAX_TOKENS_PER_EVENT,
+    };
     use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
+    use crate::nostr::events::dedup::{CLEANUP_BATCH_SIZE, DEDUP_WINDOW, instant_to_unix_secs};
     use crate::push::{ApnsClient, PushDispatcher};
     use crate::test_metrics::{
         counter_value, gauge_value as metric_gauge_value,
