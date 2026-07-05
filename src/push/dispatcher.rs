@@ -12,8 +12,9 @@
 //!
 //! # Security
 //!
-//! Device tokens are wrapped in `Zeroizing<String>` to ensure they are zeroed
-//! from memory when no longer needed, preventing sensitive data from lingering.
+//! Device tokens are wrapped in `Zeroizing<String>` while queued and while
+//! handed to provider clients, reducing avoidable cleartext heap copies before
+//! request serialization.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,8 +44,8 @@ const MAX_PENDING_QUEUE_SIZE: usize = 10_000;
 ///
 /// # Security
 ///
-/// The token field is wrapped in `Zeroizing<String>` to ensure device tokens
-/// are zeroed from memory when the message is dropped.
+/// The token field is wrapped in `Zeroizing<String>` while queued and is moved
+/// intact into the provider client when the message is sent.
 enum PushMessage {
     /// Send a notification to the given platform with the given token.
     Send {
@@ -248,7 +249,7 @@ impl PushDispatcher {
         match platform {
             Platform::Apns => {
                 if let Some(client) = apns_client {
-                    match client.send(token.as_str(), backoff_permit).await {
+                    match client.send(token, backoff_permit).await {
                         Ok(true) => {
                             trace!("APNs notification sent");
                             if let Some(ref m) = metrics {
@@ -272,7 +273,7 @@ impl PushDispatcher {
             }
             Platform::Fcm => {
                 if let Some(client) = fcm_client {
-                    match client.send(token.as_str(), backoff_permit).await {
+                    match client.send(token, backoff_permit).await {
                         Ok(true) => {
                             trace!("FCM notification sent");
                             if let Some(ref m) = metrics {
@@ -402,7 +403,7 @@ impl PushDispatcher {
                         trace!("APNs not configured, skipping notification");
                         continue;
                     }
-                    (Platform::Apns, Zeroizing::new(payload.device_token_hex()))
+                    (Platform::Apns, payload.device_token_hex())
                 }
                 Platform::Fcm => {
                     if self.fcm_client.is_none() {
@@ -410,7 +411,7 @@ impl PushDispatcher {
                         continue;
                     }
                     match payload.device_token_string() {
-                        Some(t) => (Platform::Fcm, Zeroizing::new(t)),
+                        Some(token) => (Platform::Fcm, token),
                         None => {
                             trace!("Invalid FCM token (not UTF-8)");
                             continue;
@@ -608,6 +609,76 @@ mod tests {
 
     fn queue_size_metric_value(metrics: &crate::metrics::Metrics) -> i64 {
         gauge_metric_value(metrics, "transponder_push_queue_size")
+    }
+
+    fn apns_test_payload() -> TokenPayload {
+        TokenPayload {
+            platform: Platform::Apns,
+            device_token: vec![0xaa, 0xbb, 0xcc],
+        }
+    }
+
+    fn repeated_apns_payloads(count: usize) -> Vec<TokenPayload> {
+        (0..count).map(|_| apns_test_payload()).collect()
+    }
+
+    #[tokio::test]
+    async fn send_push_records_invalid_token_metrics() {
+        use crate::config::{ApnsConfig, FcmConfig};
+        use crate::metrics::Metrics;
+        use crate::push::{ApnsClient, FcmClient};
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+        };
+        let fcm_config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let metrics = Metrics::default();
+
+        PushDispatcher::send_push(
+            Platform::Apns,
+            Zeroizing::new("not-a-hex-token".to_string()),
+            Some(Arc::new(ApnsClient::mock(apns_config, true))),
+            None,
+            Some(metrics.clone()),
+            None,
+        )
+        .await;
+        PushDispatcher::send_push(
+            Platform::Fcm,
+            Zeroizing::new("".to_string()),
+            None,
+            Some(Arc::new(FcmClient::mock(fcm_config, true))),
+            Some(metrics.clone()),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            metric_counter_value(
+                &metrics,
+                "transponder_push_failed_total",
+                &[("platform", "apns"), ("reason", "invalid_token")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_counter_value(
+                &metrics,
+                "transponder_push_failed_total",
+                &[("platform", "fcm"), ("reason", "invalid_token")]
+            ),
+            1.0
+        );
     }
 
     #[tokio::test]
@@ -876,13 +947,7 @@ mod tests {
             .await
             .unwrap();
 
-        let payloads = vec![
-            TokenPayload {
-                platform: Platform::Apns,
-                device_token: vec![0xaa, 0xbb, 0xcc],
-            };
-            2
-        ];
+        let payloads = repeated_apns_payloads(2);
 
         assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 2);
 
@@ -1208,13 +1273,7 @@ mod tests {
             .await
             .unwrap();
 
-        let payloads = vec![
-            TokenPayload {
-                platform: Platform::Apns,
-                device_token: vec![0xaa, 0xbb, 0xcc],
-            };
-            MAX_CONCURRENT_PUSHES + 2
-        ];
+        let payloads = repeated_apns_payloads(MAX_CONCURRENT_PUSHES + 2);
         assert_eq!(
             dispatcher.dispatch(payloads).await.unwrap(),
             MAX_CONCURRENT_PUSHES + 2
@@ -1322,13 +1381,7 @@ mod tests {
         let dispatcher =
             PushDispatcher::with_metrics(Some(apns_client), None, Some(metrics.clone()));
 
-        let payloads = vec![
-            TokenPayload {
-                platform: Platform::Apns,
-                device_token: vec![0xaa, 0xbb, 0xcc],
-            };
-            MAX_PENDING_QUEUE_SIZE + 1
-        ];
+        let payloads = repeated_apns_payloads(MAX_PENDING_QUEUE_SIZE + 1);
 
         let error = dispatcher.dispatch(payloads).await.unwrap_err();
 
@@ -1392,13 +1445,7 @@ mod tests {
         // to dequeue (and decrement) before the batch increment would have run
         // under the old ordering.
         for _ in 0..50 {
-            let payloads = vec![
-                TokenPayload {
-                    platform: Platform::Apns,
-                    device_token: vec![0xaa, 0xbb, 0xcc],
-                };
-                4
-            ];
+            let payloads = repeated_apns_payloads(4);
             assert_eq!(dispatcher.dispatch(payloads).await.unwrap(), 4);
 
             // Let the worker pool fully drain the batch.
@@ -1475,10 +1522,11 @@ mod tests {
         let guard = dispatcher.inflight.enter();
 
         // A retry config with a backoff long enough to observe the sleep window
-        // deterministically from the test.
+        // deterministically from the test even after retry jitter shortens the
+        // fallback sleep by up to half.
         let config = RetryConfig {
             max_retries: 3,
-            initial_backoff: Duration::from_millis(300),
+            initial_backoff: Duration::from_millis(600),
         };
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_op = attempts.clone();

@@ -90,8 +90,9 @@ impl Platform {
 ///
 /// This struct implements `ZeroizeOnDrop` to ensure all fields are zeroed
 /// when the token goes out of scope, preventing sensitive data from lingering
-/// in memory.
-#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+/// in memory. It intentionally does not implement `Clone` so sensitive buffers
+/// cannot be implicitly duplicated through whole-struct clones.
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptedToken {
     /// X-only ephemeral public key (32 bytes).
     pub ephemeral_pubkey: [u8; PUBKEY_SIZE],
@@ -138,8 +139,9 @@ impl EncryptedToken {
 ///
 /// This struct implements `ZeroizeOnDrop` to ensure the device token is zeroed
 /// when the payload goes out of scope, preventing sensitive data from lingering
-/// in memory.
-#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+/// in memory. It intentionally does not implement `Clone` so sensitive buffers
+/// cannot be implicitly duplicated through whole-struct clones.
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 pub struct TokenPayload {
     /// Target platform (APNs or FCM).
     #[zeroize(skip)]
@@ -186,16 +188,18 @@ impl TokenPayload {
         })
     }
 
-    /// Get the device token as a hex string (for APNs).
+    /// Get the device token as a zeroized hex string (for APNs).
     #[must_use]
-    pub fn device_token_hex(&self) -> String {
-        hex::encode(&self.device_token)
+    pub fn device_token_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(&self.device_token))
     }
 
-    /// Get the device token as a string (for FCM).
+    /// Get the device token as a zeroized string (for FCM).
     #[must_use]
-    pub fn device_token_string(&self) -> Option<String> {
-        String::from_utf8(self.device_token.clone()).ok()
+    pub fn device_token_string(&self) -> Option<Zeroizing<String>> {
+        std::str::from_utf8(&self.device_token)
+            .ok()
+            .map(|token| Zeroizing::new(token.to_owned()))
     }
 }
 
@@ -422,7 +426,8 @@ mod tests {
             platform: Platform::Apns,
             device_token: vec![0xde, 0xad, 0xbe, 0xef],
         };
-        assert_eq!(payload.device_token_hex(), "deadbeef");
+        let token: Zeroizing<String> = payload.device_token_hex();
+        assert_eq!(token.as_str(), "deadbeef");
     }
 
     #[test]
@@ -431,10 +436,8 @@ mod tests {
             platform: Platform::Fcm,
             device_token: b"test-token-123".to_vec(),
         };
-        assert_eq!(
-            payload.device_token_string(),
-            Some("test-token-123".to_string())
-        );
+        let token: Option<Zeroizing<String>> = payload.device_token_string();
+        assert_eq!(token.as_ref().map(|s| s.as_str()), Some("test-token-123"));
     }
 
     #[test]
