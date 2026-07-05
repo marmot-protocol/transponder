@@ -176,6 +176,31 @@ mod tests {
     use nostr_sdk::prelude::*;
     use std::time::Duration;
 
+    async fn wait_for_server_response(client: &reqwest::Client, url: String) -> reqwest::Response {
+        for _ in 0..50 {
+            match client.get(&url).send().await {
+                Ok(response) => return response,
+                Err(error) if error.is_connect() => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("request to health test server failed: {error}"),
+            }
+        }
+
+        panic!("health test server did not accept connections at {url}");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "health test server did not accept connections")]
+    async fn wait_for_server_response_times_out_if_server_never_starts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = reqwest::Client::new();
+        let _ = wait_for_server_response(&client, format!("http://{addr}/health")).await;
+    }
+
     #[test]
     fn test_health_response_serialization() {
         let response = HealthResponse {
@@ -237,16 +262,8 @@ mod tests {
         // Spawn server
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
-        // Give server time to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Test health endpoint
         let client = reqwest::Client::new();
-        let response = client
-            .get(format!("http://{}/health", addr))
-            .send()
-            .await
-            .unwrap();
+        let response = wait_for_server_response(&client, format!("http://{}/health", addr)).await;
 
         assert_eq!(response.status(), 200);
         let body: HealthResponse = response.json().await.unwrap();
@@ -295,14 +312,8 @@ mod tests {
 
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
         let client = reqwest::Client::new();
-        let response = client
-            .get(format!("http://{}/ready", addr))
-            .send()
-            .await
-            .unwrap();
+        let response = wait_for_server_response(&client, format!("http://{}/ready", addr)).await;
 
         // Should be 503 because no relays connected and no push services
         assert_eq!(response.status(), 503);
@@ -444,16 +455,8 @@ mod tests {
             server.run(shutdown_rx).await.unwrap();
         });
 
-        // Wait for server to start
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Check metrics endpoint
         let client = reqwest::Client::new();
-        let response = client
-            .get(format!("http://{}/metrics", addr))
-            .send()
-            .await
-            .unwrap();
+        let response = wait_for_server_response(&client, format!("http://{}/metrics", addr)).await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await.unwrap();
@@ -498,16 +501,8 @@ mod tests {
             server.run(shutdown_rx).await.unwrap();
         });
 
-        // Wait for server to start
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Check metrics endpoint
         let client = reqwest::Client::new();
-        let response = client
-            .get(format!("http://{}/metrics", addr))
-            .send()
-            .await
-            .unwrap();
+        let response = wait_for_server_response(&client, format!("http://{}/metrics", addr)).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
@@ -570,14 +565,8 @@ mod tests {
 
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
         let client = reqwest::Client::new();
-        let response = client
-            .get(format!("http://{}/ready", addr))
-            .send()
-            .await
-            .unwrap();
+        let response = wait_for_server_response(&client, format!("http://{}/ready", addr)).await;
 
         // Should be 200 OK because relays are connected and APNs is configured
         assert_eq!(response.status(), 200);

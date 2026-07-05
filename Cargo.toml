@@ -90,6 +90,7 @@ base64 = "0.22"
 hex = "0.4.3"
 bytes = "1.11"
 lru = "0.16"
+rand = "0.9"
 
 [dev-dependencies]
 tokio-test = "0.4.5"
