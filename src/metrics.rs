@@ -19,6 +19,9 @@ use prometheus::{
 /// All metrics for the Transponder server.
 #[derive(Clone)]
 pub struct Metrics {
+    /// When false, recording methods are no-ops.
+    enabled: bool,
+
     /// The Prometheus registry containing all metrics.
     pub registry: Registry,
 
@@ -581,6 +584,7 @@ impl Metrics {
         registry.register(Box::new(server_info.clone()))?;
 
         Ok(Self {
+            enabled: true,
             registry,
             events_received_total,
             events_processed_total,
@@ -628,8 +632,30 @@ impl Metrics {
         })
     }
 
+    /// Return a copy with recording enabled or disabled.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Whether metric recording is active.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Return a metrics handle that never records (for tests and fallback init).
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self::new().expect("metrics registry").with_enabled(false)
+    }
+
     /// Initialize server startup metrics.
     pub fn init_server_info(&self, version: &str) {
+        if !self.enabled {
+            return;
+        }
         self.server_start_time_seconds.set(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -641,6 +667,9 @@ impl Metrics {
 
     /// Set the configured relay counts.
     pub fn set_relay_counts(&self, clearnet: usize, onion: usize) {
+        if !self.enabled {
+            return;
+        }
         self.relays_configured
             .with_label_values(&["clearnet"])
             .set(clearnet as i64);
@@ -651,47 +680,74 @@ impl Metrics {
 
     /// Record an event received from relays.
     pub fn record_event_received(&self) {
+        if !self.enabled {
+            return;
+        }
         self.events_received_total.inc();
     }
 
     /// Record a successfully processed event.
     pub fn record_event_processed(&self) {
+        if !self.enabled {
+            return;
+        }
         self.events_processed_total.inc();
     }
 
     /// Record a deduplicated event.
     pub fn record_event_deduplicated(&self) {
+        if !self.enabled {
+            return;
+        }
         self.events_deduplicated_total.inc();
     }
 
     /// Record a failed event.
     pub fn record_event_failed(&self) {
+        if !self.enabled {
+            return;
+        }
         self.events_failed_total.inc();
     }
 
     /// Record an event shed by global admission control before unwrap.
     pub fn record_event_shed(&self) {
+        if !self.enabled {
+            return;
+        }
         self.events_shed_total.inc();
     }
 
     /// Record an event whose every token was shed by the per-token rate
     /// limiters, admitting zero notifications.
     pub fn record_event_rate_limited(&self) {
+        if !self.enabled {
+            return;
+        }
         self.events_rate_limited_total.inc();
     }
 
     /// Increment the number of in-flight events.
     pub fn inc_events_in_flight(&self) {
+        if !self.enabled {
+            return;
+        }
         self.events_in_flight.inc();
     }
 
     /// Decrement the number of in-flight events.
     pub fn dec_events_in_flight(&self) {
+        if !self.enabled {
+            return;
+        }
         self.events_in_flight.dec();
     }
 
     /// Observe end-to-end event processing duration.
     pub fn observe_event_processing_duration(&self, outcome: EventOutcome, duration_secs: f64) {
+        if !self.enabled {
+            return;
+        }
         observe_label_value(
             &self.event_processing_duration_seconds,
             outcome.as_str(),
@@ -701,6 +757,9 @@ impl Metrics {
 
     /// Observe gift-wrap unwrap duration.
     pub fn observe_gift_wrap_unwrap_duration(&self, outcome: OperationOutcome, duration_secs: f64) {
+        if !self.enabled {
+            return;
+        }
         observe_label_value(
             &self.gift_wrap_unwrap_duration_seconds,
             outcome.as_str(),
@@ -723,21 +782,33 @@ impl Metrics {
 
     /// Observe encrypted token count per event.
     pub fn observe_tokens_per_event(&self, count: usize) {
+        if !self.enabled {
+            return;
+        }
         self.tokens_per_event.observe(count as f64);
     }
 
     /// Observe the size in bytes of the base64-decoded encrypted token blob.
     pub fn observe_notification_content_size_bytes(&self, size: usize) {
+        if !self.enabled {
+            return;
+        }
         self.notification_content_size_bytes.observe(size as f64);
     }
 
     /// Update dedup cache size.
     pub fn set_dedup_cache_size(&self, size: usize) {
+        if !self.enabled {
+            return;
+        }
         set_usize_gauge(&self.dedup_cache_size, size);
     }
 
     /// Record dedup cache evictions.
     pub fn record_dedup_evictions(&self, count: usize) {
+        if !self.enabled {
+            return;
+        }
         self.dedup_cache_evictions_total.inc_by(count as u64);
     }
 
@@ -746,6 +817,9 @@ impl Metrics {
     /// `cache_type` should be "encrypted_token" or "device_token".
     /// `reason` should be "minute", "hour", or "capacity".
     pub fn record_rate_limited(&self, cache_type: &str, reason: Option<&str>) {
+        if !self.enabled {
+            return;
+        }
         self.tokens_rate_limited_total
             .with_label_values(&[cache_type, reason.unwrap_or("unknown")])
             .inc();
@@ -755,6 +829,9 @@ impl Metrics {
     ///
     /// `cache_type` should be "encrypted_token" or "device_token".
     pub fn set_rate_limit_cache_size(&self, cache_type: &str, size: usize) {
+        if !self.enabled {
+            return;
+        }
         self.rate_limit_cache_size
             .with_label_values(&[cache_type])
             .set(size as i64);
@@ -764,6 +841,9 @@ impl Metrics {
     ///
     /// `cache_type` should be "encrypted_token" or "device_token".
     pub fn record_rate_limit_evictions(&self, cache_type: &str, count: usize) {
+        if !self.enabled {
+            return;
+        }
         self.rate_limit_evictions_total
             .with_label_values(&[cache_type])
             .inc_by(count as u64);
@@ -773,6 +853,9 @@ impl Metrics {
     ///
     /// `cache_type` should be "encrypted_token" or "device_token".
     pub fn record_rate_limit_admission_eviction(&self, cache_type: &str) {
+        if !self.enabled {
+            return;
+        }
         self.rate_limit_admission_evictions_total
             .with_label_values(&[cache_type])
             .inc();
@@ -780,16 +863,25 @@ impl Metrics {
 
     /// Record a successful token decryption.
     pub fn record_token_decrypted(&self) {
+        if !self.enabled {
+            return;
+        }
         self.tokens_decrypted_total.inc();
     }
 
     /// Record a failed token decryption.
     pub fn record_token_decryption_failed(&self) {
+        if !self.enabled {
+            return;
+        }
         self.tokens_decryption_failed_total.inc();
     }
 
     /// Observe per-token decryption duration.
     pub fn observe_token_decrypt_duration(&self, outcome: OperationOutcome, duration_secs: f64) {
+        if !self.enabled {
+            return;
+        }
         observe_label_value(
             &self.token_decrypt_duration_seconds,
             outcome.as_str(),
@@ -799,11 +891,17 @@ impl Metrics {
 
     /// Observe the number of notifications admitted to the push dispatcher per event.
     pub fn observe_notifications_admitted_per_event(&self, count: usize) {
+        if !self.enabled {
+            return;
+        }
         self.notifications_admitted_per_event.observe(count as f64);
     }
 
     /// Record a notification dispatched to push queue.
     pub fn record_push_dispatched(&self, platform: &str) {
+        if !self.enabled {
+            return;
+        }
         self.push_dispatched_total
             .with_label_values(&[platform])
             .inc();
@@ -811,11 +909,17 @@ impl Metrics {
 
     /// Record a successful push notification.
     pub fn record_push_success(&self, platform: &str) {
+        if !self.enabled {
+            return;
+        }
         self.push_success_total.with_label_values(&[platform]).inc();
     }
 
     /// Record a failed push notification.
     pub fn record_push_failed(&self, platform: &str, reason: &str) {
+        if !self.enabled {
+            return;
+        }
         self.push_failed_total
             .with_label_values(&[platform, reason])
             .inc();
@@ -823,26 +927,41 @@ impl Metrics {
 
     /// Update the push queue size.
     pub fn set_push_queue_size(&self, size: usize) {
+        if !self.enabled {
+            return;
+        }
         set_usize_gauge(&self.push_queue_size, size);
     }
 
     /// Update the push queue capacity.
     pub fn set_push_queue_capacity(&self, size: usize) {
+        if !self.enabled {
+            return;
+        }
         set_usize_gauge(&self.push_queue_capacity, size);
     }
 
     /// Update available semaphore permits.
     pub fn set_push_semaphore_available(&self, available: usize) {
+        if !self.enabled {
+            return;
+        }
         set_usize_gauge(&self.push_semaphore_available, available);
     }
 
     /// Update the push concurrency limit.
     pub fn set_push_concurrency_limit(&self, limit: usize) {
+        if !self.enabled {
+            return;
+        }
         set_usize_gauge(&self.push_concurrency_limit, limit);
     }
 
     /// Record a push queue rejection.
     pub fn record_push_queue_rejected(&self, count: u64) {
+        if !self.enabled {
+            return;
+        }
         self.push_queue_rejected_total.inc_by(count);
     }
 
@@ -861,11 +980,17 @@ impl Metrics {
 
     /// Record a push retry attempt.
     pub fn record_push_retry(&self, platform: &str) {
+        if !self.enabled {
+            return;
+        }
         self.push_retries_total.with_label_values(&[platform]).inc();
     }
 
     /// Observe push request duration.
     pub fn observe_push_duration(&self, platform: &str, duration_secs: f64) {
+        if !self.enabled {
+            return;
+        }
         self.push_request_duration_seconds
             .with_label_values(&[platform])
             .observe(duration_secs);
@@ -873,6 +998,9 @@ impl Metrics {
 
     /// Record push response status.
     pub fn record_push_response_status(&self, platform: &str, status: u16) {
+        if !self.enabled {
+            return;
+        }
         self.push_response_status_total
             .with_label_values(&[platform, &status.to_string()])
             .inc();
@@ -880,6 +1008,9 @@ impl Metrics {
 
     /// Record an auth token refresh.
     pub fn record_auth_token_refresh(&self, service: &str) {
+        if !self.enabled {
+            return;
+        }
         self.auth_token_refreshes_total
             .with_label_values(&[service])
             .inc();
@@ -887,6 +1018,9 @@ impl Metrics {
 
     /// Update connected relay count.
     pub fn set_relays_connected(&self, relay_type: &str, count: usize) {
+        if !self.enabled {
+            return;
+        }
         self.relays_connected
             .with_label_values(&[relay_type])
             .set(count as i64);
@@ -894,16 +1028,25 @@ impl Metrics {
 
     /// Record a lagged relay notification event.
     pub fn record_relay_notifications_lagged(&self) {
+        if !self.enabled {
+            return;
+        }
         self.relay_notifications_lagged_total.inc();
     }
 
     /// Record relay notifications dropped due to receiver lag.
     pub fn record_relay_notifications_dropped(&self, count: u64) {
+        if !self.enabled {
+            return;
+        }
         self.relay_notifications_dropped_total.inc_by(count);
     }
 
     /// Set the relay subscription lookback window.
     pub fn set_relay_subscription_lookback(&self, seconds: u64) {
+        if !self.enabled {
+            return;
+        }
         self.relay_subscription_lookback_seconds
             .set(i64::try_from(seconds).unwrap_or(i64::MAX));
     }
@@ -913,6 +1056,9 @@ impl Metrics {
     /// Publishing the inbox relay list is best-effort and non-fatal at startup;
     /// this counter lets operators alert on the routing breakage it implies.
     pub fn record_inbox_relay_publish_failed(&self) {
+        if !self.enabled {
+            return;
+        }
         self.inbox_relay_publish_failed_total.inc();
     }
 

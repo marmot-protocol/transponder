@@ -72,7 +72,7 @@ struct ReadyResponse {
 struct HealthState {
     relay_client: Arc<RelayClient>,
     push_dispatcher: Arc<PushDispatcher>,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 /// Health check HTTP server.
@@ -80,7 +80,7 @@ pub struct HealthServer {
     config: HealthConfig,
     relay_client: Arc<RelayClient>,
     push_dispatcher: Arc<PushDispatcher>,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 impl HealthServer {
@@ -89,7 +89,7 @@ impl HealthServer {
         config: HealthConfig,
         relay_client: Arc<RelayClient>,
         push_dispatcher: Arc<PushDispatcher>,
-        metrics: Option<Metrics>,
+        metrics: Metrics,
     ) -> Self {
         Self {
             config,
@@ -114,7 +114,7 @@ impl HealthServer {
     /// Only when both are disabled is nothing bound.
     pub async fn bind(&self) -> Result<Option<TcpListener>> {
         let serve_health = self.config.enabled;
-        let serve_metrics = self.metrics.is_some();
+        let serve_metrics = self.metrics.is_enabled();
 
         if !serve_health && !serve_metrics {
             info!("Health server and metrics disabled; not binding a listener");
@@ -175,7 +175,7 @@ impl HealthServer {
                 .route("/health", get(health_handler))
                 .route("/ready", get(ready_handler));
         }
-        if self.metrics.is_some() {
+        if self.metrics.is_enabled() {
             router = router.route("/metrics", get(metrics_handler));
         }
 
@@ -277,15 +277,15 @@ async fn ready_handler(State(state): State<Arc<HealthState>>) -> impl IntoRespon
 
 /// Prometheus metrics handler.
 async fn metrics_handler(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
-    let Some(metrics) = &state.metrics else {
+    if !state.metrics.is_enabled() {
         return (
             StatusCode::NOT_FOUND,
             [("content-type", "text/plain")],
             vec![],
         );
-    };
+    }
 
-    let metric_families = metrics.gather();
+    let metric_families = state.metrics.gather();
     let encoder = TextEncoder::new();
     let mut buffer = vec![];
 
@@ -350,7 +350,7 @@ mod tests {
 
         let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        HealthServer::new(config, relay_client, push_dispatcher, None)
+        HealthServer::new(config, relay_client, push_dispatcher, Metrics::disabled())
     }
 
     #[tokio::test]
@@ -484,7 +484,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, Metrics::disabled());
 
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -536,7 +536,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, Metrics::disabled());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -585,7 +585,7 @@ mod tests {
             bind_address: "127.0.0.1:0".to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, Metrics::disabled());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -630,7 +630,7 @@ mod tests {
             bind_address: invalid_address.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, Metrics::disabled());
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -666,9 +666,9 @@ mod tests {
         };
         let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         metrics.init_server_info("0.0.0");
-        let metrics = Some(metrics);
+        let metrics = metrics;
 
         // Find a free port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -713,8 +713,7 @@ mod tests {
         };
         let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        // No metrics provided
-        let metrics = None;
+        let metrics = Metrics::disabled();
 
         // Find a free port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -792,7 +791,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, Metrics::disabled());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -869,7 +868,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, Metrics::disabled());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
@@ -906,7 +905,7 @@ mod tests {
         };
         let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         metrics.init_server_info("0.0.0");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -918,7 +917,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher, Some(metrics));
+        let server = HealthServer::new(config, relay_client, push_dispatcher, metrics);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
@@ -972,7 +971,7 @@ mod tests {
             },
             relay_client,
             push_dispatcher,
-            Some(Metrics::default()),
+            Metrics::new().unwrap(),
         );
 
         let listener = server.bind().await.unwrap();
@@ -1016,7 +1015,7 @@ mod tests {
         let state = Arc::new(HealthState {
             relay_client,
             push_dispatcher,
-            metrics: None,
+            metrics: Metrics::disabled(),
         });
 
         // Defensive guard: the route is only mounted when a collector exists,
@@ -1055,7 +1054,7 @@ mod tests {
             bind_address: addr.to_string(),
         };
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+        let server = HealthServer::new(config, relay_client, push_dispatcher, Metrics::disabled());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });

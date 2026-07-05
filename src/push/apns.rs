@@ -202,7 +202,7 @@ pub(crate) struct ApnsTokenGenerator {
     encoding_key: Option<EncodingKey>,
     team_id: String,
     key_id: String,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 impl ApnsTokenGenerator {
@@ -244,9 +244,7 @@ impl AuthTokenGenerator for ApnsTokenGenerator {
                 .map_err(|e| TokenAcquisitionError::permanent(Error::from(e)))?,
         );
 
-        if let Some(metrics) = &self.metrics {
-            metrics.record_auth_token_refresh("apns_jwt");
-        }
+        self.metrics.record_auth_token_refresh("apns_jwt");
 
         trace!("Generated new APNs JWT token");
         Ok(MintedToken {
@@ -261,7 +259,7 @@ pub struct ApnsClient {
     pub(crate) http_client: Client,
     pub(crate) config: ApnsConfig,
     pub(crate) token_cache: TokenCache<ApnsTokenGenerator>,
-    pub(crate) metrics: Option<Metrics>,
+    pub(crate) metrics: Metrics,
     /// Test-only override for the APNs base URL (scheme + host + port).
     #[cfg(test)]
     pub(crate) test_base_url: Option<String>,
@@ -280,11 +278,11 @@ impl ApnsClient {
     /// Create a new APNs client.
     #[allow(dead_code)]
     pub async fn new(config: ApnsConfig) -> Result<Self> {
-        Self::with_metrics(config, None).await
+        Self::with_metrics(config, Metrics::disabled()).await
     }
 
     /// Create a new APNs client with metrics.
-    pub async fn with_metrics(config: ApnsConfig, metrics: Option<Metrics>) -> Result<Self> {
+    pub async fn with_metrics(config: ApnsConfig, metrics: Metrics) -> Result<Self> {
         let http_client = Client::builder()
             .http2_prior_knowledge()
             .timeout(Duration::from_secs(30))
@@ -384,12 +382,12 @@ impl ApnsClient {
             "APNs",
             || self.send_once(url.as_str(), &request_parts),
             backoff_permit,
-            self.metrics.as_ref(),
+            self.metrics.clone(),
         )
         .await;
-        if let Some(metrics) = &self.metrics {
-            metrics.observe_push_duration("apns", start.elapsed().as_secs_f64());
-        }
+        self.metrics
+            .observe_push_duration("apns", start.elapsed().as_secs_f64());
+
         result
     }
 
@@ -423,9 +421,8 @@ impl ApnsClient {
     ) -> SendAttemptResult {
         let status = response.status();
 
-        if let Some(metrics) = &self.metrics {
-            metrics.record_push_response_status("apns", status.as_u16());
-        }
+        self.metrics
+            .record_push_response_status("apns", status.as_u16());
 
         match status.as_u16() {
             200 => {
@@ -603,7 +600,7 @@ impl ApnsClient {
                     // error can reach any log sink downstream (issue #172).
                     .map_err(|e| Error::from(e).redact_transport_url())
             },
-            self.metrics.as_ref(),
+            &self.metrics,
         )
         .await
         {
@@ -637,13 +634,13 @@ impl ApnsClient {
             encoding_key,
             team_id: config.team_id.clone(),
             key_id: config.key_id.clone(),
-            metrics: None,
+            metrics: Metrics::disabled(),
         });
         Self {
             http_client: Client::new(),
             config,
             token_cache,
-            metrics: None,
+            metrics: Metrics::disabled(),
             test_base_url: None,
         }
     }
@@ -1019,7 +1016,7 @@ mod tests {
 
         let metrics = Metrics::new().unwrap();
         let mut client = ApnsClient::mock(test_config(), false);
-        client.metrics = Some(metrics.clone());
+        client.metrics = metrics.clone();
 
         let response = Client::new()
             .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
@@ -1071,7 +1068,7 @@ mod tests {
 
         let metrics = Metrics::new().unwrap();
         let mut client = ApnsClient::mock(test_config(), true);
-        client.metrics = Some(metrics.clone());
+        client.metrics = metrics.clone();
         client.test_base_url = Some(mock_server.uri());
         client
             .seed_token("cached", SystemTime::now() + Duration::from_secs(3600))
@@ -1924,8 +1921,8 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             payload_mode: Default::default(),
         };
 
-        let metrics = Metrics::default();
-        let client = ApnsClient::with_metrics(config, Some(metrics.clone()))
+        let metrics = Metrics::new().unwrap();
+        let client = ApnsClient::with_metrics(config, metrics.clone())
             .await
             .unwrap();
 

@@ -38,10 +38,8 @@ impl BackoffPermit {
         self.permit = None;
     }
 
-    fn update_available_metric(&self, metrics: Option<&Metrics>) {
-        if let Some(metrics) = metrics {
-            metrics.set_push_semaphore_available(self.semaphore.available_permits());
-        }
+    fn update_available_metric(&self, metrics: &Metrics) {
+        metrics.set_push_semaphore_available(self.semaphore.available_permits());
     }
 
     /// Re-acquire a permit before the next attempt. Awaits if all slots are busy.
@@ -180,7 +178,7 @@ pub async fn with_retry<F, Fut>(
     service_name: &str,
     mut operation: F,
     backoff_permit: Option<&mut BackoffPermit>,
-    metrics: Option<&Metrics>,
+    metrics: Metrics,
 ) -> crate::error::Result<PushSendOutcome>
 where
     F: FnMut() -> Fut,
@@ -203,9 +201,7 @@ where
             SendAttemptResult::AuthRejected(error) if !auth_retry_used => {
                 auth_retry_used = true;
 
-                if let Some(metrics) = metrics {
-                    metrics.record_push_retry(service_name.to_lowercase().as_str());
-                }
+                metrics.record_push_retry(service_name.to_lowercase().as_str());
 
                 // Retry immediately: the rejection is not backpressure, and
                 // the client already evicted the rejected credential, so the
@@ -229,9 +225,7 @@ where
             } if retries < config.max_retries => {
                 retries += 1;
 
-                if let Some(metrics) = metrics {
-                    metrics.record_push_retry(service_name.to_lowercase().as_str());
-                }
+                metrics.record_push_retry(service_name.to_lowercase().as_str());
 
                 // Honor provider-supplied Retry-After values, but floor zero
                 // or tiny values, cap at MAX_RETRY_AFTER (untrusted input),
@@ -253,14 +247,14 @@ where
                 // requests can proceed, then re-acquire it before retrying.
                 if let Some(permit) = backoff_permit.as_deref_mut() {
                     permit.release();
-                    permit.update_available_metric(metrics);
+                    permit.update_available_metric(&metrics);
                     sleep(wait_duration).await;
                     if permit.reacquire().await.is_err() {
                         // Semaphore closed (shutdown): shed this request without
                         // classifying it as a dead device token.
                         return Ok(PushSendOutcome::RetriesExhausted);
                     }
-                    permit.update_available_metric(metrics);
+                    permit.update_available_metric(&metrics);
                 } else {
                     sleep(wait_duration).await;
                 }
@@ -352,7 +346,7 @@ pub async fn with_transport_retry<T, F, Fut>(
     config: &RetryConfig,
     service_name: &str,
     mut operation: F,
-    metrics: Option<&Metrics>,
+    metrics: &Metrics,
 ) -> crate::error::Result<T>
 where
     F: FnMut() -> Fut,
@@ -369,9 +363,7 @@ where
             {
                 retries += 1;
 
-                if let Some(metrics) = metrics {
-                    metrics.record_push_retry(service_name.to_lowercase().as_str());
-                }
+                metrics.record_push_retry(service_name.to_lowercase().as_str());
 
                 // A reqwest error can embed the request URL, and the APNs URL
                 // contains the raw device token; strip it before the error can
@@ -704,7 +696,7 @@ mod tests {
                 }
             },
             None,
-            None,
+            Metrics::disabled(),
         )
         .await;
 
@@ -735,7 +727,7 @@ mod tests {
                 }
             },
             None,
-            None,
+            Metrics::disabled(),
         )
         .await;
 
@@ -775,7 +767,7 @@ mod tests {
                 }
             },
             None,
-            None,
+            Metrics::disabled(),
         )
         .await;
 
@@ -794,6 +786,7 @@ mod tests {
             initial_backoff: Duration::from_millis(1),
         };
         let client = Client::new();
+        let metrics = Metrics::disabled();
 
         let result: crate::error::Result<bool> = with_transport_retry(
             &config,
@@ -812,7 +805,7 @@ mod tests {
                     Err(Error::from(error))
                 }
             },
-            None,
+            &metrics,
         )
         .await;
 
@@ -834,6 +827,7 @@ mod tests {
             initial_backoff: Duration::from_millis(1),
         };
         let client = Client::new();
+        let metrics = Metrics::disabled();
 
         let result: crate::error::Result<bool> = with_transport_retry(
             &config,
@@ -850,7 +844,7 @@ mod tests {
                     Err(Error::from(error))
                 }
             },
-            None,
+            &metrics,
         )
         .await;
 
@@ -880,7 +874,7 @@ mod tests {
                 }
             },
             None,
-            None,
+            Metrics::disabled(),
         )
         .await;
 
@@ -916,7 +910,7 @@ mod tests {
                 }
             },
             None,
-            None,
+            Metrics::disabled(),
         )
         .await;
 
@@ -948,7 +942,7 @@ mod tests {
                 }
             },
             None,
-            None,
+            Metrics::disabled(),
         )
         .await;
 
@@ -977,7 +971,7 @@ mod tests {
                 }
             },
             None,
-            None,
+            Metrics::disabled(),
         )
         .await;
 
@@ -1014,7 +1008,7 @@ mod tests {
                 }
             },
             None,
-            None,
+            Metrics::disabled(),
         )
         .await;
 
@@ -1078,7 +1072,7 @@ mod tests {
                     }
                 },
                 None,
-                None,
+                Metrics::disabled(),
             )
             .await
         });
@@ -1138,7 +1132,7 @@ mod tests {
             "test",
             || async { SendAttemptResult::Success(false) },
             None,
-            None,
+            Metrics::disabled(),
         )
         .await;
 
@@ -1176,7 +1170,7 @@ mod tests {
                 }
             },
             None,
-            Some(&metrics),
+            metrics.clone(),
         )
         .await;
 
@@ -1226,7 +1220,7 @@ mod tests {
                     }
                 },
                 Some(&mut bp),
-                None,
+                Metrics::disabled(),
             )
             .await
         });
@@ -1262,7 +1256,7 @@ mod tests {
         let sem = Arc::new(Semaphore::new(1));
         let permit = sem.clone().acquire_owned().await.unwrap();
         let mut bp = BackoffPermit::new(sem.clone(), permit);
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         metrics.set_push_semaphore_available(0);
 
         let config = RetryConfig {
@@ -1309,7 +1303,7 @@ mod tests {
                     }
                 },
                 Some(&mut bp),
-                Some(&metrics_for_task),
+                metrics_for_task.clone(),
             )
             .await
         });
@@ -1348,6 +1342,7 @@ mod tests {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let attempt_count_clone = attempt_count.clone();
         let client = Client::new();
+        let metrics = Metrics::disabled();
 
         let result: crate::error::Result<bool> = with_transport_retry(
             &config,
@@ -1365,7 +1360,7 @@ mod tests {
                     }
                 }
             },
-            None,
+            &metrics,
         )
         .await;
 
@@ -1383,6 +1378,7 @@ mod tests {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let attempt_count_clone = attempt_count.clone();
         let client = Client::new();
+        let metrics = Metrics::disabled();
 
         let result: crate::error::Result<bool> = with_transport_retry(
             &config,
@@ -1396,7 +1392,7 @@ mod tests {
                     Err(Error::from(error))
                 }
             },
-            None,
+            &metrics,
         )
         .await;
 
@@ -1413,6 +1409,7 @@ mod tests {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let attempt_count_clone = attempt_count.clone();
         let client = Client::new();
+        let metrics = Metrics::disabled();
 
         // A request to an unsupported URL scheme produces a `reqwest::Error`
         // whose `is_connect()` is false: the request was never dispatched to a
@@ -1435,7 +1432,7 @@ mod tests {
                     Err(Error::from(error))
                 }
             },
-            None,
+            &metrics,
         )
         .await;
 

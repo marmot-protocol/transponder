@@ -242,7 +242,7 @@ struct DispatchWorkerContext {
     inflight: Arc<InFlightTracker>,
     /// Passive per-provider delivery-health signal (see [`DeliveryHealth`]).
     delivery_health: Arc<DeliveryHealth>,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 /// Push notification dispatcher.
@@ -265,7 +265,7 @@ pub struct PushDispatcher {
     dispatcher_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     inflight: Arc<InFlightTracker>,
     delivery_health: Arc<DeliveryHealth>,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 impl PushDispatcher {
@@ -274,7 +274,7 @@ impl PushDispatcher {
     /// This spawns a dispatcher task that processes the bounded queue of notifications.
     #[allow(dead_code)]
     pub fn new(apns_client: Option<ApnsClient>, fcm_client: Option<FcmClient>) -> Self {
-        Self::with_metrics(apns_client, fcm_client, None)
+        Self::with_metrics(apns_client, fcm_client, Metrics::disabled())
     }
 
     /// Create a new push dispatcher with metrics.
@@ -283,7 +283,7 @@ impl PushDispatcher {
     pub fn with_metrics(
         apns_client: Option<ApnsClient>,
         fcm_client: Option<FcmClient>,
-        metrics: Option<Metrics>,
+        metrics: Metrics,
     ) -> Self {
         let apns_client = apns_client.map(Arc::new);
         let fcm_client = fcm_client.map(Arc::new);
@@ -296,12 +296,10 @@ impl PushDispatcher {
         let delivery_health = Arc::new(DeliveryHealth::default());
 
         // Initialize push capacity metrics
-        if let Some(ref m) = metrics {
-            m.set_push_queue_size(0);
-            m.set_push_queue_capacity(MAX_PENDING_QUEUE_SIZE);
-            m.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
-            m.set_push_concurrency_limit(MAX_CONCURRENT_PUSHES);
-        }
+        metrics.set_push_queue_size(0);
+        metrics.set_push_queue_capacity(MAX_PENDING_QUEUE_SIZE);
+        metrics.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
+        metrics.set_push_concurrency_limit(MAX_CONCURRENT_PUSHES);
 
         // Spawn the queue dispatcher task.
         let worker_context = DispatchWorkerContext {
@@ -332,10 +330,8 @@ impl PushDispatcher {
         }
     }
 
-    fn update_queue_size_metric(metrics: &Option<Metrics>, queue_depth: &AtomicUsize) {
-        if let Some(metrics) = metrics {
-            metrics.set_push_queue_size(queue_depth.load(Ordering::SeqCst));
-        }
+    fn update_queue_size_metric(metrics: &Metrics, queue_depth: &AtomicUsize) {
+        metrics.set_push_queue_size(queue_depth.load(Ordering::SeqCst));
     }
 
     fn increment_queue_depth(queue_depth: &AtomicUsize, count: usize) {
@@ -348,15 +344,13 @@ impl PushDispatcher {
         });
     }
 
-    fn update_semaphore_available_metric(metrics: &Option<Metrics>, semaphore: &Semaphore) {
-        if let Some(metrics) = metrics {
-            metrics.set_push_semaphore_available(semaphore.available_permits());
-        }
+    fn update_semaphore_available_metric(metrics: &Metrics, semaphore: &Semaphore) {
+        metrics.set_push_semaphore_available(semaphore.available_permits());
     }
 
     async fn acquire_push_permit(
         semaphore: Arc<Semaphore>,
-        metrics: &Option<Metrics>,
+        metrics: &Metrics,
     ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
         let permit = semaphore.clone().acquire_owned().await?;
         Self::update_semaphore_available_metric(metrics, &semaphore);
@@ -367,7 +361,7 @@ impl PushDispatcher {
         service_name: &str,
         platform: Platform,
         outcome: PushSendOutcome,
-        metrics: &Option<Metrics>,
+        metrics: &Metrics,
         delivery_health: &DeliveryHealth,
     ) {
         let platform_str = platform_label(platform);
@@ -375,9 +369,7 @@ impl PushDispatcher {
             PushSendOutcome::Sent => {
                 delivery_health.record_processed(platform);
                 trace!(service = service_name, "push notification sent");
-                if let Some(m) = metrics {
-                    m.record_push_success(platform_str);
-                }
+                metrics.record_push_success(platform_str);
             }
             PushSendOutcome::InvalidToken => {
                 // A definitive invalid-token verdict proves the provider
@@ -388,9 +380,7 @@ impl PushDispatcher {
                     service = service_name,
                     "push notification failed (invalid token)"
                 );
-                if let Some(m) = metrics {
-                    m.record_push_failed(platform_str, "invalid_token");
-                }
+                metrics.record_push_failed(platform_str, "invalid_token");
             }
             PushSendOutcome::RetriesExhausted => {
                 delivery_health.record_hard_failure(platform);
@@ -398,9 +388,7 @@ impl PushDispatcher {
                     service = service_name,
                     "push notification failed (retries exhausted)"
                 );
-                if let Some(m) = metrics {
-                    m.record_push_failed(platform_str, "retries_exhausted");
-                }
+                metrics.record_push_failed(platform_str, "retries_exhausted");
             }
         }
     }
@@ -410,7 +398,7 @@ impl PushDispatcher {
         token: Zeroizing<String>,
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
-        metrics: Option<Metrics>,
+        metrics: Metrics,
         delivery_health: &DeliveryHealth,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) {
@@ -439,9 +427,7 @@ impl PushDispatcher {
                             // path already strips it, but redact again here so
                             // this log sink is safe regardless.
                             debug!(error = %e.redact_transport_url(), "APNs send error");
-                            if let Some(ref m) = metrics {
-                                m.record_push_failed(platform_str, "error");
-                            }
+                            metrics.record_push_failed(platform_str, "error");
                         }
                     }
                 }
@@ -467,9 +453,7 @@ impl PushDispatcher {
                             // logging (#172). FCM's URL carries no token, but
                             // keeping the redaction uniform is defense-in-depth.
                             debug!(error = %e.redact_transport_url(), "FCM send error");
-                            if let Some(ref m) = metrics {
-                                m.record_push_failed(platform_str, "error");
-                            }
+                            metrics.record_push_failed(platform_str, "error");
                         }
                     }
                 }
@@ -643,9 +627,9 @@ impl PushDispatcher {
         // Check shutdown after platform/token filtering so post-shutdown requests
         // always fail while the rejection metric only counts admissible messages.
         if self.shutting_down.load(Ordering::SeqCst) {
-            if let Some(ref m) = self.metrics {
-                m.record_push_queue_rejected(message_count as u64);
-            }
+            self.metrics
+                .record_push_queue_rejected(message_count as u64);
+
             debug!("Dispatcher shutting down, ignoring dispatch request");
             return Err(Error::Dispatch("Dispatcher is shutting down".to_string()));
         }
@@ -659,9 +643,9 @@ impl PushDispatcher {
                 .try_reserve_many(message_count)
                 .map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => {
-                        if let Some(ref m) = self.metrics {
-                            m.record_push_queue_rejected(message_count as u64);
-                        }
+                        self.metrics
+                            .record_push_queue_rejected(message_count as u64);
+
                         warn!(
                             requested = message_count,
                             available = self.sender.capacity(),
@@ -672,9 +656,9 @@ impl PushDispatcher {
                         ))
                     }
                     mpsc::error::TrySendError::Closed(_) => {
-                        if let Some(ref m) = self.metrics {
-                            m.record_push_queue_rejected(message_count as u64);
-                        }
+                        self.metrics
+                            .record_push_queue_rejected(message_count as u64);
+
                         warn!("Push queue closed, rejecting notification batch");
                         Error::Dispatch("Push queue closed".to_string())
                     }
@@ -703,9 +687,7 @@ impl PushDispatcher {
                 token: message.token,
             });
 
-            if let Some(ref m) = self.metrics {
-                m.record_push_dispatched(platform_str);
-            }
+            self.metrics.record_push_dispatched(platform_str);
         }
 
         Ok(message_count)
@@ -837,10 +819,9 @@ impl PushDispatcher {
         self.inflight.wait_idle().await;
 
         self.queue_depth.store(0, Ordering::SeqCst);
-        if let Some(ref m) = self.metrics {
-            m.set_push_queue_size(0);
-            m.set_push_semaphore_available(self.semaphore.available_permits());
-        }
+        self.metrics.set_push_queue_size(0);
+        self.metrics
+            .set_push_semaphore_available(self.semaphore.available_permits());
 
         debug!("All queued push notifications drained");
     }
@@ -937,7 +918,7 @@ mod tests {
             service_account_path: String::new(),
             project_id: "test-project".to_string(),
         };
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
 
         let delivery_health = DeliveryHealth::default();
 
@@ -946,7 +927,7 @@ mod tests {
             Zeroizing::new("".to_string()),
             None,
             Some(Arc::new(FcmClient::mock(fcm_config, true))),
-            Some(metrics.clone()),
+            metrics.clone(),
             &delivery_health,
             None,
         )
@@ -960,29 +941,29 @@ mod tests {
 
     #[test]
     fn test_send_outcome_metrics_distinguish_invalid_token_and_retries_exhausted() {
-        let metrics = crate::metrics::Metrics::default();
-        let metrics_opt = Some(metrics.clone());
+        let metrics = crate::metrics::Metrics::new().unwrap();
+        let metrics = metrics.clone();
         let delivery_health = DeliveryHealth::default();
 
         PushDispatcher::record_send_outcome(
             "APNs",
             Platform::Apns,
             PushSendOutcome::InvalidToken,
-            &metrics_opt,
+            &metrics,
             &delivery_health,
         );
         PushDispatcher::record_send_outcome(
             "APNs",
             Platform::Apns,
             PushSendOutcome::RetriesExhausted,
-            &metrics_opt,
+            &metrics,
             &delivery_health,
         );
         PushDispatcher::record_send_outcome(
             "FCM",
             Platform::Fcm,
             PushSendOutcome::Sent,
-            &metrics_opt,
+            &metrics,
             &delivery_health,
         );
 
@@ -1046,7 +1027,7 @@ mod tests {
 
     #[test]
     fn record_send_outcome_updates_delivery_health() {
-        let metrics_opt = None;
+        let metrics = Metrics::disabled();
         let delivery_health = DeliveryHealth::default();
 
         for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
@@ -1054,7 +1035,7 @@ mod tests {
                 "APNs",
                 Platform::Apns,
                 PushSendOutcome::RetriesExhausted,
-                &metrics_opt,
+                &metrics,
                 &delivery_health,
             );
         }
@@ -1069,7 +1050,7 @@ mod tests {
             "APNs",
             Platform::Apns,
             PushSendOutcome::InvalidToken,
-            &metrics_opt,
+            &metrics,
             &delivery_health,
         );
         assert!(delivery_health.is_delivering(Platform::Apns));
@@ -1323,12 +1304,9 @@ mod tests {
         };
         let fcm_client = FcmClient::mock(fcm_config, true);
 
-        let metrics = Metrics::default();
-        let dispatcher = PushDispatcher::with_metrics(
-            Some(apns_client),
-            Some(fcm_client),
-            Some(metrics.clone()),
-        );
+        let metrics = Metrics::new().unwrap();
+        let dispatcher =
+            PushDispatcher::with_metrics(Some(apns_client), Some(fcm_client), metrics.clone());
 
         // Dispatch both APNs and FCM payloads
         let payloads = vec![
@@ -1389,11 +1367,11 @@ mod tests {
             payload_mode: Default::default(),
         };
 
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         let dispatcher = PushDispatcher::with_metrics(
             Some(ApnsClient::mock(apns_config, true)),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         );
 
         let permits = dispatcher
@@ -1535,8 +1513,8 @@ mod tests {
     async fn test_capacity_metrics_initialized() {
         use crate::metrics::Metrics;
 
-        let metrics = Metrics::default();
-        let _dispatcher = PushDispatcher::with_metrics(None, None, Some(metrics.clone()));
+        let metrics = Metrics::new().unwrap();
+        let _dispatcher = PushDispatcher::with_metrics(None, None, metrics.clone());
 
         assert_eq!(queue_size_metric_value(&metrics), 0);
         assert_eq!(
@@ -1557,13 +1535,13 @@ mod tests {
     async fn test_semaphore_available_metric_updates_on_permit_acquire() {
         use crate::metrics::Metrics;
 
-        let metrics = Metrics::default();
-        let metrics_opt = Some(metrics.clone());
+        let metrics = Metrics::new().unwrap();
+        let metrics = metrics.clone();
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSHES));
 
         metrics.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
 
-        let permit = PushDispatcher::acquire_push_permit(semaphore.clone(), &metrics_opt)
+        let permit = PushDispatcher::acquire_push_permit(semaphore.clone(), &metrics)
             .await
             .expect("permit should be acquired");
 
@@ -1573,7 +1551,7 @@ mod tests {
         );
 
         drop(permit);
-        PushDispatcher::update_semaphore_available_metric(&metrics_opt, &semaphore);
+        PushDispatcher::update_semaphore_available_metric(&metrics, &semaphore);
 
         assert_eq!(
             gauge_metric_value(&metrics, "transponder_push_semaphore_available"),
@@ -1587,7 +1565,7 @@ mod tests {
         use crate::metrics::Metrics;
         use crate::push::ApnsClient;
 
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         let dispatcher = PushDispatcher::with_metrics(
             Some(ApnsClient::mock(
                 ApnsConfig {
@@ -1602,7 +1580,7 @@ mod tests {
                 true,
             )),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         );
 
         dispatcher.wait_for_completion().await;
@@ -1626,7 +1604,7 @@ mod tests {
         use crate::metrics::Metrics;
         use crate::push::ApnsClient;
 
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         let dispatcher = PushDispatcher::with_metrics(
             Some(ApnsClient::mock(
                 ApnsConfig {
@@ -1641,7 +1619,7 @@ mod tests {
                 true,
             )),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         );
 
         dispatcher.wait_for_completion().await;
@@ -1832,9 +1810,8 @@ mod tests {
             payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
-        let metrics = Metrics::default();
-        let dispatcher =
-            PushDispatcher::with_metrics(Some(apns_client), None, Some(metrics.clone()));
+        let metrics = Metrics::new().unwrap();
+        let dispatcher = PushDispatcher::with_metrics(Some(apns_client), None, metrics.clone());
 
         let payloads = repeated_apns_payloads(MAX_PENDING_QUEUE_SIZE + 1);
 
@@ -1889,11 +1866,11 @@ mod tests {
             payload_mode: Default::default(),
         };
 
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         let dispatcher = PushDispatcher::with_metrics(
             Some(ApnsClient::mock(apns_config, true)),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         );
 
         // Many small batches maximize the number of opportunities for a worker
@@ -2007,7 +1984,7 @@ mod tests {
                     }
                 },
                 Some(&mut backoff_permit),
-                None,
+                Metrics::disabled(),
             )
             .await;
             assert!(matches!(result, Ok(PushSendOutcome::Sent)));

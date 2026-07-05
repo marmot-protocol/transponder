@@ -8,24 +8,19 @@ use crate::rate_limiter::{RateLimitReservation, RateLimiter};
 
 #[must_use]
 pub(crate) struct InFlightEventGuard<'a> {
-    metrics: Option<&'a Metrics>,
+    metrics: &'a Metrics,
 }
 
 impl<'a> InFlightEventGuard<'a> {
-    pub(crate) fn new(metrics: Option<&'a Metrics>) -> Self {
-        if let Some(m) = metrics {
-            m.inc_events_in_flight();
-        }
-
+    pub(crate) fn new(metrics: &'a Metrics) -> Self {
+        metrics.inc_events_in_flight();
         Self { metrics }
     }
 }
 
 impl Drop for InFlightEventGuard<'_> {
     fn drop(&mut self) {
-        if let Some(m) = self.metrics {
-            m.dec_events_in_flight();
-        }
+        self.metrics.dec_events_in_flight();
     }
 }
 

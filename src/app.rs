@@ -37,10 +37,8 @@ fn classify_notification_receive_error(error: &RecvError) -> NotificationReceive
     }
 }
 
-fn record_notification_receive_metrics(metrics: Option<&Metrics>, error: &RecvError) {
-    if let RecvError::Lagged(skipped) = error
-        && let Some(metrics) = metrics
-    {
+fn record_notification_receive_metrics(metrics: &Metrics, error: &RecvError) {
+    if let RecvError::Lagged(skipped) = error {
         metrics.record_relay_notifications_lagged();
         metrics.record_relay_notifications_dropped(*skipped);
     }
@@ -221,7 +219,7 @@ async fn run_event_loop(
     event_semaphore: Arc<Semaphore>,
     processor: Arc<EventProcessor>,
     event_tasks: TaskTracker,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 ) -> EventLoopExit {
     loop {
         tokio::select! {
@@ -260,7 +258,7 @@ async fn run_event_loop(
                         });
                     }
                     Err(e) => {
-                        record_notification_receive_metrics(metrics.as_ref(), &e);
+                        record_notification_receive_metrics(&metrics, &e);
 
                         match classify_notification_receive_error(&e) {
                             NotificationReceiveAction::Continue => {
@@ -337,22 +335,22 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
     // `server::health::HealthServer::bind`). The #196 rider's structural fix
     // landed there, so no separate load-time warning is needed here.
 
-    // Initialize metrics
-    let metrics = if config.metrics.enabled {
-        match Metrics::new() {
-            Ok(m) => {
-                m.init_server_info(env!("CARGO_PKG_VERSION"));
+    // Initialize metrics (always present; recording gated by `enabled`).
+    let metrics = match Metrics::new() {
+        Ok(metrics) => {
+            let metrics = metrics.with_enabled(config.metrics.enabled);
+            if metrics.is_enabled() {
+                metrics.init_server_info(env!("CARGO_PKG_VERSION"));
                 info!("Metrics initialized");
-                Some(m)
+            } else {
+                info!("Metrics disabled");
             }
-            Err(e) => {
-                error!(error = %e, "Failed to initialize metrics");
-                None
-            }
+            metrics
         }
-    } else {
-        info!("Metrics disabled");
-        None
+        Err(e) => {
+            error!(error = %e, "Failed to initialize metrics");
+            Metrics::disabled()
+        }
     };
 
     let server_private_key = resolve_server_private_key(&mut config.server)?;
@@ -1022,7 +1020,7 @@ mod tests {
     fn notification_receive_lag_records_metrics() {
         let metrics = Metrics::new().unwrap();
 
-        record_notification_receive_metrics(Some(&metrics), &RecvError::Lagged(3));
+        record_notification_receive_metrics(&metrics, &RecvError::Lagged(3));
 
         assert_eq!(metrics.relay_notifications_lagged_total.get(), 1);
         assert_eq!(metrics.relay_notifications_dropped_total.get(), 3);
@@ -1032,7 +1030,7 @@ mod tests {
     fn notification_receive_close_does_not_record_metrics() {
         let metrics = Metrics::new().unwrap();
 
-        record_notification_receive_metrics(Some(&metrics), &RecvError::Closed);
+        record_notification_receive_metrics(&metrics, &RecvError::Closed);
 
         assert_eq!(metrics.relay_notifications_lagged_total.get(), 0);
         assert_eq!(metrics.relay_notifications_dropped_total.get(), 0);
@@ -1134,7 +1132,7 @@ mod tests {
                 Arc::new(Semaphore::new(1)),
                 test_event_processor(),
                 TaskTracker::new(),
-                None,
+                Metrics::disabled(),
             ),
         )
         .await
@@ -1157,7 +1155,7 @@ mod tests {
                 Arc::new(Semaphore::new(1)),
                 test_event_processor(),
                 TaskTracker::new(),
-                None,
+                Metrics::disabled(),
             ),
         )
         .await
@@ -1180,7 +1178,7 @@ mod tests {
             Arc::clone(&semaphore),
             Arc::clone(&processor),
             event_tasks.clone(),
-            None,
+            Metrics::disabled(),
         ));
 
         notification_tx.send(test_event_notification()).unwrap();
@@ -1219,7 +1217,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             Arc::clone(&processor),
             event_tasks.clone(),
-            None,
+            Metrics::disabled(),
         ));
 
         notification_tx
@@ -1261,7 +1259,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             Arc::clone(&processor),
             event_tasks.clone(),
-            Some(metrics.clone()),
+            metrics.clone(),
         ));
 
         // The surviving (newest) event is still processed after the lag.

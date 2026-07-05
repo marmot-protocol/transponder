@@ -181,22 +181,18 @@ pub struct RelayClient {
     /// in [`RelayClient::connect`]. Used by [`RelayClient::refresh_status`] to
     /// classify connected relays by origin list instead of URL shape.
     origins: Mutex<BTreeMap<RelayUrl, RelayKind>>,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 impl RelayClient {
     /// Create a new relay client with the given keys and configuration.
     #[allow(dead_code)]
     pub async fn new(keys: Keys, config: RelayConfig) -> Result<Self> {
-        Self::with_metrics(keys, config, None).await
+        Self::with_metrics(keys, config, Metrics::disabled()).await
     }
 
     /// Create a new relay client with metrics.
-    pub async fn with_metrics(
-        keys: Keys,
-        config: RelayConfig,
-        metrics: Option<Metrics>,
-    ) -> Result<Self> {
+    pub async fn with_metrics(keys: Keys, config: RelayConfig, metrics: Metrics) -> Result<Self> {
         validate_relay_config(&config)?;
 
         let reconnect_attempt_limiter = ReconnectAttemptLimiter::new(config.max_reconnect_attempts);
@@ -211,10 +207,8 @@ impl RelayClient {
 
         let total = config.clearnet.len() + config.onion.len();
 
-        if let Some(metrics) = &metrics {
-            metrics.set_relay_counts(config.clearnet.len(), config.onion.len());
-            metrics.set_relay_subscription_lookback(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS);
-        }
+        metrics.set_relay_counts(config.clearnet.len(), config.onion.len());
+        metrics.set_relay_subscription_lookback(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS);
 
         Ok(Self {
             client,
@@ -383,10 +377,8 @@ impl RelayClient {
             }
         }
 
-        if let Some(metrics) = &self.metrics {
-            metrics.set_relays_connected("clearnet", clearnet);
-            metrics.set_relays_connected("onion", tor);
-        }
+        self.metrics.set_relays_connected("clearnet", clearnet);
+        self.metrics.set_relays_connected("onion", tor);
 
         let mut status = self.status.write().await;
         status.clearnet_connected = clearnet;
@@ -507,9 +499,7 @@ impl RelayClient {
     }
 
     fn record_inbox_relay_publish_failed(&self) {
-        if let Some(metrics) = &self.metrics {
-            metrics.record_inbox_relay_publish_failed();
-        }
+        self.metrics.record_inbox_relay_publish_failed();
     }
 
     /// The configured relay URLs to advertise, as raw config strings.
@@ -870,7 +860,7 @@ mod tests {
         let config = test_relay_config(vec![relay_url.to_string()]);
         let metrics = Metrics::new().unwrap();
 
-        let client = RelayClient::with_metrics(keys, config, Some(metrics.clone()))
+        let client = RelayClient::with_metrics(keys, config, metrics.clone())
             .await
             .unwrap();
         client.client.add_relay(&relay_url).await.unwrap();
@@ -1455,7 +1445,7 @@ mod tests {
         let config = test_relay_config(vec![relay_url.to_string()]);
         let metrics = Metrics::new().unwrap();
 
-        let client = RelayClient::with_metrics(keys, config, Some(metrics.clone()))
+        let client = RelayClient::with_metrics(keys, config, metrics.clone())
             .await
             .unwrap();
         client.client.add_relay(&relay_url).await.unwrap();
