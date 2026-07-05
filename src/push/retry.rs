@@ -4,7 +4,7 @@
 //! with configurable exponential backoff and optional Retry-After header support.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
@@ -300,18 +300,30 @@ where
 
 /// Parse a Retry-After header value into a Duration.
 ///
-/// Supports both delay-seconds format (e.g., "120") and HTTP-date format.
-/// Returns None if the header is missing or cannot be parsed.
+/// Supports both forms allowed by RFC 7231: delay-seconds (e.g., `"120"`) and
+/// HTTP-date (e.g., `"Wed, 21 Oct 2015 07:28:00 GMT"`). An HTTP-date is
+/// converted to a delay relative to the current time; a date at or in the past
+/// clamps to [`Duration::ZERO`]. Returns `None` if the header is missing or
+/// matches neither form.
 pub fn parse_retry_after(header_value: Option<&str>) -> Option<Duration> {
+    parse_retry_after_at(header_value, SystemTime::now())
+}
+
+/// [`parse_retry_after`] with an injectable `now` so the HTTP-date branch is
+/// deterministically testable.
+fn parse_retry_after_at(header_value: Option<&str>, now: SystemTime) -> Option<Duration> {
     let value = header_value?;
 
-    // Try parsing as seconds first (most common for API rate limiting)
+    // Try parsing as seconds first (most common for API rate limiting).
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
 
-    // TODO: Could add HTTP-date parsing here if needed
-    // For now, just return None for date formats
+    // Fall back to the RFC 7231 HTTP-date form, converting it to a delay
+    // relative to `now`. A date at or before `now` yields a zero delay.
+    if let Ok(when) = httpdate::parse_http_date(value) {
+        return Some(when.duration_since(now).unwrap_or(Duration::ZERO));
+    }
 
     None
 }
@@ -376,6 +388,58 @@ mod tests {
     fn test_parse_retry_after_invalid() {
         assert_eq!(parse_retry_after(Some("invalid")), None);
         assert_eq!(parse_retry_after(Some("not-a-number")), None);
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_future() {
+        // A fixed `now` keeps the delta deterministic regardless of wall clock.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_180); // 2015-10-21 07:23:00 GMT
+        assert_eq!(
+            parse_retry_after_at(Some("Wed, 21 Oct 2015 07:28:00 GMT"), now),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_past_clamps_to_zero() {
+        // `now` is after the header's date, so the delay clamps to zero rather
+        // than underflowing.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_500_000);
+        assert_eq!(
+            parse_retry_after_at(Some("Wed, 21 Oct 2015 07:28:00 GMT"), now),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_equal_now_is_zero() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_480); // 2015-10-21 07:28:00 GMT
+        assert_eq!(
+            parse_retry_after_at(Some("Wed, 21 Oct 2015 07:28:00 GMT"), now),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_via_headers() {
+        // The full header path (used by the push clients) must also honor the
+        // HTTP-date form, not just the direct parser.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert!(retry_after_from_headers(&headers).is_some());
+    }
+
+    #[test]
+    fn test_parse_retry_after_seconds_unchanged_by_now() {
+        // The delay-seconds form must remain independent of the clock.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_500_000);
+        assert_eq!(
+            parse_retry_after_at(Some("60"), now),
+            Some(Duration::from_secs(60))
+        );
     }
 
     #[test]

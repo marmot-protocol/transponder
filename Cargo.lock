@@ -6136,6 +6136,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hkdf",
+ "httpdate",
  "jsonwebtoken",
  "lru",
  "nostr-relay-builder",
