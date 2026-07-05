@@ -1551,6 +1551,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_startup_config_accepts_clearnet_relays() {
+        let relays = crate::config::RelayConfig {
+            clearnet: vec!["wss://relay.example.com".to_string()],
+            allow_unencrypted_clearnet_relays: false,
+            onion: Vec::new(),
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 30,
+        };
+
+        assert!(validate_startup_config("abc123", &relays).is_ok());
+    }
+
+    #[test]
     fn validate_startup_config_rejects_missing_private_key() {
         let relays = crate::config::RelayConfig {
             clearnet: vec!["wss://relay.example.com".to_string()],

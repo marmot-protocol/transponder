@@ -641,6 +641,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_is_empty_reports_false_with_entries() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: entries(100),
+        });
+
+        assert!(limiter.is_empty().await);
+        limiter.check_and_increment(&1u64).await;
+        assert!(!limiter.is_empty().await);
+    }
+
+    #[tokio::test]
     async fn test_rollback_increment_removes_only_reserved_hit() {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,

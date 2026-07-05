@@ -45,3 +45,16 @@ pub const DEFAULT_MAX_TOKENS_PER_EVENT: usize = 100;
 
 /// Default maximum number of events processed concurrently.
 pub const DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING: usize = 64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_retention_matches_nip59_window_plus_skew() {
+        assert_eq!(
+            DEFAULT_DEDUP_RETENTION_SECS,
+            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS + DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS
+        );
+    }
+}

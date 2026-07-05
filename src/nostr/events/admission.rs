@@ -180,3 +180,54 @@ pub(crate) fn platform_metric_label(platform: Platform) -> &'static str {
         Platform::Fcm => "fcm",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use super::*;
+    use crate::rate_limiter::{RateLimitConfig, RateLimiter};
+
+    fn entries(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("non-zero")
+    }
+
+    #[tokio::test]
+    async fn refund_rolls_back_encrypted_and_device_charges() {
+        let encrypted_limiter: RateLimiter<[u8; 32]> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: entries(10),
+        });
+        let device_limiter: RateLimiter<[u8; 32]> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: entries(10),
+        });
+
+        let encrypted_key = [1u8; 32];
+        let device_key = [2u8; 32];
+        let encrypted_reservation = encrypted_limiter
+            .check_and_increment(&encrypted_key)
+            .await
+            .reservation()
+            .expect("encrypted admit");
+        let device_reservation = device_limiter
+            .check_and_increment(&device_key)
+            .await
+            .reservation()
+            .expect("device admit");
+
+        let mut guard = AdmissionGuard::new(
+            &encrypted_limiter,
+            &device_limiter,
+            encrypted_key,
+            encrypted_reservation,
+        );
+        guard.add_device_charge(device_key, device_reservation);
+        guard.refund().await;
+
+        assert!(encrypted_limiter.is_empty().await);
+        assert!(device_limiter.is_empty().await);
+    }
+}
