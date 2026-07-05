@@ -167,6 +167,38 @@ fn event_processing_permits(max_concurrent_event_processing: usize) -> usize {
     max_concurrent_event_processing.max(1)
 }
 
+/// Outcome of racing relay startup against a shutdown signal.
+#[derive(Debug)]
+enum StartupOutcome<T> {
+    /// Startup finished; carries the connect result.
+    Connected(T),
+    /// A shutdown signal arrived before startup finished.
+    ShutdownRequested,
+}
+
+/// Awaits a startup future while remaining responsive to a shutdown signal.
+///
+/// The signal future must already have its SIGTERM/SIGINT handlers installed
+/// *before* the startup work is awaited, so a signal that arrives while waiting
+/// for relay connections exits promptly instead of being ignored until the
+/// connect timeout elapses. Shutdown is preferred (`biased`) so a signal that is
+/// already pending wins over a startup future that resolves in the same poll.
+async fn run_startup_or_shutdown<T, StartupFut, SignalFut>(
+    startup: StartupFut,
+    signal_fut: SignalFut,
+) -> StartupOutcome<T>
+where
+    StartupFut: std::future::Future<Output = T>,
+    SignalFut: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+
+        () = signal_fut => StartupOutcome::ShutdownRequested,
+        result = startup => StartupOutcome::Connected(result),
+    }
+}
+
 async fn acquire_event_processing_permit_or_shutdown(
     semaphore: Arc<Semaphore>,
     shutdown: &mut watch::Receiver<bool>,
@@ -341,11 +373,27 @@ async fn run(mut config: AppConfig) -> Result<()> {
             .context("Failed to create relay client")?,
     );
 
-    // Connect to relays
-    relay_client
-        .connect()
-        .await
-        .context("Failed to connect to relays")?;
+    // Initialize shutdown handler before connecting so a SIGTERM/SIGINT during
+    // startup exits promptly. Without this, signal handlers were installed only
+    // after `connect()` returned, so a signal received while waiting for relays
+    // (potentially up to the whole connection timeout) was ignored.
+    let shutdown = ShutdownHandler::new();
+
+    // Connect to relays, but bail out immediately if a shutdown signal arrives
+    // while we are still waiting for the first relay to connect.
+    match run_startup_or_shutdown(relay_client.connect(), shutdown.wait_for_signal()).await {
+        StartupOutcome::Connected(result) => {
+            result.context("Failed to connect to relays")?;
+        }
+        StartupOutcome::ShutdownRequested => {
+            info!("Shutdown signal received during startup; stopping before relay connection");
+            if let Err(e) = relay_client.disconnect().await {
+                warn!(error = %e, "Error disconnecting from relays during startup shutdown");
+            }
+            info!("Transponder stopped");
+            return Ok(());
+        }
+    }
 
     // Obtain the broadcast receiver BEFORE issuing the subscription REQ.
     //
@@ -383,9 +431,6 @@ async fn run(mut config: AppConfig) -> Result<()> {
         )
         .context("Failed to initialize event replay protection")?,
     );
-
-    // Initialize shutdown handler
-    let shutdown = ShutdownHandler::new();
 
     // Start health server
     let health_server = HealthServer::new(
@@ -764,6 +809,59 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(semaphore.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_startup_or_shutdown_returns_connected_when_startup_finishes_first() {
+        // A signal future that never resolves models no signal arriving; the
+        // startup future's result must be surfaced verbatim.
+        let outcome = run_startup_or_shutdown(
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::pending(),
+        )
+        .await;
+
+        assert!(matches!(outcome, StartupOutcome::Connected(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn run_startup_or_shutdown_surfaces_startup_error() {
+        let outcome = run_startup_or_shutdown(
+            async { Err::<(), anyhow::Error>(anyhow::anyhow!("connect failed")) },
+            std::future::pending(),
+        )
+        .await;
+
+        match outcome {
+            StartupOutcome::Connected(Err(error)) => {
+                assert_eq!(error.to_string(), "connect failed");
+            }
+            other => panic!("expected a surfaced startup error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_startup_or_shutdown_returns_shutdown_when_signal_arrives_first() {
+        // Startup never finishes, so only the already-ready signal can win.
+        let outcome =
+            run_startup_or_shutdown(std::future::pending::<Result<()>>(), std::future::ready(()))
+                .await;
+
+        assert!(matches!(outcome, StartupOutcome::ShutdownRequested));
+    }
+
+    #[tokio::test]
+    async fn run_startup_or_shutdown_prefers_shutdown_when_both_ready() {
+        // When both futures are ready in the same poll, the `biased` select must
+        // prefer shutdown so a pending signal is never masked by a connect that
+        // resolves simultaneously.
+        let outcome = run_startup_or_shutdown(
+            std::future::ready(Ok::<(), anyhow::Error>(())),
+            std::future::ready(()),
+        )
+        .await;
+
+        assert!(matches!(outcome, StartupOutcome::ShutdownRequested));
     }
 
     #[test]

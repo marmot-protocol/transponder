@@ -341,6 +341,15 @@ pub struct RelayConfig {
     pub connection_timeout_secs: u64,
 }
 
+/// Upper bound for the relay duration fields, in seconds.
+///
+/// `connection_timeout_secs` and `reconnect_interval_secs` are startup/retry
+/// waits, so an unbounded value (e.g. `u64::MAX`) makes startup hang effectively
+/// forever when relays are unreachable. Five minutes comfortably covers slow
+/// networks and Tor bootstrapping while keeping a misconfiguration from wedging
+/// the process, so anything larger is rejected at load time.
+const MAX_RELAY_DURATION_SECS: u64 = 300;
+
 fn default_connection_timeout() -> u64 {
     30
 }
@@ -832,9 +841,11 @@ impl AppConfig {
     /// size. A `0` count would either block every request for that limiter
     /// dimension (a silent push outage) or be silently swapped for the default,
     /// so an explicit error at load time surfaces the misconfiguration instead
-    /// of letting it reach runtime.
+    /// of letting it reach runtime. Duration fields are also range-checked so a
+    /// degenerate value cannot defeat graceful shutdown or hang startup.
     fn validate(&self) -> Result<()> {
         self.server.validate()?;
+        self.relays.validate()?;
         self.glitchtip.validate()?;
         Ok(())
     }
@@ -859,12 +870,22 @@ impl AppConfig {
 }
 
 impl ServerConfig {
-    /// Rejects rate-limit count fields and the rate-limit cache size set to `0`.
+    /// Rejects rate-limit count fields and the rate-limit cache size set to `0`,
+    /// and `shutdown_timeout_secs` set to `0`.
     ///
     /// A `0` per-minute/per-hour limit blocks every request for that limiter
     /// dimension, and a `0` cache size is silently replaced by the default
-    /// rather than honoured. Each error names the offending config field.
+    /// rather than honoured. A `0` `shutdown_timeout_secs` makes the graceful
+    /// drain time out immediately, abandoning in-flight push notifications, so
+    /// it is rejected rather than silently skipping the drain. Each error names
+    /// the offending config field.
     fn validate(&self) -> std::result::Result<(), config::ConfigError> {
+        if self.shutdown_timeout_secs == 0 {
+            return Err(config::ConfigError::Message(
+                "server.shutdown_timeout_secs must be greater than 0; a value of 0 makes graceful shutdown time out immediately and abandon in-flight push notifications".to_string(),
+            ));
+        }
+
         let zero_checked_fields = [
             (
                 "server.encrypted_token_rate_limit_per_minute",
@@ -901,6 +922,45 @@ impl ServerConfig {
             if value == 0 {
                 return Err(config::ConfigError::Message(format!(
                     "{field} must be greater than 0"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl RelayConfig {
+    /// Range-checks the relay duration fields.
+    ///
+    /// `connection_timeout_secs` is the startup wait for the first relay to
+    /// connect: `0` would time out instantly and never connect, while an
+    /// unbounded value hangs startup effectively forever when relays are
+    /// unreachable. `reconnect_interval_secs` is likewise range-checked so a
+    /// degenerate value cannot busy-loop or stall reconnection once used. Both
+    /// are capped at [`MAX_RELAY_DURATION_SECS`], and each error names the
+    /// offending field.
+    fn validate(&self) -> std::result::Result<(), config::ConfigError> {
+        let duration_fields = [
+            (
+                "relays.connection_timeout_secs",
+                self.connection_timeout_secs,
+            ),
+            (
+                "relays.reconnect_interval_secs",
+                self.reconnect_interval_secs,
+            ),
+        ];
+
+        for (field, value) in duration_fields {
+            if value == 0 {
+                return Err(config::ConfigError::Message(format!(
+                    "{field} must be greater than 0"
+                )));
+            }
+            if value > MAX_RELAY_DURATION_SECS {
+                return Err(config::ConfigError::Message(format!(
+                    "{field} must be at most {MAX_RELAY_DURATION_SECS} seconds"
                 )));
             }
         }
@@ -1930,5 +1990,153 @@ mod tests {
         assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 1);
         assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 1);
         assert_eq!(config.server.max_rate_limit_cache_size, 1);
+    }
+
+    #[test]
+    fn test_zero_shutdown_timeout_rejected_from_file() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+            shutdown_timeout_secs = 0
+        "#;
+
+        let file = create_temp_config(config_content);
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("server.shutdown_timeout_secs"),
+            "expected error to name `server.shutdown_timeout_secs`, got: {message}"
+        );
+        assert!(
+            message.contains("must be greater than 0"),
+            "expected `must be greater than 0`, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_zero_shutdown_timeout_rejected_from_env() {
+        let error =
+            from_test_env(&[("TRANSPONDER_SERVER_SHUTDOWN_TIMEOUT_SECS", "0")]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("server.shutdown_timeout_secs"),
+            "expected error to name `server.shutdown_timeout_secs`, got: {message}"
+        );
+        assert!(
+            message.contains("must be greater than 0"),
+            "expected `must be greater than 0`, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_minimal_shutdown_timeout_accepted() {
+        let config = from_test_env(&[("TRANSPONDER_SERVER_SHUTDOWN_TIMEOUT_SECS", "1")]).unwrap();
+
+        assert_eq!(config.server.shutdown_timeout_secs, 1);
+    }
+
+    #[test]
+    fn test_zero_connection_timeout_rejected() {
+        let error =
+            from_test_env(&[("TRANSPONDER_RELAYS_CONNECTION_TIMEOUT_SECS", "0")]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("relays.connection_timeout_secs"),
+            "expected error to name `relays.connection_timeout_secs`, got: {message}"
+        );
+        assert!(
+            message.contains("must be greater than 0"),
+            "expected `must be greater than 0`, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_zero_reconnect_interval_rejected() {
+        let error =
+            from_test_env(&[("TRANSPONDER_RELAYS_RECONNECT_INTERVAL_SECS", "0")]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("relays.reconnect_interval_secs"),
+            "expected error to name `relays.reconnect_interval_secs`, got: {message}"
+        );
+        assert!(
+            message.contains("must be greater than 0"),
+            "expected `must be greater than 0`, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_oversized_connection_timeout_rejected() {
+        let over = (MAX_RELAY_DURATION_SECS + 1).to_string();
+        let error = from_test_env(&[("TRANSPONDER_RELAYS_CONNECTION_TIMEOUT_SECS", over.as_str())])
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("relays.connection_timeout_secs"),
+            "expected error to name `relays.connection_timeout_secs`, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("at most {MAX_RELAY_DURATION_SECS}")),
+            "expected `at most {MAX_RELAY_DURATION_SECS}`, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_unbounded_connection_timeout_rejected() {
+        // The degenerate `u64::MAX` from the issue must be rejected rather than
+        // hanging startup effectively forever when relays are unreachable.
+        let error = from_test_env(&[(
+            "TRANSPONDER_RELAYS_CONNECTION_TIMEOUT_SECS",
+            "18446744073709551615",
+        )])
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("relays.connection_timeout_secs"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_oversized_reconnect_interval_rejected() {
+        let over = (MAX_RELAY_DURATION_SECS + 1).to_string();
+        let error = from_test_env(&[("TRANSPONDER_RELAYS_RECONNECT_INTERVAL_SECS", over.as_str())])
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("relays.reconnect_interval_secs"),
+            "expected error to name `relays.reconnect_interval_secs`, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("at most {MAX_RELAY_DURATION_SECS}")),
+            "expected `at most {MAX_RELAY_DURATION_SECS}`, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_relay_duration_upper_bound_accepted() {
+        // The exact cap must pass so operators on slow networks or Tor can use
+        // the full budget without tripping validation.
+        let cap = MAX_RELAY_DURATION_SECS.to_string();
+        let config = from_test_env(&[
+            ("TRANSPONDER_RELAYS_CONNECTION_TIMEOUT_SECS", cap.as_str()),
+            ("TRANSPONDER_RELAYS_RECONNECT_INTERVAL_SECS", cap.as_str()),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.relays.connection_timeout_secs,
+            MAX_RELAY_DURATION_SECS
+        );
+        assert_eq!(
+            config.relays.reconnect_interval_secs,
+            MAX_RELAY_DURATION_SECS
+        );
     }
 }
