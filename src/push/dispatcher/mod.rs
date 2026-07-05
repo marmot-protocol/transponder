@@ -17,9 +17,8 @@
 //! request serialization.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -63,72 +62,11 @@ const MAX_LIVE_SEND_TASKS: usize = MAX_CONCURRENT_PUSHES * LIVE_TASK_MULTIPLIER;
 /// new notification batches are rejected to protect against DoS attacks.
 const MAX_PENDING_QUEUE_SIZE: usize = 10_000;
 
-/// Number of consecutive hard delivery failures after which a provider is
-/// reported as not delivering (see [`DeliveryHealth`]).
-///
-/// "Hard" failures are outcomes indicating the provider itself is refusing or
-/// failing requests: permanent send errors (which include authentication
-/// rejections such as a revoked APNs signing key or an expired FCM service
-/// account) and exhausted retry budgets. Invalid device tokens do NOT count —
-/// a definitive invalid-token verdict proves the provider authenticated and
-/// processed the request. The threshold trades detection speed against
-/// flapping: five hard failures in a row with no intervening success is a
-/// sustained outage signal, not an isolated transient blip.
-pub const DELIVERY_FAILURE_STREAK_THRESHOLD: u32 = 5;
+mod health;
+mod inflight;
 
-/// Passive per-provider delivery-health signal derived from real send
-/// outcomes.
-///
-/// Tracks, for each push provider, the current streak of *consecutive* hard
-/// send failures. The streak grows on permanent errors and exhausted retries,
-/// and resets to zero whenever the provider demonstrably processes a request
-/// (successful send or a definitive invalid-token verdict). The readiness
-/// endpoint uses [`DeliveryHealth::is_delivering`] to gate `/ready` on live
-/// delivery capability instead of static configuration alone.
-///
-/// The signal is passive: it observes outcomes of real traffic and never
-/// probes the providers. If push traffic stops entirely, the last observed
-/// state is retained until the next send.
-#[derive(Debug, Default)]
-pub struct DeliveryHealth {
-    apns_hard_failure_streak: AtomicU32,
-    fcm_hard_failure_streak: AtomicU32,
-}
-
-impl DeliveryHealth {
-    fn streak(&self, platform: Platform) -> &AtomicU32 {
-        match platform {
-            Platform::Apns => &self.apns_hard_failure_streak,
-            Platform::Fcm => &self.fcm_hard_failure_streak,
-        }
-    }
-
-    /// Record that the provider processed a request (successful send, or a
-    /// definitive invalid-token verdict), ending any hard-failure streak.
-    pub(crate) fn record_processed(&self, platform: Platform) {
-        self.streak(platform).store(0, Ordering::SeqCst);
-    }
-
-    /// Record a hard send failure (permanent error or exhausted retries).
-    ///
-    /// Saturates instead of wrapping so an arbitrarily long outage can never
-    /// roll the streak back over to "delivering".
-    pub(crate) fn record_hard_failure(&self, platform: Platform) {
-        let _ = self
-            .streak(platform)
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |streak| {
-                Some(streak.saturating_add(1))
-            });
-    }
-
-    /// Whether the provider is currently considered to be delivering: its
-    /// consecutive hard-failure streak is below
-    /// [`DELIVERY_FAILURE_STREAK_THRESHOLD`].
-    #[must_use]
-    pub fn is_delivering(&self, platform: Platform) -> bool {
-        self.streak(platform).load(Ordering::SeqCst) < DELIVERY_FAILURE_STREAK_THRESHOLD
-    }
-}
+pub use health::{DELIVERY_FAILURE_STREAK_THRESHOLD, DeliveryHealth};
+pub(crate) use inflight::InFlightTracker;
 
 /// Metrics/logging label for a push platform.
 fn platform_label(platform: Platform) -> &'static str {
@@ -139,93 +77,17 @@ fn platform_label(platform: Platform) -> &'static str {
 }
 
 /// Internal message for the push queue.
-///
-/// # Security
-///
-/// The token field is wrapped in `Zeroizing<String>` while queued and is moved
-/// intact into the provider client when the message is sent.
 enum PushMessage {
-    /// Send a notification to the given platform with the given token.
     Send {
         platform: Platform,
         token: Zeroizing<String>,
     },
-    /// Shutdown signal for the dispatcher task.
     Shutdown,
 }
 
 struct QueuedPushMessage {
     platform: Platform,
     token: Zeroizing<String>,
-}
-
-/// Tracks the number of spawned send tasks that have not yet finished, so that
-/// graceful shutdown can wait for them to complete.
-///
-/// This is deliberately decoupled from the concurrency [`Semaphore`]: a send
-/// task that is in a retry backoff sleep releases its concurrency permit (see
-/// [`crate::push::retry::BackoffPermit`]) so the slot can be reused, but the
-/// task is still alive and may re-acquire a permit and send again. Counting
-/// permits is therefore *not* a sound proof that all send tasks have finished.
-/// This tracker counts task lifetimes end-to-end instead.
-struct InFlightTracker {
-    count: AtomicUsize,
-    idle: Notify,
-}
-
-impl InFlightTracker {
-    fn new() -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-            idle: Notify::new(),
-        }
-    }
-
-    /// Register a newly spawned send task. The returned guard decrements the
-    /// in-flight count when dropped (i.e. when the send task finishes) and
-    /// wakes any shutdown waiter once the count reaches zero.
-    fn enter(self: &Arc<Self>) -> InFlightGuard {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        InFlightGuard {
-            tracker: self.clone(),
-        }
-    }
-
-    /// Wait until no send tasks are in flight.
-    ///
-    /// Uses the register-before-check pattern so a task that finishes between
-    /// the count load and observing the notification cannot be missed: the
-    /// `Notified` future is *enabled* (waiter registered) before the count is
-    /// read. `notify_waiters()` does not store a permit, so the waiter must be
-    /// registered first; `Notified::enable()` registers it eagerly without
-    /// awaiting, which closes the lost-wakeup window.
-    async fn wait_idle(&self) {
-        loop {
-            let notified = self.idle.notified();
-            tokio::pin!(notified);
-            // Register this waiter before reading the count.
-            notified.as_mut().enable();
-            if self.count.load(Ordering::SeqCst) == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-/// RAII guard returned by [`InFlightTracker::enter`]; decrements the in-flight
-/// count and signals idle when the last in-flight task finishes.
-struct InFlightGuard {
-    tracker: Arc<InFlightTracker>,
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if self.tracker.count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            // Transitioned to zero in-flight tasks; wake any shutdown waiter.
-            self.tracker.idle.notify_waiters();
-        }
-    }
 }
 
 /// Cloneable shared state handed to the queue-draining dispatcher loop and, in
@@ -1907,7 +1769,7 @@ mod tests {
 
         // Hold a guard, then assert wait_idle does NOT return until it is dropped.
         let guard = tracker.enter();
-        assert_eq!(tracker.count.load(Ordering::SeqCst), 1);
+        assert_eq!(tracker.in_flight_count(), 1);
 
         let waiter_tracker = tracker.clone();
         let waiter = tokio::spawn(async move { waiter_tracker.wait_idle().await });
@@ -1925,7 +1787,7 @@ mod tests {
             .expect("wait_idle should complete after the last guard is dropped")
             .expect("waiter task should not panic");
 
-        assert_eq!(tracker.count.load(Ordering::SeqCst), 0);
+        assert_eq!(tracker.in_flight_count(), 0);
     }
 
     /// Regression for transponder#65: graceful shutdown must wait for send tasks
