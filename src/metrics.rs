@@ -74,6 +74,9 @@ pub struct Metrics {
     /// Total number of entries evicted from rate limit caches (by type).
     pub rate_limit_evictions_total: IntCounterVec,
 
+    /// Total number of entries evicted during admission when caches are at capacity.
+    pub rate_limit_admission_evictions_total: IntCounterVec,
+
     /// Total number of tokens successfully decrypted.
     pub tokens_decrypted_total: IntCounter,
 
@@ -345,11 +348,20 @@ impl Metrics {
         let rate_limit_evictions_total = IntCounterVec::new(
             Opts::new(
                 "transponder_rate_limit_evictions_total",
-                "Total number of entries evicted from rate limit caches",
+                "Total number of stale rate limit entries removed during cleanup",
             ),
             &["type"],
         )?;
         registry.register(Box::new(rate_limit_evictions_total.clone()))?;
+
+        let rate_limit_admission_evictions_total = IntCounterVec::new(
+            Opts::new(
+                "transponder_rate_limit_admission_evictions_total",
+                "Total number of rate limit entries evicted on the admission hot path to admit a new key",
+            ),
+            &["type"],
+        )?;
+        registry.register(Box::new(rate_limit_admission_evictions_total.clone()))?;
 
         let tokens_decrypted_total = IntCounter::with_opts(Opts::new(
             "transponder_tokens_decrypted_total",
@@ -565,6 +577,7 @@ impl Metrics {
             tokens_rate_limited_total,
             rate_limit_cache_size,
             rate_limit_evictions_total,
+            rate_limit_admission_evictions_total,
             tokens_decrypted_total,
             tokens_decryption_failed_total,
             token_decrypt_duration_seconds,
@@ -703,7 +716,7 @@ impl Metrics {
     /// Record a rate limited token.
     ///
     /// `cache_type` should be "encrypted_token" or "device_token".
-    /// `reason` should be "minute" or "hour".
+    /// `reason` should be "minute", "hour", or "capacity".
     pub fn record_rate_limited(&self, cache_type: &str, reason: Option<&str>) {
         self.tokens_rate_limited_total
             .with_label_values(&[cache_type, reason.unwrap_or("unknown")])
@@ -719,13 +732,22 @@ impl Metrics {
             .set(size as i64);
     }
 
-    /// Record rate limit cache evictions.
+    /// Record rate limit cache evictions during cleanup.
     ///
     /// `cache_type` should be "encrypted_token" or "device_token".
     pub fn record_rate_limit_evictions(&self, cache_type: &str, count: usize) {
         self.rate_limit_evictions_total
             .with_label_values(&[cache_type])
             .inc_by(count as u64);
+    }
+
+    /// Record a single admission-path rate limit cache eviction.
+    ///
+    /// `cache_type` should be "encrypted_token" or "device_token".
+    pub fn record_rate_limit_admission_eviction(&self, cache_type: &str) {
+        self.rate_limit_admission_evictions_total
+            .with_label_values(&[cache_type])
+            .inc();
     }
 
     /// Record a successful token decryption.
@@ -1358,5 +1380,40 @@ mod tests {
 
         assert_eq!(encrypted_evictions, 125);
         assert_eq!(device_evictions, 50);
+    }
+
+    #[test]
+    fn test_rate_limit_admission_evictions_metric_registered() {
+        let metrics = Metrics::new().unwrap();
+
+        metrics.record_rate_limit_admission_eviction("encrypted_token");
+        metrics.record_rate_limit_admission_eviction("device_token");
+
+        let families = metrics.registry.gather();
+        let admission_evictions = families
+            .iter()
+            .find(|f| f.name() == "transponder_rate_limit_admission_evictions_total");
+        assert!(admission_evictions.is_some());
+    }
+
+    #[test]
+    fn test_record_rate_limit_admission_evictions() {
+        let metrics = Metrics::new().unwrap();
+
+        metrics.record_rate_limit_admission_eviction("encrypted_token");
+        metrics.record_rate_limit_admission_eviction("encrypted_token");
+        metrics.record_rate_limit_admission_eviction("device_token");
+
+        let encrypted = metrics
+            .rate_limit_admission_evictions_total
+            .with_label_values(&["encrypted_token"])
+            .get();
+        let device = metrics
+            .rate_limit_admission_evictions_total
+            .with_label_values(&["device_token"])
+            .get();
+
+        assert_eq!(encrypted, 2);
+        assert_eq!(device, 1);
     }
 }

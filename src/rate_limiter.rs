@@ -53,6 +53,39 @@ pub enum RateLimitResult {
     ExceededCapacityLimit,
 }
 
+/// Outcome of [`RateLimiter::check_and_increment`], including admission side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitCheck {
+    result: RateLimitResult,
+    admission_evicted: bool,
+}
+
+impl RateLimitCheck {
+    /// Returns `true` if the request was allowed.
+    #[must_use]
+    pub fn is_allowed(self) -> bool {
+        self.result.is_allowed()
+    }
+
+    /// Returns the reason string for metrics/logging (if rate limited).
+    #[must_use]
+    pub fn limit_reason(self) -> Option<&'static str> {
+        self.result.limit_reason()
+    }
+
+    /// Returns `true` when a stale or below-limit entry was evicted to admit a new key.
+    #[must_use]
+    pub fn admission_evicted(self) -> bool {
+        self.admission_evicted
+    }
+}
+
+impl PartialEq<RateLimitResult> for RateLimitCheck {
+    fn eq(&self, other: &RateLimitResult) -> bool {
+        self.result == *other
+    }
+}
+
 impl RateLimitResult {
     /// Returns `true` if the request was allowed.
     #[must_use]
@@ -178,7 +211,10 @@ impl Default for RateLimitConfig {
 /// found in the bounded scan window, it falls back to a least-recently-used
 /// still-unlimited entry. This favors availability for legitimate new tokens
 /// over perfect accounting for below-limit keys under active cache pressure,
-/// while preserving counters for keys already at their rate limit.
+/// while preserving counters for keys already at their rate limit. Evicting a
+/// below-limit key resets its accumulated sliding-window hits; that weakens
+/// per-key precision but does not bypass limits because the global unwrap
+/// limiter still bounds total admission.
 pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
     entries: RwLock<LruCache<K, RateLimitEntry>>,
     max_per_minute: u32,
@@ -237,9 +273,10 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// - `ExceededHourLimit` if per-hour limit is reached
     /// - `ExceededCapacityLimit` if the cache is full and has no safe eviction
     ///   victim for the unknown key
-    pub async fn check_and_increment(&self, key: &K) -> RateLimitResult {
+    pub async fn check_and_increment(&self, key: &K) -> RateLimitCheck {
         let now = Instant::now();
         let mut entries = self.entries.write().await;
+        let mut admission_evicted = false;
 
         // Get or create entry (updates access position). At capacity, admit an
         // unknown key by evicting an old stale or still-unlimited entry. Entries
@@ -248,15 +285,20 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         let entry = if let Some(entry) = entries.get_mut(key) {
             entry
         } else {
-            if entries.len() >= entries.cap().get()
-                && !Self::evict_lru_admission_candidate(
+            if entries.len() >= entries.cap().get() {
+                if Self::evict_lru_admission_candidate(
                     &mut entries,
                     now,
                     self.max_per_minute,
                     self.max_per_hour,
-                )
-            {
-                return RateLimitResult::ExceededCapacityLimit;
+                ) {
+                    admission_evicted = true;
+                } else {
+                    return RateLimitCheck {
+                        result: RateLimitResult::ExceededCapacityLimit,
+                        admission_evicted: false,
+                    };
+                }
             }
             entries.put(key.clone(), RateLimitEntry::new());
             entries.get_mut(key).expect("just inserted")
@@ -266,19 +308,28 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
 
         // Check minute limit first (more likely to be hit)
         if entry.minute_hits.len() >= self.max_per_minute as usize {
-            return RateLimitResult::ExceededMinuteLimit;
+            return RateLimitCheck {
+                result: RateLimitResult::ExceededMinuteLimit,
+                admission_evicted,
+            };
         }
 
         // Check hour limit
         if entry.hour_hits.len() >= self.max_per_hour as usize {
-            return RateLimitResult::ExceededHourLimit;
+            return RateLimitCheck {
+                result: RateLimitResult::ExceededHourLimit,
+                admission_evicted,
+            };
         }
 
         // Increment counters
         entry.minute_hits.push_back(now);
         entry.hour_hits.push_back(now);
 
-        RateLimitResult::Allowed
+        RateLimitCheck {
+            result: RateLimitResult::Allowed,
+            admission_evicted,
+        }
     }
 
     /// Rolls back one previously allowed increment for a key.
@@ -593,6 +644,45 @@ mod tests {
         let stats = limiter.cleanup().await;
         assert_eq!(stats.evicted, CLEANUP_BATCH_SIZE);
         assert_eq!(stats.remaining, 1);
+    }
+
+    #[tokio::test]
+    async fn test_admission_eviction_reports_side_effect() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: 3,
+        });
+
+        for key in 1..=3 {
+            let check = limiter.check_and_increment(&key).await;
+            assert_eq!(check, RateLimitResult::Allowed);
+            assert!(!check.admission_evicted());
+        }
+
+        let check = limiter.check_and_increment(&4u64).await;
+        assert_eq!(check, RateLimitResult::Allowed);
+        assert!(check.admission_evicted());
+    }
+
+    #[tokio::test]
+    async fn test_capacity_limit_does_not_report_admission_eviction() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1,
+            max_per_hour: 100,
+            max_entries: 3,
+        });
+
+        for key in 1..=3 {
+            assert_eq!(
+                limiter.check_and_increment(&key).await,
+                RateLimitResult::Allowed
+            );
+        }
+
+        let check = limiter.check_and_increment(&4u64).await;
+        assert_eq!(check, RateLimitResult::ExceededCapacityLimit);
+        assert!(!check.admission_evicted());
     }
 
     #[tokio::test]

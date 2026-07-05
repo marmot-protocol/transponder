@@ -792,6 +792,11 @@ impl EventProcessor {
                 .encrypted_token_limiter
                 .check_and_increment(&encrypted_key)
                 .await;
+            if encrypted_result.admission_evicted()
+                && let Some(ref m) = self.metrics
+            {
+                m.record_rate_limit_admission_eviction("encrypted_token");
+            }
             if !encrypted_result.is_allowed() {
                 trace!(
                     reason = encrypted_result.limit_reason(),
@@ -838,6 +843,11 @@ impl EventProcessor {
                 .device_token_limiter
                 .check_and_increment(&device_key)
                 .await;
+            if device_result.admission_evicted()
+                && let Some(ref m) = self.metrics
+            {
+                m.record_rate_limit_admission_eviction("device_token");
+            }
             if !device_result.is_allowed() {
                 trace!(
                     reason = device_result.limit_reason(),
@@ -2807,6 +2817,94 @@ mod tests {
         assert!(processor.process(&event3).await.unwrap());
         assert_eq!(
             counter_value(&metrics, "transponder_events_shed_total", &[]),
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admission_path_eviction_records_metric() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: 3,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                encrypted_token_per_minute: 100,
+                encrypted_token_per_hour: 1000,
+                device_token_per_minute: 100,
+                device_token_per_hour: 1000,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
+            },
+        );
+
+        for _ in 0..3 {
+            let event =
+                scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+            assert!(processor.process(&event).await.unwrap());
+        }
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_rate_limit_admission_evictions_total",
+                &[("type", "encrypted_token")],
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_rate_limit_admission_evictions_total",
+                &[("type", "device_token")],
+            ),
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capacity_limit_records_metric() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: 3,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                encrypted_token_per_minute: 1,
+                encrypted_token_per_hour: 100,
+                device_token_per_minute: 100,
+                device_token_per_hour: 1000,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
+            },
+        );
+
+        for _ in 0..3 {
+            let event =
+                scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+            assert!(processor.process(&event).await.unwrap());
+        }
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_tokens_rate_limited_total",
+                &[("type", "encrypted_token"), ("reason", "capacity")],
+            ),
             1.0
         );
     }
