@@ -470,8 +470,8 @@ mod tests {
 
         assert_eq!(payload.platform, crate::crypto::Platform::Fcm);
         assert_eq!(
-            payload.device_token_string(),
-            Some("test-fcm-device-token-12345".to_string())
+            payload.device_token_string().as_ref().map(|s| s.as_str()),
+            Some("test-fcm-device-token-12345")
         );
     }
 
@@ -584,6 +584,6 @@ mod tests {
         // Decrypt token
         let payload = token_decryptor.decrypt_bytes(&token_bytes[0]).unwrap();
         assert_eq!(payload.platform, crate::crypto::Platform::Apns);
-        assert_eq!(payload.device_token_hex(), device_token_hex);
+        assert_eq!(payload.device_token_hex().as_str(), device_token_hex);
     }
 }
