@@ -587,6 +587,9 @@ impl FcmClient {
                 }
             }
             _ => {
+                // Unknown statuses are provider/protocol errors, not evidence
+                // that the device token is dead. Keep them out of the
+                // invalid-token path so operators do not prune live tokens.
                 warn!(status = %status, "FCM unexpected response");
                 SendAttemptResult::Permanent(Error::Fcm(format!(
                     "Unexpected FCM response status: {status}"

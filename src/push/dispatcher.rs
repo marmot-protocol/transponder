@@ -650,6 +650,14 @@ mod tests {
         ) as u64
     }
 
+    fn push_success_metric_value(metrics: &crate::metrics::Metrics, platform: &str) -> u64 {
+        metric_counter_value(
+            metrics,
+            "transponder_push_success_total",
+            &[("platform", platform)],
+        ) as u64
+    }
+
     #[tokio::test]
     async fn send_push_records_invalid_token_metrics() {
         use crate::config::{ApnsConfig, FcmConfig};
@@ -718,6 +726,7 @@ mod tests {
             PushSendOutcome::RetriesExhausted,
             &metrics_opt,
         );
+        PushDispatcher::record_send_outcome("FCM", "fcm", PushSendOutcome::Sent, &metrics_opt);
 
         assert_eq!(
             push_failed_metric_value(&metrics, "apns", "invalid_token"),
@@ -727,6 +736,7 @@ mod tests {
             push_failed_metric_value(&metrics, "apns", "retries_exhausted"),
             1
         );
+        assert_eq!(push_success_metric_value(&metrics, "fcm"), 1);
     }
 
     #[tokio::test]

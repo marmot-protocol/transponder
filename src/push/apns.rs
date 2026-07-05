@@ -507,6 +507,9 @@ impl ApnsClient {
                 }
             }
             _ => {
+                // Unknown statuses are provider/protocol errors, not evidence
+                // that the device token is dead. Keep them out of the
+                // invalid-token path so operators do not prune live tokens.
                 warn!(
                     payload_mode = %self.config.payload_mode,
                     status = %status,
