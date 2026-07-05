@@ -750,6 +750,31 @@ mod tests {
         assert!(elapsed < Duration::from_secs(1));
     }
 
+    /// Wait until `count` reaches at least `expected`, yielding to the scheduler
+    /// in a bounded loop.
+    ///
+    /// A paused-clock test can require more than one scheduler pass for a
+    /// spawned task to cross a fired timer boundary and run its next attempt —
+    /// especially under coverage instrumentation, where scheduling is slower and
+    /// perturbed — so a single `yield_now` is not a reliable synchronization
+    /// point. The retry task runs from "sleep fires" through incrementing the
+    /// counter to re-parking on the next sleep in a single poll (no intermediate
+    /// await), so observing the incremented count does not race ahead of the
+    /// task re-parking. The iteration cap prevents a hang if progress never
+    /// happens.
+    async fn wait_for_attempt_count(count: &AtomicU32, expected: u32) {
+        for _ in 0..10_000 {
+            if count.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "timed out waiting for attempt_count to reach {expected}; last observed {}",
+            count.load(Ordering::SeqCst)
+        );
+    }
+
     #[tokio::test]
     async fn test_with_retry_repeated_retry_after_zero_sleeps_before_each_retry() {
         tokio::time::pause();
@@ -785,7 +810,7 @@ mod tests {
             .await
         });
 
-        tokio::task::yield_now().await;
+        wait_for_attempt_count(&attempt_count, 1).await;
         assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
         assert!(!task.is_finished());
 
@@ -796,7 +821,7 @@ mod tests {
         assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
 
         tokio::time::advance(Duration::from_millis(51)).await;
-        tokio::task::yield_now().await;
+        wait_for_attempt_count(&attempt_count, 2).await;
         assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
 
         // The fallback backoff advances even while Retry-After is supplied, so
@@ -806,7 +831,7 @@ mod tests {
         assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
 
         tokio::time::advance(Duration::from_millis(101)).await;
-        tokio::task::yield_now().await;
+        wait_for_attempt_count(&attempt_count, 3).await;
         assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
 
         // The third zero-header retry uses the next 400ms fallback slot.
