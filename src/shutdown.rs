@@ -15,6 +15,33 @@ pub struct ShutdownHandler {
     receiver: watch::Receiver<bool>,
 }
 
+/// Cloneable handle that lets supervised tasks request a process-wide shutdown.
+///
+/// Handed to long-lived tasks (health server, event loop) so an unexpected
+/// failure tears the whole process down — letting the orchestrator restart it —
+/// instead of leaving a zombie that reports healthy while doing nothing.
+#[derive(Clone)]
+pub struct ShutdownTrigger {
+    sender: watch::Sender<bool>,
+}
+
+impl ShutdownTrigger {
+    /// Request a process-wide shutdown.
+    pub fn trigger(&self) {
+        let _ = self.sender.send(true);
+    }
+}
+
+/// How a shutdown was initiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownReason {
+    /// SIGTERM/SIGINT from an operator or orchestrator; a normal stop.
+    Signal,
+    /// An internal [`ShutdownTrigger`] fired by a supervised task; indicates
+    /// a critical failure, so the process should exit non-zero.
+    InternalTrigger,
+}
+
 impl ShutdownHandler {
     /// Create a new shutdown handler.
     pub fn new() -> Self {
@@ -25,6 +52,13 @@ impl ShutdownHandler {
     /// Get a receiver for shutdown signals.
     pub fn subscribe(&self) -> watch::Receiver<bool> {
         self.receiver.clone()
+    }
+
+    /// Get a cloneable handle that can trigger a shutdown from another task.
+    pub fn trigger_handle(&self) -> ShutdownTrigger {
+        ShutdownTrigger {
+            sender: self.sender.clone(),
+        }
     }
 
     /// Trigger a shutdown.
@@ -39,6 +73,29 @@ impl ShutdownHandler {
             spawn_force_quit_on_second_signal,
         )
         .await;
+    }
+
+    /// Wait until shutdown is requested, by an OS signal (SIGTERM or SIGINT)
+    /// or by an internal [`ShutdownTrigger`] fired from a supervised task,
+    /// and report which one initiated it.
+    ///
+    /// Waiting on OS signals alone would park the process forever when a
+    /// critical task (event loop, health server) dies and triggers shutdown
+    /// internally. `wait_for` also covers a trigger that fired *before* this
+    /// call, so an early supervised failure is never missed.
+    pub async fn wait_for_signal_or_trigger(&self) -> ShutdownReason {
+        let mut receiver = self.subscribe();
+        tokio::select! {
+            () = self.wait_for_signal() => ShutdownReason::Signal,
+            _ = receiver.wait_for(|&triggered| triggered) => {
+                info!("Internal shutdown trigger received, initiating shutdown");
+                // Keep signal semantics consistent with the OS-signal path: a
+                // signal arriving after an internal trigger forces the process
+                // out instead of being ignored during teardown.
+                spawn_force_quit_on_second_signal();
+                ShutdownReason::InternalTrigger
+            }
+        }
     }
 
     async fn handle_first_shutdown_signal<SignalFuture, SpawnSecond>(
@@ -227,6 +284,65 @@ mod tests {
         receiver.changed().await.unwrap();
         assert!(*receiver.borrow());
         assert!(second_listener_spawned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn trigger_handle_triggers_shutdown_for_subscribers() {
+        let handler = ShutdownHandler::new();
+        let mut receiver = handler.subscribe();
+        let trigger = handler.trigger_handle();
+
+        assert!(!*receiver.borrow());
+        trigger.trigger();
+
+        receiver.changed().await.unwrap();
+        assert!(*receiver.borrow());
+    }
+
+    #[tokio::test]
+    async fn cloned_trigger_handle_shares_the_shutdown_channel() {
+        let handler = ShutdownHandler::new();
+        let mut receiver = handler.subscribe();
+        let trigger = handler.trigger_handle();
+        let cloned = trigger.clone();
+        drop(trigger);
+
+        cloned.trigger();
+
+        receiver.changed().await.unwrap();
+        assert!(*receiver.borrow());
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_or_trigger_returns_on_internal_trigger() {
+        let handler = ShutdownHandler::new();
+        let trigger = handler.trigger_handle();
+
+        let wait = handler.wait_for_signal_or_trigger();
+        tokio::pin!(wait);
+
+        // No signal and no trigger yet: the wait must still be pending.
+        let pending = timeout(Duration::from_millis(10), &mut wait).await;
+        assert!(pending.is_err());
+
+        trigger.trigger();
+
+        let reason = timeout(Duration::from_secs(1), &mut wait)
+            .await
+            .expect("internal trigger must complete the shutdown wait");
+        assert_eq!(reason, ShutdownReason::InternalTrigger);
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_or_trigger_returns_when_already_triggered() {
+        let handler = ShutdownHandler::new();
+        handler.trigger();
+
+        // A trigger that fired before the wait started must not be missed.
+        let reason = timeout(Duration::from_secs(1), handler.wait_for_signal_or_trigger())
+            .await
+            .expect("a pre-fired trigger must complete the shutdown wait");
+        assert_eq!(reason, ShutdownReason::InternalTrigger);
     }
 
     #[tokio::test]

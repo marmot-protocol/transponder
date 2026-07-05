@@ -13,13 +13,20 @@ tor = ["nostr-sdk/tor"]
 [dependencies]
 # Async runtime
 tokio = { version = "1.49", features = ["full", "signal"] }
+# TaskTracker: tracks per-event processing tasks so in-flight gift-wrap unwrap
+# work is joinable during graceful shutdown instead of being aborted.
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Nostr
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip59"] }
 
 # Cryptography
 chacha20poly1305 = "0.10.1"
-hkdf = "0.12.4"
+# HKDF-SHA256 extract/expand is performed manually with `hmac` (already in the
+# tree via hkdf) so the PRK lives in a `Zeroizing` buffer instead of un-erasable
+# state inside an `Hkdf` value — see docs/zeroization-plan.md. The `hkdf` crate
+# itself is now a dev-dependency (reference implementation for test vectors).
+hmac = "0.12.1"
 sha2 = "0.10.9"
 secp256k1 = { version = "0.29", features = ["rand", "std"] }
 
@@ -87,6 +94,11 @@ clap = { version = "4", features = ["derive"] }
 # Metrics
 prometheus = "0.14"
 
+# Mechanical secret-pattern redaction for outgoing GlitchTip events
+# (src/redaction.rs). Not a new build unit: already in the tree via
+# sentry-backtrace.
+regex = "1.12"
+
 # Utilities
 thiserror = "2"
 zeroize = { version = "1.8", features = ["derive", "serde"] }
@@ -98,6 +110,9 @@ lru = "0.16"
 rand = "0.9"
 
 [dev-dependencies]
+# Reference HKDF implementation for the encryption side of the MIP-05 test
+# vectors; cross-checks the manual extract/expand in crypto/token.rs.
+hkdf = "0.12.4"
 tokio-test = "0.4.5"
 tempfile = "3"
 nostr-relay-builder = "0.44"

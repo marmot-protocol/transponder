@@ -99,24 +99,26 @@ impl HealthServer {
         }
     }
 
-    /// Run the health server until shutdown is signaled.
+    /// Bind the health server listener, or return `None` when nothing is
+    /// served.
     ///
-    /// Serving topology: the `/health` and `/ready` routes are mounted when
-    /// `health.enabled` is set, and `/metrics` is mounted whenever a metrics
-    /// collector exists (`metrics.enabled`) — independent of `health.enabled`,
-    /// so disabling the health endpoints cannot silently strand a running
-    /// collector without a scrape endpoint. A listener is bound on
-    /// `health.bind_address` if at least one route is mounted; when both are
-    /// disabled nothing is bound.
-    pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    /// Binding is split from [`Self::serve`] so startup can fail fast on a
+    /// bind failure — almost always a permanent misconfiguration (port in
+    /// use, bad `health.bind_address`) — instead of running indefinitely
+    /// with dead `/health`, `/ready`, and `/metrics` endpoints.
+    ///
+    /// A listener is bound when the health endpoints are enabled OR a metrics
+    /// collector exists: `/metrics` availability follows `metrics.enabled`,
+    /// independent of `health.enabled`, so disabling the health endpoints
+    /// cannot silently strand a running collector without a scrape endpoint.
+    /// Only when both are disabled is nothing bound.
+    pub async fn bind(&self) -> Result<Option<TcpListener>> {
         let serve_health = self.config.enabled;
         let serve_metrics = self.metrics.is_some();
 
         if !serve_health && !serve_metrics {
             info!("Health server and metrics disabled; not binding a listener");
-            // Wait for shutdown
-            let _ = shutdown.changed().await;
-            return Ok(());
+            return Ok(None);
         }
 
         if !serve_health {
@@ -126,6 +128,41 @@ impl HealthServer {
             );
         }
 
+        let listener = TcpListener::bind(&self.config.bind_address)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to bind health server to '{}': {}",
+                        self.config.bind_address, e
+                    ),
+                )
+            })?;
+        info!(address = %self.config.bind_address, "Health server listening");
+
+        Ok(Some(listener))
+    }
+
+    /// Serve on a previously bound listener until shutdown is signaled.
+    ///
+    /// A `None` listener means both the health endpoints and metrics are
+    /// disabled; the task then just waits for the shutdown signal so its exit
+    /// is always an expected, supervised event.
+    ///
+    /// Routes are mounted by flag: `/health` + `/ready` when `health.enabled`,
+    /// `/metrics` whenever a metrics collector exists (see [`Self::bind`]).
+    pub async fn serve(
+        &self,
+        listener: Option<TcpListener>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let Some(listener) = listener else {
+            // Nothing to serve: wait for shutdown.
+            let _ = shutdown.changed().await;
+            return Ok(());
+        };
+
         let state = Arc::new(HealthState {
             relay_client: self.relay_client.clone(),
             push_dispatcher: self.push_dispatcher.clone(),
@@ -133,12 +170,12 @@ impl HealthServer {
         });
 
         let mut router = Router::new();
-        if serve_health {
+        if self.config.enabled {
             router = router
                 .route("/health", get(health_handler))
                 .route("/ready", get(ready_handler));
         }
-        if serve_metrics {
+        if self.metrics.is_some() {
             router = router.route("/metrics", get(metrics_handler));
         }
 
@@ -156,19 +193,6 @@ impl HealthServer {
             ))
             .with_state(state);
 
-        let listener = TcpListener::bind(&self.config.bind_address)
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Failed to bind health server to '{}': {}",
-                        self.config.bind_address, e
-                    ),
-                )
-            })?;
-        info!(address = %self.config.bind_address, "Health server listening");
-
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 let _ = shutdown.changed().await;
@@ -177,6 +201,17 @@ impl HealthServer {
             .await?;
 
         Ok(())
+    }
+
+    /// Run the health server until shutdown is signaled.
+    ///
+    /// Test-only convenience combining [`Self::bind`] and [`Self::serve`];
+    /// production startup calls them separately so a bind failure aborts
+    /// startup before any relay work begins.
+    #[cfg(test)]
+    pub async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
+        let listener = self.bind().await?;
+        self.serve(listener, shutdown).await
     }
 }
 
@@ -300,6 +335,96 @@ mod tests {
 
         let client = reqwest::Client::new();
         let _ = wait_for_server_response(&client, format!("http://{addr}/health")).await;
+    }
+
+    async fn test_health_server(config: HealthConfig) -> HealthServer {
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![],
+            allow_unencrypted_clearnet_relays: true,
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        HealthServer::new(config, relay_client, push_dispatcher, None)
+    }
+
+    #[tokio::test]
+    async fn bind_returns_none_when_disabled() {
+        let server = test_health_server(HealthConfig {
+            enabled: false,
+            bind_address: "127.0.0.1:0".to_string(),
+        })
+        .await;
+
+        let listener = server.bind().await.unwrap();
+
+        assert!(listener.is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_returns_listener_on_the_configured_address() {
+        let server = test_health_server(HealthConfig {
+            enabled: true,
+            bind_address: "127.0.0.1:0".to_string(),
+        })
+        .await;
+
+        let listener = server.bind().await.unwrap();
+
+        let listener = listener.expect("enabled health server must bind a listener");
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn bind_fails_fast_when_the_port_is_taken() {
+        // Occupy a port, then ask the health server to bind the same one.
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap();
+
+        let server = test_health_server(HealthConfig {
+            enabled: true,
+            bind_address: addr.to_string(),
+        })
+        .await;
+
+        let error = server
+            .bind()
+            .await
+            .expect_err("binding an occupied port must fail");
+
+        assert!(
+            error.to_string().contains("Failed to bind health server"),
+            "error should carry bind context, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_without_listener_waits_for_shutdown() {
+        let server = test_health_server(HealthConfig {
+            enabled: false,
+            bind_address: "127.0.0.1:0".to_string(),
+        })
+        .await;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let serve = server.serve(None, shutdown_rx);
+        tokio::pin!(serve);
+
+        // Still parked while no shutdown has been signaled.
+        let pending = tokio::time::timeout(Duration::from_millis(10), &mut serve).await;
+        assert!(pending.is_err());
+
+        shutdown_tx.send(true).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut serve)
+            .await
+            .expect("disabled health task must exit on shutdown");
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -825,43 +950,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_listener_bound_when_health_and_metrics_disabled() {
+    async fn bind_returns_listener_when_metrics_enabled_and_health_disabled() {
+        use crate::metrics::Metrics;
+
         let keys = Keys::generate();
         let relay_config = RelayConfig {
             clearnet: vec![],
-            allow_unencrypted_clearnet_relays: false,
+            allow_unencrypted_clearnet_relays: true,
             onion: vec![],
             reconnect_interval_secs: 5,
-            max_reconnect_attempts: 1,
-            connection_timeout_secs: 1,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
         };
         let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
 
-        // An unbindable address proves nothing is bound: run() would fail if
-        // it attempted to create a listener.
-        let config = HealthConfig {
-            enabled: false,
-            bind_address: "999.999.999.999:9999".to_string(),
-        };
+        let server = HealthServer::new(
+            HealthConfig {
+                enabled: false,
+                bind_address: "127.0.0.1:0".to_string(),
+            },
+            relay_client,
+            push_dispatcher,
+            Some(Metrics::default()),
+        );
 
-        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
-
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        shutdown_tx.send(true).unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(2), server_handle)
-            .await
-            .expect("Server should complete")
-            .expect("Server task should not panic");
+        let listener = server.bind().await.unwrap();
 
         assert!(
-            result.is_ok(),
-            "with health and metrics disabled, run() must not bind (or fail to bind) a listener"
+            listener.is_some(),
+            "metrics.enabled must bind a listener even with health.enabled=false"
         );
+    }
+
+    #[tokio::test]
+    async fn bind_returns_none_without_attempting_when_nothing_is_served() {
+        // An unbindable address proves no bind is attempted when both the
+        // health endpoints and metrics are disabled: bind() would fail if it
+        // tried to create a listener.
+        let server = test_health_server(HealthConfig {
+            enabled: false,
+            bind_address: "999.999.999.999:9999".to_string(),
+        })
+        .await;
+
+        let listener = server.bind().await.unwrap();
+
+        assert!(listener.is_none());
     }
 
     #[tokio::test]

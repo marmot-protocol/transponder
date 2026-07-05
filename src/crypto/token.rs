@@ -8,13 +8,18 @@
 //! # Security
 //!
 //! Sensitive cryptographic material is stored in zeroizing buffers where possible;
-//! temporary secp256k1 secret keys are erased with the crate's erasure hook.
+//! temporary secp256k1 secret keys are erased with the crate's erasure hook. The
+//! HKDF extract/expand steps are performed manually so the PRK lives in a
+//! `Zeroizing` buffer rather than un-erasable state inside an `Hkdf` value (see
+//! `docs/zeroization-plan.md` for the residual gaps the pinned crates leave).
+
+use std::fmt;
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit},
 };
-use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use secp256k1::{
     Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey, constants::SECRET_KEY_SIZE,
 };
@@ -91,8 +96,9 @@ impl Platform {
 /// This struct implements `ZeroizeOnDrop` to ensure all fields are zeroed
 /// when the token goes out of scope, preventing sensitive data from lingering
 /// in memory. It intentionally does not implement `Clone` so sensitive buffers
-/// cannot be implicitly duplicated through whole-struct clones.
-#[derive(Debug, Zeroize, ZeroizeOnDrop)]
+/// cannot be implicitly duplicated through whole-struct clones. Its [`Debug`]
+/// impl is manually redacted: it prints byte lengths only, never the bytes.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct EncryptedToken {
     /// X-only ephemeral public key (32 bytes).
     pub ephemeral_pubkey: [u8; PUBKEY_SIZE],
@@ -100,6 +106,31 @@ pub struct EncryptedToken {
     pub nonce: [u8; NONCE_SIZE],
     /// Ciphertext including auth tag.
     pub ciphertext: Vec<u8>,
+}
+
+/// Redacting `Debug`: prints the type name and byte lengths only.
+///
+/// The ciphertext (and companion fields) never appear, so an accidental
+/// `{:?}` in a log, panic, or `dbg!` cannot leak token material to the
+/// console or to GlitchTip. Mirrors the redacted `Debug` guarantee tested
+/// for `UnwrappedNotification` in `crypto/nip59.rs`.
+impl fmt::Debug for EncryptedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedToken")
+            .field(
+                "ephemeral_pubkey",
+                &format_args!("[redacted; {} bytes]", self.ephemeral_pubkey.len()),
+            )
+            .field(
+                "nonce",
+                &format_args!("[redacted; {} bytes]", self.nonce.len()),
+            )
+            .field(
+                "ciphertext",
+                &format_args!("[redacted; {} bytes]", self.ciphertext.len()),
+            )
+            .finish()
+    }
 }
 
 impl EncryptedToken {
@@ -140,14 +171,34 @@ impl EncryptedToken {
 /// This struct implements `ZeroizeOnDrop` to ensure the device token is zeroed
 /// when the payload goes out of scope, preventing sensitive data from lingering
 /// in memory. It intentionally does not implement `Clone` so sensitive buffers
-/// cannot be implicitly duplicated through whole-struct clones.
-#[derive(Debug, Zeroize, ZeroizeOnDrop)]
+/// cannot be implicitly duplicated through whole-struct clones. Its [`Debug`]
+/// impl is manually redacted: it prints the platform and the token's byte
+/// length only, never the decrypted token itself.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct TokenPayload {
     /// Target platform (APNs or FCM).
     #[zeroize(skip)]
     pub platform: Platform,
     /// Device token for push notification.
     pub device_token: Vec<u8>,
+}
+
+/// Redacting `Debug`: prints the type name, platform, and token byte length.
+///
+/// The decrypted device token never appears, so a future `?payload` /
+/// `error!(?payload, ..)` / panic formatting cannot ship the plaintext token
+/// to logs or GlitchTip. Mirrors the redacted `Debug` guarantee tested for
+/// `UnwrappedNotification` in `crypto/nip59.rs`.
+impl fmt::Debug for TokenPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenPayload")
+            .field("platform", &self.platform)
+            .field(
+                "device_token",
+                &format_args!("[redacted; {} bytes]", self.device_token.len()),
+            )
+            .finish()
+    }
 }
 
 impl TokenPayload {
@@ -232,6 +283,18 @@ impl Drop for ZeroizingSecretKey {
     }
 }
 
+/// Drain an HMAC-SHA256 tag into a fixed array, wiping the intermediate output
+/// buffer so the only surviving copy is the caller's (which the caller wraps in
+/// `Zeroizing`). The consumed `Hmac` value itself is dropped without erasure —
+/// hmac 0.12 has no zeroize support — see `docs/zeroization-plan.md`.
+fn finalize_hmac(mac: Hmac<Sha256>) -> [u8; 32] {
+    let mut tag = mac.finalize().into_bytes();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&tag);
+    tag.as_mut_slice().zeroize();
+    output
+}
+
 impl TokenDecryptor {
     /// Create a new token decryptor with the given secret key.
     ///
@@ -281,13 +344,29 @@ impl TokenDecryptor {
             Zeroizing::new(x)
         };
 
-        // Derive encryption key using HKDF (wrapped for zeroization)
-        let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_x.as_ref());
+        // Derive the encryption key with HKDF-SHA256 (RFC 5869), performing the
+        // extract and expand steps manually so the PRK lives in a `Zeroizing`
+        // buffer. `Hkdf::new` would store the PRK (as PRK-keyed HMAC state)
+        // inside the returned value, which hkdf 0.12 drops without erasure.
+        //
+        // Extract: PRK = HMAC-SHA256(salt, IKM).
+        // (`<_ as Mac>` disambiguates from the `chacha20poly1305::KeyInit`
+        // import, which also provides a `new_from_slice`.)
+        let prk: Zeroizing<[u8; 32]> = {
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(HKDF_SALT)
+                .expect("HMAC-SHA256 accepts keys of any length");
+            mac.update(shared_x.as_ref());
+            Zeroizing::new(finalize_hmac(mac))
+        };
+
+        // Expand: the derived key is exactly one hash block long, so
+        // OKM = T(1) = HMAC-SHA256(PRK, info || 0x01).
         let encryption_key: Zeroizing<[u8; 32]> = {
-            let mut key = [0u8; 32];
-            hkdf.expand(HKDF_INFO, &mut key)
-                .map_err(|e| Error::Crypto(format!("HKDF expansion failed: {e}")))?;
-            Zeroizing::new(key)
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(prk.as_ref())
+                .expect("HMAC-SHA256 accepts keys of any length");
+            mac.update(HKDF_INFO);
+            mac.update(&[0x01]);
+            Zeroizing::new(finalize_hmac(mac))
         };
 
         // Decrypt using ChaCha20-Poly1305
@@ -341,6 +420,26 @@ mod tests {
         let end = 3 + token_bytes.len();
         plaintext[3..end].copy_from_slice(token_bytes);
         plaintext
+    }
+
+    /// Whether `input` contains a run of at least `target_len` consecutive hex
+    /// digits (the shape of a leaked token/key). Mirrors the helper used for
+    /// the `UnwrappedNotification` redacted-Debug test in `nip59.rs`.
+    fn contains_hex_run(input: &str, target_len: usize) -> bool {
+        let mut run_len = 0;
+
+        for ch in input.chars() {
+            if ch.is_ascii_hexdigit() {
+                run_len += 1;
+                if run_len >= target_len {
+                    return true;
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+
+        false
     }
 
     #[test]
@@ -613,6 +712,44 @@ mod tests {
 
         let err = Platform::from_byte(0x00).unwrap_err();
         assert!(err.to_string().contains("0x00"));
+    }
+
+    #[test]
+    fn test_token_payload_debug_redacts_device_token() {
+        let device_token = vec![0xAB; 32];
+        let token_hex = hex::encode(&device_token);
+        let payload = TokenPayload {
+            platform: Platform::Apns,
+            device_token,
+        };
+
+        let debug = format!("{payload:?}");
+
+        assert!(debug.contains("TokenPayload"));
+        assert!(debug.contains("Apns"));
+        assert!(debug.contains("32 bytes"));
+        // Neither the derived-Debug decimal form (`171, 171, ...`) nor any hex
+        // rendering of the token may appear.
+        assert!(!debug.contains("171"));
+        assert!(!debug.contains(&token_hex));
+        assert!(!contains_hex_run(&debug, 16));
+    }
+
+    #[test]
+    fn test_encrypted_token_debug_redacts_all_bytes() {
+        let token = EncryptedToken::from_bytes(&[0xCD; ENCRYPTED_TOKEN_SIZE]).unwrap();
+
+        let debug = format!("{token:?}");
+
+        assert!(debug.contains("EncryptedToken"));
+        // Lengths (structural metadata) are printed for every field...
+        assert!(debug.contains("32 bytes"));
+        assert!(debug.contains("12 bytes"));
+        assert!(debug.contains("1040 bytes"));
+        // ...but the bytes themselves never appear, in decimal or hex form.
+        assert!(!debug.contains("205"));
+        assert!(!debug.contains("cd"));
+        assert!(!contains_hex_run(&debug, 16));
     }
 
     #[test]

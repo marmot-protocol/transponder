@@ -16,8 +16,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use nostr_sdk::prelude::*;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 use zeroize::Zeroizing;
@@ -29,6 +30,7 @@ mod metrics;
 mod nostr;
 mod push;
 mod rate_limiter;
+mod redaction;
 mod server;
 mod shutdown;
 mod telemetry;
@@ -45,7 +47,7 @@ use nostr::client::RelayClient;
 use nostr::events::EventProcessor;
 use push::{ApnsClient, FcmClient, PushDispatcher};
 use server::HealthServer;
-use shutdown::ShutdownHandler;
+use shutdown::{ShutdownHandler, ShutdownTrigger};
 
 /// Transponder - MIP-05 Push Notification Server
 #[derive(Parser, Debug)]
@@ -111,7 +113,7 @@ const TOR_FEATURE_ENABLED: bool = false;
 /// The refresher recomputes the cached relay connection status (and the
 /// `relays_connected` gauges) on this fixed interval, so readiness probes can
 /// be pure reads of the snapshot and gauge updates track connection state
-/// rather than probe traffic. Five seconds keeps `/ready` at most one probe
+/// rather than probe traffic. Five seconds keeps `/ready` at most one refresh
 /// interval behind real connection changes for typical orchestrator probe
 /// periods (10s+) while enumerating the relay pool rarely.
 const RELAY_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -179,11 +181,12 @@ fn event_processing_permits(max_concurrent_event_processing: usize) -> usize {
 
 /// Outcome of racing relay startup against a shutdown signal.
 #[derive(Debug)]
-enum StartupOutcome<T> {
+enum StartupOutcome<T, S> {
     /// Startup finished; carries the connect result.
     Connected(T),
-    /// A shutdown signal arrived before startup finished.
-    ShutdownRequested,
+    /// A shutdown signal arrived before startup finished; carries the signal
+    /// future's output (e.g. the [`shutdown::ShutdownReason`]).
+    ShutdownRequested(S),
 }
 
 /// Awaits a startup future while remaining responsive to a shutdown signal.
@@ -193,19 +196,34 @@ enum StartupOutcome<T> {
 /// for relay connections exits promptly instead of being ignored until the
 /// connect timeout elapses. Shutdown is preferred (`biased`) so a signal that is
 /// already pending wins over a startup future that resolves in the same poll.
-async fn run_startup_or_shutdown<T, StartupFut, SignalFut>(
+async fn run_startup_or_shutdown<T, S, StartupFut, SignalFut>(
     startup: StartupFut,
     signal_fut: SignalFut,
-) -> StartupOutcome<T>
+) -> StartupOutcome<T, S>
 where
     StartupFut: std::future::Future<Output = T>,
-    SignalFut: std::future::Future<Output = ()>,
+    SignalFut: std::future::Future<Output = S>,
 {
     tokio::select! {
         biased;
 
-        () = signal_fut => StartupOutcome::ShutdownRequested,
+        reason = signal_fut => StartupOutcome::ShutdownRequested(reason),
         result = startup => StartupOutcome::Connected(result),
+    }
+}
+
+/// Map how shutdown was initiated to the process exit result.
+///
+/// A signal-initiated stop is a clean exit. An internally triggered stop means
+/// a supervised critical task failed; exiting non-zero makes orchestrators
+/// with on-failure restart policies reschedule the process instead of
+/// treating the stop as intentional.
+fn shutdown_result(reason: shutdown::ShutdownReason) -> Result<()> {
+    match reason {
+        shutdown::ShutdownReason::Signal => Ok(()),
+        shutdown::ShutdownReason::InternalTrigger => Err(anyhow::anyhow!(
+            "shutting down after a critical task failure"
+        )),
     }
 }
 
@@ -224,6 +242,168 @@ async fn acquire_event_processing_permit_or_shutdown(
         },
         permit = semaphore.acquire_owned() => permit.ok(),
     }
+}
+
+/// Why the event-consumer loop exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventLoopExit {
+    /// The loop observed the shutdown signal; expected during teardown.
+    ShutdownRequested,
+    /// The relay notification channel closed while the process was supposed
+    /// to keep running; unexpected, must tear the process down.
+    ChannelClosed,
+}
+
+/// Map an event-loop exit to a supervision result.
+///
+/// A shutdown-signal exit is the expected teardown path; a channel close means
+/// event processing silently died and, left alone, the process would become a
+/// zombie that reports healthy while handling zero events (#151).
+fn event_loop_exit_to_supervision_result(
+    exit: EventLoopExit,
+) -> std::result::Result<(), &'static str> {
+    match exit {
+        EventLoopExit::ShutdownRequested => Ok(()),
+        EventLoopExit::ChannelClosed => Err("relay notification channel closed"),
+    }
+}
+
+/// Trigger a process-wide shutdown when a critical task fails.
+///
+/// Expected exits pass `Ok(())` and are left alone. Any `Err` means a task the
+/// process cannot live without (health server, event loop) died while the rest
+/// of the process kept running; triggering shutdown makes the process exit so
+/// the orchestrator restarts it instead of leaving a zombie.
+fn supervise_critical_task<E: std::fmt::Display>(
+    task: &'static str,
+    result: std::result::Result<(), E>,
+    shutdown_trigger: &ShutdownTrigger,
+) {
+    if let Err(error) = result {
+        error!(task, error = %error, "Critical task exited unexpectedly; triggering shutdown");
+        shutdown_trigger.trigger();
+    }
+}
+
+/// Drain relay notifications and process events with bounded concurrency.
+///
+/// Each admitted event is processed in its own task spawned onto `event_tasks`,
+/// gated by a semaphore. The receive loop drains the broadcast channel quickly
+/// so it does not fall behind and trigger `Lagged` overflow, while the
+/// semaphore caps total in-flight gift-wrap unwrap (ECDH) work so a flood
+/// cannot spawn unbounded crypto tasks. An owned permit is acquired BEFORE
+/// spawning and dropped when the spawned task finishes; when the budget is
+/// exhausted the loop awaits a free permit (applying back-pressure) while
+/// still remaining responsive to shutdown signals.
+///
+/// Spawning through the [`TaskTracker`] keeps in-flight unwrap work joinable:
+/// [`staged_teardown`] waits for these tasks before draining the push
+/// dispatcher, so notifications mid-unwrap at shutdown are delivered instead
+/// of aborted (#84, #173).
+async fn run_event_loop(
+    mut notifications: broadcast::Receiver<RelayPoolNotification>,
+    mut shutdown: watch::Receiver<bool>,
+    event_semaphore: Arc<Semaphore>,
+    processor: Arc<EventProcessor>,
+    event_tasks: TaskTracker,
+    metrics: Option<Metrics>,
+) -> EventLoopExit {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                info!("Event processor shutting down");
+                return EventLoopExit::ShutdownRequested;
+            }
+            result = notifications.recv() => {
+                match result {
+                    Ok(notification) => {
+                        let RelayPoolNotification::Event { event, .. } = notification else {
+                            continue;
+                        };
+
+                        // Acquire a permit before spawning so total in-flight
+                        // unwrap work stays bounded. `None` means shutdown won
+                        // while waiting (or the semaphore closed, which never
+                        // happens here), so intentionally drop this event.
+                        let Some(permit) = acquire_event_processing_permit_or_shutdown(
+                            Arc::clone(&event_semaphore),
+                            &mut shutdown,
+                        )
+                        .await
+                        else {
+                            return EventLoopExit::ShutdownRequested;
+                        };
+
+                        let processor = processor.clone();
+                        event_tasks.spawn(async move {
+                            // Hold the permit for the lifetime of the task; it
+                            // is released when `permit` is dropped on return.
+                            let _permit = permit;
+                            if let Err(e) = processor.process(&event).await {
+                                debug!(error = %e, "Event processing error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        record_notification_receive_metrics(metrics.as_ref(), &e);
+
+                        match classify_notification_receive_error(&e) {
+                            NotificationReceiveAction::Continue => {
+                                warn!(error = %e, "Lagged relay notifications, continuing");
+                            }
+                            NotificationReceiveAction::Shutdown => {
+                                error!(error = %e, "Notification channel closed");
+                                return EventLoopExit::ChannelClosed;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Tear down the pipeline in dependency order, producers before consumers.
+///
+/// The stage order is load-bearing (#173, #84):
+///
+/// 1. Join the event loop. The shutdown watch has already fired, so it stops
+///    admitting events; joining it guarantees no new processing task can be
+///    spawned after the tracker is closed.
+/// 2. Close and drain the task tracker. In-flight gift-wrap unwraps run to
+///    completion and their `dispatch()` calls are still accepted, because the
+///    push dispatcher has not flipped `shutting_down` yet.
+/// 3. Drain the push dispatcher. `wait_for_completion` rejects new dispatches
+///    from its first instant, so it must run only after every producer above
+///    is quiesced.
+/// 4. Disconnect relays. This closes the notification broadcast channel, which
+///    is only safe (no spurious `Closed` error) once the event loop is gone.
+/// 5. Join the remaining supervised tasks (health server, cleanup, relay
+///    status refresher).
+///
+/// The caller bounds the whole sequence with the configured shutdown timeout
+/// via [`shutdown::graceful_shutdown`].
+async fn staged_teardown(
+    event_handle: tokio::task::JoinHandle<()>,
+    event_tasks: TaskTracker,
+    push_dispatcher: Arc<PushDispatcher>,
+    relay_client: Arc<RelayClient>,
+    health_handle: tokio::task::JoinHandle<()>,
+    cleanup_handle: tokio::task::JoinHandle<()>,
+    status_refresh_handle: tokio::task::JoinHandle<()>,
+) {
+    let _ = event_handle.await;
+
+    event_tasks.close();
+    event_tasks.wait().await;
+
+    push_dispatcher.wait_for_completion().await;
+
+    if let Err(e) = relay_client.disconnect().await {
+        warn!(error = %e, "Error disconnecting from relays");
+    }
+
+    let _ = tokio::join!(health_handle, cleanup_handle, status_refresh_handle);
 }
 
 #[tokio::main]
@@ -376,58 +556,10 @@ async fn run(mut config: AppConfig) -> Result<()> {
         warn!("No push services configured - notifications will not be sent");
     }
 
-    // Initialize relay client
-    let relay_client = Arc::new(
-        RelayClient::with_metrics(keys.clone(), config.relays.clone(), metrics.clone())
-            .await
-            .context("Failed to create relay client")?,
-    );
-
-    // Initialize shutdown handler before connecting so a SIGTERM/SIGINT during
-    // startup exits promptly. Without this, signal handlers were installed only
-    // after `connect()` returned, so a signal received while waiting for relays
-    // (potentially up to the whole connection timeout) was ignored.
-    let shutdown = ShutdownHandler::new();
-
-    // Connect to relays, but bail out immediately if a shutdown signal arrives
-    // while we are still waiting for the first relay to connect.
-    match run_startup_or_shutdown(relay_client.connect(), shutdown.wait_for_signal()).await {
-        StartupOutcome::Connected(result) => {
-            result.context("Failed to connect to relays")?;
-        }
-        StartupOutcome::ShutdownRequested => {
-            info!("Shutdown signal received during startup; stopping before relay connection");
-            if let Err(e) = relay_client.disconnect().await {
-                warn!(error = %e, "Error disconnecting from relays during startup shutdown");
-            }
-            info!("Transponder stopped");
-            return Ok(());
-        }
-    }
-
-    // Obtain the broadcast receiver BEFORE issuing the subscription REQ.
-    //
-    // `notifications()` returns a fresh `tokio::sync::broadcast::Receiver`, which
-    // only observes messages broadcast after it is created. The subscription uses a
-    // 2-day lookback, so relays immediately stream the stored backlog of gift wraps.
-    // If the receiver were created after `subscribe()` (e.g. inside the spawned event
-    // task), any backlog delivered before the task is first polled would be broadcast
-    // to zero receivers and silently dropped — broadcast channels do not replay
-    // history. Creating the receiver first closes that startup window entirely.
-    let mut notifications = relay_client.notifications();
-
-    // Subscribe to events
-    relay_client
-        .subscribe(keys.public_key())
-        .await
-        .context("Failed to subscribe to events")?;
-
-    // Publish inbox relay list
-    if let Err(e) = relay_client.publish_inbox_relays().await {
-        warn!(error = %e, "Failed to publish inbox relay list");
-    }
-
-    // Create event processor with configured replay protection and rate limiting
+    // Create the event processor with configured replay protection and rate
+    // limiting. Constructed before any relay network work so the event
+    // consumer can start polling the moment the notification receiver exists
+    // (see below).
     let rate_limit_config = build_rate_limit_config(&config.server);
     let replay_config = build_replay_protection_config(&config.server);
     let event_processor = Arc::new(
@@ -442,117 +574,127 @@ async fn run(mut config: AppConfig) -> Result<()> {
         .context("Failed to initialize event replay protection")?,
     );
 
-    // Start health server
+    // Initialize relay client
+    let relay_client = Arc::new(
+        RelayClient::with_metrics(keys.clone(), config.relays.clone(), metrics.clone())
+            .await
+            .context("Failed to create relay client")?,
+    );
+
+    // Initialize shutdown handler before connecting so a SIGTERM/SIGINT during
+    // startup exits promptly. Without this, signal handlers were installed only
+    // after `connect()` returned, so a signal received while waiting for relays
+    // (potentially up to the whole connection timeout) was ignored.
+    let shutdown = ShutdownHandler::new();
+
+    // Bind the health server before any relay work so a bind failure — almost
+    // always a permanent misconfiguration — fails startup fast instead of
+    // leaving a process running with dead /health, /ready, and /metrics
+    // endpoints.
     let health_server = HealthServer::new(
         config.health.clone(),
         relay_client.clone(),
         push_dispatcher.clone(),
         metrics.clone(),
     );
+    let health_listener = health_server
+        .bind()
+        .await
+        .context("Failed to start health server")?;
 
+    // Serve under supervision: a runtime health-server failure triggers global
+    // shutdown so the orchestrator restarts the process instead of leaving it
+    // running with no external health signal.
     let health_shutdown = shutdown.subscribe();
+    let health_trigger = shutdown.trigger_handle();
     let health_handle = tokio::spawn(async move {
-        if let Err(e) = health_server.run(health_shutdown).await {
-            error!(error = %e, "Health server error");
-        }
+        let result = health_server.serve(health_listener, health_shutdown).await;
+        supervise_critical_task("health server", result, &health_trigger);
     });
 
-    // Start the background relay-status refresher. It is the only writer of
-    // the cached relay status (and the relays_connected gauges) after startup:
-    // `/ready` and other readers consume the snapshot without recomputing it,
-    // so unauthenticated probes cannot drive lock or gauge churn (see
-    // RelayClient::refresh_status).
-    let mut status_refresh_shutdown = shutdown.subscribe();
-    let status_refresh_client = relay_client.clone();
-    let status_refresh_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(RELAY_STATUS_REFRESH_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                _ = status_refresh_shutdown.changed() => {
-                    break;
-                }
-                _ = interval.tick() => {
-                    status_refresh_client.refresh_status().await;
-                }
+    // Connect to relays, but bail out immediately if a shutdown signal (or an
+    // internal trigger from a supervised task) arrives while we are still
+    // waiting for the first relay to connect.
+    match run_startup_or_shutdown(
+        relay_client.connect(),
+        shutdown.wait_for_signal_or_trigger(),
+    )
+    .await
+    {
+        StartupOutcome::Connected(result) => {
+            result.context("Failed to connect to relays")?;
+        }
+        StartupOutcome::ShutdownRequested(reason) => {
+            info!("Shutdown signal received during startup; stopping before relay connection");
+            if let Err(e) = relay_client.disconnect().await {
+                warn!(error = %e, "Error disconnecting from relays during startup shutdown");
             }
+            // The shutdown watch is already set, so the health task exits on
+            // its own; join it to finish teardown cleanly.
+            let _ = health_handle.await;
+            info!("Transponder stopped");
+            return shutdown_result(reason);
         }
-    });
+    }
 
-    // Start event processing loop
-    let mut event_shutdown = shutdown.subscribe();
-    let event_metrics = metrics.clone();
-
-    // Bounded-concurrency dispatch.
+    // Obtain the broadcast receiver BEFORE issuing the subscription REQ.
     //
-    // Each admitted event is processed in its own spawned task, gated by a
-    // semaphore. The receive loop drains the broadcast channel quickly so it
-    // does not fall behind and trigger `Lagged` overflow, while the semaphore
-    // caps total in-flight gift-wrap unwrap (ECDH) work so a flood cannot spawn
-    // unbounded crypto tasks. An owned permit is acquired BEFORE spawning and
-    // dropped when the spawned task finishes; when the budget is exhausted the
-    // loop awaits a free permit (applying back-pressure) while still remaining
-    // responsive to shutdown signals.
+    // `notifications()` returns a fresh `tokio::sync::broadcast::Receiver`, which
+    // only observes messages broadcast after it is created. The subscription uses a
+    // 2-day lookback, so relays immediately stream the stored backlog of gift wraps.
+    // If the receiver were created after `subscribe()` (e.g. inside the spawned event
+    // task), any backlog delivered before the task is first polled would be broadcast
+    // to zero receivers and silently dropped — broadcast channels do not replay
+    // history. Creating the receiver first closes that startup window entirely.
+    let notifications = relay_client.notifications();
+
+    // Spawn the event consumer BEFORE `subscribe()` streams the backlog and
+    // before the `publish_inbox_relays()` network round-trip below. The early
+    // receiver above only prevents the "zero receivers" drop; a consumer must
+    // also be POLLING before any startup await that can block for a meaningful
+    // duration, or the backlog can overflow the bounded broadcast buffer while
+    // nothing drains it and the oldest gift wraps are silently lost.
+    //
+    // The loop runs under supervision: an unexpected exit (notification
+    // channel closed) triggers global shutdown instead of leaving a zombie
+    // process that reports healthy while processing nothing.
     let event_permits = event_processing_permits(config.server.max_concurrent_event_processing);
     let event_semaphore = Arc::new(Semaphore::new(event_permits));
-    let event_processor_loop = event_processor.clone();
+    let event_tasks = TaskTracker::new();
+    let event_shutdown = shutdown.subscribe();
+    let event_trigger = shutdown.trigger_handle();
+    let event_handle = {
+        let processor = event_processor.clone();
+        let event_tasks = event_tasks.clone();
+        let event_metrics = metrics.clone();
+        tokio::spawn(async move {
+            let exit = run_event_loop(
+                notifications,
+                event_shutdown,
+                event_semaphore,
+                processor,
+                event_tasks,
+                event_metrics,
+            )
+            .await;
+            supervise_critical_task(
+                "event loop",
+                event_loop_exit_to_supervision_result(exit),
+                &event_trigger,
+            );
+        })
+    };
 
-    let event_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = event_shutdown.changed() => {
-                    info!("Event processor shutting down");
-                    break;
-                }
-                result = notifications.recv() => {
-                    match result {
-                        Ok(notification) => {
-                            let RelayPoolNotification::Event { event, .. } = notification else {
-                                continue;
-                            };
+    // Subscribe to events
+    relay_client
+        .subscribe(keys.public_key())
+        .await
+        .context("Failed to subscribe to events")?;
 
-                            // Acquire a permit before spawning so total in-flight
-                            // unwrap work stays bounded. `None` means shutdown won
-                            // while waiting (or the semaphore closed, which never
-                            // happens here), so intentionally drop this event.
-                            let Some(permit) = acquire_event_processing_permit_or_shutdown(
-                                Arc::clone(&event_semaphore),
-                                &mut event_shutdown,
-                            )
-                            .await
-                            else {
-                                break;
-                            };
-
-                            let processor = event_processor_loop.clone();
-                            tokio::spawn(async move {
-                                // Hold the permit for the lifetime of the task; it
-                                // is released when `permit` is dropped on return.
-                                let _permit = permit;
-                                if let Err(e) = processor.process(&event).await {
-                                    debug!(error = %e, "Event processing error");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            record_notification_receive_metrics(event_metrics.as_ref(), &e);
-
-                            match classify_notification_receive_error(&e) {
-                                NotificationReceiveAction::Continue => {
-                                    warn!(error = %e, "Lagged relay notifications, continuing");
-                                }
-                                NotificationReceiveAction::Shutdown => {
-                                    error!(error = %e, "Notification channel closed");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
+    // Publish inbox relay list
+    if let Err(e) = relay_client.publish_inbox_relays().await {
+        warn!(error = %e, "Failed to publish inbox relay list");
+    }
 
     // Start periodic cleanup task
     let mut cleanup_shutdown = shutdown.subscribe();
@@ -573,10 +715,34 @@ async fn run(mut config: AppConfig) -> Result<()> {
         }
     });
 
+    // Start the background relay-status refresher. After startup it is the
+    // only writer of the cached relay status (and the relays_connected
+    // gauges): `/ready` and other readers consume the snapshot without
+    // recomputing it, so unauthenticated probes cannot drive lock or gauge
+    // churn (see RelayClient::refresh_status).
+    let mut status_refresh_shutdown = shutdown.subscribe();
+    let status_refresh_client = relay_client.clone();
+    let status_refresh_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RELAY_STATUS_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = status_refresh_shutdown.changed() => {
+                    break;
+                }
+                _ = interval.tick() => {
+                    status_refresh_client.refresh_status().await;
+                }
+            }
+        }
+    });
+
     info!("Transponder running");
 
-    // Wait for shutdown signal
-    shutdown.wait_for_signal().await;
+    // Wait for a shutdown signal or an internal trigger from a supervised
+    // task (health-server failure, notification channel close).
+    let shutdown_reason = shutdown.wait_for_signal_or_trigger().await;
 
     info!("Initiating graceful shutdown");
 
@@ -584,26 +750,23 @@ async fn run(mut config: AppConfig) -> Result<()> {
     // consumes the budget, `graceful_shutdown` drops the future and later cleanup
     // steps are skipped rather than extending the configured shutdown bound.
     shutdown::graceful_shutdown(
-        || async move {
-            push_dispatcher.wait_for_completion().await;
-
-            if let Err(e) = relay_client.disconnect().await {
-                warn!(error = %e, "Error disconnecting from relays");
-            }
-
-            let _ = tokio::join!(
+        || {
+            staged_teardown(
                 event_handle,
+                event_tasks,
+                push_dispatcher,
+                relay_client,
                 health_handle,
                 cleanup_handle,
-                status_refresh_handle
-            );
+                status_refresh_handle,
+            )
         },
         config.server.shutdown_timeout_secs,
     )
     .await;
 
     info!("Transponder stopped");
-    Ok(())
+    shutdown_result(shutdown_reason)
 }
 
 fn create_private_key_file(path: &Path) -> Result<File> {
@@ -855,7 +1018,7 @@ mod tests {
         // startup future's result must be surfaced verbatim.
         let outcome = run_startup_or_shutdown(
             async { Ok::<(), anyhow::Error>(()) },
-            std::future::pending(),
+            std::future::pending::<()>(),
         )
         .await;
 
@@ -866,7 +1029,7 @@ mod tests {
     async fn run_startup_or_shutdown_surfaces_startup_error() {
         let outcome = run_startup_or_shutdown(
             async { Err::<(), anyhow::Error>(anyhow::anyhow!("connect failed")) },
-            std::future::pending(),
+            std::future::pending::<()>(),
         )
         .await;
 
@@ -881,11 +1044,18 @@ mod tests {
     #[tokio::test]
     async fn run_startup_or_shutdown_returns_shutdown_when_signal_arrives_first() {
         // Startup never finishes, so only the already-ready signal can win.
-        let outcome =
-            run_startup_or_shutdown(std::future::pending::<Result<()>>(), std::future::ready(()))
-                .await;
+        // The signal future's output (here the shutdown reason) is carried
+        // through so the caller can map it to the process exit result.
+        let outcome = run_startup_or_shutdown(
+            std::future::pending::<Result<()>>(),
+            std::future::ready(shutdown::ShutdownReason::Signal),
+        )
+        .await;
 
-        assert!(matches!(outcome, StartupOutcome::ShutdownRequested));
+        assert!(matches!(
+            outcome,
+            StartupOutcome::ShutdownRequested(shutdown::ShutdownReason::Signal)
+        ));
     }
 
     #[tokio::test]
@@ -899,7 +1069,20 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(outcome, StartupOutcome::ShutdownRequested));
+        assert!(matches!(outcome, StartupOutcome::ShutdownRequested(())));
+    }
+
+    #[test]
+    fn shutdown_result_treats_signal_as_clean_exit() {
+        assert!(shutdown_result(shutdown::ShutdownReason::Signal).is_ok());
+    }
+
+    #[test]
+    fn shutdown_result_treats_internal_trigger_as_failure() {
+        let error = shutdown_result(shutdown::ShutdownReason::InternalTrigger)
+            .expect_err("an internally triggered shutdown must exit non-zero");
+
+        assert!(error.to_string().contains("critical task failure"));
     }
 
     #[test]
@@ -934,6 +1117,348 @@ mod tests {
 
         assert_eq!(metrics.relay_notifications_lagged_total.get(), 0);
         assert_eq!(metrics.relay_notifications_dropped_total.get(), 0);
+    }
+
+    fn test_event_processor() -> Arc<EventProcessor> {
+        let keys = Keys::generate();
+        let nip59_handler = Nip59Handler::new(keys.clone());
+        let mut secp_secret_key =
+            secp256k1::SecretKey::from_slice(&keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        Arc::new(EventProcessor::new(
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+        ))
+    }
+
+    fn test_event_notification() -> RelayPoolNotification {
+        let event = EventBuilder::text_note("task lifecycle test")
+            .sign_with_keys(&Keys::generate())
+            .expect("signable test event");
+        RelayPoolNotification::Event {
+            relay_url: RelayUrl::parse("ws://127.0.0.1:7777").unwrap(),
+            subscription_id: SubscriptionId::new("test-sub"),
+            event: Box::new(event),
+        }
+    }
+
+    fn test_relay_client_config() -> config::RelayConfig {
+        config::RelayConfig {
+            clearnet: vec![],
+            allow_unencrypted_clearnet_relays: true,
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        }
+    }
+
+    /// Poll until the processor has reserved exactly `expected` event IDs,
+    /// proving the spawned processing task actually ran.
+    async fn wait_for_cache_len(processor: &EventProcessor, expected: usize) -> bool {
+        for _ in 0..100 {
+            if processor.cache_len() == expected {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[test]
+    fn event_loop_shutdown_exit_is_expected() {
+        assert!(event_loop_exit_to_supervision_result(EventLoopExit::ShutdownRequested).is_ok());
+    }
+
+    #[test]
+    fn event_loop_channel_close_exit_is_a_supervised_failure() {
+        let error = event_loop_exit_to_supervision_result(EventLoopExit::ChannelClosed)
+            .expect_err("channel close must be supervised as a failure");
+
+        assert!(error.contains("notification channel closed"));
+    }
+
+    #[test]
+    fn supervise_critical_task_triggers_shutdown_on_error() {
+        let handler = ShutdownHandler::new();
+        let receiver = handler.subscribe();
+
+        supervise_critical_task("test task", Err::<(), _>("boom"), &handler.trigger_handle());
+
+        assert!(*receiver.borrow());
+    }
+
+    #[test]
+    fn supervise_critical_task_leaves_clean_exits_alone() {
+        let handler = ShutdownHandler::new();
+        let receiver = handler.subscribe();
+
+        supervise_critical_task("test task", Ok::<(), &str>(()), &handler.trigger_handle());
+
+        assert!(!*receiver.borrow());
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_exits_when_shutdown_signal_fires() {
+        let (_notification_tx, notifications) = broadcast::channel::<RelayPoolNotification>(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_event_loop(
+                notifications,
+                shutdown_rx,
+                Arc::new(Semaphore::new(1)),
+                test_event_processor(),
+                TaskTracker::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("shutdown signal must end the event loop");
+
+        assert_eq!(exit, EventLoopExit::ShutdownRequested);
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_reports_channel_close_as_unexpected_exit() {
+        let (notification_tx, notifications) = broadcast::channel::<RelayPoolNotification>(4);
+        drop(notification_tx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_event_loop(
+                notifications,
+                shutdown_rx,
+                Arc::new(Semaphore::new(1)),
+                test_event_processor(),
+                TaskTracker::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("channel close must end the event loop");
+
+        assert_eq!(exit, EventLoopExit::ChannelClosed);
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_processes_events_through_the_task_tracker() {
+        let (notification_tx, notifications) = broadcast::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let semaphore = Arc::new(Semaphore::new(2));
+        let processor = test_event_processor();
+        let event_tasks = TaskTracker::new();
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            notifications,
+            shutdown_rx,
+            Arc::clone(&semaphore),
+            Arc::clone(&processor),
+            event_tasks.clone(),
+            None,
+        ));
+
+        notification_tx.send(test_event_notification()).unwrap();
+
+        assert!(
+            wait_for_cache_len(&processor, 1).await,
+            "the event-processing task must run and reserve the event ID"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(1), loop_handle)
+            .await
+            .expect("loop must exit on shutdown")
+            .expect("loop task must not panic");
+        assert_eq!(exit, EventLoopExit::ShutdownRequested);
+
+        // In-flight processing work is tracked, joinable, and releases its
+        // semaphore permit when done.
+        event_tasks.close();
+        tokio::time::timeout(Duration::from_secs(1), event_tasks.wait())
+            .await
+            .expect("tracked processing tasks must drain");
+        assert_eq!(semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_skips_non_event_notifications() {
+        let (notification_tx, notifications) = broadcast::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let processor = test_event_processor();
+        let event_tasks = TaskTracker::new();
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            notifications,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+            Arc::clone(&processor),
+            event_tasks.clone(),
+            None,
+        ));
+
+        notification_tx
+            .send(RelayPoolNotification::Shutdown)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown_tx.send(true).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(1), loop_handle)
+            .await
+            .expect("loop must exit on shutdown")
+            .expect("loop task must not panic");
+
+        assert_eq!(exit, EventLoopExit::ShutdownRequested);
+        assert_eq!(
+            processor.cache_len(),
+            0,
+            "non-event notifications must not spawn processing work"
+        );
+        assert!(event_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_continues_after_lagged_notifications() {
+        // Capacity 1: the second pre-loop send overwrites the first, so the
+        // loop's first recv yields `Lagged` and must keep consuming.
+        let (notification_tx, notifications) = broadcast::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let metrics = Metrics::new().unwrap();
+        let processor = test_event_processor();
+        let event_tasks = TaskTracker::new();
+
+        notification_tx.send(test_event_notification()).unwrap();
+        notification_tx.send(test_event_notification()).unwrap();
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            notifications,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+            Arc::clone(&processor),
+            event_tasks.clone(),
+            Some(metrics.clone()),
+        ));
+
+        // The surviving (newest) event is still processed after the lag.
+        assert!(
+            wait_for_cache_len(&processor, 1).await,
+            "the loop must keep processing after a lag"
+        );
+        assert_eq!(metrics.relay_notifications_lagged_total.get(), 1);
+        assert_eq!(metrics.relay_notifications_dropped_total.get(), 1);
+
+        shutdown_tx.send(true).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(1), loop_handle)
+            .await
+            .expect("loop must exit on shutdown")
+            .expect("loop task must not panic");
+        assert_eq!(exit, EventLoopExit::ShutdownRequested);
+    }
+
+    #[tokio::test]
+    async fn staged_teardown_waits_for_in_flight_event_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let event_tasks = TaskTracker::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_flag = Arc::clone(&finished);
+        event_tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            finished_flag.store(true, Ordering::SeqCst);
+        });
+
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        let relay_client = Arc::new(
+            RelayClient::new(Keys::generate(), test_relay_client_config())
+                .await
+                .unwrap(),
+        );
+
+        let event_handle = tokio::spawn(async {});
+        let health_handle = tokio::spawn(async {});
+        let cleanup_handle = tokio::spawn(async {});
+        let status_refresh_handle = tokio::spawn(async {});
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            staged_teardown(
+                event_handle,
+                event_tasks.clone(),
+                push_dispatcher,
+                relay_client,
+                health_handle,
+                cleanup_handle,
+                status_refresh_handle,
+            ),
+        )
+        .await
+        .expect("staged teardown must complete");
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "in-flight event tasks must finish before teardown completes"
+        );
+        assert!(event_tasks.is_closed());
+    }
+
+    #[tokio::test]
+    async fn staged_teardown_joins_the_event_loop_before_closing_the_tracker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Model the shutdown race from the teardown-ordering bug: the event
+        // loop admits one final event right before it exits. Because teardown
+        // joins the loop before closing the tracker, that late task is still
+        // tracked, drained, and its dispatch window stays open.
+        let event_tasks = TaskTracker::new();
+        let late_task_finished = Arc::new(AtomicBool::new(false));
+
+        let event_handle = {
+            let event_tasks = event_tasks.clone();
+            let finished = Arc::clone(&late_task_finished);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                event_tasks.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    finished.store(true, Ordering::SeqCst);
+                });
+            })
+        };
+
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        let relay_client = Arc::new(
+            RelayClient::new(Keys::generate(), test_relay_client_config())
+                .await
+                .unwrap(),
+        );
+        let health_handle = tokio::spawn(async {});
+        let cleanup_handle = tokio::spawn(async {});
+        let status_refresh_handle = tokio::spawn(async {});
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            staged_teardown(
+                event_handle,
+                event_tasks.clone(),
+                push_dispatcher,
+                relay_client,
+                health_handle,
+                cleanup_handle,
+                status_refresh_handle,
+            ),
+        )
+        .await
+        .expect("staged teardown must complete");
+
+        assert!(
+            late_task_finished.load(Ordering::SeqCst),
+            "a task admitted right before the event loop exits must still be drained"
+        );
     }
 
     fn test_logging_config(level: &str) -> config::LoggingConfig {
