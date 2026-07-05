@@ -392,6 +392,13 @@ mod tests {
         assert_eq!(signal, ShutdownSignal::Sigterm);
     }
 
+    #[test]
+    fn shutdown_signal_name_labels_each_variant() {
+        // These strings appear in the operator-facing shutdown logs.
+        assert_eq!(ShutdownSignal::CtrlC.name(), "Ctrl+C");
+        assert_eq!(ShutdownSignal::Sigterm.name(), "SIGTERM");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn wait_for_shutdown_signal_receives_sigterm() {
