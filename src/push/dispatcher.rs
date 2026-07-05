@@ -602,6 +602,14 @@ impl PushDispatcher {
         let mut messages = Vec::with_capacity(requested_count);
 
         for payload in payloads {
+            // These platform/encoding filters are now a defensive second layer:
+            // `process_inner` pre-filters undispatchable tokens (unconfigured
+            // platform / non-UTF-8 FCM) via `accepts` / `token_is_encodable`
+            // BEFORE charging the rate limiters, so it can refund and count the
+            // drop (#177). Keeping the checks here too means `dispatch` never
+            // enqueues an undeliverable token even if a caller skips the
+            // pre-filter, but in the normal event path these `continue`s do not
+            // fire.
             // Extract token as Zeroizing<String> for automatic cleanup
             let (platform, token): (Platform, Zeroizing<String>) = match payload.platform {
                 Platform::Apns => {
@@ -701,6 +709,39 @@ impl PushDispatcher {
         }
 
         Ok(message_count)
+    }
+
+    /// Whether the dispatcher has a client wired for `platform`.
+    ///
+    /// This is the cheap pre-charge admission gate: `process_inner` calls it
+    /// *before* spending rate-limit budget so a token targeting an unconfigured
+    /// platform is dropped without charging (and refunding) the limiters (#177).
+    /// It mirrors the platform-client presence check inside [`Self::dispatch`]
+    /// (`apns_client.is_some()` / `fcm_client.is_some()`), keeping the two in
+    /// lock-step: `dispatch` still filters defensively, but a token this returns
+    /// `false` for never reaches it.
+    #[must_use]
+    pub fn accepts(&self, platform: Platform) -> bool {
+        match platform {
+            Platform::Apns => self.apns_client.is_some(),
+            Platform::Fcm => self.fcm_client.is_some(),
+        }
+    }
+
+    /// Whether `payload`'s device token is transport-encodable for its platform.
+    ///
+    /// FCM tokens are sent as UTF-8 strings, so a non-UTF-8 device-token blob is
+    /// undeliverable and [`Self::dispatch`] would silently drop it. Checking here
+    /// lets `process_inner` treat that token as a terminal drop and refund /
+    /// count it, rather than spend rate-limit budget on a notification that can
+    /// never be sent (#177). APNs tokens are hex-encoded from raw bytes, so they
+    /// are always encodable.
+    #[must_use]
+    pub fn token_is_encodable(payload: &TokenPayload) -> bool {
+        match payload.platform {
+            Platform::Apns => true,
+            Platform::Fcm => payload.device_token_string().is_some(),
+        }
     }
 
     /// Check if APNs is configured and ready.
@@ -1065,6 +1106,50 @@ mod tests {
 
         // Should not panic with empty payloads
         assert_eq!(dispatcher.dispatch(vec![]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_accepts_reflects_configured_platforms() {
+        use crate::config::ApnsConfig;
+        use crate::push::ApnsClient;
+
+        // No clients: accepts nothing.
+        let none = PushDispatcher::new(None, None);
+        assert!(!none.accepts(Platform::Apns));
+        assert!(!none.accepts(Platform::Fcm));
+
+        // APNs-only: accepts APNs, rejects FCM (mirrors dispatch()'s filter).
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+        };
+        let apns_only = PushDispatcher::new(Some(ApnsClient::mock(apns_config, true)), None);
+        assert!(apns_only.accepts(Platform::Apns));
+        assert!(!apns_only.accepts(Platform::Fcm));
+    }
+
+    #[test]
+    fn test_token_is_encodable_matches_dispatch_encoding() {
+        // APNs tokens (hex-encoded) are always encodable, including binary bytes.
+        assert!(PushDispatcher::token_is_encodable(&TokenPayload {
+            platform: Platform::Apns,
+            device_token: vec![0xff, 0x00, 0x01],
+        }));
+        // UTF-8 FCM token is encodable.
+        assert!(PushDispatcher::token_is_encodable(&TokenPayload {
+            platform: Platform::Fcm,
+            device_token: b"fcm-token-123".to_vec(),
+        }));
+        // Non-UTF-8 FCM token is NOT encodable — dispatch() would drop it.
+        assert!(!PushDispatcher::token_is_encodable(&TokenPayload {
+            platform: Platform::Fcm,
+            device_token: vec![0xff, 0xfe, 0x00, 0x01],
+        }));
     }
 
     #[tokio::test]
