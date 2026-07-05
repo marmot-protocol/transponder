@@ -2,19 +2,18 @@
 //!
 //! Uses token-based (JWT) authentication with a .p8 key file.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::config::{ApnsConfig, ApnsPayloadMode};
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
+use crate::push::auth::{AuthTokenGenerator, MintedToken, TokenAcquisitionError, TokenCache};
 use crate::push::retry::{self, PushSendOutcome, RetryConfig, SendAttemptResult};
 
 /// APNs JWT token lifetime (50 minutes, less than the 1 hour max).
@@ -32,14 +31,6 @@ struct ApnsClaims {
     iat: u64,
     /// Expiration timestamp.
     exp: u64,
-}
-
-/// Cached JWT token.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub(crate) struct CachedToken {
-    token: Zeroizing<String>,
-    #[zeroize(skip)]
-    expires_at: SystemTime,
 }
 
 /// APNs notification payload.
@@ -190,28 +181,102 @@ fn classify_apns_400(reason: &str) -> Apns400Classification {
     }
 }
 
-/// Validate an APNs device token format.
+/// Whether an APNs `403` `reason` indicates the provider *token* (JWT) is the
+/// problem, as opposed to a configuration/environment fault that also returns
+/// `403`.
 ///
-/// MIP-05 treats APNs tokens as variable-length opaque bytes. Transponder
-/// hex-encodes those bytes for the APNs device-token URL path, so only reject
-/// empty, odd-length, or non-hex strings here.
+/// APNs returns `403` for several unrelated conditions: `ExpiredProviderToken`
+/// and `InvalidProviderToken` mean the JWT is stale/wrong and re-minting can
+/// recover, but `BadCertificateEnvironment`, `Forbidden`, `TopicDisallowed`,
+/// etc. are static misconfigurations. Evicting (and re-signing) the JWT on
+/// every non-JWT 403 turns a static misconfiguration into a per-notification
+/// ES256 re-sign stampede, so only the JWT reasons trigger eviction and a
+/// fresh-token retry (issues #145, #85).
 #[must_use]
-fn is_valid_device_token(token: &str) -> bool {
-    !token.is_empty()
-        && token.len().is_multiple_of(2)
-        && token.chars().all(|c| c.is_ascii_hexdigit())
+fn is_apns_jwt_reason(reason: &str) -> bool {
+    matches!(reason, "ExpiredProviderToken" | "InvalidProviderToken")
+}
+
+/// APNs credential generator: local ES256 signing of a short-lived JWT.
+pub(crate) struct ApnsTokenGenerator {
+    encoding_key: Option<EncodingKey>,
+    team_id: String,
+    key_id: String,
+    metrics: Option<Metrics>,
+}
+
+impl ApnsTokenGenerator {
+    /// Whether a signing key was loaded (used by `is_configured`).
+    fn has_encoding_key(&self) -> bool {
+        self.encoding_key.is_some()
+    }
+}
+
+impl AuthTokenGenerator for ApnsTokenGenerator {
+    async fn mint(&self) -> std::result::Result<MintedToken, TokenAcquisitionError> {
+        let encoding_key = self.encoding_key.as_ref().ok_or_else(|| {
+            TokenAcquisitionError::permanent(Error::Apns("No encoding key configured".to_string()))
+        })?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| {
+                TokenAcquisitionError::permanent(Error::Apns(format!("System time error: {e}")))
+            })?
+            .as_secs();
+
+        // Backdate `iat` by the clock-skew leeway so a fast host clock does not
+        // yield an `iat` in APNs's future (403 InvalidProviderToken); `exp`
+        // stays within Apple's 1-hour max measured from the backdated `iat`.
+        let (iat, exp) = crate::push::auth_jwt_iat_exp(now, TOKEN_EXPIRATION_SECS);
+
+        let claims = ApnsClaims {
+            iss: self.team_id.clone(),
+            iat,
+            exp,
+        };
+
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(self.key_id.clone());
+
+        let token = Zeroizing::new(
+            encode(&header, &claims, encoding_key)
+                .map_err(|e| TokenAcquisitionError::permanent(Error::from(e)))?,
+        );
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_auth_token_refresh("apns_jwt");
+        }
+
+        trace!("Generated new APNs JWT token");
+        Ok(MintedToken {
+            token,
+            expires_at: SystemTime::now() + TOKEN_LIFETIME,
+        })
+    }
 }
 
 /// APNs client for sending push notifications.
 pub struct ApnsClient {
     pub(crate) http_client: Client,
     pub(crate) config: ApnsConfig,
-    pub(crate) encoding_key: Option<EncodingKey>,
-    pub(crate) cached_token: Arc<RwLock<Option<CachedToken>>>,
+    pub(crate) token_cache: TokenCache<ApnsTokenGenerator>,
     pub(crate) metrics: Option<Metrics>,
+    /// Test-only override for the APNs base URL (scheme + host + port).
+    #[cfg(test)]
+    pub(crate) test_base_url: Option<String>,
 }
 
 impl ApnsClient {
+    /// The APNs base URL (scheme + host), overridable in tests.
+    fn base_url(&self) -> &str {
+        #[cfg(test)]
+        if let Some(base) = self.test_base_url.as_deref() {
+            return base;
+        }
+        self.config.base_url()
+    }
+
     /// Create a new APNs client.
     #[allow(dead_code)]
     pub async fn new(config: ApnsConfig) -> Result<Self> {
@@ -244,82 +309,21 @@ impl ApnsClient {
             None
         };
 
+        let token_cache = TokenCache::new(ApnsTokenGenerator {
+            encoding_key,
+            team_id: config.team_id.clone(),
+            key_id: config.key_id.clone(),
+            metrics: metrics.clone(),
+        });
+
         Ok(Self {
             http_client,
             config,
-            encoding_key,
-            cached_token: Arc::new(RwLock::new(None)),
+            token_cache,
             metrics,
+            #[cfg(test)]
+            test_base_url: None,
         })
-    }
-
-    /// Get a valid JWT token, refreshing if necessary.
-    async fn get_token(&self) -> Result<Zeroizing<String>> {
-        // First check with read lock (fast path)
-        {
-            let cached = self.cached_token.read().await;
-            if let Some(ref token) = *cached
-                && token.expires_at > SystemTime::now()
-            {
-                return Ok(token.token.clone());
-            }
-        }
-
-        // Acquire write lock and double-check to avoid TOCTOU race
-        let mut cached = self.cached_token.write().await;
-        if let Some(ref token) = *cached
-            && token.expires_at > SystemTime::now()
-        {
-            return Ok(token.token.clone());
-        }
-
-        // Generate and cache new token. The caller gets a short-lived zeroizing
-        // clone for request construction while the cache owns the reusable copy.
-        let token = self.generate_token()?;
-        let cached_token = CachedToken {
-            token,
-            expires_at: SystemTime::now() + TOKEN_LIFETIME,
-        };
-        let outbound_token = cached_token.token.clone();
-        *cached = Some(cached_token);
-
-        Ok(outbound_token)
-    }
-
-    /// Generate a new JWT token.
-    fn generate_token(&self) -> Result<Zeroizing<String>> {
-        let encoding_key = self
-            .encoding_key
-            .as_ref()
-            .ok_or_else(|| Error::Apns("No encoding key configured".to_string()))?;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| Error::Apns(format!("System time error: {e}")))?
-            .as_secs();
-
-        // Backdate `iat` by the clock-skew leeway so a fast host clock does not
-        // yield an `iat` in APNs's future (403 InvalidProviderToken); `exp`
-        // stays within Apple's 1-hour max measured from the backdated `iat`.
-        let (iat, exp) = crate::push::auth_jwt_iat_exp(now, TOKEN_EXPIRATION_SECS);
-
-        let claims = ApnsClaims {
-            iss: self.config.team_id.clone(),
-            iat,
-            exp,
-        };
-
-        let mut header = Header::new(Algorithm::ES256);
-        header.kid = Some(self.config.key_id.clone());
-
-        let token = Zeroizing::new(encode(&header, &claims, encoding_key)?);
-
-        if let Some(metrics) = &self.metrics {
-            metrics.record_auth_token_refresh("apns_jwt");
-        }
-
-        trace!("Generated new APNs JWT token");
-        Ok(token)
     }
 
     /// Send a silent push notification to a device.
@@ -339,26 +343,64 @@ impl ApnsClient {
         device_token: Zeroizing<String>,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) -> Result<PushSendOutcome> {
-        // Validate token format before sending
-        if !is_valid_device_token(device_token.as_str()) {
-            trace!(
-                token_len = device_token.len(),
-                "Invalid APNs device token format"
-            );
-            return Ok(PushSendOutcome::InvalidToken);
-        }
+        // Device-token well-formedness is guaranteed upstream: the dispatcher
+        // feeds tokens produced by `TokenPayload::device_token_hex()`, which
+        // always yields even-length lowercase hex within
+        // `1..=MAX_DEVICE_TOKEN_SIZE` (bounded at decrypt time in
+        // `crypto/token.rs`). That is the single source of truth for token
+        // well-formedness (issue #199), so no re-validation happens here.
+        debug_assert!(
+            !device_token.is_empty()
+                && device_token.len().is_multiple_of(2)
+                && device_token.chars().all(|c| c.is_ascii_hexdigit()),
+            "device token must be even-length hex; TokenPayload is the single source of truth"
+        );
+
+        // Build the request template once, outside the retry closures, so a
+        // retry does not re-allocate the payload/headers (issue #198). The
+        // device-token URL is a zeroizing buffer (issue #126); reqwest still
+        // materializes the serialized body/headers into non-zeroized buffers
+        // it owns, which is the accepted #126 posture (see build_request).
+        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
+        let url = device_token_url(self.base_url(), device_token.as_str());
+
+        debug!(
+            payload_mode = %self.config.payload_mode,
+            push_type = self.config.payload_mode.push_type(),
+            priority = self.config.payload_mode.priority(),
+            topic = %self.config.bundle_id,
+            device_token = redacted_device_token_id(device_token.as_str()),
+            "Sending APNs notification"
+        );
 
         let retry_config = RetryConfig::default();
-        retry::with_retry(
+        // Record one duration sample per logical push, measured across all
+        // retries, so `push_request_duration_seconds` counts notifications
+        // rather than HTTP attempts (issue #168). Per-attempt HTTP status is
+        // still recorded in handle_response.
+        let start = Instant::now();
+        let result = retry::with_retry(
             &retry_config,
             "APNs",
-            || self.send_once(&device_token),
+            || self.send_once(url.as_str(), &request_parts),
             backoff_permit,
             self.metrics.as_ref(),
         )
-        .await
+        .await;
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_push_duration("apns", start.elapsed().as_secs_f64());
+        }
+        result
     }
 
+    /// Build the outbound request from the pre-built template.
+    ///
+    /// reqwest owns the serialized header/body buffers, so the `bearer` token
+    /// and JSON payload are materialized into non-zeroized memory it controls.
+    /// This is the accepted defense-in-depth posture for issue #126: the
+    /// upstream `Zeroizing` wrapping bounds the token's own copies, but the
+    /// serialized HTTP request cannot be zeroized without reimplementing the
+    /// client.
     fn build_request(
         &self,
         url: &str,
@@ -374,35 +416,14 @@ impl ApnsClient {
             .json(&request_parts.payload)
     }
 
-    /// Invalidate the cached token only if it still matches the one the failing
-    /// request used.
-    ///
-    /// Under concurrency another task may have already refreshed the cache with
-    /// a fresh token between the time this request read its token and the time
-    /// the authentication rejection came back. Evicting unconditionally would
-    /// discard that valid token and force redundant JWT regeneration, so the
-    /// eviction is gated on the cached entry still being the failing token.
-    async fn invalidate_cached_token(&self, failing_token: &str) {
-        let mut cached = self.cached_token.write().await;
-        if cached
-            .as_ref()
-            .is_some_and(|token| token.token.as_str() == failing_token)
-        {
-            *cached = None;
-            debug!("Invalidated cached APNs JWT after authentication rejection");
-        }
-    }
-
     async fn handle_response(
         &self,
-        request_duration: Duration,
         response: reqwest::Response,
         auth_token: &str,
     ) -> SendAttemptResult {
         let status = response.status();
 
         if let Some(metrics) = &self.metrics {
-            metrics.observe_push_duration("apns", request_duration.as_secs_f64());
             metrics.record_push_response_status("apns", status.as_u16());
         }
 
@@ -447,21 +468,42 @@ impl ApnsClient {
                 }
             }
             403 => {
-                self.invalidate_cached_token(auth_token).await;
+                // Parse the reason BEFORE deciding whether to evict. Only a
+                // genuine provider-token reason (ExpiredProviderToken /
+                // InvalidProviderToken) means the JWT is the problem; every
+                // other 403 (BadCertificateEnvironment, Forbidden, ...) is a
+                // static misconfiguration, and evicting the freshly-minted JWT
+                // on those would cause a per-notification re-sign stampede
+                // (issue #145).
                 let error = crate::push::parse_bounded_error_body::<ApnsErrorResponse>(response)
                     .await
                     .unwrap_or(ApnsErrorResponse {
                         reason: "Unknown".to_string(),
                     });
-                debug!(
-                    payload_mode = %self.config.payload_mode,
-                    reason = %error.reason,
-                    "APNs authentication error"
-                );
-                SendAttemptResult::Permanent(Error::Apns(format!(
-                    "Authentication error: {}",
-                    error.reason
-                )))
+                let apns_error =
+                    Error::Apns(format!("Authentication error: {}", error.reason));
+                if is_apns_jwt_reason(&error.reason) {
+                    // The cached JWT is stale/invalid: evict it (gated on it
+                    // still being the failing token) and ask the retry engine
+                    // to retry once with a freshly minted JWT (issue #85).
+                    self.token_cache.invalidate_if_matches(auth_token).await;
+                    debug!(
+                        payload_mode = %self.config.payload_mode,
+                        reason = %error.reason,
+                        "APNs provider-token rejected; will retry once with a fresh JWT"
+                    );
+                    SendAttemptResult::AuthRejected(apns_error)
+                } else {
+                    // Non-JWT 403: do not touch the cache, and surface as a
+                    // permanent error so a config fault is not mistaken for a
+                    // recoverable auth rejection.
+                    warn!(
+                        payload_mode = %self.config.payload_mode,
+                        reason = %error.reason,
+                        "APNs rejected request (non-token 403: configuration/environment error)"
+                    );
+                    SendAttemptResult::Permanent(apns_error)
+                }
             }
             408 => {
                 // Request timeout - retriable. Honor Retry-After if present.
@@ -526,51 +568,41 @@ impl ApnsClient {
         }
     }
 
-    /// Send a single push notification attempt without retry.
+    /// Send a single push notification attempt (one `with_retry` iteration).
     ///
-    /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
-    async fn send_once(&self, device_token: &Zeroizing<String>) -> SendAttemptResult {
-        self.send_once_with_transport_retry_config(device_token, &RetryConfig::transport())
+    /// Borrows the request template built once in [`Self::send`]; a transport
+    /// retry re-sends the same borrowed template rather than rebuilding it
+    /// (issue #198). Returns a `SendAttemptResult` indicating success, a
+    /// retriable error, an auth rejection, or a permanent error.
+    async fn send_once(&self, url: &str, request_parts: &ApnsRequestParts) -> SendAttemptResult {
+        self.send_once_with_transport_retry_config(url, request_parts, &RetryConfig::transport())
             .await
     }
 
     async fn send_once_with_transport_retry_config(
         &self,
-        device_token: &Zeroizing<String>,
+        url: &str,
+        request_parts: &ApnsRequestParts,
         transport_retry: &RetryConfig,
     ) -> SendAttemptResult {
-        let url = device_token_url(self.config.base_url(), device_token.as_str());
-
-        debug!(
-            payload_mode = %self.config.payload_mode,
-            push_type = self.config.payload_mode.push_type(),
-            priority = self.config.payload_mode.priority(),
-            topic = %self.config.bundle_id,
-            device_token = redacted_device_token_id(device_token.as_str()),
-            "Sending APNs notification"
-        );
-
-        // Add authorization header
-        let token = match self.get_token().await {
+        // Mint/read the JWT via the shared cache. A transient acquisition
+        // failure (none for APNs's pure-CPU signing today, but the shared
+        // classification allows it) maps to a retriable attempt.
+        let token = match self.token_cache.get().await {
             Ok(t) => t,
-            Err(e) => return SendAttemptResult::Permanent(e),
+            Err(e) => return e.into_send_attempt(),
         };
 
-        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
-        let (request_duration, response) = match retry::with_transport_retry(
+        let response = match retry::with_transport_retry(
             transport_retry,
             "APNs",
             || async {
-                // Start timing after JWT acquisition and per transport attempt
-                // so auth work and prior connect-retry backoff do not inflate
-                // provider latency.
-                let start = Instant::now();
-                let response = self
-                    .build_request(url.as_str(), token.as_str(), &request_parts)
+                self.build_request(url, token.as_str(), request_parts)
                     .send()
                     .await
-                    .map_err(Error::from)?;
-                Ok((start.elapsed(), response))
+                    // Strip the URL (which embeds the device token) before the
+                    // error can reach any log sink downstream (issue #172).
+                    .map_err(|e| Error::from(e).redact_transport_url())
             },
             self.metrics.as_ref(),
         )
@@ -580,8 +612,7 @@ impl ApnsClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(request_duration, response, token.as_str())
-            .await
+        self.handle_response(response, token.as_str()).await
     }
 
     /// Check if the client is properly configured.
@@ -591,7 +622,7 @@ impl ApnsClient {
             return false;
         }
 
-        self.encoding_key.is_some()
+        self.token_cache.generator().has_encoding_key()
             && !self.config.key_id.is_empty()
             && !self.config.team_id.is_empty()
             && !self.config.bundle_id.is_empty()
@@ -602,24 +633,62 @@ impl ApnsClient {
 impl ApnsClient {
     /// Create a mock APNs client for testing.
     pub(crate) fn mock(config: ApnsConfig, with_encoding_key: bool) -> Self {
+        let encoding_key = with_encoding_key.then(|| EncodingKey::from_secret(b"fake-key"));
+        let token_cache = TokenCache::new(ApnsTokenGenerator {
+            encoding_key,
+            team_id: config.team_id.clone(),
+            key_id: config.key_id.clone(),
+            metrics: None,
+        });
         Self {
             http_client: Client::new(),
             config,
-            encoding_key: if with_encoding_key {
-                Some(EncodingKey::from_secret(b"fake-key"))
-            } else {
-                None
-            },
-            cached_token: Arc::new(RwLock::new(None)),
+            token_cache,
             metrics: None,
+            test_base_url: None,
         }
+    }
+
+    /// Seed the token cache with a credential (test setup).
+    pub(crate) async fn seed_token(&self, token: &str, expires_at: SystemTime) {
+        self.token_cache.seed(token, expires_at).await;
+    }
+
+    /// The currently cached credential value, if any (test inspection).
+    pub(crate) async fn cached_token_value(&self) -> Option<String> {
+        self.token_cache.cached_token_value().await
+    }
+
+    /// Mint a JWT directly through the generator (test inspection).
+    async fn generate_token(&self) -> Result<Zeroizing<String>> {
+        self.token_cache
+            .generator()
+            .mint()
+            .await
+            .map(|minted| minted.token)
+            .map_err(|e| match e {
+                TokenAcquisitionError::Permanent(err) => err,
+                TokenAcquisitionError::Retriable { .. } => {
+                    Error::Apns("transient mint failure".to_string())
+                }
+            })
+    }
+
+    /// Get a JWT through the cache (test inspection).
+    async fn get_token(&self) -> Result<Zeroizing<String>> {
+        self.token_cache.get().await.map_err(|e| match e {
+            TokenAcquisitionError::Permanent(err) => err,
+            TokenAcquisitionError::Retriable { .. } => {
+                Error::Apns("transient mint failure".to_string())
+            }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_metrics::{counter_value, histogram_sample_count, histogram_sample_sum};
+    use crate::test_metrics::{counter_value, histogram_sample_count};
     use base64::Engine;
     use wiremock::matchers::{header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -755,130 +824,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cached_token_stores_jwt_in_zeroizing_string() {
-        // Compile-time guard: cached credentials must stay zeroizing.
-        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
-
-        let cached = CachedToken {
-            token: Zeroizing::new("cached-jwt".to_string()),
-            expires_at: SystemTime::now() + Duration::from_secs(60),
-        };
-
-        assert_zeroizing_string(&cached.token);
-    }
-
-    #[test]
-    fn test_valid_device_token() {
-        // Valid short hex token (lowercase)
-        assert!(is_valid_device_token("0123456789abcdef"));
-
-        // Valid 64-character hex token (lowercase)
-        assert!(is_valid_device_token(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        ));
-
-        // Valid longer-than-64-character hex token (uppercase)
-        assert!(is_valid_device_token(
-            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF01"
-        ));
-
-        // Valid mixed-case hex token
-        assert!(is_valid_device_token(
-            "0123456789AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789AbCdEf"
-        ));
-    }
-
-    #[test]
-    fn test_invalid_device_token_empty() {
-        assert!(!is_valid_device_token(""));
-    }
-
-    #[test]
-    fn test_invalid_device_token_odd_length() {
-        assert!(!is_valid_device_token("abc"));
-    }
-
-    #[test]
-    fn test_invalid_device_token_non_hex_chars() {
-        // Contains 'g' which is not hex
-        assert!(!is_valid_device_token(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"
-        ));
-
-        // Contains spaces
-        assert!(!is_valid_device_token(
-            "0123456789abcdef 123456789abcdef0123456789abcdef0123456789abcdef"
-        ));
-
-        // Contains special characters
-        assert!(!is_valid_device_token(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde!"
-        ));
-
-        // Contains unicode
-        assert!(!is_valid_device_token(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdéf"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_send_rejects_invalid_device_token() {
-        let config = ApnsConfig {
-            enabled: true,
-            key_id: "KEYID123".to_string(),
-            team_id: "TEAMID456".to_string(),
-            private_key_path: String::new(),
-            environment: crate::config::ApnsEnvironment::Sandbox,
-            bundle_id: "com.example.app".to_string(),
-            payload_mode: Default::default(),
-        };
-
-        let client = ApnsClient {
-            http_client: Client::new(),
-            config,
-            encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
-            cached_token: Arc::new(RwLock::new(Some(CachedToken {
-                token: Zeroizing::new("test-token".to_string()),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            }))),
-            metrics: None,
-        };
-
-        // Test with a token that contains non-hex characters
-        let result = client
-            .send(zeroizing_token("tooshort"), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            result,
-            PushSendOutcome::InvalidToken,
-            "Should return invalid-token outcome for token with non-hex characters"
-        );
-
-        // Test with token that has invalid characters
-        let result = client
-            .send(
-                zeroizing_token("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result,
-            PushSendOutcome::InvalidToken,
-            "Should return invalid-token outcome for token with invalid characters"
-        );
-
-        // Test with empty token
-        let result = client.send(zeroizing_token(""), None).await.unwrap();
-        assert_eq!(
-            result,
-            PushSendOutcome::InvalidToken,
-            "Should return invalid-token outcome for empty token"
-        );
-    }
-
     #[tokio::test]
     async fn test_send_once_returns_transport_error_after_connect_retries() {
         let proxy_addr = {
@@ -893,32 +838,34 @@ mod tests {
             .timeout(Duration::from_millis(50))
             .build()
             .unwrap();
-        let client = ApnsClient {
-            http_client,
-            config: test_config(),
-            encoding_key: None,
-            cached_token: Arc::new(RwLock::new(Some(CachedToken {
-                token: Zeroizing::new("cached-token".to_string()),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            }))),
-            metrics: None,
-        };
+        let mut client = ApnsClient::mock(test_config(), false);
+        client.http_client = http_client;
+        client
+            .seed_token(
+                "cached-token",
+                SystemTime::now() + Duration::from_secs(3600),
+            )
+            .await;
         let retry_config = RetryConfig {
             max_retries: 3,
             initial_backoff: Duration::from_millis(1),
         };
 
+        let request_parts = ApnsRequestParts::for_mode(client.config.payload_mode);
+        let url = device_token_url(client.config.base_url(), "aabbccdd11223344");
         let result = client
-            .send_once_with_transport_retry_config(
-                &zeroizing_token("aabbccdd11223344"),
-                &retry_config,
-            )
+            .send_once_with_transport_retry_config(url.as_str(), &request_parts, &retry_config)
             .await;
 
-        assert!(matches!(
-            result,
-            SendAttemptResult::Permanent(Error::Http(_))
-        ));
+        // The propagated transport error must not carry the device-token URL
+        // (issue #172): the retry engine and send path both strip it.
+        let SendAttemptResult::Permanent(Error::Http(ref http_error)) = result else {
+            panic!("expected a permanent transport error, got {result:?}");
+        };
+        assert!(
+            !http_error.to_string().contains("aabbccdd11223344"),
+            "device token leaked into transport error: {http_error}"
+        );
     }
 
     #[tokio::test]
@@ -951,34 +898,17 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let mut config = test_config();
-        // Override the environment to use the mock server
-        config.environment = crate::config::ApnsEnvironment::Sandbox;
-
         let http_client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
 
         // Create client with custom HTTP client and pre-populated token cache
-        let client = ApnsClient {
-            http_client,
-            config: ApnsConfig {
-                enabled: true,
-                key_id: "KEYID123".to_string(),
-                team_id: "TEAMID456".to_string(),
-                private_key_path: String::new(),
-                environment: crate::config::ApnsEnvironment::Sandbox,
-                bundle_id: "com.example.app".to_string(),
-                payload_mode: Default::default(),
-            },
-            encoding_key: None,
-            cached_token: Arc::new(RwLock::new(Some(CachedToken {
-                token: Zeroizing::new("test-token".to_string()),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            }))),
-            metrics: None,
-        };
+        let mut client = ApnsClient::mock(test_config(), false);
+        client.http_client = http_client;
+        client
+            .seed_token("test-token", SystemTime::now() + Duration::from_secs(3600))
+            .await;
 
         // We need to override the base_url - let's test with a modified approach
         // by creating a custom send function that uses the mock URL
@@ -1075,7 +1005,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_response_records_supplied_provider_duration() {
+    async fn test_handle_response_records_per_attempt_status_not_duration() {
+        // Metric layering (issue #168): handle_response runs once per HTTP
+        // attempt and records only the per-attempt response-status counter.
+        // Per-logical-push duration is now recorded once in send(), so
+        // handle_response must NOT observe the duration histogram.
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"/3/device/[a-f0-9]+"))
@@ -1094,27 +1028,77 @@ mod tests {
             .await
             .unwrap();
 
-        let provider_duration = Duration::from_millis(123);
-        let result = client
-            .handle_response(provider_duration, response, "test-token")
-            .await;
+        let result = client.handle_response(response, "test-token").await;
 
         assert!(matches!(result, SendAttemptResult::Success(true)));
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_response_status_total",
+                &[("platform", "apns"), ("status", "200")]
+            ),
+            1.0
+        );
+        // No duration sample from handle_response — send() owns that now. The
+        // HistogramVec has no children until send() observes one, so the
+        // family is absent from the gathered output entirely.
+        assert!(
+            !metrics.gather().iter().any(|family| {
+                family.name() == "transponder_push_request_duration_seconds"
+            }),
+            "handle_response must not observe the per-push duration histogram"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_records_one_duration_sample_per_logical_push_across_retries() {
+        // A logical push that succeeds after one 429 retry must record exactly
+        // one duration sample (issue #168) and two per-attempt status counts.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let metrics = Metrics::new().unwrap();
+        let mut client = ApnsClient::mock(test_config(), true);
+        client.metrics = Some(metrics.clone());
+        client.test_base_url = Some(mock_server.uri());
+        client
+            .seed_token("cached", SystemTime::now() + Duration::from_secs(3600))
+            .await;
+
+        let outcome = client
+            .send(zeroizing_token("aabbccdd11223344"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, PushSendOutcome::Sent);
         assert_eq!(
             histogram_sample_count(
                 &metrics,
                 "transponder_push_request_duration_seconds",
                 &[("platform", "apns")]
             ),
-            1
+            1,
+            "duration must be sampled once per logical push, not per attempt"
         );
         assert_eq!(
-            histogram_sample_sum(
+            counter_value(
                 &metrics,
-                "transponder_push_request_duration_seconds",
-                &[("platform", "apns")]
+                "transponder_push_response_status_total",
+                &[("platform", "apns"), ("status", "429")]
             ),
-            provider_duration.as_secs_f64()
+            1.0
         );
         assert_eq!(
             counter_value(
@@ -1145,7 +1129,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-token")
+            .handle_response(response, "test-token")
             .await
     }
 
@@ -1206,7 +1190,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-token")
+            .handle_response(response, "test-token")
             .await
     }
 
@@ -1298,7 +1282,7 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Duration::ZERO, response, "test-token")
+            .handle_response(response, "test-token")
             .await;
 
         let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
@@ -1334,7 +1318,7 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Duration::ZERO, response, "test-token")
+            .handle_response(response, "test-token")
             .await;
 
         let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
@@ -1447,26 +1431,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auth_error_invalidates_cached_token() {
+    async fn test_jwt_reason_403_evicts_and_asks_for_a_fresh_token_retry() {
+        // A provider-token 403 (ExpiredProviderToken) means the cached JWT is
+        // the problem: evict it (issue #145) and return AuthRejected so the
+        // retry engine retries once with a fresh JWT (issue #85).
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
             .and(path_regex(r"/3/device/[a-f0-9]+"))
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
-                "reason": "BadJwtToken"
+                "reason": "ExpiredProviderToken"
             })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
         let client = ApnsClient::mock(test_config(), false);
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("poisoned-jwt".to_string()),
-                expires_at: SystemTime::now() + TOKEN_LIFETIME,
-            });
-        }
+        client
+            .seed_token("poisoned-jwt", SystemTime::now() + TOKEN_LIFETIME)
+            .await;
 
         let response = Client::new()
             .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
@@ -1474,16 +1457,55 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client
-            .handle_response(Duration::ZERO, response, "poisoned-jwt")
+        let result = client.handle_response(response, "poisoned-jwt").await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::AuthRejected(Error::Apns(ref message))
+                if message.contains("ExpiredProviderToken")
+        ));
+        assert_eq!(client.cached_token_value().await, None);
+    }
+
+    #[tokio::test]
+    async fn test_non_jwt_403_does_not_evict_and_is_permanent() {
+        // A non-token 403 (BadCertificateEnvironment) is a static
+        // misconfiguration: the cached JWT must survive (no re-sign stampede,
+        // issue #145) and the result is a permanent error (not retriable).
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "reason": "BadCertificateEnvironment"
+            })))
+            .expect(1)
+            .mount(&mock_server)
             .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+        client
+            .seed_token("valid-jwt", SystemTime::now() + TOKEN_LIFETIME)
+            .await;
+
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client.handle_response(response, "valid-jwt").await;
 
         assert!(matches!(
             result,
             SendAttemptResult::Permanent(Error::Apns(ref message))
-                if message.contains("BadJwtToken")
+                if message.contains("BadCertificateEnvironment")
         ));
-        assert!(client.cached_token.read().await.is_none());
+        // The valid JWT must NOT be evicted by a non-token 403.
+        assert_eq!(
+            client.cached_token_value().await.as_deref(),
+            Some("valid-jwt")
+        );
     }
 
     #[tokio::test]
@@ -1503,13 +1525,9 @@ mod tests {
 
         // Simulate a concurrent task having already refreshed the cache to a
         // newer token after the failing request read its (now stale) token.
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("fresh-jwt".to_string()),
-                expires_at: SystemTime::now() + TOKEN_LIFETIME,
-            });
-        }
+        client
+            .seed_token("fresh-jwt", SystemTime::now() + TOKEN_LIFETIME)
+            .await;
 
         let response = Client::new()
             .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
@@ -1518,20 +1536,17 @@ mod tests {
             .unwrap();
 
         // The failing request used the older, now-replaced token.
-        let result = client
-            .handle_response(Duration::ZERO, response, "stale-jwt")
-            .await;
+        let result = client.handle_response(response, "stale-jwt").await;
 
         assert!(matches!(
             result,
-            SendAttemptResult::Permanent(Error::Apns(ref message))
+            SendAttemptResult::AuthRejected(Error::Apns(ref message))
                 if message.contains("InvalidProviderToken")
         ));
 
         // The freshly refreshed token must survive the stale rejection.
-        let cached = client.cached_token.read().await;
         assert_eq!(
-            cached.as_ref().map(|token| token.token.as_str()),
+            client.cached_token_value().await.as_deref(),
             Some("fresh-jwt")
         );
     }
@@ -1648,8 +1663,8 @@ mod tests {
         assert_eq!(response.status(), 500);
     }
 
-    #[test]
-    fn test_generate_token_no_encoding_key() {
+    #[tokio::test]
+    async fn test_generate_token_no_encoding_key() {
         let config = ApnsConfig {
             enabled: true,
             key_id: "KEY123".to_string(),
@@ -1661,7 +1676,7 @@ mod tests {
         };
 
         let client = ApnsClient::mock(config, false);
-        let result = client.generate_token();
+        let result = client.generate_token().await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("No encoding key"));
@@ -1682,13 +1697,12 @@ mod tests {
         let client = ApnsClient::mock(config, true);
 
         // Pre-populate the cache
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("cached-test-token".to_string()),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            });
-        }
+        client
+            .seed_token(
+                "cached-test-token",
+                SystemTime::now() + Duration::from_secs(3600),
+            )
+            .await;
 
         // Should return cached token
         let token = client.get_token().await.unwrap();
@@ -1711,13 +1725,9 @@ mod tests {
         let client = ApnsClient::mock(config, false);
 
         // Pre-populate the cache with an expired token
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("expired-token".to_string()),
-                expires_at: SystemTime::now() - Duration::from_secs(1), // Already expired
-            });
-        }
+        client
+            .seed_token("expired-token", SystemTime::now() - Duration::from_secs(1))
+            .await;
 
         // Should try to generate new token but fail since no encoding key
         let result = client.get_token().await;
@@ -1739,13 +1749,12 @@ mod tests {
         let client = ApnsClient::mock(config, false); // No encoding key
 
         // Pre-populate the cache with a valid (non-expired) token
-        {
-            let mut cached = client.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: Zeroizing::new("valid-cached-token".to_string()),
-                expires_at: SystemTime::now() + Duration::from_secs(3600), // 1 hour in the future
-            });
-        }
+        client
+            .seed_token(
+                "valid-cached-token",
+                SystemTime::now() + Duration::from_secs(3600),
+            )
+            .await;
 
         // Should return cached token (no encoding key needed since we have valid cache)
         let token = client.get_token().await.unwrap();
@@ -1765,7 +1774,7 @@ mod tests {
         };
 
         let client = ApnsClient::new(config).await.unwrap();
-        assert!(client.encoding_key.is_none());
+        assert!(!client.token_cache.generator().has_encoding_key());
     }
 
     #[tokio::test]
@@ -1811,26 +1820,14 @@ mod tests {
             .build()
             .unwrap();
 
-        let config = ApnsConfig {
-            enabled: true,
-            key_id: "KEYID123".to_string(),
-            team_id: "TEAMID456".to_string(),
-            private_key_path: String::new(),
-            environment: crate::config::ApnsEnvironment::Sandbox,
-            bundle_id: "com.example.app".to_string(),
-            payload_mode: Default::default(),
-        };
-
-        let client = ApnsClient {
-            http_client,
-            config,
-            encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
-            cached_token: Arc::new(RwLock::new(Some(CachedToken {
-                token: Zeroizing::new("test-cached-token".to_string()),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            }))),
-            metrics: None,
-        };
+        let mut client = ApnsClient::mock(test_config(), true);
+        client.http_client = http_client;
+        client
+            .seed_token(
+                "test-cached-token",
+                SystemTime::now() + Duration::from_secs(3600),
+            )
+            .await;
 
         // The send method uses self.config.base_url() which returns the real APNs URL,
         // but we can test with direct HTTP calls through the mock
@@ -1905,7 +1902,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
         };
 
         let client = ApnsClient::new(config).await.unwrap();
-        assert!(client.encoding_key.is_some());
+        assert!(client.token_cache.generator().has_encoding_key());
         assert!(client.is_configured());
     }
 
@@ -1946,7 +1943,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             .as_secs();
 
         // Generate a token
-        let token = client.generate_token().unwrap();
+        let token = client.generate_token().await.unwrap();
 
         // Token should be a valid JWT (three dot-separated parts)
         let parts: Vec<&str> = token.split('.').collect();
@@ -2053,20 +2050,16 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
         let client = ApnsClient::new(config).await.unwrap();
 
         // Cache should be empty initially
-        {
-            let cached = client.cached_token.read().await;
-            assert!(cached.is_none());
-        }
+        assert_eq!(client.cached_token_value().await, None);
 
         // Get token - should generate and cache
         let token1 = client.get_token().await.unwrap();
 
         // Cache should now have a token
-        {
-            let cached = client.cached_token.read().await;
-            assert!(cached.is_some());
-            assert_eq!(cached.as_ref().unwrap().token.as_str(), token1.as_str());
-        }
+        assert_eq!(
+            client.cached_token_value().await.as_deref(),
+            Some(token1.as_str())
+        );
 
         // Get token again - should return cached token (same value)
         let token2 = client.get_token().await.unwrap();
@@ -2091,26 +2084,11 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
 
         // Create a client that points to our mock server
         // We'll need to create a custom client for testing send_once
-        let config = ApnsConfig {
-            enabled: true,
-            key_id: "KEYID123".to_string(),
-            team_id: "TEAMID456".to_string(),
-            private_key_path: String::new(),
-            environment: crate::config::ApnsEnvironment::Sandbox,
-            bundle_id: "com.example.app".to_string(),
-            payload_mode: Default::default(),
-        };
-
-        let client = ApnsClient {
-            http_client,
-            config,
-            encoding_key: Some(EncodingKey::from_secret(b"fake-key")),
-            cached_token: Arc::new(RwLock::new(Some(CachedToken {
-                token: Zeroizing::new("test-token".to_string()),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            }))),
-            metrics: None,
-        };
+        let mut client = ApnsClient::mock(test_config(), true);
+        client.http_client = http_client;
+        client
+            .seed_token("test-token", SystemTime::now() + Duration::from_secs(3600))
+            .await;
 
         // Manually test the response handling logic by making a direct request
         let url = format!("{}/3/device/{}", mock_server.uri(), "aabbccdd11223344");
