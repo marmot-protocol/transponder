@@ -846,12 +846,7 @@ impl FcmClient {
 
     /// Set the mock service account's project id (test setup).
     pub(crate) fn set_service_account_project_id(&mut self, project_id: &str) {
-        if let Some(sa) = self
-            .token_cache
-            .generator_mut()
-            .service_account
-            .as_mut()
-        {
+        if let Some(sa) = self.token_cache.generator_mut().service_account.as_mut() {
             sa.project_id = project_id.to_string();
         }
     }
@@ -1445,9 +1440,7 @@ mod tests {
             .await
             .unwrap();
 
-        client
-            .handle_response(response, "test-access-token")
-            .await
+        client.handle_response(response, "test-access-token").await
     }
 
     /// Drive `handle_response` against a mock server returning `status_code`
@@ -1498,9 +1491,7 @@ mod tests {
             .await
             .unwrap();
 
-        client
-            .handle_response(response, "test-access-token")
-            .await
+        client.handle_response(response, "test-access-token").await
     }
 
     #[tokio::test]
@@ -1630,9 +1621,7 @@ mod tests {
             .await
             .unwrap();
 
-        client
-            .handle_response(response, "test-access-token")
-            .await
+        client.handle_response(response, "test-access-token").await
     }
 
     #[tokio::test]
@@ -1841,9 +1830,7 @@ mod tests {
             .unwrap();
 
         // The failing request used the older, now-replaced token.
-        let result = client
-            .handle_response(response, "stale-access-token")
-            .await;
+        let result = client.handle_response(response, "stale-access-token").await;
 
         assert!(matches!(
             result,
@@ -2729,8 +2716,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
     #[test]
     fn test_oauth_token_http_status_honors_retry_after_for_503() {
         let status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
-        let failure =
-            oauth_error_from_status(status, Some(Duration::from_secs(30)));
+        let failure = oauth_error_from_status(status, Some(Duration::from_secs(30)));
         assert!(matches!(
             failure,
             TokenAcquisitionError::Retriable {
@@ -2805,7 +2791,10 @@ LTP/MQIxLydQxT4+jx2NBu0=
             .await;
 
         let generator = generator_with_token_uri(&format!("{}/custom/token", mock_server.uri()));
-        let minted = generator.mint().await.expect("mint should target token_uri");
+        let minted = generator
+            .mint()
+            .await
+            .expect("mint should target token_uri");
         assert_eq!(minted.token.as_str(), "minted-token");
     }
 

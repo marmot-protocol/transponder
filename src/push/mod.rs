@@ -78,9 +78,7 @@ async fn parse_bounded_json_body<T: DeserializeOwned>(
 
 /// Read at most [`MAX_ERROR_BODY_BYTES`] of a provider error response and
 /// deserialize the bounded prefix as JSON. See [`parse_bounded_json_body`].
-async fn parse_bounded_error_body<T: DeserializeOwned>(
-    response: reqwest::Response,
-) -> Option<T> {
+async fn parse_bounded_error_body<T: DeserializeOwned>(response: reqwest::Response) -> Option<T> {
     parse_bounded_json_body(response, MAX_ERROR_BODY_BYTES).await
 }
 

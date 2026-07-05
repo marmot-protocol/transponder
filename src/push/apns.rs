@@ -480,8 +480,7 @@ impl ApnsClient {
                     .unwrap_or(ApnsErrorResponse {
                         reason: "Unknown".to_string(),
                     });
-                let apns_error =
-                    Error::Apns(format!("Authentication error: {}", error.reason));
+                let apns_error = Error::Apns(format!("Authentication error: {}", error.reason));
                 if is_apns_jwt_reason(&error.reason) {
                     // The cached JWT is stale/invalid: evict it (gated on it
                     // still being the failing token) and ask the retry engine
@@ -1043,9 +1042,10 @@ mod tests {
         // HistogramVec has no children until send() observes one, so the
         // family is absent from the gathered output entirely.
         assert!(
-            !metrics.gather().iter().any(|family| {
-                family.name() == "transponder_push_request_duration_seconds"
-            }),
+            !metrics
+                .gather()
+                .iter()
+                .any(|family| { family.name() == "transponder_push_request_duration_seconds" }),
             "handle_response must not observe the per-push duration histogram"
         );
     }
@@ -1128,9 +1128,7 @@ mod tests {
             .await
             .unwrap();
 
-        client
-            .handle_response(response, "test-token")
-            .await
+        client.handle_response(response, "test-token").await
     }
 
     #[tokio::test]
@@ -1189,9 +1187,7 @@ mod tests {
             .await
             .unwrap();
 
-        client
-            .handle_response(response, "test-token")
-            .await
+        client.handle_response(response, "test-token").await
     }
 
     #[tokio::test]
@@ -1281,9 +1277,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client
-            .handle_response(response, "test-token")
-            .await;
+        let result = client.handle_response(response, "test-token").await;
 
         let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
             panic!("expected a permanent APNs error, got {result:?}");
@@ -1317,9 +1311,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client
-            .handle_response(response, "test-token")
-            .await;
+        let result = client.handle_response(response, "test-token").await;
 
         let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
             panic!("expected a permanent APNs error, got {result:?}");
