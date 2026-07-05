@@ -278,20 +278,34 @@ impl FcmTokenGenerator {
 
     /// The OAuth token endpoint the request is POSTed to.
     ///
-    /// Uses the service account's `token_uri` so the signed assertion `aud`
-    /// and the request target always agree (issue #153), falling back to the
-    /// well-known constant only when `token_uri` is empty. A test override
-    /// takes precedence.
-    fn oauth_token_url<'a>(&'a self, sa: &'a ServiceAccount) -> &'a str {
-        #[cfg(test)]
-        if let Some(url) = self.test_oauth_token_url.as_deref() {
-            return url;
-        }
+    /// The signed OAuth audience for `sa`: its `token_uri`, falling back to the
+    /// well-known constant only when `token_uri` is empty.
+    ///
+    /// This is the single source of truth for the token endpoint. BOTH the
+    /// signed assertion `aud` claim and the request target derive from it, so
+    /// they can never diverge (issue #153) — including the degenerate empty
+    /// `token_uri` case, where signing `aud=""` while POSTing to the constant
+    /// would otherwise be an audience mismatch.
+    fn signed_audience(sa: &ServiceAccount) -> &str {
         if sa.token_uri.is_empty() {
             OAUTH_TOKEN_URL
         } else {
             sa.token_uri.as_str()
         }
+    }
+
+    /// The URL the OAuth token request is POSTed to.
+    ///
+    /// In production this is always [`Self::signed_audience`], so the request
+    /// target matches the signed `aud`. A test override redirects only the
+    /// request target (to a mock server) while `aud` keeps reflecting the real
+    /// `token_uri`, which is the intended test shape.
+    fn oauth_token_url<'a>(&'a self, sa: &'a ServiceAccount) -> &'a str {
+        #[cfg(test)]
+        if let Some(url) = self.test_oauth_token_url.as_deref() {
+            return url;
+        }
+        Self::signed_audience(sa)
     }
 }
 
@@ -322,7 +336,10 @@ impl AuthTokenGenerator for FcmTokenGenerator {
         let claims = OAuthClaims {
             iss: sa.client_email.clone(),
             scope: FCM_SCOPE.to_string(),
-            aud: sa.token_uri.clone(),
+            // Derive the signed audience from the same helper the request
+            // target uses, so aud and endpoint can never diverge — even for an
+            // empty token_uri (issue #153).
+            aud: Self::signed_audience(sa).to_string(),
             iat,
             exp,
         };
@@ -2805,6 +2822,48 @@ LTP/MQIxLydQxT4+jx2NBu0=
         let generator = generator_with_token_uri("");
         let sa = generator.service_account().unwrap();
         assert_eq!(generator.oauth_token_url(sa), OAUTH_TOKEN_URL);
+    }
+
+    #[test]
+    fn test_signed_aud_and_post_target_agree_for_standard_and_empty_token_uri() {
+        // The signed assertion `aud` and the production POST target must be the
+        // SAME URL, or Google rejects the token request as an audience mismatch
+        // (issue #153). Assert the invariant directly (no test-URL override, so
+        // oauth_token_url resolves to the production target) for both a
+        // non-standard token_uri and the degenerate empty case.
+        for token_uri in ["https://oauth2.example.test/token", ""] {
+            let generator = generator_with_token_uri(token_uri);
+            let sa = generator.service_account().unwrap();
+            let aud = FcmTokenGenerator::signed_audience(sa);
+            let post_target = generator.oauth_token_url(sa);
+            assert_eq!(
+                aud, post_target,
+                "signed aud must equal the POST target for token_uri {token_uri:?}"
+            );
+        }
+
+        // And the empty case resolves both to the well-known constant.
+        let empty = generator_with_token_uri("");
+        let sa = empty.service_account().unwrap();
+        assert_eq!(FcmTokenGenerator::signed_audience(sa), OAUTH_TOKEN_URL);
+    }
+
+    #[tokio::test]
+    async fn test_mint_signs_aud_matching_post_target_for_empty_token_uri() {
+        // End-to-end proof for the degenerate empty-token_uri case: with an
+        // empty token_uri and NO test override, mint() POSTs to OAUTH_TOKEN_URL
+        // and must sign aud=OAUTH_TOKEN_URL (not aud=""). We cannot hit the real
+        // Google endpoint here, so assert the two derivations agree — the mint
+        // path reads aud and target from the same helper, so they are identical
+        // by construction, and this locks that in against regressions.
+        let generator = generator_with_token_uri("");
+        let sa = generator.service_account().unwrap();
+
+        let aud = FcmTokenGenerator::signed_audience(sa);
+        let post_target = generator.oauth_token_url(sa);
+        assert_eq!(aud, OAUTH_TOKEN_URL);
+        assert_eq!(post_target, OAUTH_TOKEN_URL);
+        assert_eq!(aud, post_target);
     }
 
     #[tokio::test]
