@@ -49,11 +49,16 @@ Transponder uses TOML configuration files with environment variable overrides. T
 
 ```toml
 [server]
-# Server's Nostr private key in hex format (64 hex characters)
-# Prefer private_key_file for production secret handling.
+# Server's Nostr private key in hex format (64 hex characters).
+# Prefer private_key_file for production: it keeps the secret out of the config
+# file and lets the server enforce file permissions on it. An inline value here
+# (or in TRANSPONDER_SERVER_PRIVATE_KEY) is read through a dedicated zeroizing
+# path that never stores it in the config parser's un-zeroized buffers.
 private_key = ""
 
 # Alternative: path to a file containing the private key.
+# The file must be mode 0600 (not group/world readable) or the server refuses
+# to start, mirroring the 0600 that generate-keys writes.
 # Generate with: transponder generate-keys --output /path/to/server.key
 # private_key_file = "/run/secrets/transponder_private_key"
 
@@ -61,8 +66,8 @@ private_key = ""
 shutdown_timeout_secs = 10
 
 # Volatile event deduplication cache size when durable replay state is disabled
-# (default: 100000). With dedup_state_path set, all terminal event IDs inside
-# dedup_retention_secs are retained for the full NIP-59 subscription lookback.
+# (default: 100000; must be >= 1). With dedup_state_path set, all terminal event
+# IDs inside dedup_retention_secs are retained for the full NIP-59 lookback.
 # max_dedup_cache_size = 100000
 
 # Optional durable replay state for processed gift-wrap event IDs.
@@ -75,7 +80,9 @@ shutdown_timeout_secs = 10
 # max_notification_age_secs = 3600
 # max_notification_future_skew_secs = 300
 
-# Rate limiting to prevent spam and replay attacks
+# Rate limiting to prevent spam and replay attacks. Size fields must be >= 1;
+# a value of 0 is rejected at startup (it previously either silently swapped in
+# the default or rejected every event).
 # max_rate_limit_cache_size = 100000           # Tracked keys per limiter, not total timestamps
 # max_tokens_per_event = 100                   # Per notification event
 # encrypted_token_rate_limit_per_minute = 240  # Per encrypted token (replay protection)
@@ -100,7 +107,10 @@ clearnet = [
 allow_unencrypted_clearnet_relays = false
 
 # Tor/onion relays (optional)
-# Requires a build with `--features tor` and a host that can support Tor traffic
+# Requires a build with `--features tor` and a host that can support Tor traffic.
+# Each entry must be a ws:// or wss:// URL with a .onion host; a clearnet or
+# malformed entry here is rejected at startup instead of silently degrading to
+# clearnet.
 onion = []
 
 # Reconnection settings
@@ -150,20 +160,26 @@ project_id = ""
 # Enable the health check HTTP server
 enabled = true
 
-# Address and port to bind the health server to
-# Keep this on localhost unless an internal proxy, VPN, or load balancer needs it
+# Address and port to bind the health server to. Must be a valid IP:port socket
+# address (a hostname like "localhost:8080" or an out-of-range port is rejected
+# at startup). Keep this on localhost unless an internal proxy, VPN, or load
+# balancer needs it.
 bind_address = "127.0.0.1:8080"
 
 [metrics]
-# Whether Prometheus metrics are enabled
-# Metrics are exposed at /metrics on the health server port
+# Whether Prometheus metrics are enabled.
+# Metrics are exposed at /metrics on the health server port, so enabling metrics
+# with health.enabled = false leaves them unreachable (a startup warning fires).
 enabled = true
 
 [logging]
-# Log level: "trace", "debug", "info", "warn", "error", "off"
+# Log level: "trace", "debug", "info", "warn", "error", "off".
+# level = "off" silences all console output while keeping the subscriber active.
 level = "info"
 
-# Log format: "json" (structured, for production) or "pretty" (human-readable)
+# Log format: "json" (structured, for production) or "pretty" (human-readable).
+# Only "json" or "pretty" are accepted; any other value (including "off") is
+# rejected at startup. To silence logs, set level = "off".
 format = "json"
 
 [glitchtip]

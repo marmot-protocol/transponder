@@ -10,10 +10,12 @@
 
 - Reject invalid APNs `environment` configuration values at startup instead of silently routing pushes to the sandbox gateway; only `production` and `sandbox` are accepted ([#143](https://github.com/marmot-protocol/transponder/pull/143)).
 - Limit each notification event to at most 100 encrypted tokens before base64 decoding, preventing oversized events from forcing unbounded token blob allocation and rate-limit work ([#38](https://github.com/marmot-protocol/transponder/pull/38)).
+- Validate configuration at load time so misconfiguration fails loudly at startup with a named-field error instead of silently coercing or detonating later: `server.max_dedup_cache_size`, `server.max_rate_limit_cache_size`, and `server.max_tokens_per_event` now reject `0`; `health.bind_address` must parse as a socket address; `logging.format` accepts only `json`/`pretty` (unknown values, including `off`, are rejected — silence console logs with `logging.level = "off"`); and `relays.onion` entries must be `ws://`/`wss://` URLs with a `.onion` host. Change-detection for the kind-10050 inbox relay list now normalizes URLs through `RelayUrl` and selects the newest event by `created_at`, avoiding spurious republishes.
 
 ### Changed
 
 - Updated MIP-05 token handling for the expanded 1084-byte encrypted token format and variable-length APNs/FCM device tokens introduced in [marmot-protocol/mdk#254](https://github.com/marmot-protocol/mdk/pull/254) ([#40](https://github.com/marmot-protocol/transponder/pull/40)).
+- Centralized configuration defaults on the serde `default_*` functions as the single source of truth, removing the parallel `set_default` ladder that could silently drift out of sync.
 
 ### Security
 
@@ -23,3 +25,5 @@
 - Changed the default health server bind address to localhost and documented internal-only exposure for the unauthenticated health, readiness, and metrics endpoints ([#39](https://github.com/marmot-protocol/transponder/pull/39)).
 - Redacted FCM service account private keys from debug output and zeroized the service account JSON buffer after loading [#35](https://github.com/marmot-protocol/transponder/pull/35)
 - Zeroized the server Nostr private key in config state and shortened the lifetime of resolved key material during startup ([#37](https://github.com/marmot-protocol/transponder/pull/37)).
+- Refused to start when the server `private_key_file` grants group or other read access (mode `& 0o077`), mirroring the `0600` the `generate-keys` write path enforces, so an accidentally world-readable key file is rejected instead of loaded silently.
+- Kept the inline server private key (`server.private_key` / `TRANSPONDER_SERVER_PRIVATE_KEY`) out of the `config` crate's un-zeroized `Value` tree by resolving it through a dedicated `Zeroizing` path before the rest of the configuration is parsed.

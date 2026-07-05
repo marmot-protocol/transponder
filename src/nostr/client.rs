@@ -449,6 +449,11 @@ impl RelayClient {
         }
     }
 
+    /// The configured relay URLs to advertise, as raw config strings.
+    ///
+    /// The `r`-tag values published in the kind-10050 event preserve the
+    /// operator's exact spelling; change-detection normalizes separately (see
+    /// [`Self::inbox_relay_event_is_current`]).
     fn configured_inbox_relays(&self) -> BTreeSet<String> {
         self.config
             .clearnet
@@ -475,19 +480,53 @@ impl RelayClient {
             .await
             .map_err(|e| Error::Nostr(format!("Failed to fetch existing kind 10050 event: {e}")))?;
 
-        Ok(events
-            .first()
-            .is_some_and(|event| inbox_relay_tags(event) == *relay_urls))
+        // kind 10050 is replaceable: compare against the newest fetched event by
+        // `created_at`, not an arbitrary `events.first()` that can land on a
+        // stale reply from a slow/secondary relay.
+        let Some(newest) = events.iter().max_by_key(|event| event.created_at) else {
+            return Ok(false);
+        };
+
+        // Normalize both sides through `RelayUrl` before comparing so cosmetic
+        // differences (trailing slash, host case) between the config spelling
+        // and the published tag do not trigger a spurious republish. Config
+        // entries are already validated, so a parse failure there is a real
+        // error; unparseable tag values on the network side are skipped.
+        let configured = normalize_relay_urls(relay_urls.iter().map(String::as_str))?;
+        let published = normalize_relay_tags(newest);
+
+        Ok(configured == published)
     }
 }
 
-fn inbox_relay_tags(event: &Event) -> BTreeSet<String> {
+/// Normalize an iterator of config relay strings into a canonical set.
+///
+/// Returns an error if any entry fails to parse; config URLs are validated at
+/// startup, so a failure here is a real misconfiguration rather than
+/// network-supplied noise.
+fn normalize_relay_urls<'a, I>(urls: I) -> Result<BTreeSet<RelayUrl>>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    urls.into_iter()
+        .map(|url| {
+            RelayUrl::parse(url)
+                .map_err(|e| Error::Nostr(format!("Invalid configured relay URL '{url}': {e}")))
+        })
+        .collect()
+}
+
+/// Collect the `r`-tag relay URLs from an event, normalized through
+/// [`RelayUrl`]. Unparseable tag values are skipped rather than failing the
+/// comparison, since the event is network-supplied.
+fn normalize_relay_tags(event: &Event) -> BTreeSet<RelayUrl> {
     event
         .tags
         .as_slice()
         .iter()
         .filter(|tag| tag.kind() == TagKind::Relay)
-        .filter_map(|tag| tag.content().map(str::to_owned))
+        .filter_map(|tag| tag.content())
+        .filter_map(|content| RelayUrl::parse(content).ok())
         .collect()
 }
 
@@ -555,6 +594,38 @@ fn validate_relay_config(config: &RelayConfig) -> Result<()> {
         return Err(Error::Nostr(
             "Onion relays are configured, but this build does not include Tor support. Rebuild with `--features tor`.".to_string(),
         ));
+    }
+
+    // Validate the onion list symmetrically with clearnet: without this, a
+    // plaintext `ws://` or a misspelled `.onion` entry passed config validation
+    // and was added blindly, defeating the wss-only TLS enforcement and
+    // silently routing traffic over clearnet at connect time (only a `warn!`).
+    for url in &config.onion {
+        validate_onion_relay_url(url)?;
+    }
+
+    Ok(())
+}
+
+/// Rejects an onion relay URL that does not parse as a `ws://`/`wss://` URL
+/// with a `.onion` host.
+///
+/// A plaintext `ws://` entry in `relays.onion` would defeat the wss-only TLS
+/// enforcement, and a typo'd `.onion` URL would be silently dropped at connect
+/// time — either way the deployment degrades to clearnet without a hard
+/// failure. Parsing through nostr-sdk's [`RelayUrl`] (the same type the pool
+/// uses) rejects both fast at startup with a named error.
+fn validate_onion_relay_url(url: &str) -> Result<()> {
+    let parsed = RelayUrl::parse(url).map_err(|e| {
+        Error::Nostr(format!(
+            "Onion relay '{url}' is not a valid ws:// or wss:// URL: {e}"
+        ))
+    })?;
+
+    if !parsed.is_onion() {
+        return Err(Error::Nostr(format!(
+            "Onion relay '{url}' must have a .onion host"
+        )));
     }
 
     Ok(())
@@ -1415,5 +1486,151 @@ mod tests {
                 .to_string()
                 .contains("Failed to connect to any relay within 2 seconds")
         );
+    }
+
+    // ---- #122: onion relay URL validation (feature-independent parser) ----
+
+    #[test]
+    fn test_validate_onion_relay_url_accepts_ws_and_wss_onion() {
+        assert!(validate_onion_relay_url("ws://abcabcabcabcabcd.onion").is_ok());
+        assert!(validate_onion_relay_url("wss://abcabcabcabcabcd.onion").is_ok());
+        // With an explicit port, too.
+        assert!(validate_onion_relay_url("ws://abcabcabcabcabcd.onion:8080").is_ok());
+    }
+
+    #[test]
+    fn test_validate_onion_relay_url_rejects_non_onion_host() {
+        // A clearnet host slipped into relays.onion must be rejected.
+        let error = validate_onion_relay_url("wss://relay.example.com").unwrap_err();
+        assert!(error.to_string().contains(".onion"), "{error}");
+    }
+
+    #[test]
+    fn test_validate_onion_relay_url_rejects_missing_scheme() {
+        // A bare host (no ws://) must be rejected instead of silently dropped.
+        let error = validate_onion_relay_url("abcabcabcabcabcd.onion").unwrap_err();
+        assert!(
+            error.to_string().contains("valid ws:// or wss:// URL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_onion_relay_url_rejects_non_ws_scheme() {
+        // http:// is not a websocket scheme; RelayUrl::parse rejects it.
+        let error = validate_onion_relay_url("http://abcabcabcabcabcd.onion").unwrap_err();
+        assert!(
+            error.to_string().contains("valid ws:// or wss:// URL"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn test_validate_relay_config_rejects_plaintext_ws_in_onion_list() {
+        // The concrete #122 footgun: a plaintext ws:// entry with a clearnet
+        // host in relays.onion. Only reachable when the tor feature is on
+        // (otherwise the "requires tor feature" error fires first).
+        let config = RelayConfig {
+            clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
+            onion: vec!["ws://plaintext.example.com".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+        let error = validate_relay_config(&config).unwrap_err();
+        assert!(error.to_string().contains(".onion"), "{error}");
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn test_validate_relay_config_accepts_valid_onion() {
+        let config = RelayConfig {
+            clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
+            onion: vec!["ws://abcabcabcabcabcd.onion".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+        assert!(validate_relay_config(&config).is_ok());
+    }
+
+    // ---- #124: normalized inbox comparison + newest-event selection ----
+
+    fn kind_10050_event(keys: &Keys, created_at: Timestamp, relay_urls: &[&str]) -> Event {
+        let tags: Vec<Tag> = relay_urls
+            .iter()
+            .map(|url| Tag::custom(TagKind::Relay, [*url]))
+            .collect();
+        EventBuilder::new(Kind::Custom(10050), "")
+            .tags(tags)
+            .custom_created_at(created_at)
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_normalize_relay_tags_ignores_trailing_slash_and_case() {
+        let keys = Keys::generate();
+        // The published event uses a trailing slash and mixed host case.
+        let event = kind_10050_event(&keys, Timestamp::now(), &["wss://Relay.Example.com/"]);
+        let published = normalize_relay_tags(&event);
+        // The config side uses the bare, lowercase form.
+        let configured = normalize_relay_urls(["wss://relay.example.com"]).unwrap();
+        assert_eq!(
+            published, configured,
+            "cosmetic URL differences must normalize to the same set (no spurious republish)"
+        );
+    }
+
+    #[test]
+    fn test_normalize_relay_tags_skips_unparseable_tag_values() {
+        let keys = Keys::generate();
+        let event = kind_10050_event(
+            &keys,
+            Timestamp::now(),
+            &["wss://relay.example.com", "not a url"],
+        );
+        let published = normalize_relay_tags(&event);
+        // Only the parseable URL survives.
+        assert_eq!(published.len(), 1);
+        assert!(published.contains(&RelayUrl::parse("wss://relay.example.com").unwrap()));
+    }
+
+    #[test]
+    fn test_normalize_relay_urls_errors_on_bad_config_entry() {
+        let error = normalize_relay_urls(["totally invalid"]).unwrap_err();
+        assert!(
+            error.to_string().contains("Invalid configured relay URL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_newest_kind_10050_event_selected_by_created_at() {
+        // Verifies the max_by_key(created_at) selection logic: given two events,
+        // the newest one's normalized tag set is what change-detection compares
+        // against, regardless of fetch order.
+        let keys = Keys::generate();
+        let older = kind_10050_event(
+            &keys,
+            Timestamp::from(1_000),
+            &["wss://old-relay.example.com"],
+        );
+        let newer = kind_10050_event(
+            &keys,
+            Timestamp::from(2_000),
+            &["wss://new-relay.example.com"],
+        );
+
+        let events = [older.clone(), newer.clone()];
+        let selected = events.iter().max_by_key(|e| e.created_at).unwrap();
+        assert_eq!(selected.id, newer.id, "the newest event must be selected");
+
+        let published = normalize_relay_tags(selected);
+        let configured = normalize_relay_urls(["wss://new-relay.example.com"]).unwrap();
+        assert_eq!(published, configured);
     }
 }

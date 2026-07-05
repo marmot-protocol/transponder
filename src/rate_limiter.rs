@@ -200,7 +200,12 @@ pub struct RateLimitConfig {
     /// for a least-recently-used stale entry to evict, then falls back to the
     /// least-recently-used entry that is still below its own rate limits; if no
     /// safe victim is found, the unknown key is rejected.
-    pub max_entries: usize,
+    ///
+    /// `NonZeroUsize` so a zero capacity is unrepresentable here: production
+    /// config rejects `server.max_rate_limit_cache_size = 0` at load time with
+    /// a named-field error instead of the constructor silently substituting a
+    /// default.
+    pub max_entries: NonZeroUsize,
 }
 
 impl Default for RateLimitConfig {
@@ -208,7 +213,7 @@ impl Default for RateLimitConfig {
         Self {
             max_per_minute: DEFAULT_RATE_LIMIT_PER_MINUTE,
             max_per_hour: DEFAULT_RATE_LIMIT_PER_HOUR,
-            max_entries: DEFAULT_MAX_SIZE,
+            max_entries: NonZeroUsize::new(DEFAULT_MAX_SIZE).expect("DEFAULT_MAX_SIZE is non-zero"),
         }
     }
 }
@@ -247,11 +252,8 @@ pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
 impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// Creates a new rate limiter with the given configuration.
     pub fn new(config: RateLimitConfig) -> Self {
-        let size = NonZeroUsize::new(config.max_entries)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_MAX_SIZE).expect("DEFAULT_MAX_SIZE is non-zero"));
-
         Self {
-            entries: RwLock::new(LruCache::new(size)),
+            entries: RwLock::new(LruCache::new(config.max_entries)),
             max_per_minute: config.max_per_minute,
             max_per_hour: config.max_per_hour,
             next_hit_id: AtomicU64::new(0),
@@ -440,12 +442,16 @@ fn remove_hit(hits: &mut VecDeque<(Instant, u64)>, hit_id: u64) {
 mod tests {
     use super::*;
 
+    fn entries(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("test max_entries must be non-zero")
+    }
+
     #[tokio::test]
     async fn test_allows_within_limits() {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         for _ in 0..10 {
@@ -458,7 +464,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 5,
             max_per_hour: 100,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         for _ in 0..5 {
@@ -479,7 +485,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 1,
             max_per_hour: 1,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         let reservation = limiter
@@ -500,7 +506,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         let first = limiter
@@ -520,7 +526,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: 1,
+            max_entries: entries(1),
         });
 
         let first = limiter
@@ -543,7 +549,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 100,
             max_per_hour: 5,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         for _ in 0..5 {
@@ -563,7 +569,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 5,
             max_per_hour: 100,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         for _ in 0..5 {
@@ -584,7 +590,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 5,
             max_per_hour: 100,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         assert!(limiter.check_and_increment(&1u64).await.is_allowed());
@@ -615,7 +621,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 100,
             max_per_hour: 5,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         for _ in 0..5 {
@@ -636,7 +642,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 100,
             max_per_hour: 5,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         assert!(limiter.check_and_increment(&1u64).await.is_allowed());
@@ -665,7 +671,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 2,
             max_per_hour: 10,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         // Key 1 hits limit
@@ -686,7 +692,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         limiter.check_and_increment(&1u64).await;
@@ -708,7 +714,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: CLEANUP_BATCH_SIZE + 1,
+            max_entries: entries(CLEANUP_BATCH_SIZE + 1),
         });
 
         for key in 0..=CLEANUP_BATCH_SIZE as u64 {
@@ -729,7 +735,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: 3,
+            max_entries: entries(3),
         });
 
         for key in 1..=3 {
@@ -748,7 +754,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 1,
             max_per_hour: 100,
-            max_entries: 3,
+            max_entries: entries(3),
         });
 
         for key in 1..=3 {
@@ -765,7 +771,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: 3,
+            max_entries: entries(3),
         });
 
         limiter.check_and_increment(&1u64).await;
@@ -817,7 +823,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
             max_per_hour: 100,
-            max_entries: CLEANUP_BATCH_SIZE + 1,
+            max_entries: entries(CLEANUP_BATCH_SIZE + 1),
         });
 
         for key in 0..=CLEANUP_BATCH_SIZE as u64 {
@@ -844,7 +850,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 1,
             max_per_hour: 100,
-            max_entries: 3,
+            max_entries: entries(3),
         });
 
         limiter.check_and_increment(&1u64).await;
@@ -865,7 +871,7 @@ mod tests {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 1,
             max_per_hour: 100,
-            max_entries: 2,
+            max_entries: entries(2),
         });
 
         assert!(limiter.check_and_increment(&1u64).await.is_allowed());
@@ -913,7 +919,7 @@ mod tests {
         let limiter: RateLimiter<[u8; 32]> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 5,
             max_per_hour: 100,
-            max_entries: 100,
+            max_entries: entries(100),
         });
 
         let key1 = [1u8; 32];
