@@ -21,13 +21,14 @@ use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
-use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
+use crate::crypto::{Nip59Handler, Platform, TokenDecryptor, TokenPayload};
 use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
 use crate::rate_limiter::{
     DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
-    DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig, RateLimiter,
+    DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig,
+    RateLimitReservation, RateLimiter,
 };
 
 /// Maximum NIP-59 timestamp randomization window for gift wraps.
@@ -136,6 +137,37 @@ impl SeenEventStore {
             Self::Retained(seen) => {
                 seen.remove(event_id);
             }
+        }
+    }
+
+    /// Refresh an existing reservation into a terminal entry in place.
+    ///
+    /// On the success hot path the ID is already present from `try_reserve`, so
+    /// this mutates its `SeenEvent` (new `seen_at`, `terminal = true`) instead of
+    /// re-inserting a fresh value. Returns `true` when the set size changed
+    /// (i.e. the entry was absent and had to be inserted — e.g. an entry evicted
+    /// by LRU pressure between reservation and completion), so the caller only
+    /// pays a `dedup_cache_size` gauge write when the length actually moved. This
+    /// removes the redundant second gauge update the double-lock success path
+    /// carried (#197) while preserving the completion-timestamp-refresh and
+    /// terminal-flip semantics `mark_seen` provided.
+    fn mark_terminal(&mut self, event_id: EventId, seen_at: Instant) -> bool {
+        match self {
+            Self::Bounded(seen) => {
+                if let Some(existing) = seen.peek_mut(&event_id) {
+                    *existing = SeenEvent::terminal(seen_at);
+                    // Promote to most-recently-used to match the prior `put`
+                    // behavior, which refreshed LRU position on completion.
+                    seen.promote(&event_id);
+                    false
+                } else {
+                    seen.put(event_id, SeenEvent::terminal(seen_at));
+                    true
+                }
+            }
+            Self::Retained(seen) => seen
+                .insert(event_id, SeenEvent::terminal(seen_at))
+                .is_none(),
         }
     }
 
@@ -346,6 +378,127 @@ enum ProcessOutcome {
     /// This is transient back-pressure: the event stays retryable once budget
     /// recovers.
     RateLimitedShed,
+}
+
+/// A per-token admission charge that must be explicitly resolved.
+///
+/// Created after the encrypted-token limiter admits a token, and (once the
+/// device-token limiter also admits) after that charge too. It makes the
+/// charge/refund lifecycle transactional so no admission path can silently
+/// strand a spent rate-limit increment (the class of bug behind #170 and #177):
+///
+/// - [`commit`](AdmissionGuard::commit) — the token was fully admitted and
+///   handed toward the dispatcher; the charges are handed off to the caller's
+///   dispatch-failure rollback ledger. Returns the keys and reservations.
+/// - [`refund`](AdmissionGuard::refund) — the token is being dropped *after*
+///   being charged (device-limiter reject per #170, or an undispatchable
+///   platform / non-UTF-8 token discovered post-decrypt per #177). Every charge
+///   the guard holds is rolled back so the drop leaves no spent budget.
+/// - [`keep_charge`](AdmissionGuard::keep_charge) — the token is dropped but its
+///   charge is *intentionally retained* (decrypt failure: an invalid encrypted
+///   blob must still spend replay/spam budget, documented in #170).
+///
+/// The `Drop` impl asserts the guard was resolved. Because the limiter refund is
+/// `async` (the stripe lock is a tokio `RwLock`), a `Drop`-time auto-refund
+/// would have to block; the guard is therefore an explicit-consume guard rather
+/// than a fire-and-forget RAII one. This keeps the refund decision in exactly
+/// one place per exit path while remaining `async`-correct — the trade the
+/// tracker calls out as acceptable when a blocking Drop is not.
+#[must_use = "an AdmissionGuard must be committed, refunded, or explicitly kept"]
+struct AdmissionGuard<'a> {
+    encrypted_limiter: &'a RateLimiter<[u8; 32]>,
+    device_limiter: &'a RateLimiter<[u8; 32]>,
+    encrypted_key: [u8; 32],
+    encrypted_reservation: RateLimitReservation,
+    /// Present once the device-token limiter has also admitted the token.
+    device: Option<([u8; 32], RateLimitReservation)>,
+    resolved: bool,
+}
+
+impl<'a> AdmissionGuard<'a> {
+    /// Record the encrypted-token charge just made for a token.
+    fn new(
+        encrypted_limiter: &'a RateLimiter<[u8; 32]>,
+        device_limiter: &'a RateLimiter<[u8; 32]>,
+        encrypted_key: [u8; 32],
+        encrypted_reservation: RateLimitReservation,
+    ) -> Self {
+        Self {
+            encrypted_limiter,
+            device_limiter,
+            encrypted_key,
+            encrypted_reservation,
+            device: None,
+            resolved: false,
+        }
+    }
+
+    /// Record the device-token charge for the same token.
+    fn add_device_charge(&mut self, device_key: [u8; 32], reservation: RateLimitReservation) {
+        self.device = Some((device_key, reservation));
+    }
+
+    /// Roll back every charge this guard holds (encrypted, and device if any).
+    ///
+    /// Used on every drop-after-charge path: a device-limiter reject (#170) and
+    /// a post-decrypt undispatchable/non-UTF-8 drop (#177).
+    async fn refund(mut self) {
+        self.encrypted_limiter
+            .rollback_increment(&self.encrypted_key, self.encrypted_reservation)
+            .await;
+        if let Some((device_key, reservation)) = self.device {
+            self.device_limiter
+                .rollback_increment(&device_key, reservation)
+                .await;
+        }
+        self.resolved = true;
+    }
+
+    /// Intentionally keep the charge(s) — the drop is a deliberate budget spend.
+    fn keep_charge(mut self) {
+        self.resolved = true;
+    }
+
+    /// Hand off the fully-admitted charges to the caller's rollback ledger.
+    fn commit(mut self) -> AdmittedCharges {
+        self.resolved = true;
+        let (device_key, device_reservation) = self
+            .device
+            .expect("commit requires a device-token charge to have been recorded");
+        AdmittedCharges {
+            encrypted_key: self.encrypted_key,
+            encrypted_reservation: self.encrypted_reservation,
+            device_key,
+            device_reservation,
+        }
+    }
+}
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.resolved,
+            "AdmissionGuard dropped without commit/refund/keep_charge — a rate-limit charge would be stranded"
+        );
+    }
+}
+
+/// Fully-admitted rate-limit charges for one token, recorded so a later
+/// dispatch-admission failure can roll back exactly the increments it spent.
+struct AdmittedCharges {
+    encrypted_key: [u8; 32],
+    encrypted_reservation: RateLimitReservation,
+    device_key: [u8; 32],
+    device_reservation: RateLimitReservation,
+}
+
+/// Metrics label for a push platform (matches the dispatcher's `platform`
+/// label values so drop counters aggregate with send counters).
+fn platform_metric_label(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Apns => "apns",
+        Platform::Fcm => "fcm",
+    }
 }
 
 /// Event processor for handling incoming gift-wrapped notifications.
@@ -830,13 +983,15 @@ impl EventProcessor {
         // Rate limiting happens BEFORE decryption intentionally:
         // Prevents wasting CPU on tokens we'll immediately rate-limit anyway.
         let mut payloads = Vec::with_capacity(token_bytes.len());
-        let mut admitted_rate_limit_keys = Vec::with_capacity(token_bytes.len());
+        let mut admitted_rate_limit_keys: Vec<AdmittedCharges> =
+            Vec::with_capacity(token_bytes.len());
         // Track whether a zero-admission outcome is purely a transient per-token
         // rate-limit shed. `rate_limited_any` records that at least one token was
         // dropped by a limiter; `terminally_dropped_any` records that at least one
-        // token was dropped for a permanent reason (undecryptable per MIP-05), so
-        // the event genuinely carried invalid tokens rather than momentarily
-        // over-budget ones.
+        // token was dropped for a permanent reason (undecryptable per MIP-05, or
+        // targeting an unconfigured platform / carrying a non-encodable token per
+        // #177), so the event genuinely carried undispatchable tokens rather than
+        // momentarily over-budget ones.
         let mut rate_limited_any = false;
         let mut terminally_dropped_any = false;
         for bytes in token_bytes {
@@ -851,6 +1006,7 @@ impl EventProcessor {
             {
                 m.record_rate_limit_admission_eviction("encrypted_token");
             }
+            self.publish_rate_limit_gauge("encrypted_token", encrypted_result.sampled_cache_len());
             if !encrypted_result.is_allowed() {
                 rate_limited_any = true;
                 trace!(
@@ -865,6 +1021,16 @@ impl EventProcessor {
             let encrypted_reservation = encrypted_result
                 .reservation()
                 .expect("allowed encrypted-token admission must carry a reservation");
+            // The encrypted-token limiter has now been charged. From here every
+            // exit path must resolve this guard: refund on a device reject or an
+            // undispatchable-token drop, keep on decrypt failure, commit on full
+            // admission. This is the fix for the #170 stranded encrypted charge.
+            let mut guard = AdmissionGuard::new(
+                &self.encrypted_token_limiter,
+                &self.device_token_limiter,
+                encrypted_key,
+                encrypted_reservation,
+            );
 
             // Decrypt the token
             let decrypt_started_at = StageTimer::start();
@@ -880,11 +1046,12 @@ impl EventProcessor {
                     p
                 }
                 Err(e) => {
-                    // Silently ignore invalid tokens per MIP-05 spec
+                    // Silently ignore invalid tokens per MIP-05 spec.
                     // Keep the encrypted-token rate-limit increment: invalid
                     // encrypted blobs should still spend replay/spam budget.
                     // A decrypt failure is permanent, so a zero-admission event
                     // that hit one is terminal, not a retryable rate shed.
+                    guard.keep_charge();
                     terminally_dropped_any = true;
                     trace!(error = %e, "Failed to decrypt token (ignoring)");
                     if let Some(ref m) = self.metrics {
@@ -898,6 +1065,34 @@ impl EventProcessor {
                 }
             };
 
+            // Pre-charge dispatch filter (#177): the platform/token is only known
+            // after decrypt, but it is known BEFORE the device-token limiter is
+            // charged. If the dispatcher could not send this token — its platform
+            // is unconfigured, or (FCM) the token bytes are not UTF-8 — drop it
+            // now, refunding the encrypted charge (no device charge yet) and
+            // recording a real drop metric, instead of letting `dispatch()` drop
+            // it silently after both limiters were charged.
+            if !self.push_dispatcher.accepts(payload.platform) {
+                guard.refund().await;
+                terminally_dropped_any = true;
+                let platform = platform_metric_label(payload.platform);
+                trace!(platform, "Dropping token: platform not configured");
+                if let Some(ref m) = self.metrics {
+                    m.record_push_failed(platform, "unconfigured");
+                }
+                continue;
+            }
+            if !PushDispatcher::token_is_encodable(&payload) {
+                guard.refund().await;
+                terminally_dropped_any = true;
+                let platform = platform_metric_label(payload.platform);
+                trace!(platform, "Dropping token: device token not encodable");
+                if let Some(ref m) = self.metrics {
+                    m.record_push_failed(platform, "invalid_encoding");
+                }
+                continue;
+            }
+
             // Rate limit check 2: Is this device token within rate limits?
             let device_key = Self::hash_device_token_key(&payload);
             let device_result = self
@@ -909,7 +1104,14 @@ impl EventProcessor {
             {
                 m.record_rate_limit_admission_eviction("device_token");
             }
+            self.publish_rate_limit_gauge("device_token", device_result.sampled_cache_len());
             if !device_result.is_allowed() {
+                // The device limiter rejected this token. Refund the encrypted
+                // charge already spent for it (#170): without this, the encrypted
+                // blob's replay/spam budget was consumed for a token that was
+                // never admitted, so a legitimate transient redelivery could read
+                // as a replay.
+                guard.refund().await;
                 rate_limited_any = true;
                 trace!(
                     reason = device_result.limit_reason(),
@@ -923,16 +1125,12 @@ impl EventProcessor {
             let device_reservation = device_result
                 .reservation()
                 .expect("allowed device-token admission must carry a reservation");
+            guard.add_device_charge(device_key, device_reservation);
 
             payloads.push(payload);
             // Keep this paired with `payloads`: dispatch admission failure
             // rolls back exactly the rate-limit increments for admitted work.
-            admitted_rate_limit_keys.push((
-                encrypted_key,
-                encrypted_reservation,
-                device_key,
-                device_reservation,
-            ));
+            admitted_rate_limit_keys.push(guard.commit());
         }
 
         if payloads.is_empty() {
@@ -963,14 +1161,12 @@ impl EventProcessor {
                 Ok(ProcessOutcome::Admitted)
             }
             Err(e) => {
-                for (encrypted_key, encrypted_reservation, device_key, device_reservation) in
-                    &admitted_rate_limit_keys
-                {
+                for charges in &admitted_rate_limit_keys {
                     self.encrypted_token_limiter
-                        .rollback_increment(encrypted_key, *encrypted_reservation)
+                        .rollback_increment(&charges.encrypted_key, charges.encrypted_reservation)
                         .await;
                     self.device_token_limiter
-                        .rollback_increment(device_key, *device_reservation)
+                        .rollback_increment(&charges.device_key, charges.device_reservation)
                         .await;
                 }
 
@@ -983,6 +1179,20 @@ impl EventProcessor {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Publish a sampled live rate-limit cache size to the gauge (#125).
+    ///
+    /// `check_and_increment` returns `Some(len)` on the sampled fraction of
+    /// admissions and `None` otherwise, so this refreshes the
+    /// `transponder_rate_limit_cache_size` gauge as the cache grows toward
+    /// capacity — making saturation onset visible without waiting for the 60s
+    /// cleanup tick — while keeping the metric's existing per-`cache_type`
+    /// label shape and paying a gauge write only on sampled calls.
+    fn publish_rate_limit_gauge(&self, cache_type: &str, sampled_len: Option<usize>) {
+        if let (Some(len), Some(m)) = (sampled_len, self.metrics.as_ref()) {
+            m.set_rate_limit_cache_size(cache_type, len);
         }
     }
 
@@ -1067,10 +1277,14 @@ impl EventProcessor {
         let now = Instant::now();
         {
             let mut seen = self.seen_events.write().await;
-            seen.put(event_id, SeenEvent::terminal(now));
-
-            // Update cache size metric
-            if let Some(ref m) = self.metrics {
+            // Refresh the existing reservation in place. On the success hot path
+            // the ID is already present from `try_reserve`, so the size does not
+            // change and the redundant second `dedup_cache_size` gauge write the
+            // old double-lock path carried is skipped (#197). The gauge is only
+            // touched on the rare path where the entry was evicted between
+            // reservation and completion and had to be re-inserted.
+            let size_changed = seen.mark_terminal(event_id, now);
+            if size_changed && let Some(ref m) = self.metrics {
                 m.set_dedup_cache_size(seen.len());
             }
         }
@@ -2516,7 +2730,23 @@ mod tests {
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
         let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
-        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        // Wire a configured APNs mock so APNs tokens are genuinely dispatchable.
+        // With no client the #177 pre-charge filter would (correctly) drop and
+        // refund every APNs token as "unconfigured", so the device/encrypted
+        // rate-limit paths these helpers exercise would never actually charge.
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+        };
+        let push_dispatcher = Arc::new(PushDispatcher::new(
+            Some(ApnsClient::mock(apns_config, true)),
+            None,
+        ));
         EventProcessor::with_full_config(
             nip59_handler,
             token_decryptor,
@@ -2729,6 +2959,439 @@ mod tests {
         let result4 = processor.process(&event4).await;
         assert!(result4.is_ok());
         assert!(result4.unwrap(), "Different encrypted token should work");
+    }
+
+    #[tokio::test]
+    async fn test_device_reject_refunds_encrypted_charge() {
+        // #170: when the device-token limiter rejects a token, the encrypted
+        // charge already spent for that same token must be rolled back, so a
+        // legitimate transient redelivery does not read as a replay.
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+        use base64::prelude::*;
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        // Device limiter allows 1/min; encrypted allows many. The device token
+        // is the same across events (same device), encrypted blobs differ.
+        let processor = create_processor_with_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: NonZeroUsize::new(100).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
+                encrypted_token_per_minute: 100,
+                encrypted_token_per_hour: 1000,
+                device_token_per_minute: 1,
+                device_token_per_hour: 100,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
+            },
+        );
+
+        // First event: admitted, consumes the single device slot.
+        let event1 =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&event1).await.unwrap());
+
+        // Second event: a fresh encrypted blob for the SAME device. The device
+        // limiter is now at its 1/min cap and rejects the token.
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let encrypted = encryptor.encrypt(&TestToken::apns(device_token));
+        let encrypted_key = EventProcessor::hash_bytes(&encrypted);
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(BASE64_STANDARD.encode(&encrypted))
+            .build();
+        let event2 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
+            .build(&content)
+            .await;
+
+        assert!(!processor.process(&event2).await.unwrap());
+
+        // The encrypted charge for event2's blob was refunded on the device
+        // reject: its key holds no residual hit (the entry is removed once both
+        // counters reach zero).
+        assert_eq!(
+            processor
+                .encrypted_token_limiter
+                .peek_counts(&encrypted_key)
+                .await,
+            None,
+            "device reject must refund the encrypted-token charge (#170)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unconfigured_platform_token_refunds_and_counts_drop() {
+        // #177: a decrypted token whose platform has no configured client must
+        // be dropped BEFORE it can strand rate-limit budget, and the drop must
+        // be visible via a real metric.
+        use crate::push::FcmClient;
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+        use base64::prelude::*;
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        // FCM-only dispatcher, but the event carries an APNs token → unconfigured.
+        let nip59_handler = Nip59Handler::new(server_keys.clone());
+        let mut secp_secret_key =
+            secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
+        let fcm_config = crate::config::FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let metrics = Metrics::new().expect("metrics");
+        let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
+            None,
+            Some(FcmClient::mock(fcm_config, true)),
+            Some(metrics.clone()),
+        ));
+        let processor = EventProcessor::with_full_config(
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+            DEFAULT_MAX_DEDUP_CACHE_SIZE,
+            TokenRateLimitConfig::default(),
+            Some(metrics.clone()),
+        );
+
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let encrypted = encryptor.encrypt(&TestToken::apns(
+            "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344",
+        ));
+        let encrypted_key = EventProcessor::hash_bytes(&encrypted);
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(BASE64_STANDARD.encode(&encrypted))
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build(&content)
+            .await;
+
+        // The APNs token is dropped as unconfigured; the event carried nothing
+        // dispatchable (terminal, not a retryable rate shed).
+        assert!(processor.process(&event).await.unwrap());
+
+        // The encrypted charge was refunded — no stranded budget (#177).
+        assert_eq!(
+            processor
+                .encrypted_token_limiter
+                .peek_counts(&encrypted_key)
+                .await,
+            None,
+            "unconfigured-platform drop must refund the encrypted charge"
+        );
+        // The device limiter was never charged (drop happens before it).
+        assert_eq!(processor.device_token_limiter.len().await, 0);
+        // The drop is recorded by a real metric.
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_failed_total",
+                &[("platform", "apns"), ("reason", "unconfigured")],
+            ),
+            1.0,
+            "unconfigured-platform drop must be counted (#177)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_utf8_fcm_token_refunds_and_counts_drop() {
+        // #177: an FCM token whose device bytes are not UTF-8 is undeliverable.
+        // It must be dropped before charging the device limiter, its encrypted
+        // charge refunded, and the drop counted as invalid_encoding.
+        use crate::crypto::token::{ENCRYPTED_TOKEN_SIZE, PLATFORM_FCM};
+        use crate::push::FcmClient;
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+        use base64::prelude::*;
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        let fcm_config = crate::config::FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let metrics = Metrics::new().expect("metrics");
+        let nip59_handler = Nip59Handler::new(server_keys.clone());
+        let mut secp_secret_key =
+            secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
+        let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
+            None,
+            Some(FcmClient::mock(fcm_config, true)),
+            Some(metrics.clone()),
+        ));
+        let processor = EventProcessor::with_full_config(
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+            DEFAULT_MAX_DEDUP_CACHE_SIZE,
+            TokenRateLimitConfig::default(),
+            Some(metrics.clone()),
+        );
+
+        // Build an FCM token whose device bytes are not valid UTF-8.
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let non_utf8_fcm = TestToken {
+            platform: PLATFORM_FCM,
+            device_token: vec![0xff, 0xfe, 0x00, 0x01],
+        };
+        let encrypted = encryptor.encrypt(&non_utf8_fcm);
+        assert_eq!(encrypted.len(), ENCRYPTED_TOKEN_SIZE);
+        let encrypted_key = EventProcessor::hash_bytes(&encrypted);
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(BASE64_STANDARD.encode(&encrypted))
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build(&content)
+            .await;
+
+        assert!(processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            processor
+                .encrypted_token_limiter
+                .peek_counts(&encrypted_key)
+                .await,
+            None,
+            "non-UTF-8 FCM drop must refund the encrypted charge"
+        );
+        assert_eq!(processor.device_token_limiter.len().await, 0);
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_failed_total",
+                &[("platform", "fcm"), ("reason", "invalid_encoding")],
+            ),
+            1.0,
+            "non-UTF-8 FCM drop must be counted as invalid_encoding (#177)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_failure_keeps_encrypted_charge() {
+        // #170 note: the decrypt-failure path intentionally KEEPS the encrypted
+        // charge (invalid blobs still spend replay/spam budget). Guard against a
+        // regression from the refund refactor.
+        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
+        use base64::prelude::*;
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        // A correctly-sized but undecryptable blob (random bytes).
+        let junk = vec![0x11u8; crate::crypto::token::ENCRYPTED_TOKEN_SIZE];
+        let encrypted_key = EventProcessor::hash_bytes(&junk);
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(BASE64_STANDARD.encode(&junk))
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build(&content)
+            .await;
+
+        let processor = create_processor_with_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: NonZeroUsize::new(100).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
+                encrypted_token_per_minute: 100,
+                encrypted_token_per_hour: 1000,
+                device_token_per_minute: 100,
+                device_token_per_hour: 1000,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
+            },
+        );
+
+        assert!(processor.process(&event).await.unwrap());
+
+        // The encrypted charge is retained: the blob spent its replay budget.
+        assert_eq!(
+            processor
+                .encrypted_token_limiter
+                .peek_counts(&encrypted_key)
+                .await,
+            Some((1, 1)),
+            "decrypt-failure path must keep the encrypted charge (#170 note)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_device_rejects_do_not_strand_encrypted_charges() {
+        // Concurrency regression for the #170 guard: many distinct-blob events
+        // for the SAME device are processed in parallel. The device limiter
+        // admits only a few; the rest are device-rejected and must each refund
+        // their (distinct) encrypted charge. Afterwards the encrypted limiter
+        // must hold no more residual charges than the device limiter admitted —
+        // no interleaving may strand an encrypted increment.
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+        use base64::prelude::*;
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        const DEVICE_LIMIT: u32 = 3;
+        let processor = Arc::new(create_processor_with_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: NonZeroUsize::new(1000).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
+                encrypted_token_per_minute: 1000,
+                encrypted_token_per_hour: 10000,
+                device_token_per_minute: DEVICE_LIMIT,
+                device_token_per_hour: 1000,
+                global_unwrap_per_minute: 100000,
+                global_unwrap_per_hour: 1000000,
+            },
+        ));
+
+        // Build many events, each with a distinct encrypted blob for the same
+        // device token, and track each blob's encrypted-limiter key.
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        const EVENTS: usize = 40;
+        let mut events = Vec::with_capacity(EVENTS);
+        let mut encrypted_keys = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            let encrypted = encryptor.encrypt(&TestToken::apns(device_token));
+            encrypted_keys.push(EventProcessor::hash_bytes(&encrypted));
+            let content = NotificationContentBuilder::new(&server_keys)
+                .with_raw_token(BASE64_STANDARD.encode(&encrypted))
+                .build();
+            events.push(
+                GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
+                    .build(&content)
+                    .await,
+            );
+        }
+
+        let mut handles = Vec::with_capacity(EVENTS);
+        for event in events {
+            let processor = Arc::clone(&processor);
+            handles.push(tokio::spawn(async move { processor.process(&event).await }));
+        }
+        for handle in handles {
+            let _ = handle.await.expect("task panicked");
+        }
+
+        // Count encrypted charges that remain across every distinct blob.
+        let mut residual_encrypted = 0usize;
+        for key in &encrypted_keys {
+            if processor
+                .encrypted_token_limiter
+                .peek_counts(key)
+                .await
+                .is_some()
+            {
+                residual_encrypted += 1;
+            }
+        }
+
+        // The device limiter admitted at most DEVICE_LIMIT tokens; every other
+        // blob's encrypted charge was refunded on its device reject. Anything
+        // above DEVICE_LIMIT would be a stranded charge.
+        assert!(
+            residual_encrypted <= DEVICE_LIMIT as usize,
+            "stranded encrypted charges: {residual_encrypted} > device limit {DEVICE_LIMIT}"
+        );
+        // All admitted tokens share one device key (same device token), so the
+        // device limiter holds a single entry whose hit count equals the number
+        // of admitted tokens. Residual encrypted charges must equal exactly that
+        // — one retained encrypted charge per admitted (device-charged) token,
+        // none stranded.
+        let device_payload = TokenPayload {
+            platform: Platform::Apns,
+            device_token: hex::decode(device_token).expect("valid hex"),
+        };
+        let device_key = EventProcessor::hash_device_token_key(&device_payload);
+        let device_hits = processor
+            .device_token_limiter
+            .peek_counts(&device_key)
+            .await
+            .map(|(minute, _)| minute as usize)
+            .unwrap_or(0);
+        assert_eq!(
+            residual_encrypted, device_hits,
+            "residual encrypted charges must match device-admitted hit count exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_rate_limit_cache_size_gauge_updates_before_cleanup() {
+        // #125: the rate-limit cache-size gauge must reflect growth on the
+        // admission path, not only at the 60s cleanup tick. The first admission
+        // is sampled, so the gauge is non-zero after processing without any
+        // cleanup call.
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+
+        assert!(processor.process(&event).await.unwrap());
+
+        // No cleanup() has run; the gauge was updated opportunistically on the
+        // sampled admission.
+        assert_eq!(
+            metric_gauge_value(
+                &metrics,
+                "transponder_rate_limit_cache_size",
+                &[("type", "encrypted_token")],
+            ),
+            1.0,
+            "encrypted-token cache-size gauge must update on admission (#125)"
+        );
+        assert_eq!(
+            metric_gauge_value(
+                &metrics,
+                "transponder_rate_limit_cache_size",
+                &[("type", "device_token")],
+            ),
+            1.0,
+            "device-token cache-size gauge must update on admission (#125)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_path_updates_dedup_gauge_once() {
+        // #197: the successful path folds the completion refresh so it does not
+        // redundantly re-write the dedup cache-size gauge. After processing one
+        // fresh event the gauge reads exactly 1 (reservation), and mark_seen's
+        // in-place terminal refresh does not change it.
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+
+        assert!(processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            gauge_value(&metrics, "transponder_dedup_cache_size"),
+            1.0,
+            "dedup gauge reflects the single retained terminal entry"
+        );
+        assert!(processor.is_duplicate(&event.id).await);
+        // The completion refresh kept the entry terminal (a replay dedups).
+        assert!(!processor.process(&event).await.unwrap());
     }
 
     #[tokio::test]
