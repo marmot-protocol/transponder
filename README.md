@@ -157,19 +157,19 @@ service_account_path = ""
 project_id = ""
 
 [health]
-# Enable the health check HTTP server
+# Enable the /health and /ready endpoints
 enabled = true
 
-# Address and port to bind the health server to. Must be a valid IP:port socket
-# address (a hostname like "localhost:8080" or an out-of-range port is rejected
-# at startup). Keep this on localhost unless an internal proxy, VPN, or load
-# balancer needs it.
+# Address and port to bind the health/metrics listener to. Must be a valid
+# IP:port socket address (a hostname like "localhost:8080" or an out-of-range
+# port is rejected at startup). Keep this on localhost unless an internal proxy,
+# VPN, or load balancer needs it.
 bind_address = "127.0.0.1:8080"
 
 [metrics]
 # Whether Prometheus metrics are enabled.
-# Metrics are exposed at /metrics on the health server port, so enabling metrics
-# with health.enabled = false leaves them unreachable (a startup warning fires).
+# /metrics is served on health.bind_address whenever metrics are enabled, even
+# if the health endpoints (health.enabled) are disabled.
 enabled = true
 
 [logging]
@@ -398,10 +398,10 @@ When enabled, Transponder exposes HTTP endpoints for monitoring:
 | Endpoint | Description | Success |
 |----------|-------------|---------|
 | `GET /health` | Liveness check - is the server running? | Always 200 OK |
-| `GET /ready` | Readiness check - can the server process requests? | 200 if relays connected and at least one push service configured |
-| `GET /metrics` | Prometheus metrics (when metrics enabled) | 200 with metrics in Prometheus text format |
+| `GET /ready` | Readiness check - can the server currently deliver notifications? | 200 if relays connected, at least one push service configured, and no configured push service is in a sustained delivery-failure streak |
+| `GET /metrics` | Prometheus metrics (when metrics enabled - served even if the health endpoints are disabled) | 200 with metrics in Prometheus text format |
 
-The default bind address is `127.0.0.1:8080` so these unauthenticated endpoints stay local. If external health checks are required, bind to a specific internal interface or put the endpoints behind a reverse proxy, VPN, or load balancer with access controls.
+The default bind address is `127.0.0.1:8080` so these unauthenticated endpoints stay local. If external health checks are required, bind to a specific internal interface or put the endpoints behind a reverse proxy, VPN, or load balancer with access controls. The listener additionally enforces a per-request timeout, a small request-body limit, and a global concurrency cap.
 
 ### Readiness Response
 
@@ -410,13 +410,17 @@ The default bind address is `127.0.0.1:8080` so these unauthenticated endpoints 
   "status": "ready",
   "relays_connected": true,
   "apns_configured": true,
-  "fcm_configured": false
+  "fcm_configured": false,
+  "apns_delivering": true,
+  "fcm_delivering": true
 }
 ```
 
+Readiness probes are side-effect-free: they read a cached relay-status snapshot maintained by a background refresher instead of enumerating the relay pool per request. The `*_delivering` fields expose a passive per-provider signal derived from real send outcomes - a provider is reported as not delivering (and `/ready` returns 503) once it accumulates a sustained streak of consecutive hard send failures (authentication rejections, permanent errors, or exhausted retries) with no intervening success. The signal never probes the providers, so with zero push traffic it retains its last observed state.
+
 ## Metrics
 
-Transponder exposes Prometheus metrics at `/metrics` on the health server port (default 8080 on localhost). Metrics are enabled by default and can be disabled via configuration.
+Transponder exposes Prometheus metrics at `/metrics` on the health server port (default 8080 on localhost). Metrics are enabled by default and can be disabled via configuration. The `/metrics` endpoint is served whenever metrics are enabled, even when the health endpoints (`health.enabled = false`) are disabled.
 
 ### Available Metrics
 

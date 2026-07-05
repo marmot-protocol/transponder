@@ -79,6 +79,7 @@ project_id = ""
 
 [health]
 enabled = true
+# Must be a valid IP:port socket address (rejected at startup otherwise).
 # Keep native deployments bound to localhost by default. For Docker Compose,
 # compose.prod.yml overrides this to 0.0.0.0 inside the container while
 # publishing the host port on 127.0.0.1 only.

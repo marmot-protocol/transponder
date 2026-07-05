@@ -509,11 +509,18 @@ pub struct FcmConfig {
 /// Health check server configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
-    /// Whether the health check server is enabled.
+    /// Whether the health check endpoints (`/health`, `/ready`) are enabled.
+    ///
+    /// Independent of `metrics.enabled`: disabling the health endpoints does
+    /// not disable the `/metrics` endpoint, which is served on
+    /// `bind_address` whenever metrics are enabled.
     #[serde(default = "default_health_enabled")]
     pub enabled: bool,
 
-    /// Bind address for the health check server.
+    /// Bind address for the health/metrics listener.
+    ///
+    /// All routes are unauthenticated; keep this on loopback or an internal
+    /// interface unless the endpoints sit behind an access-controlled proxy.
     #[serde(default = "default_health_bind_address")]
     pub bind_address: String,
 }
@@ -529,7 +536,10 @@ fn default_health_bind_address() -> String {
 /// Metrics configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetricsConfig {
-    /// Whether metrics are enabled.
+    /// Whether Prometheus metrics are enabled.
+    ///
+    /// When enabled, `/metrics` is served on `health.bind_address` even if
+    /// the health endpoints themselves (`health.enabled`) are disabled.
     #[serde(default = "default_metrics_enabled")]
     pub enabled: bool,
 }
@@ -937,13 +947,6 @@ impl AppConfig {
         self.health.validate()?;
         self.glitchtip.validate()?;
         Ok(())
-    }
-
-    /// True when Prometheus metrics are enabled but unreachable because the
-    /// health server that exposes `/metrics` is disabled.
-    #[must_use]
-    pub fn metrics_enabled_without_health_server(&self) -> bool {
-        self.metrics.enabled && !self.health.enabled
     }
 
     /// Load configuration from a file path with environment variable overrides.
@@ -2589,23 +2592,6 @@ mod tests {
     fn test_health_bind_address_valid_accepted() {
         let config = from_test_env(&[("TRANSPONDER_HEALTH_BIND_ADDRESS", "0.0.0.0:9100")]).unwrap();
         assert_eq!(config.health.bind_address, "0.0.0.0:9100");
-    }
-
-    // ---- #196 rider: metrics without health warning predicate ----
-
-    #[test]
-    fn test_metrics_without_health_predicate() {
-        let mut config = from_test_env(&[]).unwrap();
-        config.metrics.enabled = true;
-        config.health.enabled = false;
-        assert!(config.metrics_enabled_without_health_server());
-
-        config.health.enabled = true;
-        assert!(!config.metrics_enabled_without_health_server());
-
-        config.metrics.enabled = false;
-        config.health.enabled = false;
-        assert!(!config.metrics_enabled_without_health_server());
     }
 
     // ---- #156: private key never enters the config Value tree ----
