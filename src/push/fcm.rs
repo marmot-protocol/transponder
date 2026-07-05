@@ -103,14 +103,14 @@ pub(crate) struct CachedToken {
 }
 
 /// FCM message payload.
-#[derive(Debug, Serialize)]
-struct FcmRequest {
-    message: FcmMessage,
+#[derive(Serialize)]
+struct FcmRequest<'a> {
+    message: FcmMessage<'a>,
 }
 
-#[derive(Debug, Serialize)]
-struct FcmMessage {
-    token: String,
+#[derive(Serialize)]
+struct FcmMessage<'a> {
+    token: &'a str,
     android: Option<AndroidConfig>,
     data: Option<std::collections::HashMap<String, String>>,
 }
@@ -386,12 +386,12 @@ impl FcmClient {
     /// sleeping retry does not occupy an in-flight concurrency slot.
     pub async fn send(
         &self,
-        device_token: &str,
+        device_token: Zeroizing<String>,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) -> Result<bool> {
         // Validate token format before spending an OAuth-authenticated round-trip
         // and FCM quota on a clearly-malformed token (mirrors APNs).
-        if !is_valid_fcm_token(device_token) {
+        if !is_valid_fcm_token(device_token.as_str()) {
             trace!(
                 token_len = device_token.len(),
                 "Invalid FCM device token format"
@@ -403,7 +403,7 @@ impl FcmClient {
         retry::with_retry(
             &retry_config,
             "FCM",
-            || self.send_once(device_token),
+            || self.send_once(&device_token),
             backoff_permit,
             self.metrics.as_ref(),
         )
@@ -421,7 +421,7 @@ impl FcmClient {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: device_token.to_string(),
+                token: device_token,
                 android: Some(AndroidConfig {
                     priority: "high".to_string(),
                 }),
@@ -588,7 +588,7 @@ impl FcmClient {
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
-    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+    async fn send_once(&self, device_token: &Zeroizing<String>) -> SendAttemptResult {
         let project_id = match self.project_id() {
             Ok(id) => id,
             Err(e) => return SendAttemptResult::Permanent(e),
@@ -610,7 +610,7 @@ impl FcmClient {
                 // not inflate provider latency.
                 let start = Instant::now();
                 let response = self
-                    .build_request(&url, access_token.as_str(), device_token)
+                    .build_request(&url, access_token.as_str(), device_token.as_str())
                     .send()
                     .await
                     .map_err(Error::from)?;
@@ -719,6 +719,10 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn zeroizing_token(token: &str) -> Zeroizing<String> {
+        Zeroizing::new(token.to_owned())
+    }
+
     #[test]
     fn test_cached_token_stores_access_token_in_zeroizing_string() {
         // Compile-time guard: cached credentials must stay zeroizing.
@@ -760,6 +764,25 @@ mod tests {
 
         assert_eq!(response.access_token.as_str(), "provider-access-token");
         assert_zeroizing_string(&response.access_token);
+    }
+
+    #[test]
+    fn test_fcm_request_borrows_device_token_from_zeroizing_string() {
+        // Compile-time guard: request construction must not copy the device
+        // token into an owned plain String before reqwest serializes the body.
+        fn assert_borrowed_token(_: &str) {}
+
+        let token = zeroizing_token("device-token-123");
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: token.as_str(),
+                android: None,
+                data: None,
+            },
+        };
+
+        assert_borrowed_token(request.message.token);
+        assert_eq!(request.message.token, "device-token-123");
     }
 
     #[test]
@@ -824,7 +847,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "test-token".to_string(),
+                token: "test-token",
                 android: Some(AndroidConfig {
                     priority: "high".to_string(),
                 }),
@@ -904,7 +927,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: Some(AndroidConfig {
                     priority: "high".to_string(),
                 }),
@@ -952,7 +975,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "invalid-token".to_string(),
+                token: "invalid-token",
                 android: None,
                 data: None,
             },
@@ -1000,7 +1023,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "unregistered-token".to_string(),
+                token: "unregistered-token",
                 android: None,
                 data: None,
             },
@@ -1455,7 +1478,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "any-token".to_string(),
+                token: "any-token",
                 android: None,
                 data: None,
             },
@@ -1615,7 +1638,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "any-token".to_string(),
+                token: "any-token",
                 android: None,
                 data: None,
             },
@@ -1717,7 +1740,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "any-token".to_string(),
+                token: "any-token",
                 android: None,
                 data: None,
             },
@@ -1831,7 +1854,7 @@ mod tests {
     fn test_fcm_message_without_android() {
         let request = FcmRequest {
             message: FcmMessage {
-                token: "test-token".to_string(),
+                token: "test-token",
                 android: None,
                 data: None,
             },
@@ -1846,7 +1869,7 @@ mod tests {
     fn test_fcm_message_with_empty_data() {
         let request = FcmRequest {
             message: FcmMessage {
-                token: "test-token".to_string(),
+                token: "test-token",
                 android: Some(AndroidConfig {
                     priority: "high".to_string(),
                 }),
@@ -1979,7 +2002,9 @@ mod tests {
             });
         }
 
-        let result = client.send("test-device-token", None).await;
+        let result = client
+            .send(zeroizing_token("test-device-token"), None)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No project ID"));
     }
@@ -1994,7 +2019,9 @@ mod tests {
 
         let client = FcmClient::mock(config, false);
 
-        let result = client.send("test-device-token", None).await;
+        let result = client
+            .send(zeroizing_token("test-device-token"), None)
+            .await;
         assert!(result.is_err());
         assert!(
             result
@@ -2015,7 +2042,9 @@ mod tests {
         let mut client = FcmClient::mock(config, true);
         client.service_account.as_mut().unwrap().project_id = "x/../../admin/v1".to_string();
 
-        let result = client.send("test-device-token", None).await;
+        let result = client
+            .send(zeroizing_token("test-device-token"), None)
+            .await;
         assert!(result.is_err());
         assert!(
             result
@@ -2036,7 +2065,9 @@ mod tests {
         // Client without service account - will fail to get access token
         let client = FcmClient::mock(config, false);
 
-        let result = client.send("test-device-token", None).await;
+        let result = client
+            .send(zeroizing_token("test-device-token"), None)
+            .await;
         assert!(result.is_err());
         assert!(
             result
@@ -2101,7 +2132,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: None,
                 data: None,
             },
@@ -2143,7 +2174,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: None,
                 data: None,
             },
@@ -2184,7 +2215,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: None,
                 data: None,
             },
@@ -2242,7 +2273,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: None,
                 data: None,
             },
@@ -2329,18 +2360,27 @@ mod tests {
         };
         let client = FcmClient::mock(config, false);
 
-        assert!(!client.send("", None).await.unwrap(), "empty token");
         assert!(
-            !client.send("token with space", None).await.unwrap(),
+            !client.send(zeroizing_token(""), None).await.unwrap(),
+            "empty token"
+        );
+        assert!(
+            !client
+                .send(zeroizing_token("token with space"), None)
+                .await
+                .unwrap(),
             "whitespace token"
         );
         assert!(
-            !client.send("tokén-with-unicode", None).await.unwrap(),
+            !client
+                .send(zeroizing_token("tokén-with-unicode"), None)
+                .await
+                .unwrap(),
             "unicode token"
         );
         assert!(
             !client
-                .send(&"a".repeat(MAX_FCM_TOKEN_LEN + 1), None)
+                .send(Zeroizing::new("a".repeat(MAX_FCM_TOKEN_LEN + 1)), None)
                 .await
                 .unwrap(),
             "overlong token"

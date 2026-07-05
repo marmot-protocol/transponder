@@ -12,8 +12,9 @@
 //!
 //! # Security
 //!
-//! Device tokens are wrapped in `Zeroizing<String>` to ensure they are zeroed
-//! from memory when no longer needed, preventing sensitive data from lingering.
+//! Device tokens are wrapped in `Zeroizing<String>` while queued and while
+//! handed to provider clients, reducing avoidable cleartext heap copies before
+//! request serialization.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,8 +44,8 @@ const MAX_PENDING_QUEUE_SIZE: usize = 10_000;
 ///
 /// # Security
 ///
-/// The token field is wrapped in `Zeroizing<String>` to ensure device tokens
-/// are zeroed from memory when the message is dropped.
+/// The token field is wrapped in `Zeroizing<String>` while queued and is moved
+/// intact into the provider client when the message is sent.
 enum PushMessage {
     /// Send a notification to the given platform with the given token.
     Send {
@@ -248,7 +249,7 @@ impl PushDispatcher {
         match platform {
             Platform::Apns => {
                 if let Some(client) = apns_client {
-                    match client.send(token.as_str(), backoff_permit).await {
+                    match client.send(token, backoff_permit).await {
                         Ok(true) => {
                             trace!("APNs notification sent");
                             if let Some(ref m) = metrics {
@@ -272,7 +273,7 @@ impl PushDispatcher {
             }
             Platform::Fcm => {
                 if let Some(client) = fcm_client {
-                    match client.send(token.as_str(), backoff_permit).await {
+                    match client.send(token, backoff_permit).await {
                         Ok(true) => {
                             trace!("FCM notification sent");
                             if let Some(ref m) = metrics {
