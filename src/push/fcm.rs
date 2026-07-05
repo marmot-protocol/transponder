@@ -16,7 +16,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::config::FcmConfig;
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
-use crate::push::retry::{self, RetryConfig, SendAttemptResult};
+use crate::push::retry::{self, PushSendOutcome, RetryConfig, SendAttemptResult};
 
 /// FCM OAuth2 token endpoint.
 const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -173,7 +173,7 @@ struct FcmErrorDetail {
 #[derive(Debug, PartialEq, Eq)]
 enum FcmClassification {
     /// The provider explicitly reported the token as unregistered; the token
-    /// should be treated as dead (`Success(false)`).
+    /// should be treated as dead.
     TokenDead,
     /// A configuration, payload, or path error that is permanent for this
     /// provider but unrelated to the device token; must surface as an error
@@ -483,11 +483,12 @@ impl FcmClient {
 
     /// Send a silent push notification to a device.
     ///
-    /// Returns `Ok(true)` if successful, `Ok(false)` if the token is invalid/expired,
+    /// Returns [`PushSendOutcome::Sent`] if FCM accepted the notification,
+    /// [`PushSendOutcome::InvalidToken`] if the token is invalid/expired,
     /// or `Err` for other failures.
     ///
-    /// This method automatically retries transient failures (429, 5xx) with
-    /// exponential backoff.
+    /// This method automatically retries transient failures (408, 429, 5xx)
+    /// with exponential backoff.
     ///
     /// When `backoff_permit` is `Some`, the dispatcher concurrency permit is
     /// released during backoff sleeps and re-acquired before each retry, so a
@@ -496,7 +497,7 @@ impl FcmClient {
         &self,
         device_token: Zeroizing<String>,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
-    ) -> Result<bool> {
+    ) -> Result<PushSendOutcome> {
         // Validate token format before spending an OAuth-authenticated round-trip
         // and FCM quota on a clearly-malformed token (mirrors APNs).
         if !is_valid_fcm_token(device_token.as_str()) {
@@ -504,7 +505,7 @@ impl FcmClient {
                 token_len = device_token.len(),
                 "Invalid FCM device token format"
             );
-            return Ok(false);
+            return Ok(PushSendOutcome::InvalidToken);
         }
 
         let retry_config = RetryConfig::default();
@@ -665,6 +666,15 @@ impl FcmClient {
                 self.classify_error_response(response, 404, "NOT_FOUND")
                     .await
             }
+            408 => {
+                // Request timeout - retriable. Honor Retry-After if present.
+                let retry_after = retry::retry_after_from_headers(response.headers());
+                debug!(status = %status, "FCM request timeout (retriable)");
+                SendAttemptResult::Retriable {
+                    status_code: 408,
+                    retry_after,
+                }
+            }
             429 => {
                 // Rate limited - retriable
                 let retry_after = retry::retry_after_from_headers(response.headers());
@@ -685,6 +695,9 @@ impl FcmClient {
                 }
             }
             _ => {
+                // Unknown statuses are provider/protocol errors, not evidence
+                // that the device token is dead. Keep them out of the
+                // invalid-token path so operators do not prune live tokens.
                 warn!(status = %status, "FCM unexpected response");
                 SendAttemptResult::Permanent(Error::Fcm(format!(
                     "Unexpected FCM response status: {status}"
@@ -1417,6 +1430,18 @@ mod tests {
             result,
             SendAttemptResult::Retriable {
                 status_code: 500,
+                retry_after: None,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_408_is_retriable() {
+        let result = fcm_status_result(408, None).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Retriable {
+                status_code: 408,
                 retry_after: None,
             }
         ));
@@ -2493,7 +2518,7 @@ mod tests {
     async fn test_send_rejects_invalid_token_without_oauth() {
         // A client with no service account / encoding key would error on the
         // OAuth round-trip if it ever reached it. Invalid tokens must instead
-        // short-circuit to Ok(false) before any auth lookup or request build.
+        // short-circuit to InvalidToken before any auth lookup or request build.
         let config = FcmConfig {
             enabled: true,
             service_account_path: String::new(),
@@ -2501,29 +2526,33 @@ mod tests {
         };
         let client = FcmClient::mock(config, false);
 
-        assert!(
-            !client.send(zeroizing_token(""), None).await.unwrap(),
+        assert_eq!(
+            client.send(zeroizing_token(""), None).await.unwrap(),
+            PushSendOutcome::InvalidToken,
             "empty token"
         );
-        assert!(
-            !client
+        assert_eq!(
+            client
                 .send(zeroizing_token("token with space"), None)
                 .await
                 .unwrap(),
+            PushSendOutcome::InvalidToken,
             "whitespace token"
         );
-        assert!(
-            !client
+        assert_eq!(
+            client
                 .send(zeroizing_token("tokén-with-unicode"), None)
                 .await
                 .unwrap(),
+            PushSendOutcome::InvalidToken,
             "unicode token"
         );
-        assert!(
-            !client
+        assert_eq!(
+            client
                 .send(Zeroizing::new("a".repeat(MAX_FCM_TOKEN_LEN + 1)), None)
                 .await
                 .unwrap(),
+            PushSendOutcome::InvalidToken,
             "overlong token"
         );
     }
@@ -2739,7 +2768,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
             result.is_ok(),
             "expected success after OAuth retry: {result:?}"
         );
-        assert!(result.unwrap());
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
     }
 
     #[tokio::test]
