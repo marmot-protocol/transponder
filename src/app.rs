@@ -336,22 +336,19 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
     // landed there, so no separate load-time warning is needed here.
 
     // Initialize metrics (always present; recording gated by `enabled`).
-    let metrics = match Metrics::new() {
-        Ok(metrics) => {
-            let metrics = metrics.with_enabled(config.metrics.enabled);
-            if metrics.is_enabled() {
-                metrics.init_server_info(env!("CARGO_PKG_VERSION"));
-                info!("Metrics initialized");
-            } else {
-                info!("Metrics disabled");
-            }
-            metrics
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to initialize metrics");
-            Metrics::disabled()
-        }
-    };
+    let metrics = Metrics::new()
+        .map(|metrics| metrics.with_enabled(config.metrics.enabled))
+        .map_err(|error| {
+            error!(error = %error, "Failed to initialize metrics");
+            error
+        })
+        .context("Failed to initialize metrics")?;
+    if metrics.is_enabled() {
+        metrics.init_server_info(env!("CARGO_PKG_VERSION"));
+        info!("Metrics initialized");
+    } else {
+        info!("Metrics disabled");
+    }
 
     let server_private_key = resolve_server_private_key(&mut config.server)?;
 

@@ -45,3 +45,26 @@ pub fn server_config_with(
     f(&mut config);
     config
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_server_config_has_no_zeroed_limits() {
+        let config = default_server_config();
+        assert_ne!(config.max_dedup_cache_size, 0);
+        assert_ne!(config.max_rate_limit_cache_size, 0);
+        assert_ne!(config.max_tokens_per_event, 0);
+        assert_ne!(config.shutdown_timeout_secs, 0);
+        assert_ne!(config.max_concurrent_event_processing, 0);
+    }
+
+    #[test]
+    fn server_config_with_applies_override() {
+        let config = server_config_with(default_server_config(), |c| {
+            c.max_tokens_per_event = 42;
+        });
+        assert_eq!(config.max_tokens_per_event, 42);
+    }
+}

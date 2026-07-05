@@ -773,6 +773,9 @@ impl Metrics {
         outcome: OperationOutcome,
         duration_secs: f64,
     ) {
+        if !self.enabled {
+            return;
+        }
         observe_label_value(
             &self.notification_parse_duration_seconds,
             outcome.as_str(),
@@ -971,6 +974,9 @@ impl Metrics {
         outcome: OperationOutcome,
         duration_secs: f64,
     ) {
+        if !self.enabled {
+            return;
+        }
         observe_label_value(
             &self.push_dispatch_admission_duration_seconds,
             outcome.as_str(),
@@ -1085,6 +1091,30 @@ mod tests {
     fn test_metrics_creation() {
         let metrics = Metrics::new().unwrap();
         assert!(!metrics.registry.gather().is_empty());
+    }
+
+    #[test]
+    fn test_disabled_metrics_observers_are_no_ops() {
+        let metrics = Metrics::new().unwrap().with_enabled(false);
+        assert!(!metrics.is_enabled());
+
+        metrics.observe_notification_parse_duration(OperationOutcome::Success, 0.001);
+        metrics.observe_push_dispatch_admission_duration(OperationOutcome::Success, 0.001);
+
+        assert_eq!(
+            metrics
+                .notification_parse_duration_seconds
+                .with_label_values(&[OperationOutcome::Success.as_str()])
+                .get_sample_count(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .push_dispatch_admission_duration_seconds
+                .with_label_values(&[OperationOutcome::Success.as_str()])
+                .get_sample_count(),
+            0
+        );
     }
 
     #[test]
