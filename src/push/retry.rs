@@ -38,6 +38,12 @@ impl BackoffPermit {
         self.permit = None;
     }
 
+    fn update_available_metric(&self, metrics: Option<&Metrics>) {
+        if let Some(metrics) = metrics {
+            metrics.set_push_semaphore_available(self.semaphore.available_permits());
+        }
+    }
+
     /// Re-acquire a permit before the next attempt. Awaits if all slots are busy.
     /// Returns `Err` only if the semaphore was closed (shutdown).
     async fn reacquire(&mut self) -> Result<(), tokio::sync::AcquireError> {
@@ -174,11 +180,13 @@ where
                 // requests can proceed, then re-acquire it before retrying.
                 if let Some(permit) = backoff_permit.as_deref_mut() {
                     permit.release();
+                    permit.update_available_metric(metrics);
                     sleep(wait_duration).await;
                     if permit.reacquire().await.is_err() {
                         // Semaphore closed (shutdown): shed this request.
                         return Ok(false);
                     }
+                    permit.update_available_metric(metrics);
                 } else {
                     sleep(wait_duration).await;
                 }
@@ -806,6 +814,99 @@ mod tests {
             "permit should be released during backoff sleep"
         );
 
+        let result = task.await.unwrap();
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_updates_semaphore_metric_during_backoff_transitions() {
+        use crate::metrics::Metrics;
+        use crate::test_metrics::gauge_value as metric_gauge_value;
+        use tokio::sync::oneshot;
+
+        fn semaphore_gauge(metrics: &Metrics) -> i64 {
+            metric_gauge_value(metrics, "transponder_push_semaphore_available", &[]) as i64
+        }
+
+        // A single-permit semaphore makes each transition observable: the
+        // initial attempt holds the only slot, backoff releases it, and the
+        // retry re-acquires it before the second attempt starts.
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let mut bp = BackoffPermit::new(sem.clone(), permit);
+        let metrics = Metrics::default();
+        metrics.set_push_semaphore_available(0);
+
+        let config = RetryConfig {
+            max_retries: 1,
+            initial_backoff: Duration::from_millis(50),
+        };
+
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+        let metrics_for_task = metrics.clone();
+        let (second_attempt_tx, second_attempt_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let mut second_attempt_tx = Some(second_attempt_tx);
+        let mut finish_rx = Some(finish_rx);
+
+        let task = tokio::spawn(async move {
+            with_retry(
+                &config,
+                "test",
+                || {
+                    let attempt = attempt_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                    let signal_second_attempt = if attempt == 2 {
+                        second_attempt_tx.take()
+                    } else {
+                        None
+                    };
+                    let wait_for_assertion = if attempt == 2 { finish_rx.take() } else { None };
+
+                    async move {
+                        if attempt == 1 {
+                            SendAttemptResult::Retriable {
+                                status_code: 429,
+                                retry_after: None,
+                            }
+                        } else {
+                            if let Some(tx) = signal_second_attempt {
+                                let _ = tx.send(());
+                            }
+                            if let Some(rx) = wait_for_assertion {
+                                let _ = rx.await;
+                            }
+                            SendAttemptResult::Success(true)
+                        }
+                    }
+                },
+                Some(&mut bp),
+                Some(&metrics_for_task),
+            )
+            .await
+        });
+
+        // During backoff the permit has been released, and the metric must
+        // reflect the real free slot instead of staying stale at zero.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(sem.available_permits(), 1);
+        assert_eq!(semaphore_gauge(&metrics), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), second_attempt_rx)
+            .await
+            .expect("retry should start a second attempt")
+            .expect("second attempt signal should be sent");
+
+        // The second attempt starts only after the retry path re-acquires the
+        // permit. The gauge must dip back to zero at that transition.
+        assert_eq!(sem.available_permits(), 0);
+        assert_eq!(semaphore_gauge(&metrics), 0);
+
+        finish_tx
+            .send(())
+            .expect("second attempt should still be waiting for test assertion");
         let result = task.await.unwrap();
         assert!(result.is_ok());
         assert!(result.unwrap());
