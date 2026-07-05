@@ -1,12 +1,12 @@
 //! Error and panic reporting to a GlitchTip (Sentry-compatible) instance.
 //!
 //! Reporting is opt-in: it activates only when a DSN is configured. Transponder's
-//! own `ERROR` events are forwarded — first-party only, see [`glitchtip_layer`] —
+//! own `ERROR` events are forwarded — first-party only, see `glitchtip_layer` —
 //! together with panics, which Sentry's global hook captures from anywhere in the
 //! process (not just first-party code). First-party message content is kept clean
 //! by the "never log secrets" invariant in AGENTS.md; because the panic hook is
 //! not target-scoped, every outgoing event additionally passes through the
-//! mechanical redaction backstop in [`scrub_event`] (see [`crate::redaction`]).
+//! mechanical redaction backstop in `scrub_event` (see [`crate::redaction`]).
 
 use std::sync::Arc;
 

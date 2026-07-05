@@ -36,7 +36,7 @@ impl StageTimer {
     }
 }
 
-/// Outcome of [`EventProcessor::process_inner`].
+/// Outcome of the event processor's inner processing path.
 ///
 /// Distinguishes a terminal result (notifications admitted, or the event
 /// genuinely carried nothing dispatchable) from a purely transient per-token

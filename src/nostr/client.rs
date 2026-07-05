@@ -353,7 +353,7 @@ impl RelayClient {
     /// This is the only place the cached [`RelayStatus`] and the
     /// `transponder_relays_connected` gauges are written: it enumerates the
     /// relay pool, classifies each connected relay by the configured list it
-    /// came from (see [`classify_relay_kind`]), and stores the result. It is
+    /// came from (see `classify_relay_kind`), and stores the result. It is
     /// driven by `connect()` while polling for the first connection and by
     /// the periodic status-refresher task in `main` — never by the read paths
     /// ([`Self::get_status`]/[`Self::is_connected`]), so readiness probes are

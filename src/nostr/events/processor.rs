@@ -972,7 +972,6 @@ mod tests {
     use crate::crypto::Platform;
     use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
     use crate::defaults::{
-        DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_MAX_DEDUP_CACHE_SIZE,
         DEFAULT_MAX_NOTIFICATION_AGE_SECS, DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
         DEFAULT_MAX_TOKENS_PER_EVENT,
     };
@@ -985,7 +984,6 @@ mod tests {
     };
     use crate::test_support::{default_server_config, server_config_with};
     use crate::test_vectors::scenarios;
-    use zeroize::Zeroizing;
 
     #[test]
     fn token_rate_limit_config_from_server_config_matches_settings() {
@@ -1963,7 +1961,7 @@ mod tests {
                 .await,
             Some((0, 0))
         );
-        assert_eq!(processor.device_token_limiter.len().await, 0);
+        assert!(processor.device_token_limiter.is_empty().await);
         assert_eq!(
             counter_value(&metrics, "transponder_events_processed_total", &[]),
             0.0
@@ -2710,7 +2708,7 @@ mod tests {
             "unconfigured-platform drop must refund the encrypted charge"
         );
         // The device limiter was never charged (drop happens before it).
-        assert_eq!(processor.device_token_limiter.len().await, 0);
+        assert!(processor.device_token_limiter.is_empty().await);
         // The drop is recorded by a real metric.
         assert_eq!(
             counter_value(
@@ -2879,7 +2877,7 @@ mod tests {
             None,
             "non-UTF-8 FCM drop must refund the encrypted charge"
         );
-        assert_eq!(processor.device_token_limiter.len().await, 0);
+        assert!(processor.device_token_limiter.is_empty().await);
         assert_eq!(
             counter_value(
                 &metrics,

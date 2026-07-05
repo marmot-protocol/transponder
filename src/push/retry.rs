@@ -328,7 +328,7 @@ fn should_retry_transport(err: &reqwest::Error) -> bool {
 /// Execute an async transport operation with exponential backoff retry.
 ///
 /// Only `Error::Http` failures whose underlying `reqwest::Error` is a
-/// connection-establishment error (see [`should_retry_transport`]) are
+/// connection-establishment error (see `should_retry_transport`) are
 /// retried. Restricting retries to pre-delivery connect errors avoids
 /// duplicating non-idempotent POSTs (a read/timeout error can fire *after*
 /// the provider already accepted the request) and bounds worst-case permit-hold

@@ -8,7 +8,8 @@ use tokio::sync::Notify;
 /// Tracks the number of spawned send tasks that have not yet finished, so that
 /// graceful shutdown can wait for them to complete.
 ///
-/// This is deliberately decoupled from the concurrency [`Semaphore`]: a send
+/// This is deliberately decoupled from the concurrency
+/// [`tokio::sync::Semaphore`]: a send
 /// task that is in a retry backoff sleep releases its concurrency permit (see
 /// [`crate::push::retry::BackoffPermit`]) so the slot can be reused, but the
 /// task is still alive and may re-acquire a permit and send again. Counting

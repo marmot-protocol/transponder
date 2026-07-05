@@ -855,7 +855,6 @@ mod tests {
     use crate::test_support::{default_server_config, server_config_with};
     use axum::{Router, http::StatusCode, routing::get};
     use std::io::Write;
-    use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
 

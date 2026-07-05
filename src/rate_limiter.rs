@@ -120,7 +120,7 @@ impl RateLimitCheck {
     /// Returns a sampled total-entry count for opportunistic gauge updates.
     ///
     /// `Some(len)` on the sampled fraction of admissions (see
-    /// [`GAUGE_SAMPLE_INTERVAL`]); `None` otherwise. Lets the caller keep the
+    /// `GAUGE_SAMPLE_INTERVAL`); `None` otherwise. Lets the caller keep the
     /// `transponder_rate_limit_cache_size` gauge fresh as the cache grows
     /// toward capacity without a metric write per check.
     #[must_use]
@@ -555,6 +555,12 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         self.total_len().await
     }
 
+    /// Returns whether the rate limiter has no entries.
+    #[cfg(test)]
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
     /// Checks the current count without incrementing.
     #[cfg(test)]
     pub async fn peek_counts(&self, key: &K) -> Option<(u32, u32)> {
@@ -630,7 +636,7 @@ mod tests {
 
         limiter.rollback_increment(&1u64, reservation).await;
 
-        assert_eq!(limiter.len().await, 0);
+        assert!(limiter.is_empty().await);
         assert!(limiter.check_and_increment(&1u64).await.is_allowed());
     }
 
