@@ -385,14 +385,14 @@ impl ApnsClient {
 
     async fn handle_response(
         &self,
-        start: Instant,
+        request_duration: Duration,
         response: reqwest::Response,
         auth_token: &str,
     ) -> SendAttemptResult {
         let status = response.status();
 
         if let Some(metrics) = &self.metrics {
-            metrics.observe_push_duration("apns", start.elapsed().as_secs_f64());
+            metrics.observe_push_duration("apns", request_duration.as_secs_f64());
             metrics.record_push_response_status("apns", status.as_u16());
         }
 
@@ -507,7 +507,6 @@ impl ApnsClient {
         device_token: &str,
         transport_retry: &RetryConfig,
     ) -> SendAttemptResult {
-        let start = Instant::now();
         let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
 
         debug!(
@@ -526,14 +525,20 @@ impl ApnsClient {
         };
 
         let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
-        let response = match retry::with_transport_retry(
+        let (request_duration, response) = match retry::with_transport_retry(
             transport_retry,
             "APNs",
             || async {
-                self.build_request(&url, token.as_str(), &request_parts)
+                // Start timing after JWT acquisition and per transport attempt
+                // so auth work and prior connect-retry backoff do not inflate
+                // provider latency.
+                let start = Instant::now();
+                let response = self
+                    .build_request(&url, token.as_str(), &request_parts)
                     .send()
                     .await
-                    .map_err(Error::from)
+                    .map_err(Error::from)?;
+                Ok((start.elapsed(), response))
             },
             self.metrics.as_ref(),
         )
@@ -543,7 +548,8 @@ impl ApnsClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(start, response, token.as_str()).await
+        self.handle_response(request_duration, response, token.as_str())
+            .await
     }
 
     /// Check if the client is properly configured.
@@ -581,6 +587,7 @@ impl ApnsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_metrics::{counter_value, histogram_sample_count, histogram_sample_sum};
     use base64::Engine;
     use wiremock::matchers::{header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1006,6 +1013,58 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_handle_response_records_supplied_provider_duration() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let metrics = Metrics::new().unwrap();
+        let mut client = ApnsClient::mock(test_config(), false);
+        client.metrics = Some(metrics.clone());
+
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        let provider_duration = Duration::from_millis(123);
+        let result = client
+            .handle_response(provider_duration, response, "test-token")
+            .await;
+
+        assert!(matches!(result, SendAttemptResult::Success(true)));
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_push_request_duration_seconds",
+                &[("platform", "apns")]
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_sum(
+                &metrics,
+                "transponder_push_request_duration_seconds",
+                &[("platform", "apns")]
+            ),
+            provider_duration.as_secs_f64()
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_response_status_total",
+                &[("platform", "apns"), ("status", "200")]
+            ),
+            1.0
+        );
+    }
+
     async fn apns_400_result(reason: &str) -> SendAttemptResult {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1025,7 +1084,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Instant::now(), response, "test-token")
+            .handle_response(Duration::ZERO, response, "test-token")
             .await
     }
 
@@ -1086,7 +1145,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Instant::now(), response, "test-token")
+            .handle_response(Duration::ZERO, response, "test-token")
             .await
     }
 
@@ -1257,7 +1316,7 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Instant::now(), response, "poisoned-jwt")
+            .handle_response(Duration::ZERO, response, "poisoned-jwt")
             .await;
 
         assert!(matches!(
@@ -1301,7 +1360,7 @@ mod tests {
 
         // The failing request used the older, now-replaced token.
         let result = client
-            .handle_response(Instant::now(), response, "stale-jwt")
+            .handle_response(Duration::ZERO, response, "stale-jwt")
             .await;
 
         assert!(matches!(

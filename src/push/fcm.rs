@@ -477,14 +477,14 @@ impl FcmClient {
 
     async fn handle_response(
         &self,
-        start: Instant,
+        request_duration: Duration,
         response: reqwest::Response,
         access_token: &str,
     ) -> SendAttemptResult {
         let status = response.status();
 
         if let Some(metrics) = &self.metrics {
-            metrics.observe_push_duration("fcm", start.elapsed().as_secs_f64());
+            metrics.observe_push_duration("fcm", request_duration.as_secs_f64());
             metrics.record_push_response_status("fcm", status.as_u16());
         }
 
@@ -537,7 +537,6 @@ impl FcmClient {
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
     async fn send_once(&self, device_token: &str) -> SendAttemptResult {
-        let start = Instant::now();
         let project_id = match self.project_id() {
             Ok(id) => id,
             Err(e) => return SendAttemptResult::Permanent(e),
@@ -550,14 +549,20 @@ impl FcmClient {
         };
 
         let transport_retry = RetryConfig::transport();
-        let response = match retry::with_transport_retry(
+        let (request_duration, response) = match retry::with_transport_retry(
             &transport_retry,
             "FCM",
             || async {
-                self.build_request(&url, access_token.as_str(), device_token)
+                // Start timing after OAuth acquisition and per transport
+                // attempt so auth refreshes and prior connect-retry backoff do
+                // not inflate provider latency.
+                let start = Instant::now();
+                let response = self
+                    .build_request(&url, access_token.as_str(), device_token)
                     .send()
                     .await
-                    .map_err(Error::from)
+                    .map_err(Error::from)?;
+                Ok((start.elapsed(), response))
             },
             self.metrics.as_ref(),
         )
@@ -567,7 +572,7 @@ impl FcmClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(start, response, access_token.as_str())
+        self.handle_response(request_duration, response, access_token.as_str())
             .await
     }
 
@@ -658,6 +663,7 @@ impl FcmClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_metrics::{counter_value, histogram_sample_count, histogram_sample_sum};
     use wiremock::matchers::{body_partial_json, header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1030,6 +1036,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_handle_response_records_supplied_provider_duration() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let metrics = Metrics::new().unwrap();
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let mut client = FcmClient::mock(config, false);
+        client.metrics = Some(metrics.clone());
+
+        let response = Client::new()
+            .post(format!(
+                "{}/v1/projects/test-project/messages:send",
+                mock_server.uri()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let provider_duration = Duration::from_millis(123);
+        let result = client
+            .handle_response(provider_duration, response, "test-access-token")
+            .await;
+
+        assert!(matches!(result, SendAttemptResult::Success(true)));
+        assert_eq!(
+            histogram_sample_count(
+                &metrics,
+                "transponder_push_request_duration_seconds",
+                &[("platform", "fcm")]
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_sample_sum(
+                &metrics,
+                "transponder_push_request_duration_seconds",
+                &[("platform", "fcm")]
+            ),
+            provider_duration.as_secs_f64()
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_response_status_total",
+                &[("platform", "fcm"), ("status", "200")]
+            ),
+            1.0
+        );
+    }
+
     /// Drive `handle_response` against a mock server returning `status_code`
     /// with the given FCM error body, returning the classified result.
     async fn fcm_error_result_with_body(
@@ -1061,7 +1127,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Instant::now(), response, "test-access-token")
+            .handle_response(Duration::ZERO, response, "test-access-token")
             .await
     }
 
@@ -1114,7 +1180,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Instant::now(), response, "test-access-token")
+            .handle_response(Duration::ZERO, response, "test-access-token")
             .await
     }
 
@@ -1290,7 +1356,7 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Instant::now(), response, "poisoned-access-token")
+            .handle_response(Duration::ZERO, response, "poisoned-access-token")
             .await;
 
         assert!(matches!(
@@ -1346,7 +1412,7 @@ mod tests {
 
         // The failing request used the older, now-replaced token.
         let result = client
-            .handle_response(Instant::now(), response, "stale-access-token")
+            .handle_response(Duration::ZERO, response, "stale-access-token")
             .await;
 
         assert!(matches!(
