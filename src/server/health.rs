@@ -1,21 +1,53 @@
 //! Health check HTTP server.
 //!
-//! Provides `/health` (liveness) and `/ready` (readiness) endpoints.
+//! Provides `/health` (liveness) and `/ready` (readiness) endpoints, plus the
+//! Prometheus `/metrics` endpoint.
+//!
+//! `/metrics` availability is governed by `metrics.enabled`, independent of
+//! `health.enabled`: disabling the health endpoints does not silence the
+//! metrics endpoint (both share the `health.bind_address` listener). The
+//! listener is hardened with a per-request timeout, a request-body cap, and a
+//! global concurrency limit; it should nevertheless stay loopback-bound or
+//! behind an access-controlled proxy, as all routes are unauthenticated.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
+use tracing::{error, info, warn};
 
 use crate::config::HealthConfig;
 use crate::error::Result;
 use crate::metrics::Metrics;
 use crate::nostr::client::RelayClient;
 use crate::push::PushDispatcher;
+
+/// Per-request timeout for the health/metrics listener.
+///
+/// Bounds slow-request (slowloris-style) holds on the unauthenticated port; a
+/// few seconds is generous for handlers that do only cached reads and a
+/// registry gather/encode.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum accepted request-body size.
+///
+/// None of the health/metrics endpoints take a request body, so anything
+/// beyond a trivial allowance is rejected with `413 Payload Too Large`.
+const MAX_REQUEST_BODY_BYTES: usize = 1024;
+
+/// Maximum concurrently processed requests across all routes.
+///
+/// Health probes and metric scrapes are low-rate; excess concurrent requests
+/// queue behind this cap instead of consuming unbounded task slots and file
+/// descriptors.
+const MAX_CONCURRENT_REQUESTS: usize = 32;
 
 /// Health check response.
 #[derive(Debug, Serialize)]
@@ -32,6 +64,8 @@ struct ReadyResponse {
     relays_connected: bool,
     apns_configured: bool,
     fcm_configured: bool,
+    apns_delivering: bool,
+    fcm_delivering: bool,
 }
 
 /// Shared state for health check handlers.
@@ -65,16 +99,33 @@ impl HealthServer {
         }
     }
 
-    /// Bind the health server listener, or return `None` when disabled.
+    /// Bind the health server listener, or return `None` when nothing is
+    /// served.
     ///
     /// Binding is split from [`Self::serve`] so startup can fail fast on a
     /// bind failure — almost always a permanent misconfiguration (port in
     /// use, bad `health.bind_address`) — instead of running indefinitely
     /// with dead `/health`, `/ready`, and `/metrics` endpoints.
+    ///
+    /// A listener is bound when the health endpoints are enabled OR a metrics
+    /// collector exists: `/metrics` availability follows `metrics.enabled`,
+    /// independent of `health.enabled`, so disabling the health endpoints
+    /// cannot silently strand a running collector without a scrape endpoint.
+    /// Only when both are disabled is nothing bound.
     pub async fn bind(&self) -> Result<Option<TcpListener>> {
-        if !self.config.enabled {
-            info!("Health server disabled");
+        let serve_health = self.config.enabled;
+        let serve_metrics = self.metrics.is_some();
+
+        if !serve_health && !serve_metrics {
+            info!("Health server and metrics disabled; not binding a listener");
             return Ok(None);
+        }
+
+        if !serve_health {
+            warn!(
+                address = %self.config.bind_address,
+                "Health endpoints disabled but metrics are enabled; serving only /metrics"
+            );
         }
 
         let listener = TcpListener::bind(&self.config.bind_address)
@@ -95,16 +146,19 @@ impl HealthServer {
 
     /// Serve on a previously bound listener until shutdown is signaled.
     ///
-    /// A `None` listener means the health server is disabled; the task then
-    /// just waits for the shutdown signal so its exit is always an expected,
-    /// supervised event.
+    /// A `None` listener means both the health endpoints and metrics are
+    /// disabled; the task then just waits for the shutdown signal so its exit
+    /// is always an expected, supervised event.
+    ///
+    /// Routes are mounted by flag: `/health` + `/ready` when `health.enabled`,
+    /// `/metrics` whenever a metrics collector exists (see [`Self::bind`]).
     pub async fn serve(
         &self,
         listener: Option<TcpListener>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let Some(listener) = listener else {
-            // Disabled: wait for shutdown.
+            // Nothing to serve: wait for shutdown.
             let _ = shutdown.changed().await;
             return Ok(());
         };
@@ -115,10 +169,28 @@ impl HealthServer {
             metrics: self.metrics.clone(),
         });
 
-        let app = Router::new()
-            .route("/health", get(health_handler))
-            .route("/ready", get(ready_handler))
-            .route("/metrics", get(metrics_handler))
+        let mut router = Router::new();
+        if self.config.enabled {
+            router = router
+                .route("/health", get(health_handler))
+                .route("/ready", get(ready_handler));
+        }
+        if self.metrics.is_some() {
+            router = router.route("/metrics", get(metrics_handler));
+        }
+
+        // Hardening layers: bound how long any request may run, reject
+        // request bodies (these endpoints take none), and cap concurrent
+        // in-flight requests on this unauthenticated listener. axum applies
+        // the last-added layer outermost, so requests flow
+        // timeout -> body limit -> concurrency cap -> route.
+        let app = router
+            .layer(GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
+            .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                REQUEST_TIMEOUT,
+            ))
             .with_state(state);
 
         axum::serve(listener, app)
@@ -151,18 +223,49 @@ async fn health_handler() -> impl IntoResponse {
 }
 
 /// Readiness check handler.
+///
+/// `/ready` reports whether this process can currently deliver notifications.
+/// It returns `200` only when ALL of the following hold:
+///
+/// 1. **Relays connected** — at least one relay connection, read from the
+///    cached status snapshot maintained by the background status refresher
+///    (and by startup polling). The probe itself is side-effect-free: it
+///    performs no relay-pool enumeration, takes no write locks, and rewrites
+///    no gauges.
+/// 2. **Push configured** — at least one push provider (APNs/FCM) is
+///    configured.
+/// 3. **Providers delivering** — no *configured* provider is in a sustained
+///    streak of consecutive hard send failures (provider auth rejections and
+///    other permanent errors, or exhausted retry budgets). This signal is
+///    passive: it is derived from real send outcomes and never probes the
+///    providers, so a revoked APNs key or expired FCM service account flips
+///    readiness once the failure streak is observed on live traffic.
+///
+/// Not reflected: per-relay coverage (a single connected relay of many is
+/// still "connected"), push-queue saturation, and delivery latency. With no
+/// push traffic, the delivery-health signal retains its last observed state.
 async fn ready_handler(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
     let relays_connected = state.relay_client.is_connected().await;
     let apns_configured = state.push_dispatcher.has_apns();
     let fcm_configured = state.push_dispatcher.has_fcm();
+    let apns_delivering = state.push_dispatcher.is_apns_delivering();
+    let fcm_delivering = state.push_dispatcher.is_fcm_delivering();
 
-    let is_ready = relays_connected && (apns_configured || fcm_configured);
+    let push_configured = apns_configured || fcm_configured;
+    // Only configured providers gate readiness; an unconfigured provider's
+    // delivery state is irrelevant.
+    let providers_delivering =
+        (!apns_configured || apns_delivering) && (!fcm_configured || fcm_delivering);
+
+    let is_ready = relays_connected && push_configured && providers_delivering;
 
     let response = ReadyResponse {
         status: if is_ready { "ready" } else { "not_ready" }.to_string(),
         relays_connected,
         apns_configured,
         fcm_configured,
+        apns_delivering,
+        fcm_delivering,
     };
 
     if is_ready {
@@ -340,10 +443,14 @@ mod tests {
             relays_connected: true,
             apns_configured: true,
             fcm_configured: false,
+            apns_delivering: true,
+            fcm_delivering: true,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("ready"));
         assert!(json.contains("relays_connected"));
+        assert!(json.contains("apns_delivering"));
+        assert!(json.contains("fcm_delivering"));
     }
 
     #[tokio::test]
@@ -445,6 +552,9 @@ mod tests {
         assert!(!body.relays_connected);
         assert!(!body.apns_configured);
         assert!(!body.fcm_configured);
+        // No failures observed yet, so the passive delivery signal is healthy.
+        assert!(body.apns_delivering);
+        assert!(body.fcm_delivering);
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
@@ -691,13 +801,279 @@ mod tests {
         let client = reqwest::Client::new();
         let response = wait_for_server_response(&client, format!("http://{}/ready", addr)).await;
 
-        // Should be 200 OK because relays are connected and APNs is configured
+        // Should be 200 OK because relays are connected, APNs is configured,
+        // and no delivery-failure streak has been observed.
         assert_eq!(response.status(), 200);
         let body: ReadyResponse = response.json().await.unwrap();
         assert_eq!(body.status, "ready");
         assert!(body.relays_connected);
         assert!(body.apns_configured);
         assert!(!body.fcm_configured);
+        assert!(body.apns_delivering);
+        assert!(body.fcm_delivering);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_ready_not_ready_when_configured_provider_stops_delivering() {
+        use crate::config::ApnsConfig;
+        use crate::crypto::Platform;
+        use crate::push::ApnsClient;
+        use crate::push::dispatcher::DELIVERY_FAILURE_STREAK_THRESHOLD;
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![relay_url.to_string()],
+            allow_unencrypted_clearnet_relays: true,
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        relay_client.connect().await.unwrap();
+
+        let apns_config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: String::new(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+        };
+        let apns_client = ApnsClient::mock(apns_config, true);
+        let push_dispatcher = Arc::new(PushDispatcher::new(Some(apns_client), None));
+
+        // Simulate a sustained hard-failure streak (e.g. a revoked APNs key
+        // rejecting every send) as the dispatcher would record it.
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+            push_dispatcher
+                .delivery_health()
+                .record_hard_failure(Platform::Apns);
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = HealthConfig {
+            enabled: true,
+            bind_address: addr.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
+
+        let client = reqwest::Client::new();
+        let response = wait_for_server_response(&client, format!("http://{}/ready", addr)).await;
+
+        // Relays are connected and APNs is configured, but delivery is in a
+        // sustained failure streak: readiness must reflect delivery capability.
+        assert_eq!(response.status(), 503);
+        let body: ReadyResponse = response.json().await.unwrap();
+        assert_eq!(body.status, "not_ready");
+        assert!(body.relays_connected);
+        assert!(body.apns_configured);
+        assert!(!body.apns_delivering);
+        assert!(body.fcm_delivering);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_metrics_served_when_health_endpoints_disabled() {
+        use crate::metrics::Metrics;
+
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 1,
+            connection_timeout_secs: 1,
+        };
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+        let metrics = Metrics::default();
+        metrics.init_server_info("0.0.0");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = HealthConfig {
+            enabled: false, // health endpoints off, metrics still enabled
+            bind_address: addr.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher, Some(metrics));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
+
+        let client = reqwest::Client::new();
+        let response = wait_for_server_response(&client, format!("http://{}/metrics", addr)).await;
+
+        // /metrics must be reachable even though the health endpoints are off.
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("transponder_server_info"));
+
+        // The health endpoints themselves stay unmounted.
+        let health = client
+            .get(format!("http://{}/health", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::NOT_FOUND);
+        let ready = client
+            .get(format!("http://{}/ready", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::NOT_FOUND);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test]
+    async fn bind_returns_listener_when_metrics_enabled_and_health_disabled() {
+        use crate::metrics::Metrics;
+
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![],
+            allow_unencrypted_clearnet_relays: true,
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+
+        let server = HealthServer::new(
+            HealthConfig {
+                enabled: false,
+                bind_address: "127.0.0.1:0".to_string(),
+            },
+            relay_client,
+            push_dispatcher,
+            Some(Metrics::default()),
+        );
+
+        let listener = server.bind().await.unwrap();
+
+        assert!(
+            listener.is_some(),
+            "metrics.enabled must bind a listener even with health.enabled=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_returns_none_without_attempting_when_nothing_is_served() {
+        // An unbindable address proves no bind is attempted when both the
+        // health endpoints and metrics are disabled: bind() would fail if it
+        // tried to create a listener.
+        let server = test_health_server(HealthConfig {
+            enabled: false,
+            bind_address: "999.999.999.999:9999".to_string(),
+        })
+        .await;
+
+        let listener = server.bind().await.unwrap();
+
+        assert!(listener.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_metrics_handler_returns_not_found_without_metrics() {
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![],
+            allow_unencrypted_clearnet_relays: false,
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 1,
+            connection_timeout_secs: 1,
+        };
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+
+        let state = Arc::new(HealthState {
+            relay_client,
+            push_dispatcher,
+            metrics: None,
+        });
+
+        // Defensive guard: the route is only mounted when a collector exists,
+        // but the handler still answers 404 rather than panicking if invoked
+        // without one.
+        let response = metrics_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_request_body_limit_rejects_oversized_bodies() {
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+
+        let keys = Keys::generate();
+        let relay_config = RelayConfig {
+            clearnet: vec![relay_url.to_string()],
+            allow_unencrypted_clearnet_relays: true,
+            onion: vec![],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 5,
+        };
+
+        let relay_client = Arc::new(RelayClient::new(keys, relay_config).await.unwrap());
+        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = HealthConfig {
+            enabled: true,
+            bind_address: addr.to_string(),
+        };
+
+        let server = HealthServer::new(config, relay_client, push_dispatcher, None);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
+
+        let client = reqwest::Client::new();
+        // Wait until the listener is up before sending the oversized request.
+        let _ = wait_for_server_response(&client, format!("http://{}/health", addr)).await;
+
+        let response = client
+            .get(format!("http://{}/health", addr))
+            .body(vec![0u8; MAX_REQUEST_BODY_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+
+        // Health endpoints take no request bodies; oversized ones are
+        // rejected outright by the body-limit layer.
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;

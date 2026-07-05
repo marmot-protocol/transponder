@@ -149,17 +149,21 @@ service_account_path = ""
 project_id = ""
 
 [health]
-# Whether the health check HTTP server is enabled
+# Whether the health check endpoints (/health, /ready) are enabled.
+# Independent of [metrics].enabled: disabling the health endpoints does not
+# disable /metrics, which is served on bind_address whenever metrics are
+# enabled.
 enabled = true
 
-# Address to bind the health check server to.
+# Address to bind the health/metrics listener to.
 # Keep this on localhost unless an internal proxy, VPN, or load balancer needs
 # access to the endpoint.
 bind_address = "127.0.0.1:8080"
 
 [metrics]
-# Whether Prometheus metrics are enabled
-# Metrics are exposed at /metrics on the health server port
+# Whether Prometheus metrics are enabled.
+# Metrics are exposed at /metrics on the health server bind address whenever
+# enabled - even if the health endpoints ([health].enabled) are disabled.
 enabled = true
 
 [logging]

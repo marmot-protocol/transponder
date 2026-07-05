@@ -108,6 +108,16 @@ const TOR_FEATURE_ENABLED: bool = true;
 #[cfg(not(feature = "tor"))]
 const TOR_FEATURE_ENABLED: bool = false;
 
+/// Cadence of the background relay-status refresh.
+///
+/// The refresher recomputes the cached relay connection status (and the
+/// `relays_connected` gauges) on this fixed interval, so readiness probes can
+/// be pure reads of the snapshot and gauge updates track connection state
+/// rather than probe traffic. Five seconds keeps `/ready` at most one refresh
+/// interval behind real connection changes for typical orchestrator probe
+/// periods (10s+) while enumerating the relay pool rarely.
+const RELAY_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
 fn validate_startup_config(server_private_key: &str, relays: &config::RelayConfig) -> Result<()> {
     if server_private_key.is_empty() {
         anyhow::bail!("Server private key is required");
@@ -368,7 +378,8 @@ async fn run_event_loop(
 ///    is quiesced.
 /// 4. Disconnect relays. This closes the notification broadcast channel, which
 ///    is only safe (no spurious `Closed` error) once the event loop is gone.
-/// 5. Join the remaining supervised tasks (health server, cleanup).
+/// 5. Join the remaining supervised tasks (health server, cleanup, relay
+///    status refresher).
 ///
 /// The caller bounds the whole sequence with the configured shutdown timeout
 /// via [`shutdown::graceful_shutdown`].
@@ -379,6 +390,7 @@ async fn staged_teardown(
     relay_client: Arc<RelayClient>,
     health_handle: tokio::task::JoinHandle<()>,
     cleanup_handle: tokio::task::JoinHandle<()>,
+    status_refresh_handle: tokio::task::JoinHandle<()>,
 ) {
     let _ = event_handle.await;
 
@@ -391,7 +403,7 @@ async fn staged_teardown(
         warn!(error = %e, "Error disconnecting from relays");
     }
 
-    let _ = tokio::join!(health_handle, cleanup_handle);
+    let _ = tokio::join!(health_handle, cleanup_handle, status_refresh_handle);
 }
 
 #[tokio::main]
@@ -703,6 +715,29 @@ async fn run(mut config: AppConfig) -> Result<()> {
         }
     });
 
+    // Start the background relay-status refresher. After startup it is the
+    // only writer of the cached relay status (and the relays_connected
+    // gauges): `/ready` and other readers consume the snapshot without
+    // recomputing it, so unauthenticated probes cannot drive lock or gauge
+    // churn (see RelayClient::refresh_status).
+    let mut status_refresh_shutdown = shutdown.subscribe();
+    let status_refresh_client = relay_client.clone();
+    let status_refresh_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RELAY_STATUS_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = status_refresh_shutdown.changed() => {
+                    break;
+                }
+                _ = interval.tick() => {
+                    status_refresh_client.refresh_status().await;
+                }
+            }
+        }
+    });
+
     info!("Transponder running");
 
     // Wait for a shutdown signal or an internal trigger from a supervised
@@ -723,6 +758,7 @@ async fn run(mut config: AppConfig) -> Result<()> {
                 relay_client,
                 health_handle,
                 cleanup_handle,
+                status_refresh_handle,
             )
         },
         config.server.shutdown_timeout_secs,
@@ -1347,6 +1383,7 @@ mod tests {
         let event_handle = tokio::spawn(async {});
         let health_handle = tokio::spawn(async {});
         let cleanup_handle = tokio::spawn(async {});
+        let status_refresh_handle = tokio::spawn(async {});
 
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1357,6 +1394,7 @@ mod tests {
                 relay_client,
                 health_handle,
                 cleanup_handle,
+                status_refresh_handle,
             ),
         )
         .await
@@ -1400,6 +1438,7 @@ mod tests {
         );
         let health_handle = tokio::spawn(async {});
         let cleanup_handle = tokio::spawn(async {});
+        let status_refresh_handle = tokio::spawn(async {});
 
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1410,6 +1449,7 @@ mod tests {
                 relay_client,
                 health_handle,
                 cleanup_handle,
+                status_refresh_handle,
             ),
         )
         .await

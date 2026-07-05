@@ -493,11 +493,18 @@ pub struct FcmConfig {
 /// Health check server configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
-    /// Whether the health check server is enabled.
+    /// Whether the health check endpoints (`/health`, `/ready`) are enabled.
+    ///
+    /// Independent of `metrics.enabled`: disabling the health endpoints does
+    /// not disable the `/metrics` endpoint, which is served on
+    /// `bind_address` whenever metrics are enabled.
     #[serde(default = "default_health_enabled")]
     pub enabled: bool,
 
-    /// Bind address for the health check server.
+    /// Bind address for the health/metrics listener.
+    ///
+    /// All routes are unauthenticated; keep this on loopback or an internal
+    /// interface unless the endpoints sit behind an access-controlled proxy.
     #[serde(default = "default_health_bind_address")]
     pub bind_address: String,
 }
@@ -513,7 +520,10 @@ fn default_health_bind_address() -> String {
 /// Metrics configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetricsConfig {
-    /// Whether metrics are enabled.
+    /// Whether Prometheus metrics are enabled.
+    ///
+    /// When enabled, `/metrics` is served on `health.bind_address` even if
+    /// the health endpoints themselves (`health.enabled`) are disabled.
     #[serde(default = "default_metrics_enabled")]
     pub enabled: bool,
 }
