@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -213,6 +214,12 @@ pub struct FcmClient {
     pub(crate) encoding_key: Option<EncodingKey>,
     pub(crate) cached_token: Arc<RwLock<Option<CachedToken>>>,
     pub(crate) metrics: Option<Metrics>,
+    /// Overrides the FCM API origin in unit tests.
+    #[cfg(test)]
+    pub(crate) test_push_base_url: Option<String>,
+    /// Overrides the OAuth token endpoint in unit tests.
+    #[cfg(test)]
+    pub(crate) test_oauth_token_url: Option<String>,
 }
 
 impl FcmClient {
@@ -257,6 +264,10 @@ impl FcmClient {
             encoding_key,
             cached_token: Arc::new(RwLock::new(None)),
             metrics,
+            #[cfg(test)]
+            test_push_base_url: None,
+            #[cfg(test)]
+            test_oauth_token_url: None,
         })
     }
 
@@ -329,7 +340,18 @@ impl FcmClient {
 
         let response = self
             .http_client
-            .post(OAUTH_TOKEN_URL)
+            .post({
+                #[cfg(test)]
+                {
+                    self.test_oauth_token_url
+                        .as_deref()
+                        .unwrap_or(OAUTH_TOKEN_URL)
+                }
+                #[cfg(not(test))]
+                {
+                    OAUTH_TOKEN_URL
+                }
+            })
             .form(&request)
             .send()
             .await?;
@@ -400,10 +422,14 @@ impl FcmClient {
         }
 
         let retry_config = RetryConfig::default();
+        let auth_already_retried = Arc::new(AtomicBool::new(false));
         retry::with_retry(
             &retry_config,
             "FCM",
-            || self.send_once(device_token),
+            || {
+                let auth_already_retried = Arc::clone(&auth_already_retried);
+                async move { self.send_once(device_token, &auth_already_retried).await }
+            },
             backoff_permit,
             self.metrics.as_ref(),
         )
@@ -516,6 +542,7 @@ impl FcmClient {
         request_duration: Duration,
         response: reqwest::Response,
         access_token: &str,
+        auth_already_retried: &AtomicBool,
     ) -> SendAttemptResult {
         let status = response.status();
 
@@ -534,10 +561,18 @@ impl FcmClient {
                     .await
             }
             401 => {
-                // Auth error - permanent for this request, refresh on the next one.
+                // Auth error: invalidate and retry once with a fresh token.
                 self.invalidate_cached_token(access_token).await;
                 debug!("FCM authentication error");
-                SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
+                if auth_already_retried.load(Ordering::Relaxed) {
+                    SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
+                } else {
+                    auth_already_retried.store(true, Ordering::Relaxed);
+                    SendAttemptResult::Retriable {
+                        status_code: 401,
+                        retry_after: None,
+                    }
+                }
             }
             403 => {
                 // Project or service-account authorization failure. This is a
@@ -588,12 +623,28 @@ impl FcmClient {
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
-    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+    async fn send_once(
+        &self,
+        device_token: &str,
+        auth_already_retried: &AtomicBool,
+    ) -> SendAttemptResult {
         let project_id = match self.project_id() {
             Ok(id) => id,
             Err(e) => return SendAttemptResult::Permanent(e),
         };
-        let url = format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
+        let origin = {
+            #[cfg(test)]
+            {
+                self.test_push_base_url
+                    .as_deref()
+                    .unwrap_or("https://fcm.googleapis.com")
+            }
+            #[cfg(not(test))]
+            {
+                "https://fcm.googleapis.com"
+            }
+        };
+        let url = format!("{origin}/v1/projects/{project_id}/messages:send");
 
         let access_token = match self.get_access_token().await {
             Ok(t) => t,
@@ -624,8 +675,13 @@ impl FcmClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(request_duration, response, access_token.as_str())
-            .await
+        self.handle_response(
+            request_duration,
+            response,
+            access_token.as_str(),
+            auth_already_retried,
+        )
+        .await
     }
 
     /// Check if the client is properly configured.
@@ -708,6 +764,8 @@ impl FcmClient {
             encoding_key,
             cached_token: Arc::new(RwLock::new(None)),
             metrics: None,
+            test_push_base_url: None,
+            test_oauth_token_url: None,
         }
     }
 }
@@ -716,6 +774,7 @@ impl FcmClient {
 mod tests {
     use super::*;
     use crate::test_metrics::{counter_value, histogram_sample_count, histogram_sample_sum};
+    use std::sync::atomic::AtomicBool;
     use wiremock::matchers::{body_partial_json, header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1117,8 +1176,14 @@ mod tests {
             .unwrap();
 
         let provider_duration = Duration::from_millis(123);
+        let auth_already_retried = AtomicBool::new(false);
         let result = client
-            .handle_response(provider_duration, response, "test-access-token")
+            .handle_response(
+                provider_duration,
+                response,
+                "test-access-token",
+                &auth_already_retried,
+            )
             .await;
 
         assert!(matches!(result, SendAttemptResult::Success(true)));
@@ -1179,7 +1244,12 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-access-token")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "test-access-token",
+                &AtomicBool::new(false),
+            )
             .await
     }
 
@@ -1232,7 +1302,12 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-access-token")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "test-access-token",
+                &AtomicBool::new(false),
+            )
             .await
     }
 
@@ -1352,7 +1427,12 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-access-token")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "test-access-token",
+                &AtomicBool::new(false),
+            )
             .await
     }
 
@@ -1513,13 +1593,20 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Duration::ZERO, response, "poisoned-access-token")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "poisoned-access-token",
+                &AtomicBool::new(false),
+            )
             .await;
 
         assert!(matches!(
             result,
-            SendAttemptResult::Permanent(Error::Fcm(ref message))
-                if message.contains("Authentication error")
+            SendAttemptResult::Retriable {
+                status_code: 401,
+                retry_after: None,
+            }
         ));
         assert!(client.cached_token.read().await.is_none());
     }
@@ -1569,13 +1656,20 @@ mod tests {
 
         // The failing request used the older, now-replaced token.
         let result = client
-            .handle_response(Duration::ZERO, response, "stale-access-token")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "stale-access-token",
+                &AtomicBool::new(false),
+            )
             .await;
 
         assert!(matches!(
             result,
-            SendAttemptResult::Permanent(Error::Fcm(ref message))
-                if message.contains("Authentication error")
+            SendAttemptResult::Retriable {
+                status_code: 401,
+                retry_after: None,
+            }
         ));
 
         // The freshly refreshed token must survive the stale rejection.
@@ -2062,6 +2156,8 @@ mod tests {
             encoding_key: None,
             cached_token: Arc::new(RwLock::new(None)),
             metrics: None,
+            test_push_base_url: None,
+            test_oauth_token_url: None,
         };
 
         // Should not be configured - no encoding key
@@ -2344,6 +2440,166 @@ mod tests {
                 .await
                 .unwrap(),
             "overlong token"
+        );
+    }
+
+    const TEST_RSA_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC+GxS/essTKEM5
+bSql04wNM6bWhLra5xzgADABcUEiim9dJCr5eCILPxf8O8fPwH1nh52xbvRrAGZo
+P/ifvUyE/50BnWJhKSmKG2+Wyg5Ns2iDW43uw+CgJTLTEYxAxu4F5SSoMsWQfYOG
+GwgFKjdBra+q40la7Sm0CMuo6qsr76T+De4e+00HMuOWyXe9YZ8MhDrYMcluS7cg
+XW/a351QdhfKqeagkK7QqxqsOQB6NnCi61Y4zwyjioaP6Cefsfs9By9qM3zrir0j
+roDPoc2NkBPqtRNTNfBA9IdS1/AiAhgSRWMrxsfieCmNga/TBTFU180A+doLUTWk
+fvRwmxt5AgMBAAECggEAANz53aqcSzGzIdeLoOdHRj4r30lVpiqN1G9y+41+eDGn
+34s4LDv1+8/W2ndeUp4xjsbcSd4JFO0ydqQquA8pm3V9kQn8R6Vo+dm8MOa2OBCM
+9HXvfMW6kObJicQojnJwyhaDV/je2FQvkZKkGTTnvXmhMXESgbiPtTCKImUjyMfN
+5xs6bWQ+g1gYuYPWZuoxZxRJkPFku0T9XQ47aJGs+dE96NaVqszxXdoukXPyhLXt
+oODFOw0HmLKv2bblVGNCUe85bqOsSGQp4i6uL36t1UttRW2dHqPpeblw4Oqqgz41
+SwcQLI+FDAcMtnep0KljMYYYQFUZaUND7NScm9E4YQKBgQDl410xzSnY6blkt04V
+NpTiBeXP3YAue9mW8Tpwr4JPR1KCUO54yVXlBLdWdXxAY32BmtUKPuqxS1YhfW8L
+up5etVFNi3t+ypLkRPVc2mOIJsDrktP52JpMt2E49ktjkRwJ1gP093I121I4X8vT
+rcaK+3LrB/OeMxrnZ6uLRT2LYQKBgQDTsu8/4i1qD1CHnc9glsMslgQLEv0TDbLa
+/+OlYD4lMxWUwu0VoYoBhqhHuMckOCW/eU1IfsEm3V6zZnC57BkAx9mG4gE/ph9K
+n/8LgQyFuxDTr8rG40yWG2xKHjnOplhKz9Ueb2/8TBpmrdlnpB0HmFAQTCCr7f9i
+/t/69o/fGQKBgEvTyByyMJh014sKD35dx5QaH+iFhk9O2MG6Be2/Znsh6mxDp7U9
+q9Bj0tl43Sgb6P0EBjtf72fVkq5vQl6bCrvwkMXEOVLkHLmgqVIcUvJI3h+WCceC
+k7q0TiRM0SchaR8xcZKuwARVuHQR3RiQXEnhkNFHiSrobnpfrqy8hQVhAoGBAIkL
+mypmBzRTubQxiyBiOPNSIkfxAPgmtBRl9z8F8PUv/taQ4d5Q9wBJ5gKYMgLWfklY
+A5ncxLmeMUI+HNefaghBWCajhF9p8XPj473UywB/u0Lu2HyshNXf5tiMfKu0sA+u
+P682QO65bZXvEYCwk0Jpbds/DR+AMQYrLWBP4Y9xAoGBAK0QTHlksazbQbQHVAMj
+TQ0NPq9Ae59tIP9fyBtHW66COFbl/Tj0duKBwO61MVh/NIRlN8/Hn9r0g6DEnOtg
+sRSdaT8BkFB06cnXa6BDjSNYsLxNyoiR0r/mNvwiDlNPLjE4Ebso6dCS8oFuIiUT
++R/Znes0ozpQpNTzp9qRstrk
+-----END PRIVATE KEY-----";
+
+    async fn fcm_client_for_mock(mock_uri: &str) -> (FcmClient, tempfile::NamedTempFile) {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let sa_json = serde_json::json!({
+            "type": "service_account",
+            "project_id": "test-project",
+            "private_key": TEST_RSA_PRIVATE_KEY,
+            "client_email": "test@test.iam.gserviceaccount.com",
+            "token_uri": format!("{mock_uri}/token"),
+        });
+        let mut sa_file = NamedTempFile::new().unwrap();
+        sa_file.write_all(sa_json.to_string().as_bytes()).unwrap();
+
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: sa_file.path().to_string_lossy().to_string(),
+            project_id: "test-project".to_string(),
+        };
+
+        let mut client = FcmClient::with_metrics(config, None).await.unwrap();
+        client.test_push_base_url = Some(mock_uri.to_string());
+        client.test_oauth_token_url = Some(format!("{mock_uri}/token"));
+        (client, sa_file)
+    }
+
+    #[tokio::test]
+    async fn test_send_retries_auth_error_then_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 401,
+                    "message": "Request had invalid authentication credentials.",
+                    "status": "UNAUTHENTICATED"
+                }
+            })))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/test-project/messages/123456"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (client, _sa_file) = fcm_client_for_mock(&mock_server.uri()).await;
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("stale-access-token".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let result = client.send("device-token-123", None).await;
+        assert!(result.unwrap());
+
+        let cached = client.cached_token.read().await;
+        assert!(cached.is_some());
+        assert_eq!(
+            cached.as_ref().unwrap().token.as_str(),
+            "fresh-access-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_persistent_auth_error_is_bounded() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 401,
+                    "message": "Request had invalid authentication credentials.",
+                    "status": "UNAUTHENTICATED"
+                }
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let (client, _sa_file) = fcm_client_for_mock(&mock_server.uri()).await;
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("stale-access-token".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let result = client.send("device-token-123", None).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Authentication error")
         );
     }
 }

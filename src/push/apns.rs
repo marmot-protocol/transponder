@@ -3,6 +3,7 @@
 //! Uses token-based (JWT) authentication with a .p8 key file.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -205,6 +206,9 @@ pub struct ApnsClient {
     pub(crate) encoding_key: Option<EncodingKey>,
     pub(crate) cached_token: Arc<RwLock<Option<CachedToken>>>,
     pub(crate) metrics: Option<Metrics>,
+    /// Overrides the APNs API base URL in unit tests.
+    #[cfg(test)]
+    pub(crate) test_push_base_url: Option<String>,
 }
 
 impl ApnsClient {
@@ -246,6 +250,8 @@ impl ApnsClient {
             encoding_key,
             cached_token: Arc::new(RwLock::new(None)),
             metrics,
+            #[cfg(test)]
+            test_push_base_url: None,
         })
     }
 
@@ -344,10 +350,14 @@ impl ApnsClient {
         }
 
         let retry_config = RetryConfig::default();
+        let auth_already_retried = Arc::new(AtomicBool::new(false));
         retry::with_retry(
             &retry_config,
             "APNs",
-            || self.send_once(device_token),
+            || {
+                let auth_already_retried = Arc::clone(&auth_already_retried);
+                async move { self.send_once(device_token, &auth_already_retried).await }
+            },
             backoff_permit,
             self.metrics.as_ref(),
         )
@@ -393,6 +403,7 @@ impl ApnsClient {
         request_duration: Duration,
         response: reqwest::Response,
         auth_token: &str,
+        auth_already_retried: &AtomicBool,
     ) -> SendAttemptResult {
         let status = response.status();
 
@@ -453,10 +464,18 @@ impl ApnsClient {
                     reason = %error.reason,
                     "APNs authentication error"
                 );
-                SendAttemptResult::Permanent(Error::Apns(format!(
-                    "Authentication error: {}",
-                    error.reason
-                )))
+                if auth_already_retried.load(Ordering::Relaxed) {
+                    SendAttemptResult::Permanent(Error::Apns(format!(
+                        "Authentication error: {}",
+                        error.reason
+                    )))
+                } else {
+                    auth_already_retried.store(true, Ordering::Relaxed);
+                    SendAttemptResult::Retriable {
+                        status_code: 403,
+                        retry_after: None,
+                    }
+                }
             }
             410 => {
                 // Token is no longer valid (device unregistered)
@@ -506,17 +525,38 @@ impl ApnsClient {
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
-    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
-        self.send_once_with_transport_retry_config(device_token, &RetryConfig::transport())
-            .await
+    async fn send_once(
+        &self,
+        device_token: &str,
+        auth_already_retried: &AtomicBool,
+    ) -> SendAttemptResult {
+        self.send_once_with_transport_retry_config(
+            device_token,
+            &RetryConfig::transport(),
+            auth_already_retried,
+        )
+        .await
     }
 
     async fn send_once_with_transport_retry_config(
         &self,
         device_token: &str,
         transport_retry: &RetryConfig,
+        auth_already_retried: &AtomicBool,
     ) -> SendAttemptResult {
-        let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
+        let push_base = {
+            #[cfg(test)]
+            {
+                self.test_push_base_url
+                    .as_deref()
+                    .unwrap_or(self.config.base_url())
+            }
+            #[cfg(not(test))]
+            {
+                self.config.base_url()
+            }
+        };
+        let url = format!("{push_base}/3/device/{device_token}");
 
         debug!(
             payload_mode = %self.config.payload_mode,
@@ -557,8 +597,13 @@ impl ApnsClient {
             Err(e) => return SendAttemptResult::Permanent(e),
         };
 
-        self.handle_response(request_duration, response, token.as_str())
-            .await
+        self.handle_response(
+            request_duration,
+            response,
+            token.as_str(),
+            auth_already_retried,
+        )
+        .await
     }
 
     /// Check if the client is properly configured.
@@ -589,6 +634,7 @@ impl ApnsClient {
             },
             cached_token: Arc::new(RwLock::new(None)),
             metrics: None,
+            test_push_base_url: None,
         }
     }
 }
@@ -598,6 +644,7 @@ mod tests {
     use super::*;
     use crate::test_metrics::{counter_value, histogram_sample_count, histogram_sample_sum};
     use base64::Engine;
+    use std::sync::atomic::AtomicBool;
     use wiremock::matchers::{header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zeroize::Zeroizing;
@@ -803,6 +850,7 @@ mod tests {
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
             metrics: None,
+            test_push_base_url: None,
         };
 
         // Test with a token that contains non-hex characters
@@ -853,6 +901,7 @@ mod tests {
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
             metrics: None,
+            test_push_base_url: None,
         };
         let retry_config = RetryConfig {
             max_retries: 3,
@@ -860,7 +909,11 @@ mod tests {
         };
 
         let result = client
-            .send_once_with_transport_retry_config("aabbccdd11223344", &retry_config)
+            .send_once_with_transport_retry_config(
+                "aabbccdd11223344",
+                &retry_config,
+                &AtomicBool::new(false),
+            )
             .await;
 
         assert!(matches!(
@@ -926,6 +979,7 @@ mod tests {
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
             metrics: None,
+            test_push_base_url: None,
         };
 
         // We need to override the base_url - let's test with a modified approach
@@ -1043,8 +1097,14 @@ mod tests {
             .unwrap();
 
         let provider_duration = Duration::from_millis(123);
+        let auth_already_retried = AtomicBool::new(false);
         let result = client
-            .handle_response(provider_duration, response, "test-token")
+            .handle_response(
+                provider_duration,
+                response,
+                "test-token",
+                &auth_already_retried,
+            )
             .await;
 
         assert!(matches!(result, SendAttemptResult::Success(true)));
@@ -1093,7 +1153,12 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-token")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "test-token",
+                &AtomicBool::new(false),
+            )
             .await
     }
 
@@ -1154,7 +1219,12 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Duration::ZERO, response, "test-token")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "test-token",
+                &AtomicBool::new(false),
+            )
             .await
     }
 
@@ -1222,8 +1292,14 @@ mod tests {
             .await
             .unwrap();
 
+        let auth_already_retried = AtomicBool::new(false);
         let result = client
-            .handle_response(Duration::ZERO, response, "test-token")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "test-token",
+                &auth_already_retried,
+            )
             .await;
 
         let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
@@ -1259,7 +1335,47 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Duration::ZERO, response, "test-token")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "test-token",
+                &AtomicBool::new(false),
+            )
+            .await;
+
+        let SendAttemptResult::Retriable { status_code, .. } = result else {
+            panic!("expected a retriable APNs auth error, got {result:?}");
+        };
+        assert_eq!(status_code, 403);
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_403_oversized_body_is_permanent_after_auth_retry() {
+        let padding = "A".repeat(4 * 1024 * 1024);
+        let huge_body = format!(r#"{{"reason":"{padding}"}}"#);
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(huge_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+        let response = Client::new()
+            .post(format!("{}/3/device/{}", mock_server.uri(), "deadbeef1234"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "test-token",
+                &AtomicBool::new(true),
+            )
             .await;
 
         let SendAttemptResult::Permanent(Error::Apns(message)) = result else {
@@ -1267,8 +1383,6 @@ mod tests {
         };
         assert!(message.contains("Authentication error"));
         assert!(message.contains("Unknown"));
-        // The oversized provider body must not leak into the error message,
-        // which stays bounded regardless of the (huge) upstream body.
         assert!(!message.contains(&padding));
         assert!(message.len() < 128);
     }
@@ -1400,13 +1514,20 @@ mod tests {
             .unwrap();
 
         let result = client
-            .handle_response(Duration::ZERO, response, "poisoned-jwt")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "poisoned-jwt",
+                &AtomicBool::new(false),
+            )
             .await;
 
         assert!(matches!(
             result,
-            SendAttemptResult::Permanent(Error::Apns(ref message))
-                if message.contains("BadJwtToken")
+            SendAttemptResult::Retriable {
+                status_code: 403,
+                retry_after: None,
+            }
         ));
         assert!(client.cached_token.read().await.is_none());
     }
@@ -1444,13 +1565,20 @@ mod tests {
 
         // The failing request used the older, now-replaced token.
         let result = client
-            .handle_response(Duration::ZERO, response, "stale-jwt")
+            .handle_response(
+                Duration::ZERO,
+                response,
+                "stale-jwt",
+                &AtomicBool::new(false),
+            )
             .await;
 
         assert!(matches!(
             result,
-            SendAttemptResult::Permanent(Error::Apns(ref message))
-                if message.contains("InvalidProviderToken")
+            SendAttemptResult::Retriable {
+                status_code: 403,
+                retry_after: None,
+            }
         ));
 
         // The freshly refreshed token must survive the stale rejection.
@@ -1755,6 +1883,7 @@ mod tests {
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
             metrics: None,
+            test_push_base_url: None,
         };
 
         // The send method uses self.config.base_url() which returns the real APNs URL,
@@ -2035,6 +2164,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
             }))),
             metrics: None,
+            test_push_base_url: None,
         };
 
         // Manually test the response handling logic by making a direct request
@@ -2176,5 +2306,103 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             .unwrap();
 
         assert_eq!(response2.status(), 200);
+    }
+
+    const TEST_EC_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G
+-----END PRIVATE KEY-----";
+
+    async fn apns_client_for_mock(mock_uri: &str) -> (ApnsClient, tempfile::NamedTempFile) {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file.write_all(TEST_EC_PRIVATE_KEY.as_bytes()).unwrap();
+
+        let config = ApnsConfig {
+            enabled: true,
+            key_id: "KEY123".to_string(),
+            team_id: "TEAM456".to_string(),
+            private_key_path: key_file.path().to_string_lossy().to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+        };
+
+        let mut client = ApnsClient::with_metrics(config, None).await.unwrap();
+        client.test_push_base_url = Some(mock_uri.to_string());
+        (client, key_file)
+    }
+
+    #[tokio::test]
+    async fn test_send_retries_auth_error_then_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "reason": "ExpiredProviderToken"
+            })))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (client, _key_file) = apns_client_for_mock(&mock_server.uri()).await;
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("stale-jwt".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let result = client.send("aabbccdd11223344", None).await;
+        assert!(result.unwrap());
+
+        let cached = client.cached_token.read().await;
+        assert!(cached.is_some());
+        assert_ne!(cached.as_ref().unwrap().token.as_str(), "stale-jwt");
+    }
+
+    #[tokio::test]
+    async fn test_send_persistent_auth_error_is_bounded() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/3/device/[a-f0-9]+"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "reason": "InvalidProviderToken"
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let (client, _key_file) = apns_client_for_mock(&mock_server.uri()).await;
+        {
+            let mut cached = client.cached_token.write().await;
+            *cached = Some(CachedToken {
+                token: Zeroizing::new("stale-jwt".to_string()),
+                expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            });
+        }
+
+        let result = client.send("aabbccdd11223344", None).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Authentication error")
+        );
     }
 }
