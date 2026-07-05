@@ -21,7 +21,6 @@ use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
 use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
-use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
 use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
 use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
@@ -792,9 +791,7 @@ impl EventProcessor {
                         parse_started_at.elapsed_secs(),
                     );
                     m.observe_tokens_per_event(token_bytes.len());
-                    m.observe_notification_content_size_bytes(
-                        token_bytes.len() * ENCRYPTED_TOKEN_SIZE,
-                    );
+                    m.observe_notification_content_size_bytes(notification.content.len());
                 }
                 token_bytes
             }
@@ -1428,9 +1425,11 @@ mod tests {
             ),
             1
         );
+        // One encrypted token is 1084 bytes, transported as base64 text; the
+        // metric records the received content size, not a reconstruction.
         assert_eq!(
             histogram_sample_sum(&metrics, "transponder_notification_content_size_bytes", &[]),
-            ENCRYPTED_TOKEN_SIZE as f64
+            (ENCRYPTED_TOKEN_SIZE.div_ceil(3) * 4) as f64
         );
     }
 
