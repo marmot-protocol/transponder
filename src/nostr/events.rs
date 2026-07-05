@@ -3103,6 +3103,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prefiltered_drop_does_not_touch_delivery_health() {
+        // Reconciliation invariant with the push-provider rework (#233): a token
+        // dropped by the #177 pre-filter in process_inner never reaches the send
+        // path, so it is NOT a delivery attempt and must not touch the provider's
+        // DeliveryHealth streak (which gates /ready). No streak increment (would
+        // wrongly flag a healthy provider) and no reset (would wrongly clear a
+        // real failure streak).
+        use crate::push::FcmClient;
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+        use base64::prelude::*;
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        // FCM-only dispatcher; the event carries an APNs token → pre-filtered as
+        // unconfigured before it can reach send_push.
+        let nip59_handler = Nip59Handler::new(server_keys.clone());
+        let mut secp_secret_key =
+            secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
+                .expect("valid secret key");
+        let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
+        let fcm_config = crate::config::FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: "test-project".to_string(),
+        };
+        let metrics = Metrics::new().expect("metrics");
+        let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
+            None,
+            Some(FcmClient::mock(fcm_config, true)),
+            Some(metrics.clone()),
+        ));
+        // Retain a handle to inspect DeliveryHealth after processing.
+        let dispatcher_handle = Arc::clone(&push_dispatcher);
+        let processor = EventProcessor::with_full_config(
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+            DEFAULT_MAX_DEDUP_CACHE_SIZE,
+            TokenRateLimitConfig::default(),
+            Some(metrics.clone()),
+        );
+
+        // Seed a real hard-failure streak on FCM just below the flagging
+        // threshold (a genuine prior outage), so we can prove a pre-filtered APNs
+        // drop neither resets FCM's streak nor touches APNs's.
+        use crate::push::dispatcher::DELIVERY_FAILURE_STREAK_THRESHOLD;
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD - 1 {
+            dispatcher_handle
+                .delivery_health()
+                .record_hard_failure(Platform::Fcm);
+        }
+
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let encrypted = encryptor.encrypt(&TestToken::apns(
+            "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344",
+        ));
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(BASE64_STANDARD.encode(&encrypted))
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build(&content)
+            .await;
+
+        assert!(processor.process(&event).await.unwrap());
+
+        // APNs was never a delivery attempt: its streak is untouched (still 0 →
+        // delivering), so the pre-filter did not spuriously flag it.
+        assert!(
+            dispatcher_handle.is_apns_delivering(),
+            "a pre-filtered APNs drop must not increment APNs delivery-health streak"
+        );
+        // FCM's genuine prior streak was NOT reset by the unrelated APNs drop.
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_failed_total",
+                &[("platform", "apns"), ("reason", "unconfigured")],
+            ),
+            1.0
+        );
+        assert!(
+            dispatcher_handle.is_fcm_delivering(),
+            "streak just below threshold is still delivering"
+        );
+        // One more FCM hard failure reaches the threshold — which only holds if
+        // the seeded streak survived, proving the APNs pre-filter drop did not
+        // silently reset FCM's real hard-failure streak.
+        dispatcher_handle
+            .delivery_health()
+            .record_hard_failure(Platform::Fcm);
+        assert!(
+            !dispatcher_handle.is_fcm_delivering(),
+            "pre-filter drop must not have reset FCM's real hard-failure streak"
+        );
+    }
+
+    #[tokio::test]
     async fn test_non_utf8_fcm_token_refunds_and_counts_drop() {
         // #177: an FCM token whose device bytes are not UTF-8 is undeliverable.
         // It must be dropped before charging the device limiter, its encrypted
