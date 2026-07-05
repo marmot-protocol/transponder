@@ -2691,7 +2691,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
         client.test_oauth_token_url = Some(mock_server.uri());
         client.test_fcm_api_base_url = Some(mock_server.uri());
 
-        let result = client.send("device-token-123", None).await;
+        let result = client.send(zeroizing_token("device-token-123"), None).await;
         assert!(
             result.is_ok(),
             "expected success after OAuth retry: {result:?}"
@@ -2716,7 +2716,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
         client.test_oauth_token_url = Some(mock_server.uri());
         client.test_fcm_api_base_url = Some(mock_server.uri());
 
-        let result = client.send("device-token-123", None).await;
+        let result = client.send(zeroizing_token("device-token-123"), None).await;
         assert!(result.is_err(), "expected permanent OAuth failure");
         let message = result.unwrap_err().to_string();
         assert!(message.contains("OAuth token request failed"));
