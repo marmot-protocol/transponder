@@ -186,16 +186,18 @@ impl TokenPayload {
         })
     }
 
-    /// Get the device token as a hex string (for APNs).
+    /// Get the device token as a zeroized hex string (for APNs).
     #[must_use]
-    pub fn device_token_hex(&self) -> String {
-        hex::encode(&self.device_token)
+    pub fn device_token_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(&self.device_token))
     }
 
-    /// Get the device token as a string (for FCM).
+    /// Get the device token as a zeroized string (for FCM).
     #[must_use]
-    pub fn device_token_string(&self) -> Option<String> {
-        String::from_utf8(self.device_token.clone()).ok()
+    pub fn device_token_string(&self) -> Option<Zeroizing<String>> {
+        std::str::from_utf8(&self.device_token)
+            .ok()
+            .map(|token| Zeroizing::new(token.to_owned()))
     }
 }
 
@@ -422,7 +424,8 @@ mod tests {
             platform: Platform::Apns,
             device_token: vec![0xde, 0xad, 0xbe, 0xef],
         };
-        assert_eq!(payload.device_token_hex(), "deadbeef");
+        let token: Zeroizing<String> = payload.device_token_hex();
+        assert_eq!(token.as_str(), "deadbeef");
     }
 
     #[test]
@@ -431,10 +434,8 @@ mod tests {
             platform: Platform::Fcm,
             device_token: b"test-token-123".to_vec(),
         };
-        assert_eq!(
-            payload.device_token_string(),
-            Some("test-token-123".to_string())
-        );
+        let token: Option<Zeroizing<String>> = payload.device_token_string();
+        assert_eq!(token.as_ref().map(|s| s.as_str()), Some("test-token-123"));
     }
 
     #[test]

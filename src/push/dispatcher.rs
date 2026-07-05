@@ -402,7 +402,7 @@ impl PushDispatcher {
                         trace!("APNs not configured, skipping notification");
                         continue;
                     }
-                    (Platform::Apns, Zeroizing::new(payload.device_token_hex()))
+                    (Platform::Apns, payload.device_token_hex())
                 }
                 Platform::Fcm => {
                     if self.fcm_client.is_none() {
@@ -410,7 +410,7 @@ impl PushDispatcher {
                         continue;
                     }
                     match payload.device_token_string() {
-                        Some(t) => (Platform::Fcm, Zeroizing::new(t)),
+                        Some(token) => (Platform::Fcm, token),
                         None => {
                             trace!("Invalid FCM token (not UTF-8)");
                             continue;
