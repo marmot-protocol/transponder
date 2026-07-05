@@ -294,10 +294,15 @@ impl ApnsClient {
             .map_err(|e| Error::Apns(format!("System time error: {e}")))?
             .as_secs();
 
+        // Backdate `iat` by the clock-skew leeway so a fast host clock does not
+        // yield an `iat` in APNs's future (403 InvalidProviderToken); `exp`
+        // stays within Apple's 1-hour max measured from the backdated `iat`.
+        let (iat, exp) = crate::push::auth_jwt_iat_exp(now, TOKEN_EXPIRATION_SECS);
+
         let claims = ApnsClaims {
             iss: self.config.team_id.clone(),
-            iat: now,
-            exp: now + TOKEN_EXPIRATION_SECS,
+            iat,
+            exp,
         };
 
         let mut header = Header::new(Algorithm::ES256);
@@ -1860,6 +1865,11 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             .await
             .unwrap();
 
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
         // Generate a token
         let token = client.generate_token().unwrap();
 
@@ -1920,6 +1930,24 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
         let iat = claims["iat"].as_u64().unwrap();
         let exp = claims["exp"].as_u64().unwrap();
         assert_eq!(exp - iat, 3600, "exp should be iat + 3600 seconds");
+
+        // iat must be backdated by the clock-skew leeway so a fast host clock
+        // does not stamp an iat in APNs's future. Bound it by the wall-clock
+        // times captured before and after signing so the assertion is stable
+        // even if the test crosses a second boundary.
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let leeway = crate::push::AUTH_JWT_CLOCK_SKEW_LEEWAY_SECS;
+        assert!(
+            iat >= before.saturating_sub(leeway),
+            "iat ({iat}) should be no earlier than the backdated start ({before} - {leeway})"
+        );
+        assert!(
+            iat <= after.saturating_sub(leeway),
+            "iat ({iat}) should be backdated at least {leeway}s before now ({after})"
+        );
     }
 
     #[tokio::test]
