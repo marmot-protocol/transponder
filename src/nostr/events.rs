@@ -806,10 +806,9 @@ impl EventProcessor {
             }
         };
 
-        if token_bytes.is_empty() {
-            return Ok(ProcessOutcome::Admitted);
-        }
-
+        // `parse_tokens_with_limit` rejects empty blobs with `InvalidToken`, so
+        // `token_bytes` is non-empty on the `Ok` path; the "nothing admitted"
+        // case is handled after the per-token loop.
         debug!(token_count = token_bytes.len(), "Decrypting tokens");
 
         // Decrypt each token and dispatch notifications, with rate limiting.
