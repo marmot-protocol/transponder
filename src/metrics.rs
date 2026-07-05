@@ -39,6 +39,12 @@ pub struct Metrics {
     /// gift-wrap unwrap (ECDH) was attempted.
     pub events_shed_total: IntCounter,
 
+    /// Total number of events whose every carried token was shed purely by the
+    /// per-token rate limiters, admitting zero notifications. Like
+    /// [`Self::events_shed_total`] this is transient back-pressure: the event is
+    /// left retryable and is not counted as processed.
+    pub events_rate_limited_total: IntCounter,
+
     /// Current number of events actively being processed.
     pub events_in_flight: IntGauge,
 
@@ -168,6 +174,9 @@ pub enum EventOutcome {
     Processed,
     /// Event was skipped because it was already seen.
     Duplicate,
+    /// Every token the event carried was shed by the per-token rate limiters,
+    /// so no notification was admitted. Transient: the event stays retryable.
+    RateLimited,
 }
 
 impl EventOutcome {
@@ -177,6 +186,7 @@ impl EventOutcome {
             Self::Failed => "failed",
             Self::Processed => "processed",
             Self::Duplicate => "duplicate",
+            Self::RateLimited => "rate_limited",
         }
     }
 }
@@ -259,6 +269,12 @@ impl Metrics {
             "Total number of events shed by global admission control before the gift-wrap unwrap (ECDH) was attempted",
         ))?;
         registry.register(Box::new(events_shed_total.clone()))?;
+
+        let events_rate_limited_total = IntCounter::with_opts(Opts::new(
+            "transponder_events_rate_limited_total",
+            "Total number of events whose every carried token was shed purely by the per-token rate limiters, admitting zero notifications",
+        ))?;
+        registry.register(Box::new(events_rate_limited_total.clone()))?;
 
         let events_in_flight = IntGauge::with_opts(Opts::new(
             "transponder_events_in_flight",
@@ -566,6 +582,7 @@ impl Metrics {
             events_deduplicated_total,
             events_failed_total,
             events_shed_total,
+            events_rate_limited_total,
             events_in_flight,
             event_processing_duration_seconds,
             gift_wrap_unwrap_duration_seconds,
@@ -650,6 +667,12 @@ impl Metrics {
     /// Record an event shed by global admission control before unwrap.
     pub fn record_event_shed(&self) {
         self.events_shed_total.inc();
+    }
+
+    /// Record an event whose every token was shed by the per-token rate
+    /// limiters, admitting zero notifications.
+    pub fn record_event_rate_limited(&self) {
+        self.events_rate_limited_total.inc();
     }
 
     /// Increment the number of in-flight events.
@@ -922,6 +945,7 @@ mod tests {
         metrics.record_event_deduplicated();
         metrics.record_event_failed();
         metrics.record_event_shed();
+        metrics.record_event_rate_limited();
         metrics.inc_events_in_flight();
         metrics.observe_event_processing_duration(EventOutcome::Processed, 0.01);
         metrics.observe_gift_wrap_unwrap_duration(OperationOutcome::Success, 0.005);
@@ -948,6 +972,10 @@ mod tests {
         );
         assert_eq!(
             counter_value(&metrics, "transponder_events_shed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
             1.0
         );
         assert_eq!(
