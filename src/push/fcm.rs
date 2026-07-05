@@ -185,6 +185,26 @@ fn classify_fcm_error(error: &FcmError) -> FcmClassification {
     }
 }
 
+fn fcm_provider_error_code(error: &FcmError) -> Option<&str> {
+    error.details.iter().find_map(|detail| {
+        if detail.type_url.as_deref() == Some(FCM_ERROR_DETAIL_TYPE) {
+            detail.error_code.as_deref()
+        } else {
+            None
+        }
+    })
+}
+
+fn fcm_error_summary(error: &FcmError) -> String {
+    let mut summary = format!("{} - {}", error.status, error.message);
+    if let Some(error_code) = fcm_provider_error_code(error).filter(|code| *code != error.status) {
+        summary.push_str(" (");
+        summary.push_str(error_code);
+        summary.push(')');
+    }
+    summary
+}
+
 /// FCM client for sending push notifications.
 pub struct FcmClient {
     pub(crate) http_client: Client,
@@ -431,6 +451,25 @@ impl FcmClient {
         }
     }
 
+    /// Parse an FCM error response, falling back to a status-derived error when
+    /// the provider body is empty, non-JSON, or exceeds the bounded read limit.
+    async fn parse_error_response(
+        response: reqwest::Response,
+        default_code: u32,
+        default_status: &str,
+    ) -> FcmErrorResponse {
+        crate::push::parse_bounded_error_body::<FcmErrorResponse>(response)
+            .await
+            .unwrap_or(FcmErrorResponse {
+                error: FcmError {
+                    code: default_code,
+                    message: "Unknown".to_string(),
+                    status: default_status.to_string(),
+                    details: Vec::new(),
+                },
+            })
+    }
+
     /// Parse an FCM error response and classify it as a dead token or a
     /// permanent error.
     ///
@@ -448,16 +487,7 @@ impl FcmClient {
         default_code: u32,
         default_status: &str,
     ) -> SendAttemptResult {
-        let error = crate::push::parse_bounded_error_body::<FcmErrorResponse>(response)
-            .await
-            .unwrap_or(FcmErrorResponse {
-                error: FcmError {
-                    code: default_code,
-                    message: "Unknown".to_string(),
-                    status: default_status.to_string(),
-                    details: Vec::new(),
-                },
-            });
+        let error = Self::parse_error_response(response, default_code, default_status).await;
 
         match classify_fcm_error(&error.error) {
             FcmClassification::TokenDead => {
@@ -471,8 +501,8 @@ impl FcmClient {
                     "FCM rejected request (configuration or request error)"
                 );
                 SendAttemptResult::Permanent(Error::Fcm(format!(
-                    "Bad request: {} - {}",
-                    error.error.status, error.error.message
+                    "Bad request: {}",
+                    fcm_error_summary(&error.error)
                 )))
             }
         }
@@ -506,6 +536,20 @@ impl FcmClient {
                 error!("FCM authentication error");
                 SendAttemptResult::Permanent(Error::Fcm("Authentication error".to_string()))
             }
+            403 => {
+                // Project or service-account authorization failure. This is a
+                // provider-wide configuration outage, not a dead device token.
+                let error = Self::parse_error_response(response, 403, "PERMISSION_DENIED").await;
+                error!(
+                    status = %error.error.status,
+                    fcm_error_code = fcm_provider_error_code(&error.error).unwrap_or("unknown"),
+                    "FCM permission denied"
+                );
+                SendAttemptResult::Permanent(Error::Fcm(format!(
+                    "FCM permission denied: {} (check Cloud Messaging API enablement / service-account IAM)",
+                    fcm_error_summary(&error.error)
+                )))
+            }
             404 => {
                 self.classify_error_response(response, 404, "NOT_FOUND")
                     .await
@@ -531,7 +575,9 @@ impl FcmClient {
             }
             _ => {
                 warn!(status = %status, "FCM unexpected response");
-                SendAttemptResult::Success(false)
+                SendAttemptResult::Permanent(Error::Fcm(format!(
+                    "Unexpected FCM response status: {status}"
+                )))
             }
         }
     }
@@ -1303,7 +1349,7 @@ mod tests {
             .unwrap();
 
         client
-            .handle_response(Instant::now(), response, "test-access-token")
+            .handle_response(Duration::ZERO, response, "test-access-token")
             .await
     }
 
@@ -1329,6 +1375,52 @@ mod tests {
         // which stays bounded regardless of the (huge) upstream body.
         assert!(!message.contains(&padding));
         assert!(message.len() < 128);
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_403_permission_denied_is_permanent_error() {
+        // PERMISSION_DENIED is a project/service-account configuration outage,
+        // not a dead device token. Preserve the provider status/message/code so
+        // operators can distinguish IAM, API-disabled, and sender-mismatch cases.
+        let result = fcm_error_result_with_body(
+            403,
+            serde_json::json!({
+                "error": {
+                    "code": 403,
+                    "message": "Sender ID mismatch.",
+                    "status": "PERMISSION_DENIED",
+                    "details": [
+                        {
+                            "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+                            "errorCode": "SENDER_ID_MISMATCH"
+                        }
+                    ]
+                }
+            }),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("permission denied")
+                    && message.contains("PERMISSION_DENIED")
+                    && message.contains("Sender ID mismatch")
+                    && message.contains("SENDER_ID_MISMATCH")
+                    && message.contains("Cloud Messaging API")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_unexpected_status_is_permanent_error() {
+        // Unknown statuses should surface as provider errors rather than being
+        // counted as invalid device tokens.
+        let result = fcm_status_result(418, None).await;
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Fcm(ref message))
+                if message.contains("Unexpected FCM response status")
+                    && message.contains("418")
+        ));
     }
 
     #[tokio::test]
