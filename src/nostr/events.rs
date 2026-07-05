@@ -802,6 +802,9 @@ impl EventProcessor {
                 }
                 continue;
             }
+            let encrypted_reservation = encrypted_result
+                .reservation()
+                .expect("allowed encrypted-token admission must carry a reservation");
 
             // Decrypt the token
             let decrypt_started_at = StageTimer::start();
@@ -848,11 +851,19 @@ impl EventProcessor {
                 }
                 continue;
             }
+            let device_reservation = device_result
+                .reservation()
+                .expect("allowed device-token admission must carry a reservation");
 
             payloads.push(payload);
             // Keep this paired with `payloads`: dispatch admission failure
             // rolls back exactly the rate-limit increments for admitted work.
-            admitted_rate_limit_keys.push((encrypted_key, device_key));
+            admitted_rate_limit_keys.push((
+                encrypted_key,
+                encrypted_reservation,
+                device_key,
+                device_reservation,
+            ));
         }
 
         if payloads.is_empty() {
@@ -876,12 +887,14 @@ impl EventProcessor {
                 Ok(count)
             }
             Err(e) => {
-                for (encrypted_key, device_key) in &admitted_rate_limit_keys {
+                for (encrypted_key, encrypted_reservation, device_key, device_reservation) in
+                    &admitted_rate_limit_keys
+                {
                     self.encrypted_token_limiter
-                        .rollback_increment(encrypted_key)
+                        .rollback_increment(encrypted_key, *encrypted_reservation)
                         .await;
                     self.device_token_limiter
-                        .rollback_increment(device_key)
+                        .rollback_increment(device_key, *device_reservation)
                         .await;
                 }
 
