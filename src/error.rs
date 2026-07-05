@@ -58,6 +58,24 @@ pub enum Error {
     Hex(#[from] hex::FromHexError),
 }
 
+impl Error {
+    /// Strip any URL embedded in an underlying HTTP transport error.
+    ///
+    /// `reqwest::Error`'s `Display` includes the request URL, and the APNs
+    /// request URL embeds the raw device token (`/3/device/<token>`). Every
+    /// transport error that can reach a log sink or be converted downstream
+    /// must pass through this (or `reqwest::Error::without_url` directly)
+    /// first so the token can never leak into logs (issue #172). No-op for
+    /// non-HTTP errors.
+    #[must_use]
+    pub fn redact_transport_url(self) -> Self {
+        match self {
+            Self::Http(error) => Self::Http(error.without_url()),
+            other => other,
+        }
+    }
+}
+
 /// Result type alias using our Error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -137,5 +155,29 @@ mod tests {
         let debug_str = format!("{:?}", err);
         assert!(debug_str.contains("Crypto"));
         assert!(debug_str.contains("test"));
+    }
+
+    #[tokio::test]
+    async fn test_redact_transport_url_strips_device_token_from_http_error() {
+        // The APNs URL embeds the device token in its path; redact_transport_url
+        // must strip it so the error Display cannot leak the token (issue #172).
+        let error = reqwest::Client::new()
+            .post("http://127.0.0.1:9/3/device/aabbccddeeff00112233")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("aabbccddeeff00112233"));
+
+        let redacted = Error::Http(error).redact_transport_url();
+        assert!(
+            !redacted.to_string().contains("aabbccddeeff00112233"),
+            "device token leaked after redaction: {redacted}"
+        );
+    }
+
+    #[test]
+    fn test_redact_transport_url_is_noop_for_non_http_errors() {
+        let err = Error::Apns("bad request".to_string()).redact_transport_url();
+        assert_eq!(err.to_string(), "APNs error: bad request");
     }
 }

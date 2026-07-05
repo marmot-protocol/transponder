@@ -74,6 +74,18 @@ pub const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum backoff duration cap.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
+/// Upper bound on an honored provider-supplied `Retry-After` value.
+///
+/// The header is provider/network-controlled input. Without a ceiling, a
+/// misbehaving or compromised endpoint could pin a send task — which holds a
+/// decrypted device token and an in-flight guard that blocks graceful-shutdown
+/// drain — in a backoff sleep for an arbitrary duration (issue #162). 60
+/// seconds comfortably covers genuine provider backpressure (APNs/FCM hints
+/// are typically single-digit seconds) while bounding how long an untrusted
+/// header can pin a task. Deliberately larger than [`MAX_BACKOFF`], which only
+/// caps locally-computed exponential backoff.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 /// Minimum server-requested backoff duration.
 const MIN_RETRY_BACKOFF: Duration = DEFAULT_INITIAL_BACKOFF;
 
@@ -137,6 +149,16 @@ pub enum SendAttemptResult {
         /// Optional Retry-After duration from the response header.
         retry_after: Option<Duration>,
     },
+    /// The provider rejected the request's auth credential (an APNs `403`
+    /// with a provider-token `reason`, or an FCM `401`).
+    ///
+    /// The client has already invalidated the cached credential, so the next
+    /// attempt will mint a fresh one. [`with_retry`] allows exactly one
+    /// immediate retry per logical push for this variant (issue #85): a
+    /// transient rejection (clock skew, key rotation window) recovers with
+    /// the fresh credential, while a genuinely bad key fails again and
+    /// surfaces the carried error instead of looping.
+    AuthRejected(crate::error::Error),
     /// Permanent error that should not be retried.
     Permanent(crate::error::Error),
 }
@@ -166,6 +188,11 @@ where
 {
     let mut retries = 0;
     let mut backoff = config.initial_backoff;
+    // One-shot budget for retrying after a provider auth rejection with a
+    // freshly minted credential (issue #85). Tracked separately from the
+    // transient-retry budget so an auth recovery does not consume (or get
+    // starved by) 429/5xx retries.
+    let mut auth_retry_used = false;
     // Reborrow across loop iterations: `Option<&mut T>` is not `Copy`.
     let mut backoff_permit = backoff_permit;
 
@@ -173,6 +200,29 @@ where
         match operation().await {
             SendAttemptResult::Success(true) => return Ok(PushSendOutcome::Sent),
             SendAttemptResult::Success(false) => return Ok(PushSendOutcome::InvalidToken),
+            SendAttemptResult::AuthRejected(error) if !auth_retry_used => {
+                auth_retry_used = true;
+
+                if let Some(metrics) = metrics {
+                    metrics.record_push_retry(service_name.to_lowercase().as_str());
+                }
+
+                // Retry immediately: the rejection is not backpressure, and
+                // the client already evicted the rejected credential, so the
+                // next attempt mints a fresh one.
+                warn!(
+                    service = service_name,
+                    error = %error,
+                    "Provider rejected auth credential; retrying once with a freshly minted token"
+                );
+            }
+            SendAttemptResult::AuthRejected(error) => {
+                warn!(
+                    service = service_name,
+                    "Provider rejected a freshly minted auth credential; not retrying again"
+                );
+                return Err(error);
+            }
             SendAttemptResult::Retriable {
                 status_code,
                 retry_after,
@@ -184,9 +234,10 @@ where
                 }
 
                 // Honor provider-supplied Retry-After values, but floor zero
-                // or tiny values and jitter every sleep so concurrent failures
-                // do not retry in synchronized waves. Only cap locally-computed
-                // exponential backoff to avoid runaway delays.
+                // or tiny values, cap at MAX_RETRY_AFTER (untrusted input),
+                // and jitter every sleep so concurrent failures do not retry
+                // in synchronized waves. Locally-computed exponential backoff
+                // is capped separately at MAX_BACKOFF.
                 let wait_duration = retry_sleep_duration(retry_after, backoff);
 
                 warn!(
@@ -236,7 +287,11 @@ fn retry_sleep_base(retry_after: Option<Duration>, backoff: Duration) -> (Durati
     let fallback = backoff.min(MAX_BACKOFF);
     match retry_after {
         Some(Duration::ZERO) => (MIN_RETRY_BACKOFF.max(fallback), true),
-        Some(server_delay) => (server_delay.max(MIN_RETRY_BACKOFF), true),
+        // Honor the provider hint, but clamp it: floored so a tiny value
+        // cannot produce hot-loop retries, and capped so an untrusted header
+        // cannot pin the task (and its decrypted token) arbitrarily long
+        // (issue #162).
+        Some(server_delay) => (server_delay.clamp(MIN_RETRY_BACKOFF, MAX_RETRY_AFTER), true),
         None => (fallback, false),
     }
 }
@@ -318,6 +373,12 @@ where
                     metrics.record_push_retry(service_name.to_lowercase().as_str());
                 }
 
+                // A reqwest error can embed the request URL, and the APNs URL
+                // contains the raw device token; strip it before the error can
+                // reach any log sink (issue #172). The push clients already
+                // strip at the conversion site, but this keeps the retry
+                // engine safe regardless of caller discipline.
+                let error = error.without_url();
                 warn!(
                     service = service_name,
                     error = %error,
@@ -331,6 +392,9 @@ where
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
             Err(Error::Http(error)) if should_retry_transport(&error) => {
+                // Strip any URL (which may embed a device token) before both
+                // logging and propagating the exhausted error (issue #172).
+                let error = error.without_url();
                 warn!(
                     service = service_name,
                     error = %error,
@@ -341,8 +405,10 @@ where
             }
             // Non-connect transport errors are not retriable: the provider may
             // already have accepted the (non-idempotent) request, so return
-            // immediately without retrying.
-            Err(error) => return Err(error),
+            // immediately without retrying. The URL is stripped so downstream
+            // logging of the propagated error cannot leak a device token
+            // (issue #172).
+            Err(error) => return Err(error.redact_transport_url()),
         }
     }
 }
@@ -588,6 +654,213 @@ mod tests {
         let sleep = retry_sleep_duration(None, Duration::from_secs(60));
 
         assert_duration_between(sleep, MAX_BACKOFF - MAX_RETRY_JITTER, MAX_BACKOFF);
+    }
+
+    #[test]
+    fn test_retry_sleep_duration_caps_untrusted_retry_after() {
+        // A hostile/misbehaving provider sends `Retry-After: 86400`. The
+        // honored delay must clamp to MAX_RETRY_AFTER (plus at most one
+        // additive jitter window), not pin the task for a day (issue #162).
+        let sleep = retry_sleep_duration(
+            Some(Duration::from_secs(86_400)),
+            Duration::from_millis(100),
+        );
+
+        assert_duration_between(sleep, MAX_RETRY_AFTER, MAX_RETRY_AFTER + MAX_RETRY_JITTER);
+    }
+
+    #[test]
+    fn test_retry_sleep_duration_honors_retry_after_at_cap_boundary() {
+        // A Retry-After exactly at the cap is honored unchanged.
+        let sleep = retry_sleep_duration(Some(MAX_RETRY_AFTER), Duration::from_millis(100));
+
+        assert_duration_between(sleep, MAX_RETRY_AFTER, MAX_RETRY_AFTER + MAX_RETRY_JITTER);
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_auth_rejected_retries_once_then_succeeds() {
+        // First attempt: provider rejects the auth credential. The retry
+        // engine must immediately retry once (fresh credential), and the
+        // second attempt's success must resolve the push as Sent (issue #85).
+        let config = RetryConfig::default();
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+
+        let start = std::time::Instant::now();
+        let result = with_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempts == 1 {
+                        SendAttemptResult::AuthRejected(crate::error::Error::Apns(
+                            "Authentication error: ExpiredProviderToken".to_string(),
+                        ))
+                    } else {
+                        SendAttemptResult::Success(true)
+                    }
+                }
+            },
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+        // The auth retry is immediate: no backoff sleep is inserted.
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_auth_rejected_twice_returns_error() {
+        // A second rejection means the freshly minted credential was also
+        // rejected (genuinely bad key): surface the error instead of looping.
+        let config = RetryConfig::default();
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+
+        let result = with_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    SendAttemptResult::AuthRejected(crate::error::Error::Fcm(
+                        "Authentication error".to_string(),
+                    ))
+                }
+            },
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::Fcm(ref message))
+            if message.contains("Authentication error")));
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_auth_retry_budget_is_separate_from_transient_budget() {
+        // An auth retry must not consume the transient 429/5xx budget: after
+        // the one-shot auth recovery, the full transient budget still applies.
+        let config = RetryConfig {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(1),
+        };
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+
+        let result = with_retry(
+            &config,
+            "test",
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    let attempts = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    match attempts {
+                        1 => SendAttemptResult::AuthRejected(crate::error::Error::Apns(
+                            "Authentication error: ExpiredProviderToken".to_string(),
+                        )),
+                        2 | 3 => SendAttemptResult::Retriable {
+                            status_code: 503,
+                            retry_after: None,
+                        },
+                        _ => SendAttemptResult::Success(true),
+                    }
+                }
+            },
+            None,
+            None,
+        )
+        .await;
+
+        // 1 auth-rejected attempt + 1 fresh attempt + 2 transient retries.
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_with_transport_retry_redacts_url_from_exhausted_connect_error() {
+        // The APNs request URL embeds the raw device token. When transport
+        // retries exhaust, the propagated (and logged) error must not carry
+        // the URL (issue #172).
+        let config = RetryConfig {
+            max_retries: 1,
+            initial_backoff: Duration::from_millis(1),
+        };
+        let client = Client::new();
+
+        let result: crate::error::Result<bool> = with_transport_retry(
+            &config,
+            "test",
+            || {
+                let client = client.clone();
+                async move {
+                    let error = client
+                        .post("http://127.0.0.1:9/3/device/aabbccddeeff00112233")
+                        .send()
+                        .await
+                        .unwrap_err();
+                    assert!(error.is_connect());
+                    // Deliberately convert WITHOUT stripping the URL to prove
+                    // the retry engine redacts even without caller discipline.
+                    Err(Error::from(error))
+                }
+            },
+            None,
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        let rendered = error.to_string();
+        assert!(matches!(error, Error::Http(_)));
+        assert!(
+            !rendered.contains("aabbccddeeff00112233"),
+            "device token leaked into transport error display: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_transport_retry_redacts_url_from_non_retriable_error() {
+        // Non-connect transport errors return through the terminal arm; the
+        // URL (which may embed a device token) must be stripped there too.
+        let config = RetryConfig {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(1),
+        };
+        let client = Client::new();
+
+        let result: crate::error::Result<bool> = with_transport_retry(
+            &config,
+            "test",
+            || {
+                let client = client.clone();
+                async move {
+                    let error = client
+                        .post("ftp://example.invalid/3/device/aabbccddeeff00112233")
+                        .send()
+                        .await
+                        .unwrap_err();
+                    assert!(!error.is_connect());
+                    Err(Error::from(error))
+                }
+            },
+            None,
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        let rendered = error.to_string();
+        assert!(matches!(error, Error::Http(_)));
+        assert!(
+            !rendered.contains("aabbccddeeff00112233"),
+            "device token leaked into transport error display: {rendered}"
+        );
     }
 
     #[tokio::test]
