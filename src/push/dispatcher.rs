@@ -1522,10 +1522,11 @@ mod tests {
         let guard = dispatcher.inflight.enter();
 
         // A retry config with a backoff long enough to observe the sleep window
-        // deterministically from the test.
+        // deterministically from the test even after retry jitter shortens the
+        // fallback sleep by up to half.
         let config = RetryConfig {
             max_retries: 3,
-            initial_backoff: Duration::from_millis(300),
+            initial_backoff: Duration::from_millis(600),
         };
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_op = attempts.clone();
