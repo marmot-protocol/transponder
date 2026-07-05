@@ -30,8 +30,11 @@ const FCM_ERROR_DETAIL_TYPE: &str = "type.googleapis.com/google.firebase.fcm.v1.
 /// FCM provider-specific error code for an unregistered/dead device token.
 const FCM_ERROR_UNREGISTERED: &str = "UNREGISTERED";
 
-/// Access token lifetime (50 minutes).
+/// Fallback access token lifetime (50 minutes) used when the provider omits expiry.
 const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
+
+/// Safety margin subtracted from provider-reported OAuth token lifetimes.
+const TOKEN_REFRESH_SAFETY_MARGIN_SECS: u64 = 60;
 
 /// Upper bound on FCM registration token length.
 ///
@@ -92,6 +95,19 @@ struct TokenRequest {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: Zeroizing<String>,
+    expires_in: Option<u64>,
+}
+
+/// Return how long an FCM OAuth token should stay cached.
+///
+/// Google is authoritative for issued token lifetimes; keep a small local
+/// safety margin so Transponder refreshes before the provider-side expiry.
+fn token_cache_lifetime(expires_in: Option<u64>) -> Duration {
+    expires_in
+        .map(|seconds| {
+            Duration::from_secs(seconds.saturating_sub(TOKEN_REFRESH_SAFETY_MARGIN_SECS))
+        })
+        .unwrap_or(TOKEN_LIFETIME)
 }
 
 /// Cached access token.
@@ -344,9 +360,10 @@ impl FcmClient {
         // Cache the token while still holding the write lock. The caller gets a
         // short-lived zeroizing clone for request construction while the cache
         // owns the reusable copy.
+        let ttl = token_cache_lifetime(token_response.expires_in);
         let cached_token = CachedToken {
             token: token_response.access_token,
-            expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            expires_at: SystemTime::now() + ttl,
         };
         let outbound_token = cached_token.token.clone();
         **cached = Some(cached_token);
@@ -746,9 +763,9 @@ mod tests {
     }
 
     #[test]
-    fn test_token_response_deserializes_access_token_as_zeroizing_string() {
+    fn test_token_response_deserializes_access_token_and_expiry() {
         // Compile-time guard: provider bearer tokens must deserialize directly
-        // into zeroizing storage while ignoring unused response metadata.
+        // into zeroizing storage while preserving provider lifetime metadata.
         fn assert_zeroizing_string(_: &Zeroizing<String>) {}
 
         let response: TokenResponse = serde_json::from_value(serde_json::json!({
@@ -759,7 +776,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.access_token.as_str(), "provider-access-token");
+        assert_eq!(response.expires_in, Some(3600));
         assert_zeroizing_string(&response.access_token);
+    }
+
+    #[test]
+    fn test_token_cache_lifetime_uses_provider_expiry_with_safety_margin() {
+        assert_eq!(
+            token_cache_lifetime(Some(3600)),
+            Duration::from_secs(3600 - TOKEN_REFRESH_SAFETY_MARGIN_SECS)
+        );
+    }
+
+    #[test]
+    fn test_token_cache_lifetime_falls_back_when_provider_omits_expiry() {
+        let response: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "provider-access-token"
+        }))
+        .unwrap();
+
+        assert_eq!(response.expires_in, None);
+        assert_eq!(token_cache_lifetime(response.expires_in), TOKEN_LIFETIME);
+    }
+
+    #[test]
+    fn test_token_cache_lifetime_saturates_short_provider_expiry() {
+        assert_eq!(token_cache_lifetime(Some(30)), Duration::from_secs(0));
     }
 
     #[test]
