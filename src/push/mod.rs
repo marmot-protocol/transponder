@@ -1,6 +1,7 @@
 //! Push notification clients and dispatching.
 
 pub mod apns;
+pub mod auth;
 pub mod dispatcher;
 pub mod fcm;
 pub mod retry;
@@ -32,33 +33,37 @@ const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 /// usable token lifetime.
 const AUTH_JWT_CLOCK_SKEW_LEEWAY_SECS: u64 = 30;
 
-/// Read at most [`MAX_ERROR_BODY_BYTES`] of a provider error response and
-/// deserialize the bounded prefix as JSON.
+/// Read at most `max_bytes` of a response body and deserialize the bounded
+/// prefix as JSON.
 ///
 /// If the server declares a body larger than the cap, the helper returns before
 /// reading it. Otherwise the body is streamed chunk by chunk and reading stops
 /// as soon as the cap is reached, so the full body is never buffered. Returns
 /// `None` when the body is unreadable, exceeds the cap, or does not parse (e.g.
 /// an empty or non-JSON body, or a JSON document truncated by the cap), letting
-/// callers fall back to their default status-derived classification.
-async fn parse_bounded_error_body<T: DeserializeOwned>(
+/// callers fall back to their default classification.
+///
+/// The intermediate buffer is zeroized on drop because some callers parse
+/// credential-bearing bodies through it (the FCM OAuth token success body).
+async fn parse_bounded_json_body<T: DeserializeOwned>(
     mut response: reqwest::Response,
+    max_bytes: usize,
 ) -> Option<T> {
     if response
         .content_length()
-        .is_some_and(|len| len > MAX_ERROR_BODY_BYTES as u64)
+        .is_some_and(|len| len > max_bytes as u64)
     {
         return None;
     }
 
-    let mut body = Vec::new();
+    let mut body = zeroize::Zeroizing::new(Vec::new());
 
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                if body.len() + chunk.len() > MAX_ERROR_BODY_BYTES {
-                    // The body is larger than any legitimate provider error
-                    // payload; stop reading and fall back to the default.
+                if body.len() + chunk.len() > max_bytes {
+                    // The body is larger than any legitimate payload for this
+                    // call site; stop reading and fall back to the default.
                     return None;
                 }
                 body.extend_from_slice(&chunk);
@@ -69,6 +74,14 @@ async fn parse_bounded_error_body<T: DeserializeOwned>(
     }
 
     serde_json::from_slice(&body).ok()
+}
+
+/// Read at most [`MAX_ERROR_BODY_BYTES`] of a provider error response and
+/// deserialize the bounded prefix as JSON. See [`parse_bounded_json_body`].
+async fn parse_bounded_error_body<T: DeserializeOwned>(
+    response: reqwest::Response,
+) -> Option<T> {
+    parse_bounded_json_body(response, MAX_ERROR_BODY_BYTES).await
 }
 
 /// Compute the `iat`/`exp` claims for a provider auth JWT from the current Unix
