@@ -2,7 +2,7 @@
 //!
 //! Listens for SIGTERM and SIGINT signals and coordinates shutdown.
 
-use std::time::Duration;
+use std::{future, io, time::Duration};
 
 use tokio::signal;
 use tokio::sync::watch;
@@ -34,34 +34,129 @@ impl ShutdownHandler {
 
     /// Wait for a shutdown signal (SIGTERM or SIGINT).
     pub async fn wait_for_signal(&self) {
-        let ctrl_c = async {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
-        };
-
-        #[cfg(unix)]
-        let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler")
-                .recv()
-                .await;
-        };
-
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
-        tokio::select! {
-            _ = ctrl_c => {
-                info!("Received Ctrl+C, initiating shutdown");
-            }
-            _ = terminate => {
-                info!("Received SIGTERM, initiating shutdown");
-            }
-        }
-
-        self.trigger();
+        self.handle_first_shutdown_signal(
+            wait_for_shutdown_signal(),
+            spawn_force_quit_on_second_signal,
+        )
+        .await;
     }
+
+    async fn handle_first_shutdown_signal<SignalFuture, SpawnSecond>(
+        &self,
+        signal: SignalFuture,
+        spawn_second_signal_listener: SpawnSecond,
+    ) where
+        SignalFuture: future::Future<Output = ShutdownSignal>,
+        SpawnSecond: FnOnce(),
+    {
+        let signal = signal.await;
+        info!(
+            signal = signal.name(),
+            "Received shutdown signal, initiating shutdown"
+        );
+        self.trigger();
+        spawn_second_signal_listener();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownSignal {
+    CtrlC,
+    Sigterm,
+}
+
+impl ShutdownSignal {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::CtrlC => "Ctrl+C",
+            Self::Sigterm => "SIGTERM",
+        }
+    }
+}
+
+async fn wait_for_shutdown_signal() -> ShutdownSignal {
+    select_shutdown_signal(wait_for_ctrl_c_signal(), wait_for_sigterm_signal()).await
+}
+
+async fn select_shutdown_signal<CtrlC, Terminate>(
+    ctrl_c: CtrlC,
+    terminate: Terminate,
+) -> ShutdownSignal
+where
+    CtrlC: future::Future<Output = ()>,
+    Terminate: future::Future<Output = ()>,
+{
+    tokio::select! {
+        _ = ctrl_c => ShutdownSignal::CtrlC,
+        _ = terminate => ShutdownSignal::Sigterm,
+    }
+}
+
+async fn wait_for_ctrl_c_signal() {
+    wait_for_fallible_signal("Ctrl+C", signal::ctrl_c()).await;
+}
+
+#[cfg(unix)]
+async fn wait_for_sigterm_signal() {
+    let mut terminate = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(error) => {
+            wait_forever_after_signal_install_error("SIGTERM", error).await;
+            return;
+        }
+    };
+
+    terminate.recv().await;
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm_signal() {
+    future::pending::<()>().await;
+}
+
+async fn wait_for_fallible_signal<Fut>(signal_name: &'static str, signal: Fut)
+where
+    Fut: future::Future<Output = io::Result<()>>,
+{
+    match signal.await {
+        Ok(()) => {}
+        Err(error) => wait_forever_after_signal_install_error(signal_name, error).await,
+    }
+}
+
+async fn wait_forever_after_signal_install_error(signal_name: &'static str, error: io::Error) {
+    warn!(
+        signal = signal_name,
+        error = %error,
+        "Failed to install shutdown signal handler; signal disabled"
+    );
+    future::pending::<()>().await;
+}
+
+fn spawn_force_quit_on_second_signal() {
+    // Detached by design: once graceful shutdown starts, a repeated signal must
+    // force the process out even if cleanup is still running. Tests inject a
+    // capturing closure, but production uses `std::process::exit` directly.
+    let handle = tokio::spawn(force_quit_after_second_signal(
+        wait_for_shutdown_signal(),
+        std::process::exit,
+    ));
+    drop(handle);
+}
+
+async fn force_quit_after_second_signal<SignalFuture, Exit, ExitOutput>(
+    signal: SignalFuture,
+    exit: Exit,
+) where
+    SignalFuture: future::Future<Output = ShutdownSignal>,
+    Exit: FnOnce(i32) -> ExitOutput,
+{
+    let signal = signal.await;
+    warn!(
+        signal = signal.name(),
+        "Received second shutdown signal, forcing exit"
+    );
+    exit(1);
 }
 
 impl Default for ShutdownHandler {
@@ -112,6 +207,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_signal_triggers_shutdown_and_spawns_second_signal_listener() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let handler = ShutdownHandler::new();
+        let mut receiver = handler.subscribe();
+        let second_listener_spawned = Arc::new(AtomicBool::new(false));
+        let spawned_flag = Arc::clone(&second_listener_spawned);
+
+        handler
+            .handle_first_shutdown_signal(async { ShutdownSignal::CtrlC }, move || {
+                spawned_flag.store(true, Ordering::SeqCst);
+            })
+            .await;
+
+        receiver.changed().await.unwrap();
+        assert!(*receiver.borrow());
+        assert!(second_listener_spawned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn test_multiple_subscribers() {
         let handler = ShutdownHandler::new();
         let mut rx1 = handler.subscribe();
@@ -132,6 +250,84 @@ mod tests {
         let receiver = handler.subscribe();
         // Default state should be false (not shutdown)
         assert!(!*receiver.borrow());
+    }
+
+    #[tokio::test]
+    async fn select_shutdown_signal_returns_ctrl_c_when_ctrl_c_completes() {
+        let signal = select_shutdown_signal(future::ready(()), future::pending()).await;
+
+        assert_eq!(signal, ShutdownSignal::CtrlC);
+    }
+
+    #[tokio::test]
+    async fn select_shutdown_signal_returns_sigterm_when_sigterm_completes() {
+        let signal = select_shutdown_signal(future::pending(), future::ready(())).await;
+
+        assert_eq!(signal, ShutdownSignal::Sigterm);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_shutdown_signal_receives_sigterm() {
+        // Exercises Tokio's process-wide SIGTERM handler registration. Keep the
+        // guard alive so the test signal is consumed instead of terminating the
+        // test binary.
+        let _sigterm_guard = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+        let waiter = tokio::spawn(wait_for_shutdown_signal());
+        tokio::task::yield_now().await;
+
+        let status = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(std::process::id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let signal = timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(signal, ShutdownSignal::Sigterm);
+    }
+
+    #[tokio::test]
+    async fn force_quit_after_second_signal_exits_with_failure_status() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicI32, Ordering},
+        };
+
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let captured_exit_code = Arc::clone(&exit_code);
+
+        force_quit_after_second_signal(async { ShutdownSignal::Sigterm }, move |code| {
+            captured_exit_code.store(code, Ordering::SeqCst);
+        })
+        .await;
+
+        assert_eq!(exit_code.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fallible_signal_completes_when_handler_succeeds() {
+        let result = timeout(
+            Duration::from_millis(50),
+            wait_for_fallible_signal("test", async { Ok(()) }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fallible_signal_install_error_waits_forever() {
+        let result = timeout(
+            Duration::from_millis(10),
+            wait_for_fallible_signal("test", async { Err(io::Error::other("install failed")) }),
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]
