@@ -380,12 +380,18 @@ pub struct EventProcessor {
 }
 
 /// Configuration for token rate limiting.
+///
+/// The size fields are [`NonZeroUsize`] so a zero cache capacity or token
+/// limit is unrepresentable here: production config rejects zeros at load
+/// time with named-field errors instead of constructors silently substituting
+/// defaults (`max_cache_size`) or rejecting every notification event
+/// (`max_tokens_per_event`).
 #[derive(Debug, Clone, Copy)]
 pub struct TokenRateLimitConfig {
     /// Maximum entries in each rate limit cache.
-    pub max_cache_size: usize,
+    pub max_cache_size: NonZeroUsize,
     /// Maximum encrypted tokens accepted in a single event.
-    pub max_tokens_per_event: usize,
+    pub max_tokens_per_event: NonZeroUsize,
     /// Max encrypted token requests per minute.
     pub encrypted_token_per_minute: u32,
     /// Max encrypted token requests per hour.
@@ -403,8 +409,10 @@ pub struct TokenRateLimitConfig {
 impl Default for TokenRateLimitConfig {
     fn default() -> Self {
         Self {
-            max_cache_size: DEFAULT_MAX_SIZE,
-            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+            max_cache_size: NonZeroUsize::new(DEFAULT_MAX_SIZE)
+                .expect("DEFAULT_MAX_SIZE is non-zero"),
+            max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT)
+                .expect("DEFAULT_MAX_TOKENS_PER_EVENT is non-zero"),
             encrypted_token_per_minute: DEFAULT_RATE_LIMIT_PER_MINUTE,
             encrypted_token_per_hour: DEFAULT_RATE_LIMIT_PER_HOUR,
             device_token_per_minute: DEFAULT_RATE_LIMIT_PER_MINUTE,
@@ -424,7 +432,12 @@ pub struct ReplayProtectionConfig {
     /// When `dedup_state_path` is set, all terminal event IDs inside
     /// `dedup_retention` are kept so durable replay state covers the full relay
     /// lookback window instead of being capped by this LRU size.
-    pub max_dedup_cache_size: usize,
+    ///
+    /// `NonZeroUsize` so a zero capacity is unrepresentable here: production
+    /// config rejects `server.max_dedup_cache_size = 0` at load time with a
+    /// named-field error instead of the constructor silently substituting the
+    /// default.
+    pub max_dedup_cache_size: NonZeroUsize,
     /// Optional durable replay-state path.
     ///
     /// The file stores only public Nostr gift-wrap event IDs and the time they
@@ -444,7 +457,8 @@ pub struct ReplayProtectionConfig {
 impl Default for ReplayProtectionConfig {
     fn default() -> Self {
         Self {
-            max_dedup_cache_size: DEFAULT_MAX_DEDUP_CACHE_SIZE,
+            max_dedup_cache_size: NonZeroUsize::new(DEFAULT_MAX_DEDUP_CACHE_SIZE)
+                .expect("DEFAULT_MAX_DEDUP_CACHE_SIZE is non-zero"),
             dedup_state_path: None,
             dedup_retention: DEDUP_WINDOW,
             max_notification_age: Duration::from_secs(DEFAULT_MAX_NOTIFICATION_AGE_SECS),
@@ -510,7 +524,8 @@ impl EventProcessor {
             push_dispatcher,
             rate_limit_config,
             ReplayProtectionConfig {
-                max_dedup_cache_size,
+                max_dedup_cache_size: NonZeroUsize::new(max_dedup_cache_size)
+                    .expect("test dedup cache size must be non-zero"),
                 ..ReplayProtectionConfig::default()
             },
             metrics,
@@ -527,10 +542,9 @@ impl EventProcessor {
         replay_config: ReplayProtectionConfig,
         metrics: Option<Metrics>,
     ) -> Result<Self> {
-        let cache_size = NonZeroUsize::new(replay_config.max_dedup_cache_size).unwrap_or(
-            NonZeroUsize::new(DEFAULT_MAX_DEDUP_CACHE_SIZE)
-                .expect("DEFAULT_MAX_DEDUP_CACHE_SIZE is non-zero"),
-        );
+        // `max_dedup_cache_size` is `NonZeroUsize`, so the previous silent
+        // zero-to-default substitution is unrepresentable.
+        let cache_size = replay_config.max_dedup_cache_size;
 
         let (seen_events, dedup_persistence) = if let Some(path) = replay_config.dedup_state_path {
             let seen =
@@ -559,7 +573,7 @@ impl EventProcessor {
             global_unwrap_limiter: RateLimiter::new(RateLimitConfig {
                 max_per_minute: rate_limit_config.global_unwrap_per_minute,
                 max_per_hour: rate_limit_config.global_unwrap_per_hour,
-                max_entries: 1,
+                max_entries: NonZeroUsize::MIN,
             }),
             encrypted_token_limiter: RateLimiter::new(RateLimitConfig {
                 max_per_minute: rate_limit_config.encrypted_token_per_minute,
@@ -571,7 +585,7 @@ impl EventProcessor {
                 max_per_hour: rate_limit_config.device_token_per_hour,
                 max_entries: rate_limit_config.max_cache_size,
             }),
-            max_tokens_per_event: rate_limit_config.max_tokens_per_event,
+            max_tokens_per_event: rate_limit_config.max_tokens_per_event.get(),
             metrics,
         })
     }
@@ -1617,7 +1631,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_path = dir.path().join("dedup-state.tsv");
         let replay_config = ReplayProtectionConfig {
-            max_dedup_cache_size: 2,
+            max_dedup_cache_size: NonZeroUsize::new(2).unwrap(),
             dedup_state_path: Some(state_path.clone()),
             ..ReplayProtectionConfig::default()
         };
@@ -2024,8 +2038,8 @@ mod tests {
             create_processor_with_shutdown_dispatcher_metrics_and_rate_limits(
                 &server_keys,
                 TokenRateLimitConfig {
-                    max_cache_size: 100,
-                    max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                    max_cache_size: NonZeroUsize::new(100).unwrap(),
+                    max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                     encrypted_token_per_minute: 1,
                     encrypted_token_per_hour: 1,
                     device_token_per_minute: 1,
@@ -2079,8 +2093,8 @@ mod tests {
             create_processor_with_shutdown_dispatcher_metrics_and_rate_limits(
                 &server_keys,
                 TokenRateLimitConfig {
-                    max_cache_size: 100,
-                    max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                    max_cache_size: NonZeroUsize::new(100).unwrap(),
+                    max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                     encrypted_token_per_minute: 0,
                     encrypted_token_per_hour: 100,
                     device_token_per_minute: 100,
@@ -2316,13 +2330,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_size_zero_uses_default() {
+    #[should_panic(expected = "test dedup cache size must be non-zero")]
+    async fn test_cache_size_zero_is_rejected() {
+        // A zero dedup cache size is no longer silently swapped for the default:
+        // `ReplayProtectionConfig::max_dedup_cache_size` is `NonZeroUsize`, so a
+        // zero is unrepresentable. Production config rejects
+        // `server.max_dedup_cache_size = 0` at load time before it can reach the
+        // constructor (see the config validation tests); this asserts the
+        // in-memory construction path cannot be built with a zero either.
         let server_keys = Keys::generate();
-        let processor = create_processor_with_cache_size(&server_keys, 0);
-
-        let event_id = EventId::all_zeros();
-        processor.mark_seen(event_id).await;
-        assert!(processor.is_duplicate(&event_id).await);
+        let _ = create_processor_with_cache_size(&server_keys, 0);
     }
 
     #[tokio::test]
@@ -2519,8 +2536,8 @@ mod tests {
         let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
             &server_keys,
             TokenRateLimitConfig {
-                max_cache_size: 100,
-                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                max_cache_size: NonZeroUsize::new(100).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                 encrypted_token_per_minute: 100,
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 1,
@@ -2584,8 +2601,8 @@ mod tests {
         let processor = create_processor_with_rate_limits(
             &server_keys,
             TokenRateLimitConfig {
-                max_cache_size: 100,
-                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                max_cache_size: NonZeroUsize::new(100).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                 encrypted_token_per_minute: 100, // High limit for encrypted tokens
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 2, // Only allow 2 per minute per device
@@ -2647,8 +2664,8 @@ mod tests {
         let processor = create_processor_with_rate_limits(
             &server_keys,
             TokenRateLimitConfig {
-                max_cache_size: 100,
-                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                max_cache_size: NonZeroUsize::new(100).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                 encrypted_token_per_minute: 2, // Only allow 2 per minute per encrypted token
                 encrypted_token_per_hour: 100,
                 device_token_per_minute: 100, // High limit for device tokens
@@ -2728,8 +2745,8 @@ mod tests {
         let processor = create_processor_with_rate_limits(
             &server_keys,
             TokenRateLimitConfig {
-                max_cache_size: 100,
-                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                max_cache_size: NonZeroUsize::new(100).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                 encrypted_token_per_minute: 1,
                 encrypted_token_per_hour: 100,
                 device_token_per_minute: 100,
@@ -2797,8 +2814,8 @@ mod tests {
         let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
             &server_keys,
             TokenRateLimitConfig {
-                max_cache_size: 100,
-                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                max_cache_size: NonZeroUsize::new(100).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                 encrypted_token_per_minute: 100,
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 1,
@@ -2916,8 +2933,8 @@ mod tests {
         let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
             &server_keys,
             TokenRateLimitConfig {
-                max_cache_size: 100,
-                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                max_cache_size: NonZeroUsize::new(100).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                 // The valid token's device budget is exhausted by the warmup, so
                 // it is rate-limited; the other token is undecryptable.
                 encrypted_token_per_minute: 100,
@@ -2964,8 +2981,8 @@ mod tests {
         global_unwrap_per_hour: u32,
     ) -> TokenRateLimitConfig {
         TokenRateLimitConfig {
-            max_cache_size: 100,
-            max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+            max_cache_size: NonZeroUsize::new(100).unwrap(),
+            max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
             // Generous per-token limits so only the global limiter can shed.
             encrypted_token_per_minute: 100_000,
             encrypted_token_per_hour: 100_000,
@@ -3117,8 +3134,8 @@ mod tests {
         let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
             &server_keys,
             TokenRateLimitConfig {
-                max_cache_size: 3,
-                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                max_cache_size: NonZeroUsize::new(3).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                 encrypted_token_per_minute: 100,
                 encrypted_token_per_hour: 1000,
                 device_token_per_minute: 100,
@@ -3165,8 +3182,8 @@ mod tests {
         let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
             &server_keys,
             TokenRateLimitConfig {
-                max_cache_size: 3,
-                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                max_cache_size: NonZeroUsize::new(3).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
                 encrypted_token_per_minute: 1,
                 encrypted_token_per_hour: 100,
                 device_token_per_minute: 100,

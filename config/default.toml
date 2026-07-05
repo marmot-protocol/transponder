@@ -2,12 +2,20 @@
 # MIP-05 Push Notification Server
 
 [server]
-# Server's Nostr private key (hex format)
-# Prefer private_key_file for production secret handling.
+# Server's Nostr private key (hex format).
+#
+# Prefer private_key_file for production. An inline private_key here (or in
+# TRANSPONDER_SERVER_PRIVATE_KEY) is read through a dedicated zeroizing path so
+# it never lands in the config parser's un-zeroized buffers, but a file keeps
+# the secret out of the config file entirely and lets the loader enforce
+# permissions on it.
 private_key = ""
 
 # Alternative: path to a file containing the private key.
 # Useful with Docker secrets or other mounted secret files.
+# The file must NOT be group- or world-readable (mode 0600): the server refuses
+# to start if it grants group/other access, mirroring the 0600 that
+# generate-keys writes.
 # Generate with: transponder generate-keys --output /run/secrets/transponder_private_key
 # private_key_file = "/run/secrets/transponder_private_key"
 
@@ -20,6 +28,8 @@ shutdown_timeout_secs = 10
 # Applies only when dedup_state_path is unset. Durable replay state retains all
 # terminal event IDs inside dedup_retention_secs so restart/reconnect replay
 # suppression covers the full NIP-59 subscription lookback window.
+# Must be >= 1; a value of 0 is rejected at startup (it was previously swapped
+# for the default silently).
 # Default: 100000
 # max_dedup_cache_size = 100000
 
@@ -47,10 +57,14 @@ shutdown_timeout_secs = 10
 # Transponder has two such limiters.
 # At capacity, new keys evict stale or below-limit entries when possible.
 # If no safe eviction candidate exists, the new key is rate limited.
+# Must be >= 1; a value of 0 is rejected at startup (it was previously swapped
+# for the 100000 default silently, per limiter).
 # Default: 100000 entries per cache
 # max_rate_limit_cache_size = 100000
 
 # Maximum encrypted tokens accepted in a single notification event.
+# Must be >= 1; a value of 0 is rejected at startup (it would reject every
+# notification event — a total, silent push outage).
 # Default: 100
 # max_tokens_per_event = 100
 
@@ -105,6 +119,9 @@ allow_unencrypted_clearnet_relays = false
 
 # Tor/onion relays (optional)
 # Requires a binary built with: cargo build --features tor
+# Each entry must be a ws:// or wss:// URL with a .onion host; a plaintext
+# clearnet URL or a malformed .onion entry here is rejected at startup rather
+# than silently degrading to clearnet.
 onion = []
 
 # Reconnection settings. reconnect_interval_secs must be between 1 and 300 seconds.
@@ -156,6 +173,9 @@ project_id = ""
 enabled = true
 
 # Address to bind the health/metrics listener to.
+# Must be a valid IP:port socket address (e.g. "127.0.0.1:8080"); a hostname
+# like "localhost:8080" or an out-of-range port is rejected at startup so a
+# typo cannot silently disable /health, /ready, and /metrics.
 # Keep this on localhost unless an internal proxy, VPN, or load balancer needs
 # access to the endpoint.
 bind_address = "127.0.0.1:8080"
@@ -167,10 +187,14 @@ bind_address = "127.0.0.1:8080"
 enabled = true
 
 [logging]
-# Log level: "trace", "debug", "info", "warn", "error", "off"
+# Log level: "trace", "debug", "info", "warn", "error", "off".
+# Use level = "off" to silence all console output; it keeps the tracing
+# subscriber installed so error reporting and runtime filter changes still work.
 level = "info"
 
-# Log format: "json" (for production) or "pretty" (for development)
+# Log format: "json" (for production) or "pretty" (for development).
+# Only "json" and "pretty" are accepted; any other value (including "off") is
+# rejected at startup. To silence logs, use logging.level = "off".
 format = "json"
 
 [glitchtip]

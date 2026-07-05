@@ -12,12 +12,27 @@
 //! ignored rather than treated as errors, so ambient service-discovery
 //! variables injected by Kubernetes and Docker (e.g. `TRANSPONDER_SERVICE_HOST`,
 //! `TRANSPONDER_PORT_8080_TCP`) do not abort startup.
+//!
+//! Defaults live in exactly one place: the serde `default_*` functions on the
+//! section structs (backed by the shared `DEFAULT_*` consts). The `config`
+//! crate builder only seeds each section as an empty table so `try_deserialize`
+//! reaches those serde defaults even when a section is absent from every
+//! source.
+//!
+//! The server private key is special-cased for secret hygiene: an inline
+//! `server.private_key` (TOML) or `TRANSPONDER_SERVER_PRIVATE_KEY` (env) value
+//! is extracted through a dedicated [`Zeroizing`] path *before* the remaining
+//! configuration is handed to the `config` crate, so the secret never sits in
+//! the crate's un-zeroized `Value` tree. Prefer `server.private_key_file` in
+//! production; the file must not be group/other readable.
 
-use config::{Config, ConfigBuilder, File, builder::DefaultState};
+use config::{Config, ConfigBuilder, File, FileFormat, builder::DefaultState};
 use serde::{Deserialize, Deserializer};
 use std::{
     env,
     ffi::OsString,
+    fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 use tokio::sync::Semaphore;
@@ -124,7 +139,13 @@ fn default_rate_limit_per_hour() -> u32 {
 #[derive(Clone, Deserialize)]
 pub struct ServerConfig {
     /// Server's Nostr private key (hex or nsec format).
-    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    ///
+    /// Never deserialized from the `config` crate's `Value` tree: the inline
+    /// TOML value and the `TRANSPONDER_SERVER_PRIVATE_KEY` env override are
+    /// extracted through a dedicated [`Zeroizing`] path in the load functions
+    /// and assigned here afterwards, so the secret never sits in the crate's
+    /// un-zeroized intermediate buffers. Prefer `private_key_file`.
+    #[serde(skip_deserializing, default = "default_private_key")]
     pub private_key: Zeroizing<String>,
 
     /// Path to a file containing the server's Nostr private key.
@@ -300,13 +321,8 @@ fn default_shutdown_timeout() -> u64 {
     10
 }
 
-fn deserialize_zeroizing_string<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Zeroizing<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    String::deserialize(deserializer).map(Zeroizing::new)
+fn default_private_key() -> Zeroizing<String> {
+    Zeroizing::new(String::new())
 }
 
 /// Relay connection configuration.
@@ -539,17 +555,61 @@ pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
 
-    /// Log format: "json" or "pretty".
+    /// Log format: [`LogFormat::Json`] or [`LogFormat::Pretty`].
     #[serde(default = "default_log_format")]
-    pub format: String,
+    pub format: LogFormat,
+}
+
+/// Console log output format.
+///
+/// Unknown values — including `"off"` — are rejected at config load. Console
+/// logging is silenced with `logging.level = "off"`, which keeps a tracing
+/// subscriber installed (so runtime filter changes and error reporting keep
+/// working) instead of dropping all output unrecoverably.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Structured JSON output for production log aggregation.
+    #[default]
+    Json,
+
+    /// Human-readable output for development.
+    Pretty,
+}
+
+impl<'de> Deserialize<'de> for LogFormat {
+    // Hand-written instead of derived so the error for the plausible-but-wrong
+    // `format = "off"` (and any typo) names the field and points at
+    // `logging.level = "off"`, the supported way to silence console logs.
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "json" => Ok(Self::Json),
+            "pretty" => Ok(Self::Pretty),
+            other => Err(serde::de::Error::custom(format!(
+                "logging.format must be \"json\" or \"pretty\", got \"{other}\"; to silence console logs set logging.level = \"off\""
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json => f.write_str("json"),
+            Self::Pretty => f.write_str("pretty"),
+        }
+    }
 }
 
 fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_log_format() -> String {
-    "json".to_string()
+fn default_log_format() -> LogFormat {
+    LogFormat::Json
 }
 
 /// GlitchTip (Sentry-compatible) error-reporting configuration.
@@ -597,98 +657,50 @@ fn default_glitchtip_environment() -> String {
     "production".to_string()
 }
 
+/// Top-level configuration sections.
+///
+/// Seeded as empty tables so `try_deserialize` reaches every field's serde
+/// `default_*` fn even when a section is absent from all sources.
+const CONFIG_SECTIONS: &[&str] = &[
+    "server",
+    "relays",
+    "apns",
+    "fcm",
+    "health",
+    "metrics",
+    "logging",
+    "glitchtip",
+];
+
+/// Build the base config with each section seeded as an empty table.
+///
+/// Deliberately sets **no default values**: the serde `default_*` fns on the
+/// section structs are the single source of defaults (see the module docs).
+/// Without these structural seeds, a config source that omits a whole section
+/// would fail deserialization with `missing field` instead of using defaults.
 fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
-    Ok(Config::builder()
-        // Start with default values
-        .set_default("server.private_key", "")?
-        .set_default("server.private_key_file", "")?
-        .set_default("server.shutdown_timeout_secs", 10)?
-        .set_default(
-            "server.max_dedup_cache_size",
-            DEFAULT_MAX_DEDUP_CACHE_SIZE as i64,
-        )?
-        .set_default("server.dedup_state_path", "")?
-        .set_default(
-            "server.dedup_retention_secs",
-            DEFAULT_DEDUP_RETENTION_SECS as i64,
-        )?
-        .set_default(
-            "server.max_notification_age_secs",
-            DEFAULT_MAX_NOTIFICATION_AGE_SECS as i64,
-        )?
-        .set_default(
-            "server.max_notification_future_skew_secs",
-            DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS as i64,
-        )?
-        .set_default(
-            "server.max_rate_limit_cache_size",
-            DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE as i64,
-        )?
-        .set_default(
-            "server.max_tokens_per_event",
-            DEFAULT_MAX_TOKENS_PER_EVENT as i64,
-        )?
-        .set_default(
-            "server.encrypted_token_rate_limit_per_minute",
-            DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
-        )?
-        .set_default(
-            "server.encrypted_token_rate_limit_per_hour",
-            DEFAULT_RATE_LIMIT_PER_HOUR as i64,
-        )?
-        .set_default(
-            "server.device_token_rate_limit_per_minute",
-            DEFAULT_RATE_LIMIT_PER_MINUTE as i64,
-        )?
-        .set_default(
-            "server.device_token_rate_limit_per_hour",
-            DEFAULT_RATE_LIMIT_PER_HOUR as i64,
-        )?
-        .set_default(
-            "server.max_concurrent_event_processing",
-            DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING as i64,
-        )?
-        .set_default(
-            "server.global_unwrap_rate_limit_per_minute",
-            DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE as i64,
-        )?
-        .set_default(
-            "server.global_unwrap_rate_limit_per_hour",
-            DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR as i64,
-        )?
-        .set_default("relays.clearnet", Vec::<String>::new())?
-        .set_default("relays.allow_unencrypted_clearnet_relays", false)?
-        .set_default("relays.onion", Vec::<String>::new())?
-        .set_default("relays.reconnect_interval_secs", 5)?
-        .set_default("relays.max_reconnect_attempts", 10)?
-        .set_default("relays.connection_timeout_secs", 30)?
-        .set_default("apns.enabled", false)?
-        .set_default("apns.key_id", "")?
-        .set_default("apns.team_id", "")?
-        .set_default("apns.private_key_path", "")?
-        .set_default("apns.environment", "production")?
-        .set_default("apns.bundle_id", "")?
-        .set_default("apns.payload_mode", "silent")?
-        .set_default("fcm.enabled", false)?
-        .set_default("fcm.service_account_path", "")?
-        .set_default("fcm.project_id", "")?
-        .set_default("health.enabled", true)?
-        .set_default("health.bind_address", DEFAULT_HEALTH_BIND_ADDRESS)?
-        .set_default("metrics.enabled", true)?
-        .set_default("logging.level", "info")?
-        .set_default("logging.format", "json")?
-        .set_default("glitchtip.dsn", "")?
-        .set_default("glitchtip.environment", "production")?
-        .set_default("glitchtip.traces_sample_rate", 0.0)?)
+    let mut builder = Config::builder();
+    for section in CONFIG_SECTIONS {
+        builder = builder.set_default(*section, config::Map::<String, config::Value>::new())?;
+    }
+    Ok(builder)
 }
 
+/// Apply `TRANSPONDER_*` environment overrides to the builder.
+///
+/// Returns the updated builder plus the raw `TRANSPONDER_SERVER_PRIVATE_KEY`
+/// value, if present. The private key is intercepted here — never stored in
+/// the builder — so the secret stays in a [`Zeroizing`] buffer instead of the
+/// `config` crate's un-zeroized `Value` tree.
 fn apply_env_overrides<I>(
     mut builder: ConfigBuilder<DefaultState>,
     env_iter: I,
-) -> Result<ConfigBuilder<DefaultState>>
+) -> Result<(ConfigBuilder<DefaultState>, Option<Zeroizing<String>>)>
 where
     I: IntoIterator<Item = (OsString, OsString)>,
 {
+    let mut private_key: Option<Zeroizing<String>> = None;
+
     for (key, value) in env_iter {
         let Some((env_key, config_key)) = env_var_to_config_key(key)? else {
             continue;
@@ -700,6 +712,11 @@ where
             ))
         })?;
 
+        if config_key == PRIVATE_KEY_CONFIG_KEY {
+            private_key = Some(Zeroizing::new(value));
+            continue;
+        }
+
         builder = if is_string_list_key(&config_key) {
             builder.set_override(&config_key, parse_string_list_env(&env_key, &value)?)?
         } else {
@@ -707,7 +724,33 @@ where
         };
     }
 
-    Ok(builder)
+    Ok((builder, private_key))
+}
+
+const PRIVATE_KEY_CONFIG_KEY: &str = "server.private_key";
+
+/// Remove an inline `server.private_key` from a parsed TOML document, moving
+/// the secret into a [`Zeroizing`] buffer.
+///
+/// Called before the document is handed to the `config` crate so the secret
+/// never enters the crate's `Value` tree. The extracted `String` is moved (not
+/// copied) out of the TOML value, so no additional plaintext copy is left
+/// behind in the document.
+fn extract_inline_private_key(
+    doc: &mut toml::Table,
+) -> std::result::Result<Option<Zeroizing<String>>, config::ConfigError> {
+    let Some(server) = doc.get_mut("server").and_then(toml::Value::as_table_mut) else {
+        return Ok(None);
+    };
+
+    match server.remove("private_key") {
+        None => Ok(None),
+        Some(toml::Value::String(key)) => Ok(Some(Zeroizing::new(key))),
+        Some(other) => Err(config::ConfigError::Message(format!(
+            "server.private_key must be a string, got a TOML {}",
+            other.type_str()
+        ))),
+    }
 }
 
 // Preserve underscores in field names by splitting only once after the section.
@@ -836,10 +879,40 @@ impl AppConfig {
         P: AsRef<Path>,
         I: IntoIterator<Item = (OsString, OsString)>,
     {
-        let builder = base_config_builder()?.add_source(File::from(path.as_ref()));
-        let config = apply_env_overrides(builder, env_iter)?.build()?;
+        let path = path.as_ref();
 
-        let config: Self = config.try_deserialize()?;
+        // Read and parse the TOML ourselves so an inline `server.private_key`
+        // can be moved into a `Zeroizing` buffer before the document reaches
+        // the `config` crate's un-zeroized `Value` tree. The raw file contents
+        // (which may contain the secret) are zeroized on drop.
+        let raw = Zeroizing::new(fs::read_to_string(path).map_err(|error| {
+            config::ConfigError::Message(format!(
+                "failed to read config file {}: {error}",
+                path.display()
+            ))
+        })?);
+        let mut doc: toml::Table = toml::from_str(&raw).map_err(|error| {
+            config::ConfigError::Message(format!(
+                "failed to parse config file {}: {error}",
+                path.display()
+            ))
+        })?;
+        let file_private_key = extract_inline_private_key(&mut doc)?;
+        let sanitized = toml::to_string(&doc).map_err(|error| {
+            config::ConfigError::Message(format!(
+                "failed to re-encode config file {}: {error}",
+                path.display()
+            ))
+        })?;
+
+        let builder =
+            base_config_builder()?.add_source(File::from_str(&sanitized, FileFormat::Toml));
+        let (builder, env_private_key) = apply_env_overrides(builder, env_iter)?;
+        let config = builder.build()?;
+
+        let mut config: Self = config.try_deserialize()?;
+        // Environment overrides file config, matching every other key.
+        config.server.private_key = env_private_key.or(file_private_key).unwrap_or_default();
         config.validate()?;
         Ok(config)
     }
@@ -848,9 +921,11 @@ impl AppConfig {
     where
         I: IntoIterator<Item = (OsString, OsString)>,
     {
-        let config = apply_env_overrides(base_config_builder()?, env_iter)?.build()?;
+        let (builder, env_private_key) = apply_env_overrides(base_config_builder()?, env_iter)?;
+        let config = builder.build()?;
 
-        let config: Self = config.try_deserialize()?;
+        let mut config: Self = config.try_deserialize()?;
+        config.server.private_key = env_private_key.unwrap_or_default();
         config.validate()?;
         Ok(config)
     }
@@ -858,15 +933,18 @@ impl AppConfig {
     /// Validates configuration values that cannot be expressed by the type
     /// system or `serde` defaults.
     ///
-    /// Rejects `0` for the rate-limit count fields and the rate-limit cache
-    /// size. A `0` count would either block every request for that limiter
-    /// dimension (a silent push outage) or be silently swapped for the default,
-    /// so an explicit error at load time surfaces the misconfiguration instead
-    /// of letting it reach runtime. Duration fields are also range-checked so a
-    /// degenerate value cannot defeat graceful shutdown or hang startup.
+    /// Rejects `0` for the rate-limit count fields and the cache sizes. A `0`
+    /// count would either block every request for that limiter dimension (a
+    /// silent push outage) or be silently swapped for the default, so an
+    /// explicit error at load time surfaces the misconfiguration instead of
+    /// letting it reach runtime. Duration fields are also range-checked so a
+    /// degenerate value cannot defeat graceful shutdown or hang startup, and
+    /// `health.bind_address` must parse as a socket address so a typo cannot
+    /// silently disable the health/readiness/metrics endpoints.
     fn validate(&self) -> Result<()> {
         self.server.validate()?;
         self.relays.validate()?;
+        self.health.validate()?;
         self.glitchtip.validate()?;
         Ok(())
     }
@@ -891,18 +969,22 @@ impl AppConfig {
 }
 
 impl ServerConfig {
-    /// Rejects rate-limit count fields and the rate-limit cache size set to `0`,
-    /// `shutdown_timeout_secs` set to `0`, and
-    /// `max_concurrent_event_processing` above [`MAX_CONCURRENT_EVENT_PROCESSING`].
+    /// Rejects rate-limit count fields, the cache sizes, and
+    /// `max_tokens_per_event` set to `0`, `shutdown_timeout_secs` set to `0`,
+    /// and `max_concurrent_event_processing` above
+    /// [`MAX_CONCURRENT_EVENT_PROCESSING`].
     ///
     /// A `0` per-minute/per-hour limit blocks every request for that limiter
-    /// dimension, and a `0` cache size is silently replaced by the default
-    /// rather than honoured. A `0` `shutdown_timeout_secs` makes the graceful
-    /// drain time out immediately, abandoning in-flight push notifications, so
-    /// it is rejected rather than silently skipping the drain. An oversized
-    /// `max_concurrent_event_processing` would panic in `Semaphore::new` at
-    /// startup, so it is range-checked here. Each error names the offending
-    /// config field.
+    /// dimension, a `0` `max_tokens_per_event` rejects every notification
+    /// event (a total, silent push outage), and a `0` cache size used to be
+    /// silently replaced by the default rather than honoured — the downstream
+    /// constructors now take `NonZeroUsize`, so the zero is rejected here with
+    /// a named-field error instead. A `0` `shutdown_timeout_secs` makes the
+    /// graceful drain time out immediately, abandoning in-flight push
+    /// notifications, so it is rejected rather than silently skipping the
+    /// drain. An oversized `max_concurrent_event_processing` would panic in
+    /// `Semaphore::new` at startup, so it is range-checked here. Each error
+    /// names the offending config field.
     fn validate(&self) -> std::result::Result<(), config::ConfigError> {
         if self.shutdown_timeout_secs == 0 {
             return Err(config::ConfigError::Message(
@@ -938,6 +1020,14 @@ impl ServerConfig {
             (
                 "server.max_rate_limit_cache_size",
                 self.max_rate_limit_cache_size as u64,
+            ),
+            (
+                "server.max_dedup_cache_size",
+                self.max_dedup_cache_size as u64,
+            ),
+            (
+                "server.max_tokens_per_event",
+                self.max_tokens_per_event as u64,
             ),
             ("server.dedup_retention_secs", self.dedup_retention_secs),
         ];
@@ -996,6 +1086,27 @@ impl RelayConfig {
         }
 
         Ok(())
+    }
+}
+
+impl HealthConfig {
+    /// Rejects a `bind_address` that does not parse as a socket address.
+    ///
+    /// The health server binds this address at startup; without a load-time
+    /// check, a typo (e.g. a hostname like `localhost:8080`, or an out-of-range
+    /// port) surfaces only as a runtime bind failure. Validated even when the
+    /// health server is disabled so a dormant misconfiguration cannot hide
+    /// until the endpoint is re-enabled.
+    fn validate(&self) -> std::result::Result<(), config::ConfigError> {
+        self.bind_address
+            .parse::<SocketAddr>()
+            .map_err(|error| {
+                config::ConfigError::Message(format!(
+                    "health.bind_address \"{}\" is not a valid socket address (expected IP:port, e.g. \"127.0.0.1:8080\"): {error}",
+                    self.bind_address
+                ))
+            })
+            .map(|_| ())
     }
 }
 
@@ -1260,7 +1371,7 @@ mod tests {
         assert_eq!(config.health.bind_address, "127.0.0.1:9090");
         assert!(config.metrics.enabled);
         assert_eq!(config.logging.level, "debug");
-        assert_eq!(config.logging.format, "pretty");
+        assert_eq!(config.logging.format, LogFormat::Pretty);
     }
 
     #[test]
@@ -1302,7 +1413,7 @@ mod tests {
         assert_eq!(config.health.bind_address, "127.0.0.1:8080");
         assert!(config.metrics.enabled);
         assert_eq!(config.logging.level, "info");
-        assert_eq!(config.logging.format, "json");
+        assert_eq!(config.logging.format, LogFormat::Json);
     }
 
     #[test]
@@ -1345,7 +1456,7 @@ mod tests {
         assert!(config.health.enabled);
         assert_eq!(config.health.bind_address, "127.0.0.1:8080");
         assert_eq!(config.logging.level, "info");
-        assert_eq!(config.logging.format, "json");
+        assert_eq!(config.logging.format, LogFormat::Json);
     }
 
     #[test]
@@ -1646,7 +1757,7 @@ mod tests {
     #[test]
     fn test_logging_config_defaults() {
         assert_eq!(default_log_level(), "info");
-        assert_eq!(default_log_format(), "json");
+        assert_eq!(default_log_format(), LogFormat::Json);
     }
 
     #[test]
@@ -2221,5 +2332,344 @@ mod tests {
             config.server.max_concurrent_event_processing,
             MAX_CONCURRENT_EVENT_PROCESSING
         );
+    }
+
+    // ---- #171: single source of defaults ----
+
+    #[test]
+    fn test_empty_toml_loads_all_serde_defaults() {
+        // The `set_default` ladder is gone; an empty config file (no sections at
+        // all) must still load, driven entirely by the serde `default_*` fns.
+        // This is the load path that previously relied on the config-crate
+        // defaults, so it is the regression guard for #171.
+        let file = create_temp_config("");
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+
+        assert_eq!(
+            config.server.shutdown_timeout_secs,
+            default_shutdown_timeout()
+        );
+        assert_eq!(
+            config.server.max_dedup_cache_size,
+            default_max_dedup_cache_size()
+        );
+        assert_eq!(
+            config.server.max_rate_limit_cache_size,
+            default_max_rate_limit_cache_size()
+        );
+        assert_eq!(
+            config.server.max_tokens_per_event,
+            default_max_tokens_per_event()
+        );
+        assert_eq!(
+            config.relays.reconnect_interval_secs,
+            default_reconnect_interval()
+        );
+        assert_eq!(
+            config.relays.connection_timeout_secs,
+            default_connection_timeout()
+        );
+        assert_eq!(config.apns.environment, default_apns_environment());
+        assert!(config.health.enabled);
+        assert_eq!(config.health.bind_address, DEFAULT_HEALTH_BIND_ADDRESS);
+        assert!(config.metrics.enabled);
+        assert_eq!(config.logging.level, default_log_level());
+        assert_eq!(config.logging.format, default_log_format());
+        assert_eq!(
+            config.glitchtip.environment,
+            default_glitchtip_environment()
+        );
+        // No private key set anywhere.
+        assert_eq!(config.server.private_key.as_str(), "");
+    }
+
+    #[test]
+    fn test_completely_empty_toml_table_loads_defaults() {
+        // Even a document that only declares empty section tables must succeed.
+        let file = create_temp_config(
+            "[server]\n[relays]\n[apns]\n[fcm]\n[health]\n[metrics]\n[logging]\n[glitchtip]\n",
+        );
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+        assert_eq!(config.server.shutdown_timeout_secs, 10);
+        assert_eq!(config.logging.format, LogFormat::Json);
+    }
+
+    // ---- #149 / #166: reject-zero cache/size fields ----
+
+    #[test]
+    fn test_zero_max_dedup_cache_size_rejected_from_file() {
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+            max_dedup_cache_size = 0
+        "#,
+        );
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("server.max_dedup_cache_size"), "{message}");
+        assert!(message.contains("must be greater than 0"), "{message}");
+    }
+
+    #[test]
+    fn test_zero_max_dedup_cache_size_rejected_from_env() {
+        let error = from_test_env(&[("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "0")]).unwrap_err();
+        assert!(
+            error.to_string().contains("server.max_dedup_cache_size"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_zero_max_tokens_per_event_rejected_from_file() {
+        // A zero here caused a total silent push outage (#149): every event
+        // failed token parsing. It must fail at load instead.
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+            max_tokens_per_event = 0
+        "#,
+        );
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("server.max_tokens_per_event"), "{message}");
+        assert!(message.contains("must be greater than 0"), "{message}");
+    }
+
+    #[test]
+    fn test_zero_max_tokens_per_event_rejected_from_env() {
+        let error = from_test_env(&[("TRANSPONDER_SERVER_MAX_TOKENS_PER_EVENT", "0")]).unwrap_err();
+        assert!(
+            error.to_string().contains("server.max_tokens_per_event"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_zero_max_rate_limit_cache_size_rejected() {
+        // #166: previously coerced to 100k inside RateLimiter::new.
+        let error =
+            from_test_env(&[("TRANSPONDER_SERVER_MAX_RATE_LIMIT_CACHE_SIZE", "0")]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("server.max_rate_limit_cache_size"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_minimal_cache_and_token_sizes_accepted() {
+        let config = from_test_env(&[
+            ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "1"),
+            ("TRANSPONDER_SERVER_MAX_TOKENS_PER_EVENT", "1"),
+            ("TRANSPONDER_SERVER_MAX_RATE_LIMIT_CACHE_SIZE", "1"),
+        ])
+        .unwrap();
+        assert_eq!(config.server.max_dedup_cache_size, 1);
+        assert_eq!(config.server.max_tokens_per_event, 1);
+        assert_eq!(config.server.max_rate_limit_cache_size, 1);
+    }
+
+    // ---- #150 / #142: LogFormat enum ----
+
+    #[test]
+    fn test_log_format_parses_json_and_pretty() {
+        for (value, expected) in [("json", LogFormat::Json), ("pretty", LogFormat::Pretty)] {
+            let config_content = format!(
+                r#"
+                [server]
+                private_key = "test"
+
+                [logging]
+                format = "{value}"
+            "#
+            );
+            let file = create_temp_config(&config_content);
+            let config = load_with_test_env(file.path(), &[]).unwrap();
+            assert_eq!(config.logging.format, expected);
+        }
+    }
+
+    #[test]
+    fn test_log_format_off_is_rejected() {
+        // #150: `format = "off"` used to silently disable ALL logging. It must
+        // now fail at load with a message pointing to `logging.level = "off"`.
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+
+            [logging]
+            format = "off"
+        "#,
+        );
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("logging.format"), "{message}");
+        assert!(message.contains("off"), "{message}");
+        assert!(message.contains("level"), "{message}");
+    }
+
+    #[test]
+    fn test_log_format_unknown_value_is_rejected() {
+        // #142: a typo like "jsno" must not silently fall back to a default.
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+
+            [logging]
+            format = "jsno"
+        "#,
+        );
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("logging.format"), "{message}");
+        assert!(message.contains("jsno"), "{message}");
+    }
+
+    #[test]
+    fn test_log_format_rejected_from_env() {
+        let error = from_test_env(&[("TRANSPONDER_LOGGING_FORMAT", "off")]).unwrap_err();
+        assert!(error.to_string().contains("logging.format"), "{error}");
+    }
+
+    #[test]
+    fn test_log_format_display_round_trips() {
+        assert_eq!(LogFormat::Json.to_string(), "json");
+        assert_eq!(LogFormat::Pretty.to_string(), "pretty");
+    }
+
+    // ---- #167: health.bind_address SocketAddr validation ----
+
+    #[test]
+    fn test_health_bind_address_hostname_rejected() {
+        // A hostname is not a SocketAddr; the health server would fail to bind
+        // at runtime and silently take down /health, /ready, /metrics.
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+
+            [health]
+            bind_address = "localhost:8080"
+        "#,
+        );
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("health.bind_address"), "{message}");
+        assert!(message.contains("localhost:8080"), "{message}");
+    }
+
+    #[test]
+    fn test_health_bind_address_out_of_range_port_rejected() {
+        let error =
+            from_test_env(&[("TRANSPONDER_HEALTH_BIND_ADDRESS", "127.0.0.1:99999")]).unwrap_err();
+        assert!(error.to_string().contains("health.bind_address"), "{error}");
+    }
+
+    #[test]
+    fn test_health_bind_address_validated_even_when_disabled() {
+        // A dormant misconfiguration must still be caught so it cannot hide
+        // until the health server is re-enabled.
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+
+            [health]
+            enabled = false
+            bind_address = "not-an-address"
+        "#,
+        );
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        assert!(error.to_string().contains("health.bind_address"), "{error}");
+    }
+
+    #[test]
+    fn test_health_bind_address_valid_accepted() {
+        let config = from_test_env(&[("TRANSPONDER_HEALTH_BIND_ADDRESS", "0.0.0.0:9100")]).unwrap();
+        assert_eq!(config.health.bind_address, "0.0.0.0:9100");
+    }
+
+    // ---- #156: private key never enters the config Value tree ----
+
+    #[test]
+    fn test_inline_private_key_resolved_from_file() {
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "inline-secret-key"
+        "#,
+        );
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+        assert_eq!(config.server.private_key.as_str(), "inline-secret-key");
+    }
+
+    #[test]
+    fn test_env_private_key_overrides_inline_file_value() {
+        // Precedence must match every other key: env beats file.
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "file-secret-key"
+        "#,
+        );
+        let config = load_with_test_env(
+            file.path(),
+            &[("TRANSPONDER_SERVER_PRIVATE_KEY", "env-secret-key")],
+        )
+        .unwrap();
+        assert_eq!(config.server.private_key.as_str(), "env-secret-key");
+    }
+
+    #[test]
+    fn test_non_string_inline_private_key_rejected() {
+        // A non-string inline value is a misconfiguration and must fail with a
+        // named-field error rather than being silently ignored.
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = 12345
+        "#,
+        );
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        assert!(error.to_string().contains("server.private_key"), "{error}");
+    }
+
+    #[test]
+    fn test_extract_inline_private_key_removes_from_doc() {
+        // Direct unit check that the secret is moved out of the parsed TOML doc
+        // (so it never reaches the config crate's Value tree).
+        let mut doc: toml::Table = toml::from_str(
+            r#"
+            [server]
+            private_key = "top-secret"
+            private_key_file = "/some/path"
+        "#,
+        )
+        .unwrap();
+
+        let extracted = extract_inline_private_key(&mut doc).unwrap();
+        assert_eq!(extracted.as_deref().map(|z| z.as_str()), Some("top-secret"));
+
+        let server = doc.get("server").unwrap().as_table().unwrap();
+        assert!(!server.contains_key("private_key"));
+        // Non-secret sibling keys are untouched.
+        assert!(server.contains_key("private_key_file"));
+    }
+
+    #[test]
+    fn test_extract_inline_private_key_absent_is_none() {
+        let mut doc: toml::Table = toml::from_str(
+            r#"
+            [server]
+            private_key_file = "/some/path"
+        "#,
+        )
+        .unwrap();
+        assert!(extract_inline_private_key(&mut doc).unwrap().is_none());
     }
 }

@@ -2,7 +2,9 @@
 # Copy this to config/production.toml and adjust for your deployment.
 
 [server]
-# Recommended for production: supply the key via
+# Recommended for production: supply the key via a permission-scoped file
+# (mode 0600). The server refuses to start if the key file is group/world
+# readable.
 # TRANSPONDER_SERVER_PRIVATE_KEY_FILE=/run/secrets/transponder_private_key
 # Generate with: transponder generate-keys --output /run/secrets/transponder_private_key
 private_key = ""
@@ -50,6 +52,8 @@ allow_unencrypted_clearnet_relays = false
 
 # Add onion relays only if you intend to run a Tor-enabled build and can spare
 # additional memory/CPU for Tor circuits.
+# Each entry must be a ws:// or wss:// URL with a .onion host; malformed or
+# clearnet entries here are rejected at startup.
 # Build with: docker build --build-arg CARGO_FEATURES='--features tor' -t transponder:local .
 onion = []
 
@@ -75,6 +79,7 @@ project_id = ""
 
 [health]
 enabled = true
+# Must be a valid IP:port socket address (rejected at startup otherwise).
 # Keep native deployments bound to localhost by default. For Docker Compose,
 # compose.prod.yml overrides this to 0.0.0.0 inside the container while
 # publishing the host port on 127.0.0.1 only.
@@ -84,7 +89,10 @@ bind_address = "127.0.0.1:8080"
 enabled = true
 
 [logging]
+# level = "off" silences all console output (subscriber stays installed).
 level = "info"
+# Only "json" or "pretty"; any other value (including "off") is rejected at
+# startup. Silence logs with level = "off", not format.
 format = "json"
 
 [glitchtip]
