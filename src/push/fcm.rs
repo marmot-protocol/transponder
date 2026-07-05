@@ -30,8 +30,11 @@ const FCM_ERROR_DETAIL_TYPE: &str = "type.googleapis.com/google.firebase.fcm.v1.
 /// FCM provider-specific error code for an unregistered/dead device token.
 const FCM_ERROR_UNREGISTERED: &str = "UNREGISTERED";
 
-/// Access token lifetime (50 minutes).
+/// Fallback access token lifetime (50 minutes) used when the provider omits expiry.
 const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
+
+/// Safety margin subtracted from provider-reported OAuth token lifetimes.
+const TOKEN_REFRESH_SAFETY_MARGIN_SECS: u64 = 60;
 
 /// Upper bound on FCM registration token length.
 ///
@@ -92,6 +95,20 @@ struct TokenRequest {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: Zeroizing<String>,
+    expires_in: Option<u64>,
+}
+
+/// Return how long an FCM OAuth token should stay cached.
+///
+/// Google is authoritative for issued token lifetimes; keep a small local
+/// safety margin so Transponder refreshes before the provider-side expiry.
+#[must_use]
+fn token_cache_lifetime(expires_in: Option<u64>) -> Duration {
+    expires_in
+        .map(|seconds| {
+            Duration::from_secs(seconds.saturating_sub(TOKEN_REFRESH_SAFETY_MARGIN_SECS))
+        })
+        .unwrap_or(TOKEN_LIFETIME)
 }
 
 /// Cached access token.
@@ -103,14 +120,14 @@ pub(crate) struct CachedToken {
 }
 
 /// FCM message payload.
-#[derive(Debug, Serialize)]
-struct FcmRequest {
-    message: FcmMessage,
+#[derive(Serialize)]
+struct FcmRequest<'a> {
+    message: FcmMessage<'a>,
 }
 
-#[derive(Debug, Serialize)]
-struct FcmMessage {
-    token: String,
+#[derive(Serialize)]
+struct FcmMessage<'a> {
+    token: &'a str,
     android: Option<AndroidConfig>,
     data: Option<std::collections::HashMap<String, String>>,
 }
@@ -205,6 +222,57 @@ fn fcm_error_summary(error: &FcmError) -> String {
     summary
 }
 
+/// Outcome of an OAuth token refresh attempt for push retry classification.
+#[derive(Debug)]
+enum TokenAcquisitionError {
+    /// Configuration, credential, or non-retriable OAuth rejection.
+    Permanent(Error),
+    /// Transient OAuth endpoint or transport failure.
+    Retriable {
+        status_code: u16,
+        retry_after: Option<Duration>,
+    },
+}
+
+impl TokenAcquisitionError {
+    fn permanent(err: Error) -> Self {
+        Self::Permanent(err)
+    }
+
+    fn from_http_status(status: reqwest::StatusCode, retry_after: Option<Duration>) -> Self {
+        let status_code = status.as_u16();
+        if status == 429 || status.is_server_error() {
+            Self::Retriable {
+                status_code,
+                retry_after,
+            }
+        } else {
+            Self::Permanent(Error::Fcm(oauth_failure_message(status)))
+        }
+    }
+
+    fn from_transport(err: reqwest::Error) -> Self {
+        debug!(error = %err, "FCM OAuth token transport error");
+        Self::Retriable {
+            status_code: 0,
+            retry_after: None,
+        }
+    }
+
+    fn into_send_attempt(self) -> SendAttemptResult {
+        match self {
+            Self::Permanent(error) => SendAttemptResult::Permanent(error),
+            Self::Retriable {
+                status_code,
+                retry_after,
+            } => SendAttemptResult::Retriable {
+                status_code,
+                retry_after,
+            },
+        }
+    }
+}
+
 /// FCM client for sending push notifications.
 pub struct FcmClient {
     pub(crate) http_client: Client,
@@ -213,6 +281,12 @@ pub struct FcmClient {
     pub(crate) encoding_key: Option<EncodingKey>,
     pub(crate) cached_token: Arc<RwLock<Option<CachedToken>>>,
     pub(crate) metrics: Option<Metrics>,
+    /// Test-only override for the OAuth token endpoint URL.
+    #[cfg(test)]
+    pub(crate) test_oauth_token_url: Option<String>,
+    /// Test-only override for the FCM v1 API base URL (scheme + host + port).
+    #[cfg(test)]
+    pub(crate) test_fcm_api_base_url: Option<String>,
 }
 
 impl FcmClient {
@@ -257,11 +331,33 @@ impl FcmClient {
             encoding_key,
             cached_token: Arc::new(RwLock::new(None)),
             metrics,
+            #[cfg(test)]
+            test_oauth_token_url: None,
+            #[cfg(test)]
+            test_fcm_api_base_url: None,
         })
     }
 
+    fn oauth_token_url(&self) -> &str {
+        #[cfg(test)]
+        if let Some(url) = self.test_oauth_token_url.as_deref() {
+            return url;
+        }
+        OAUTH_TOKEN_URL
+    }
+
+    fn fcm_messages_send_url(&self, project_id: &str) -> String {
+        #[cfg(test)]
+        if let Some(base) = self.test_fcm_api_base_url.as_deref() {
+            return format!("{base}/v1/projects/{project_id}/messages:send");
+        }
+        format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send")
+    }
+
     /// Get a valid access token, refreshing if necessary.
-    async fn get_access_token(&self) -> Result<Zeroizing<String>> {
+    async fn get_access_token(
+        &self,
+    ) -> std::result::Result<Zeroizing<String>, TokenAcquisitionError> {
         // First check with read lock (fast path)
         {
             let cached = self.cached_token.read().await;
@@ -290,20 +386,22 @@ impl FcmClient {
     async fn refresh_token_inner(
         &self,
         cached: &mut tokio::sync::RwLockWriteGuard<'_, Option<CachedToken>>,
-    ) -> Result<Zeroizing<String>> {
-        let sa = self
-            .service_account
-            .as_ref()
-            .ok_or_else(|| Error::Fcm("No service account configured".to_string()))?;
+    ) -> std::result::Result<Zeroizing<String>, TokenAcquisitionError> {
+        let sa = self.service_account.as_ref().ok_or_else(|| {
+            TokenAcquisitionError::permanent(Error::Fcm(
+                "No service account configured".to_string(),
+            ))
+        })?;
 
-        let encoding_key = self
-            .encoding_key
-            .as_ref()
-            .ok_or_else(|| Error::Fcm("No encoding key available".to_string()))?;
+        let encoding_key = self.encoding_key.as_ref().ok_or_else(|| {
+            TokenAcquisitionError::permanent(Error::Fcm("No encoding key available".to_string()))
+        })?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| Error::Fcm(format!("System time error: {e}")))?
+            .map_err(|e| {
+                TokenAcquisitionError::permanent(Error::Fcm(format!("System time error: {e}")))
+            })?
             .as_secs();
 
         // Backdate `iat` by the clock-skew leeway so a fast host clock does not
@@ -320,7 +418,10 @@ impl FcmClient {
         };
 
         let header = Header::new(Algorithm::RS256);
-        let jwt = Zeroizing::new(encode(&header, &claims, encoding_key)?);
+        let jwt = Zeroizing::new(
+            encode(&header, &claims, encoding_key)
+                .map_err(|e| TokenAcquisitionError::permanent(Error::from(e)))?,
+        );
 
         let request = TokenRequest {
             grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
@@ -329,24 +430,31 @@ impl FcmClient {
 
         let response = self
             .http_client
-            .post(OAUTH_TOKEN_URL)
+            .post(self.oauth_token_url())
             .form(&request)
             .send()
-            .await?;
+            .await
+            .map_err(TokenAcquisitionError::from_transport)?;
 
         if !response.status().is_success() {
             let status = response.status();
-            return Err(Error::Fcm(oauth_failure_message(status)));
+            let retry_after = retry::retry_after_from_headers(response.headers());
+            debug!(status = %status, "FCM OAuth token request failed");
+            return Err(TokenAcquisitionError::from_http_status(status, retry_after));
         }
 
-        let token_response: TokenResponse = response.json().await?;
+        let token_response: TokenResponse = response
+            .json()
+            .await
+            .map_err(|e| TokenAcquisitionError::permanent(Error::from(e)))?;
 
         // Cache the token while still holding the write lock. The caller gets a
         // short-lived zeroizing clone for request construction while the cache
         // owns the reusable copy.
+        let ttl = token_cache_lifetime(token_response.expires_in);
         let cached_token = CachedToken {
             token: token_response.access_token,
-            expires_at: SystemTime::now() + TOKEN_LIFETIME,
+            expires_at: SystemTime::now() + ttl,
         };
         let outbound_token = cached_token.token.clone();
         **cached = Some(cached_token);
@@ -387,12 +495,12 @@ impl FcmClient {
     /// sleeping retry does not occupy an in-flight concurrency slot.
     pub async fn send(
         &self,
-        device_token: &str,
+        device_token: Zeroizing<String>,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) -> Result<PushSendOutcome> {
         // Validate token format before spending an OAuth-authenticated round-trip
         // and FCM quota on a clearly-malformed token (mirrors APNs).
-        if !is_valid_fcm_token(device_token) {
+        if !is_valid_fcm_token(device_token.as_str()) {
             trace!(
                 token_len = device_token.len(),
                 "Invalid FCM device token format"
@@ -404,7 +512,7 @@ impl FcmClient {
         retry::with_retry(
             &retry_config,
             "FCM",
-            || self.send_once(device_token),
+            || self.send_once(&device_token),
             backoff_permit,
             self.metrics.as_ref(),
         )
@@ -422,7 +530,7 @@ impl FcmClient {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: device_token.to_string(),
+                token: device_token,
                 android: Some(AndroidConfig {
                     priority: "high".to_string(),
                 }),
@@ -601,16 +709,16 @@ impl FcmClient {
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
-    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+    async fn send_once(&self, device_token: &Zeroizing<String>) -> SendAttemptResult {
         let project_id = match self.project_id() {
             Ok(id) => id,
             Err(e) => return SendAttemptResult::Permanent(e),
         };
-        let url = format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
+        let url = self.fcm_messages_send_url(project_id);
 
         let access_token = match self.get_access_token().await {
             Ok(t) => t,
-            Err(e) => return SendAttemptResult::Permanent(e),
+            Err(e) => return e.into_send_attempt(),
         };
 
         let transport_retry = RetryConfig::transport();
@@ -623,7 +731,7 @@ impl FcmClient {
                 // not inflate provider latency.
                 let start = Instant::now();
                 let response = self
-                    .build_request(&url, access_token.as_str(), device_token)
+                    .build_request(&url, access_token.as_str(), device_token.as_str())
                     .send()
                     .await
                     .map_err(Error::from)?;
@@ -721,6 +829,8 @@ impl FcmClient {
             encoding_key,
             cached_token: Arc::new(RwLock::new(None)),
             metrics: None,
+            test_oauth_token_url: None,
+            test_fcm_api_base_url: None,
         }
     }
 }
@@ -731,6 +841,10 @@ mod tests {
     use crate::test_metrics::{counter_value, histogram_sample_count, histogram_sample_sum};
     use wiremock::matchers::{body_partial_json, header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn zeroizing_token(token: &str) -> Zeroizing<String> {
+        Zeroizing::new(token.to_owned())
+    }
 
     #[test]
     fn test_cached_token_stores_access_token_in_zeroizing_string() {
@@ -759,9 +873,9 @@ mod tests {
     }
 
     #[test]
-    fn test_token_response_deserializes_access_token_as_zeroizing_string() {
+    fn test_token_response_deserializes_access_token_and_expiry() {
         // Compile-time guard: provider bearer tokens must deserialize directly
-        // into zeroizing storage while ignoring unused response metadata.
+        // into zeroizing storage while preserving provider lifetime metadata.
         fn assert_zeroizing_string(_: &Zeroizing<String>) {}
 
         let response: TokenResponse = serde_json::from_value(serde_json::json!({
@@ -772,7 +886,51 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.access_token.as_str(), "provider-access-token");
+        assert_eq!(response.expires_in, Some(3600));
         assert_zeroizing_string(&response.access_token);
+    }
+
+    #[test]
+    fn test_token_cache_lifetime_uses_provider_expiry_with_safety_margin() {
+        assert_eq!(
+            token_cache_lifetime(Some(3600)),
+            Duration::from_secs(3600 - TOKEN_REFRESH_SAFETY_MARGIN_SECS)
+        );
+    }
+
+    #[test]
+    fn test_token_cache_lifetime_falls_back_when_provider_omits_expiry() {
+        let response: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "provider-access-token"
+        }))
+        .unwrap();
+
+        assert_eq!(response.expires_in, None);
+        assert_eq!(token_cache_lifetime(response.expires_in), TOKEN_LIFETIME);
+    }
+
+    #[test]
+    fn test_token_cache_lifetime_saturates_short_provider_expiry() {
+        assert_eq!(token_cache_lifetime(Some(30)), Duration::from_secs(0));
+    }
+
+    #[test]
+    fn test_fcm_request_borrows_device_token_from_zeroizing_string() {
+        // Compile-time guard: request construction must not copy the device
+        // token into an owned plain String before reqwest serializes the body.
+        fn assert_borrowed_token(_: &str) {}
+
+        let token = zeroizing_token("device-token-123");
+        let request = FcmRequest {
+            message: FcmMessage {
+                token: token.as_str(),
+                android: None,
+                data: None,
+            },
+        };
+
+        assert_borrowed_token(request.message.token);
+        assert_eq!(request.message.token, "device-token-123");
     }
 
     #[test]
@@ -837,7 +995,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "test-token".to_string(),
+                token: "test-token",
                 android: Some(AndroidConfig {
                     priority: "high".to_string(),
                 }),
@@ -917,7 +1075,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: Some(AndroidConfig {
                     priority: "high".to_string(),
                 }),
@@ -965,7 +1123,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "invalid-token".to_string(),
+                token: "invalid-token",
                 android: None,
                 data: None,
             },
@@ -1013,7 +1171,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "unregistered-token".to_string(),
+                token: "unregistered-token",
                 android: None,
                 data: None,
             },
@@ -1480,7 +1638,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "any-token".to_string(),
+                token: "any-token",
                 android: None,
                 data: None,
             },
@@ -1640,7 +1798,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "any-token".to_string(),
+                token: "any-token",
                 android: None,
                 data: None,
             },
@@ -1742,7 +1900,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "any-token".to_string(),
+                token: "any-token",
                 android: None,
                 data: None,
             },
@@ -1824,8 +1982,12 @@ mod tests {
         let client = FcmClient::mock(config, false);
         let result = client.get_access_token().await;
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("No service account"));
+        match result.unwrap_err() {
+            TokenAcquisitionError::Permanent(err) => {
+                assert!(err.to_string().contains("No service account"));
+            }
+            TokenAcquisitionError::Retriable { .. } => panic!("expected permanent error"),
+        }
     }
 
     #[test]
@@ -1856,7 +2018,7 @@ mod tests {
     fn test_fcm_message_without_android() {
         let request = FcmRequest {
             message: FcmMessage {
-                token: "test-token".to_string(),
+                token: "test-token",
                 android: None,
                 data: None,
             },
@@ -1871,7 +2033,7 @@ mod tests {
     fn test_fcm_message_with_empty_data() {
         let request = FcmRequest {
             message: FcmMessage {
-                token: "test-token".to_string(),
+                token: "test-token",
                 android: Some(AndroidConfig {
                     priority: "high".to_string(),
                 }),
@@ -1963,12 +2125,12 @@ mod tests {
         // Should try to refresh but fail since no service account
         let result = client.get_access_token().await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("No service account")
-        );
+        match result.unwrap_err() {
+            TokenAcquisitionError::Permanent(err) => {
+                assert!(err.to_string().contains("No service account"));
+            }
+            TokenAcquisitionError::Retriable { .. } => panic!("expected permanent error"),
+        }
     }
 
     #[test]
@@ -2004,7 +2166,9 @@ mod tests {
             });
         }
 
-        let result = client.send("test-device-token", None).await;
+        let result = client
+            .send(zeroizing_token("test-device-token"), None)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No project ID"));
     }
@@ -2019,7 +2183,9 @@ mod tests {
 
         let client = FcmClient::mock(config, false);
 
-        let result = client.send("test-device-token", None).await;
+        let result = client
+            .send(zeroizing_token("test-device-token"), None)
+            .await;
         assert!(result.is_err());
         assert!(
             result
@@ -2040,7 +2206,9 @@ mod tests {
         let mut client = FcmClient::mock(config, true);
         client.service_account.as_mut().unwrap().project_id = "x/../../admin/v1".to_string();
 
-        let result = client.send("test-device-token", None).await;
+        let result = client
+            .send(zeroizing_token("test-device-token"), None)
+            .await;
         assert!(result.is_err());
         assert!(
             result
@@ -2061,7 +2229,9 @@ mod tests {
         // Client without service account - will fail to get access token
         let client = FcmClient::mock(config, false);
 
-        let result = client.send("test-device-token", None).await;
+        let result = client
+            .send(zeroizing_token("test-device-token"), None)
+            .await;
         assert!(result.is_err());
         assert!(
             result
@@ -2087,6 +2257,8 @@ mod tests {
             encoding_key: None,
             cached_token: Arc::new(RwLock::new(None)),
             metrics: None,
+            test_oauth_token_url: None,
+            test_fcm_api_base_url: None,
         };
 
         // Should not be configured - no encoding key
@@ -2126,7 +2298,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: None,
                 data: None,
             },
@@ -2168,7 +2340,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: None,
                 data: None,
             },
@@ -2209,7 +2381,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: None,
                 data: None,
             },
@@ -2267,7 +2439,7 @@ mod tests {
 
         let request = FcmRequest {
             message: FcmMessage {
-                token: "device-token-123".to_string(),
+                token: "device-token-123",
                 android: None,
                 data: None,
             },
@@ -2355,27 +2527,273 @@ mod tests {
         let client = FcmClient::mock(config, false);
 
         assert_eq!(
-            client.send("", None).await.unwrap(),
+            client.send(zeroizing_token(""), None).await.unwrap(),
             PushSendOutcome::InvalidToken,
             "empty token"
         );
         assert_eq!(
-            client.send("token with space", None).await.unwrap(),
+            client
+                .send(zeroizing_token("token with space"), None)
+                .await
+                .unwrap(),
             PushSendOutcome::InvalidToken,
             "whitespace token"
         );
         assert_eq!(
-            client.send("tokén-with-unicode", None).await.unwrap(),
+            client
+                .send(zeroizing_token("tokén-with-unicode"), None)
+                .await
+                .unwrap(),
             PushSendOutcome::InvalidToken,
             "unicode token"
         );
         assert_eq!(
             client
-                .send(&"a".repeat(MAX_FCM_TOKEN_LEN + 1), None)
+                .send(Zeroizing::new("a".repeat(MAX_FCM_TOKEN_LEN + 1)), None)
                 .await
                 .unwrap(),
             PushSendOutcome::InvalidToken,
             "overlong token"
         );
+    }
+
+    /// RSA private key used only to exercise the OAuth JWT-signing path in
+    /// wiremock integration tests. The key is not a real credential.
+    const TEST_RSA_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC+ck55JGyU1jFS
+zlGUrJT1e9UL8voNAYXMTP34v3Mo1Gg4gs8CQnuBsO6RLnHoQtIYNdopqNE536il
+zvcnQGBkS4gn1wAJjm+16sQZYPvykwFNNmWAkcWKIfn2qZcE3GAC2W2W6knH5ser
+T2+2mrHrFMd1hML8JYH+hJsPuH1tNK2JfRrNkUJOmG6NUAqU8LT8P2bI4Fi6iAGI
+RzGxaRqmBBJ97jx6dwakqFU+6XQiIxQ5wq0yakN/auhPT1lKfNa0mzE1QnG0t3Ht
+Mfc7b77ToA7mHkln6+9KEPupULsD0H+O2W46KvIIwzeS6kk2aleIPMMVMVAw/UHl
+LYaVuSCLAgMBAAECggEAAyPOUGf91ExdvtBA/xMDV7LFde95GOrMAmzIiSfa5bLu
+zvO1JwPilmZM4J7j6ODlJtoIcURjwrEBzk4FvCNvE2g9Y+7DBOVQyS6IMiTrsnmi
+/VtmvAJrP9ZEkUEFiOJ7QMDF8kWFluKiqxvhqyCMy2Ppz/Gy50ZVCNW12sH/a2P6
+KLsSRwLQxl/v+TTiYxSPN2OsPi5xucbxV9fAA4G1EURgnjg540PiagbV2Kj8mwBB
+ZRqrBVfWpyPQGVMwQUfSn0dQ4zJnOZPszKpaIMF2pu6yKpkf66u4X2baefL3yjez
+FCoiwIvJhAvgQV4bIrcmOPmEIGhM087SFuC1q3QtQQKBgQDm2jiChO6xeOKeiZlJ
+i4r/PjG/gNOVMi0IkGkfVfxSs3ZnFUlCU3LMHpI+sG7w+8EM+PsNtCfVk8ZKc/0w
+mK5FdRh7j8/uIVAz1FV3H5c40B8w93w8VLeZvShMZRTyCNw2wMoMuOI+ZvAdt8m3
+0hZSqEX7bvCAwlnG6llfcDPIQQKBgQDTMUlU276xP69VQIT6JQMT7uL5pfJ8o4/l
+tZ/LN9Vd7bWeeSXXFtdJ057xmNMPafCu6ZNZ1XtpTjaB3dvpzDS0w2AULV/vBt6u
+2mUjU4CG3hrYpmtvVHHOeRJpqBySj79Cy6PV6Wd80qhDna1rpPEd12DH54tEr4WI
+jl0V7jwVywKBgQDEWKSptmDCR7wP9Z6P5ATz9TUg2XScOBH/b7xJb7vtp0A0ivFF
+XW6NWA8xDKU/iBD5dKcrT6h1yntkBeU6ORI4d1C8f2Pt+R2bB6UtbYwUQUfWQRjE
+w5VpSG6HE45OEeUjGLSBP5sGUk02KYSDOUfNQ9xJ72DVUvhC7D3Zo7gXQQKBgDQp
+mT4vZGMtIqZA4FdUavUybLdSqJjmYTVQbd5otPeVLeWtcI42owgmD70GjSLifMMH
+CBEJLIku+0GKRbXybRY0p3d0WZyVKs0vPgnCpx0ooKLgP+rohY+E0epszlnYzVm3
+KIk+NARdl5fTyzCqNa+0McBOTVSysZ2v5Af1pruPAoGAfstlp38kcS9jlEyz6ykr
+5+GInq5o7ZdjcoHnQ6Vz8PhfKxy92LQSkT3Dz/qHU9aqKA4YaEt9ftzvphortnnu
+HdBEAGGbO85e4Qu6cPFfNMf3nK/gchAwBudaQEhGDAarVre0rDxjOpeaNmABo82P
+LTP/MQIxLydQxT4+jx2NBu0=
+-----END PRIVATE KEY-----";
+
+    fn mock_client_with_rsa_service_account(project_id: &str) -> FcmClient {
+        let config = FcmConfig {
+            enabled: true,
+            service_account_path: String::new(),
+            project_id: project_id.to_string(),
+        };
+        let sa = ServiceAccount {
+            account_type: "service_account".to_string(),
+            project_id: project_id.to_string(),
+            private_key: Zeroizing::new(TEST_RSA_PRIVATE_KEY.to_string()),
+            client_email: "test@test.iam.gserviceaccount.com".to_string(),
+            token_uri: "https://oauth2.googleapis.com/token".to_string(),
+        };
+        let encoding_key =
+            EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).expect("test RSA key");
+
+        FcmClient {
+            http_client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("http client"),
+            config,
+            service_account: Some(sa),
+            encoding_key: Some(encoding_key),
+            cached_token: Arc::new(RwLock::new(None)),
+            metrics: None,
+            test_oauth_token_url: None,
+            test_fcm_api_base_url: None,
+        }
+    }
+
+    #[test]
+    fn test_oauth_token_http_status_classifies_transient_failures_as_retriable() {
+        for status_code in [429_u16, 500, 503] {
+            let status = reqwest::StatusCode::from_u16(status_code).unwrap();
+            let failure = TokenAcquisitionError::from_http_status(status, None);
+            assert!(
+                matches!(
+                    failure,
+                    TokenAcquisitionError::Retriable {
+                        status_code: code,
+                        retry_after: None,
+                    } if code == status_code
+                ),
+                "status {status_code} should be retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_oauth_token_http_status_classifies_permanent_oauth_failures() {
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let failure = TokenAcquisitionError::from_http_status(status, None);
+        assert!(matches!(
+            failure,
+            TokenAcquisitionError::Permanent(Error::Fcm(ref message))
+                if message == "OAuth token request failed: 400 Bad Request"
+        ));
+    }
+
+    #[test]
+    fn test_oauth_token_http_status_honors_retry_after_for_503() {
+        let status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
+        let failure =
+            TokenAcquisitionError::from_http_status(status, Some(Duration::from_secs(30)));
+        assert!(matches!(
+            failure,
+            TokenAcquisitionError::Retriable {
+                status_code: 503,
+                retry_after: Some(delay),
+            } if delay == Duration::from_secs(30)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_access_token_oauth_503_is_retriable() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut client = mock_client_with_rsa_service_account("test-project");
+        client.test_oauth_token_url = Some(mock_server.uri());
+
+        let result = client.get_access_token().await;
+        assert!(matches!(
+            result,
+            Err(TokenAcquisitionError::Retriable {
+                status_code: 503,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_access_token_oauth_transport_error_is_retriable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut client = mock_client_with_rsa_service_account("test-project");
+        client.test_oauth_token_url = Some(format!("http://{addr}/token"));
+
+        let result = client.get_access_token().await;
+        assert!(matches!(
+            result,
+            Err(TokenAcquisitionError::Retriable {
+                status_code: 0,
+                retry_after: None,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_access_token_oauth_400_is_permanent() {
+        let mock_server = MockServer::start().await;
+
+        let secret = "assertion-jwt-secret-".repeat(1_000);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(format!(
+                "{{\"error\":\"invalid_grant\",\"error_description\":\"{secret}\"}}"
+            )))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut client = mock_client_with_rsa_service_account("test-project");
+        client.test_oauth_token_url = Some(mock_server.uri());
+
+        let result = client.get_access_token().await;
+        let TokenAcquisitionError::Permanent(Error::Fcm(message)) = result.unwrap_err() else {
+            panic!("expected permanent OAuth failure");
+        };
+        assert_eq!(message, "OAuth token request failed: 400 Bad Request");
+        assert!(!message.contains("invalid_grant"));
+        assert!(!message.contains(&secret));
+    }
+
+    #[tokio::test]
+    async fn test_send_retries_transient_oauth_failure_then_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/projects/.+/messages:send"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/test-project/messages/123456"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock-access-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut client = mock_client_with_rsa_service_account("test-project");
+        client.test_oauth_token_url = Some(mock_server.uri());
+        client.test_fcm_api_base_url = Some(mock_server.uri());
+
+        let result = client.send(zeroizing_token("device-token-123"), None).await;
+        assert!(
+            result.is_ok(),
+            "expected success after OAuth retry: {result:?}"
+        );
+        assert_eq!(result.unwrap(), PushSendOutcome::Sent);
+    }
+
+    #[tokio::test]
+    async fn test_send_does_not_retry_permanent_oauth_failure() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Invalid JWT Signature."
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut client = mock_client_with_rsa_service_account("test-project");
+        client.test_oauth_token_url = Some(mock_server.uri());
+        client.test_fcm_api_base_url = Some(mock_server.uri());
+
+        let result = client.send(zeroizing_token("device-token-123"), None).await;
+        assert!(result.is_err(), "expected permanent OAuth failure");
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("OAuth token request failed"));
+        assert!(message.contains("400"));
+        assert!(!message.contains("invalid_grant"));
+        assert!(!message.contains("Invalid JWT Signature"));
     }
 }

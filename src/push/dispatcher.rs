@@ -12,8 +12,9 @@
 //!
 //! # Security
 //!
-//! Device tokens are wrapped in `Zeroizing<String>` to ensure they are zeroed
-//! from memory when no longer needed, preventing sensitive data from lingering.
+//! Device tokens are wrapped in `Zeroizing<String>` while queued and while
+//! handed to provider clients, reducing avoidable cleartext heap copies before
+//! request serialization.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -44,8 +45,8 @@ const MAX_PENDING_QUEUE_SIZE: usize = 10_000;
 ///
 /// # Security
 ///
-/// The token field is wrapped in `Zeroizing<String>` to ensure device tokens
-/// are zeroed from memory when the message is dropped.
+/// The token field is wrapped in `Zeroizing<String>` while queued and is moved
+/// intact into the provider client when the message is sent.
 enum PushMessage {
     /// Send a notification to the given platform with the given token.
     Send {
@@ -283,7 +284,7 @@ impl PushDispatcher {
         match platform {
             Platform::Apns => {
                 if let Some(client) = apns_client {
-                    match client.send(token.as_str(), backoff_permit).await {
+                    match client.send(token, backoff_permit).await {
                         Ok(outcome) => {
                             Self::record_send_outcome("APNs", platform_str, outcome, &metrics);
                         }
@@ -298,7 +299,7 @@ impl PushDispatcher {
             }
             Platform::Fcm => {
                 if let Some(client) = fcm_client {
-                    match client.send(token.as_str(), backoff_permit).await {
+                    match client.send(token, backoff_permit).await {
                         Ok(outcome) => {
                             Self::record_send_outcome("FCM", platform_str, outcome, &metrics);
                         }
@@ -419,7 +420,7 @@ impl PushDispatcher {
                         trace!("APNs not configured, skipping notification");
                         continue;
                     }
-                    (Platform::Apns, Zeroizing::new(payload.device_token_hex()))
+                    (Platform::Apns, payload.device_token_hex())
                 }
                 Platform::Fcm => {
                     if self.fcm_client.is_none() {
@@ -427,7 +428,7 @@ impl PushDispatcher {
                         continue;
                     }
                     match payload.device_token_string() {
-                        Some(t) => (Platform::Fcm, Zeroizing::new(t)),
+                        Some(token) => (Platform::Fcm, token),
                         None => {
                             trace!("Invalid FCM token (not UTF-8)");
                             continue;
@@ -1580,10 +1581,11 @@ mod tests {
         let guard = dispatcher.inflight.enter();
 
         // A retry config with a backoff long enough to observe the sleep window
-        // deterministically from the test.
+        // deterministically from the test even after retry jitter shortens the
+        // fallback sleep by up to half.
         let config = RetryConfig {
             max_retries: 3,
-            initial_backoff: Duration::from_millis(300),
+            initial_backoff: Duration::from_millis(600),
         };
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_op = attempts.clone();

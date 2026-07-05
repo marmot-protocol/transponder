@@ -329,6 +329,24 @@ impl StageTimer {
     }
 }
 
+/// Outcome of [`EventProcessor::process_inner`].
+///
+/// Distinguishes a terminal result (notifications admitted, or the event
+/// genuinely carried nothing dispatchable) from a purely transient per-token
+/// rate-limit shed, which must be treated like the global-limiter shed:
+/// retryable, not marked terminally seen, and not counted as processed.
+enum ProcessOutcome {
+    /// The event reached a terminal state: `count` notifications were admitted
+    /// to the dispatcher (possibly zero when every token was invalid or targeted
+    /// an unconfigured platform). Replays should short-circuit as duplicates.
+    Admitted(usize),
+    /// Every token the event carried was shed purely by the per-token rate
+    /// limiters, admitting zero notifications and dropping nothing terminally.
+    /// This is transient back-pressure: the event stays retryable once budget
+    /// recovers.
+    RateLimitedShed,
+}
+
 /// Event processor for handling incoming gift-wrapped notifications.
 pub struct EventProcessor {
     nip59_handler: Nip59Handler,
@@ -632,7 +650,7 @@ impl EventProcessor {
 
         // Process the event
         match self.process_inner(event).await {
-            Ok(count) => {
+            Ok(ProcessOutcome::Admitted(count)) => {
                 // Refresh the seen timestamp now that processing succeeded, so
                 // the dedup window is measured from completion. The reservation
                 // taken above already keeps the event marked seen.
@@ -651,6 +669,23 @@ impl EventProcessor {
                     );
                 }
                 Ok(true)
+            }
+            Ok(ProcessOutcome::RateLimitedShed) => {
+                // Every token was shed purely by a momentary per-token budget.
+                // Mirror the global-shed path: this is transient back-pressure,
+                // not a permanent result. Release the reservation so a relay
+                // redelivery after the rate window resets is not dropped as a
+                // duplicate, and do NOT count it as processed.
+                self.release_reservation(&event.id).await;
+                trace!("Shed event (all tokens per-token rate limited)");
+                if let Some(ref m) = self.metrics {
+                    m.record_event_rate_limited();
+                    m.observe_event_processing_duration(
+                        EventOutcome::RateLimited,
+                        started_at.elapsed_secs(),
+                    );
+                }
+                Ok(false)
             }
             Err(e) => {
                 if Self::is_permanent_error(&e) {
@@ -718,7 +753,7 @@ impl EventProcessor {
     }
 
     /// Inner processing logic for an event.
-    async fn process_inner(&self, event: &Event) -> Result<usize> {
+    async fn process_inner(&self, event: &Event) -> Result<ProcessOutcome> {
         // Unwrap the gift wrap to get the notification request
         let unwrap_started_at = StageTimer::start();
         let notification = match self.nip59_handler.unwrap(event).await {
@@ -774,7 +809,7 @@ impl EventProcessor {
         };
 
         if token_bytes.is_empty() {
-            return Ok(0);
+            return Ok(ProcessOutcome::Admitted(0));
         }
 
         debug!(token_count = token_bytes.len(), "Decrypting tokens");
@@ -785,6 +820,14 @@ impl EventProcessor {
         // Prevents wasting CPU on tokens we'll immediately rate-limit anyway.
         let mut payloads = Vec::with_capacity(token_bytes.len());
         let mut admitted_rate_limit_keys = Vec::with_capacity(token_bytes.len());
+        // Track whether a zero-admission outcome is purely a transient per-token
+        // rate-limit shed. `rate_limited_any` records that at least one token was
+        // dropped by a limiter; `terminally_dropped_any` records that at least one
+        // token was dropped for a permanent reason (undecryptable per MIP-05), so
+        // the event genuinely carried invalid tokens rather than momentarily
+        // over-budget ones.
+        let mut rate_limited_any = false;
+        let mut terminally_dropped_any = false;
         for bytes in token_bytes {
             // Rate limit check 1: encrypted token (replay protection)
             let encrypted_key = Self::hash_bytes(&bytes);
@@ -792,7 +835,13 @@ impl EventProcessor {
                 .encrypted_token_limiter
                 .check_and_increment(&encrypted_key)
                 .await;
+            if encrypted_result.admission_evicted()
+                && let Some(ref m) = self.metrics
+            {
+                m.record_rate_limit_admission_eviction("encrypted_token");
+            }
             if !encrypted_result.is_allowed() {
+                rate_limited_any = true;
                 trace!(
                     reason = encrypted_result.limit_reason(),
                     "Rate limited encrypted token"
@@ -802,6 +851,9 @@ impl EventProcessor {
                 }
                 continue;
             }
+            let encrypted_reservation = encrypted_result
+                .reservation()
+                .expect("allowed encrypted-token admission must carry a reservation");
 
             // Decrypt the token
             let decrypt_started_at = StageTimer::start();
@@ -820,6 +872,9 @@ impl EventProcessor {
                     // Silently ignore invalid tokens per MIP-05 spec
                     // Keep the encrypted-token rate-limit increment: invalid
                     // encrypted blobs should still spend replay/spam budget.
+                    // A decrypt failure is permanent, so a zero-admission event
+                    // that hit one is terminal, not a retryable rate shed.
+                    terminally_dropped_any = true;
                     trace!(error = %e, "Failed to decrypt token (ignoring)");
                     if let Some(ref m) = self.metrics {
                         m.record_token_decryption_failed();
@@ -838,7 +893,13 @@ impl EventProcessor {
                 .device_token_limiter
                 .check_and_increment(&device_key)
                 .await;
+            if device_result.admission_evicted()
+                && let Some(ref m) = self.metrics
+            {
+                m.record_rate_limit_admission_eviction("device_token");
+            }
             if !device_result.is_allowed() {
+                rate_limited_any = true;
                 trace!(
                     reason = device_result.limit_reason(),
                     "Rate limited device token"
@@ -848,18 +909,33 @@ impl EventProcessor {
                 }
                 continue;
             }
+            let device_reservation = device_result
+                .reservation()
+                .expect("allowed device-token admission must carry a reservation");
 
             payloads.push(payload);
             // Keep this paired with `payloads`: dispatch admission failure
             // rolls back exactly the rate-limit increments for admitted work.
-            admitted_rate_limit_keys.push((encrypted_key, device_key));
+            admitted_rate_limit_keys.push((
+                encrypted_key,
+                encrypted_reservation,
+                device_key,
+                device_reservation,
+            ));
         }
 
         if payloads.is_empty() {
             if let Some(ref m) = self.metrics {
                 m.observe_notifications_admitted_per_event(0);
             }
-            return Ok(0);
+            // Distinguish a pure per-token rate-limit shed (retryable) from an
+            // event that genuinely carried no dispatchable token (terminal). The
+            // shed path only applies when at least one token was rate-limited and
+            // none was dropped for a permanent reason.
+            if rate_limited_any && !terminally_dropped_any {
+                return Ok(ProcessOutcome::RateLimitedShed);
+            }
+            return Ok(ProcessOutcome::Admitted(0));
         }
 
         // Dispatch notifications
@@ -873,15 +949,17 @@ impl EventProcessor {
                     );
                     m.observe_notifications_admitted_per_event(count);
                 }
-                Ok(count)
+                Ok(ProcessOutcome::Admitted(count))
             }
             Err(e) => {
-                for (encrypted_key, device_key) in &admitted_rate_limit_keys {
+                for (encrypted_key, encrypted_reservation, device_key, device_reservation) in
+                    &admitted_rate_limit_keys
+                {
                     self.encrypted_token_limiter
-                        .rollback_increment(encrypted_key)
+                        .rollback_increment(encrypted_key, *encrypted_reservation)
                         .await;
                     self.device_token_limiter
-                        .rollback_increment(device_key)
+                        .rollback_increment(device_key, *device_reservation)
                         .await;
                 }
 
@@ -2014,7 +2092,12 @@ mod tests {
             )
             .await;
 
-        assert!(processor.process(&event).await.unwrap());
+        // The single token is shed by the encrypted-token limiter, admitting
+        // zero notifications. This is a pure per-token rate shed, so the event
+        // is transient back-pressure: `process` returns false and the event is
+        // left retryable rather than marked terminally seen.
+        assert!(!processor.process(&event).await.unwrap());
+        assert_eq!(processor.cache_len(), 0);
 
         assert_eq!(
             processor
@@ -2026,6 +2109,10 @@ mod tests {
         assert_eq!(processor.device_token_limiter.len().await, 0);
         assert_eq!(
             counter_value(&metrics, "transponder_events_processed_total", &[]),
+            0.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
             1.0
         );
         assert_eq!(
@@ -2448,13 +2535,20 @@ mod tests {
             scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
         assert!(processor.process(&event1).await.unwrap());
 
+        // The second event reuses the same device token, so its only token is
+        // shed by the device-token limiter. Zero admission by a pure per-token
+        // rate shed is transient: it returns false and is not counted processed.
         let event2 =
             scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
-        assert!(processor.process(&event2).await.unwrap());
+        assert!(!processor.process(&event2).await.unwrap());
 
         assert_eq!(
             counter_value(&metrics, "transponder_events_processed_total", &[]),
-            2.0
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
+            1.0
         );
         assert_eq!(
             counter_value(
@@ -2519,14 +2613,15 @@ mod tests {
         assert!(result2.is_ok());
         assert!(result2.unwrap(), "Second notification should be processed");
 
-        // Third notification to same device should be rate limited
-        // The event processes OK (returns true) but the token is skipped internally
+        // Third notification to same device should be rate limited. Its only
+        // token is shed by the device-token limiter, admitting zero
+        // notifications. A pure per-token rate shed is transient back-pressure,
+        // so the event returns false and stays retryable (not marked seen).
         let event3 =
             scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
         let result3 = processor.process(&event3).await;
         assert!(result3.is_ok());
-        // Still returns true because event was processed, but 0 notifications sent
-        assert!(result3.unwrap());
+        assert!(!result3.unwrap());
 
         // A different device should still work
         let other_device = "1111111122222222333333334444444411111111222222223333333344444444";
@@ -2595,14 +2690,16 @@ mod tests {
             "Second use of encrypted token should succeed"
         );
 
-        // Third use of the same encrypted blob should be rate limited
+        // Third use of the same encrypted blob should be rate limited. The only
+        // token is shed by the encrypted-token limiter, admitting zero
+        // notifications. A pure per-token rate shed is transient back-pressure,
+        // so the event returns false and stays retryable (not marked seen).
         let event3 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
             .build(&content)
             .await;
         let result3 = processor.process(&event3).await;
         assert!(result3.is_ok());
-        // Event processes but token is skipped
-        assert!(result3.unwrap());
+        assert!(!result3.unwrap());
 
         // A different encrypted token (same device) should work since we rate limit
         // encrypted tokens first
@@ -2676,6 +2773,188 @@ mod tests {
         assert!(
             result3.unwrap(),
             "Token should be allowed after window reset"
+        );
+    }
+
+    // === Per-Token Rate-Limit Shed Tests (issue #195) ===
+
+    /// An event whose every (non-empty) token is shed by a per-token rate
+    /// limiter must be treated like a global shed: the reservation is released,
+    /// the event is not marked terminally seen, and a redelivery within the
+    /// dedup window is admitted once the rate window resets.
+    #[tokio::test]
+    async fn test_all_tokens_rate_limited_leaves_event_retryable() {
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+
+        tokio::time::pause();
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        // Only one device notification per minute is allowed.
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: 100,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                encrypted_token_per_minute: 100,
+                encrypted_token_per_hour: 1000,
+                device_token_per_minute: 1,
+                device_token_per_hour: 100,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
+            },
+        );
+
+        // Spend the device-token budget on an unrelated event.
+        let warmup =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&warmup).await.unwrap());
+
+        // Reuse the exact same encrypted blob so a redelivery is a genuine dedup
+        // candidate: identical event content and (below) identical event ID.
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let encrypted_b64 = encryptor.encrypt_base64(&TestToken::apns(device_token));
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(encrypted_b64)
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
+            .build(&content)
+            .await;
+
+        // Every token is shed by the device-token limiter, so zero notifications
+        // are admitted. The shed is a pure per-token rate shed: transient.
+        assert!(!processor.process(&event).await.unwrap());
+
+        // The event was NOT marked terminally seen, so it stays retryable.
+        assert!(!processor.is_duplicate(&event.id).await);
+        assert_eq!(processor.cache_len(), 1); // only `warmup` remains terminal
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            1.0 // only `warmup`
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
+            1.0
+        );
+
+        // A relay redelivery of the same event ID within the dedup window is not
+        // dropped as a duplicate; once the rate window resets it is admitted.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(processor.process(&event).await.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            2.0
+        );
+    }
+
+    /// A zero-admission event caused by a genuinely invalid (undecryptable)
+    /// token — not rate limiting — stays terminal: it is marked seen and a
+    /// replay short-circuits as a duplicate rather than being retried.
+    #[tokio::test]
+    async fn test_all_tokens_invalid_is_terminal_not_rate_limited() {
+        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
+        use base64::prelude::*;
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+
+        // A correctly sized but undecryptable token blob: parsing succeeds, but
+        // decryption fails, so the token is dropped for a permanent reason.
+        let garbage = BASE64_STANDARD.encode([0u8; ENCRYPTED_TOKEN_SIZE]);
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(garbage)
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
+            .build(&content)
+            .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+
+        // Zero admission, but the cause is a permanently invalid token, so the
+        // event is terminal (processed with zero notifications), not a rate shed.
+        assert!(processor.process(&event).await.unwrap());
+        assert!(processor.is_duplicate(&event.id).await);
+        assert_eq!(processor.cache_len(), 1);
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
+            0.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_tokens_decryption_failed_total", &[]),
+            1.0
+        );
+
+        // A replay short-circuits as a duplicate, confirming terminal semantics.
+        assert!(!processor.process(&event).await.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            1.0
+        );
+    }
+
+    /// When an event carries a mix of rate-limited and invalid tokens and admits
+    /// none, the presence of a permanently invalid token makes it terminal: the
+    /// event genuinely carried a bad token, so it is not a pure rate shed.
+    #[tokio::test]
+    async fn test_mixed_rate_limited_and_invalid_zero_admission_is_terminal() {
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+        use base64::prelude::*;
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: 100,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                // The valid token's device budget is exhausted by the warmup, so
+                // it is rate-limited; the other token is undecryptable.
+                encrypted_token_per_minute: 100,
+                encrypted_token_per_hour: 1000,
+                device_token_per_minute: 1,
+                device_token_per_hour: 100,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
+            },
+        );
+
+        let warmup =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&warmup).await.unwrap());
+
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let valid_b64 = encryptor.encrypt_base64(&TestToken::apns(device_token));
+        let garbage_b64 = BASE64_STANDARD.encode([0u8; ENCRYPTED_TOKEN_SIZE]);
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(valid_b64)
+            .with_raw_token(garbage_b64)
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
+            .build(&content)
+            .await;
+
+        // Zero admitted, but one token was permanently invalid, so terminal.
+        assert!(processor.process(&event).await.unwrap());
+        assert!(processor.is_duplicate(&event.id).await);
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
+            0.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            2.0
         );
     }
 
@@ -2807,6 +3086,96 @@ mod tests {
         assert!(processor.process(&event3).await.unwrap());
         assert_eq!(
             counter_value(&metrics, "transponder_events_shed_total", &[]),
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admission_path_eviction_records_metric() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: 3,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                encrypted_token_per_minute: 100,
+                encrypted_token_per_hour: 1000,
+                device_token_per_minute: 100,
+                device_token_per_hour: 1000,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
+            },
+        );
+
+        for _ in 0..3 {
+            let event =
+                scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+            assert!(processor.process(&event).await.unwrap());
+        }
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_rate_limit_admission_evictions_total",
+                &[("type", "encrypted_token")],
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_rate_limit_admission_evictions_total",
+                &[("type", "device_token")],
+            ),
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capacity_limit_records_metric() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: 3,
+                max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
+                encrypted_token_per_minute: 1,
+                encrypted_token_per_hour: 100,
+                device_token_per_minute: 100,
+                device_token_per_hour: 1000,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
+            },
+        );
+
+        for _ in 0..3 {
+            let event =
+                scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+            assert!(processor.process(&event).await.unwrap());
+        }
+
+        // The sole token is shed by the capacity limit, so the event is a
+        // retryable rate-limit shed (returns false, not marked seen).
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        assert!(!processor.process(&event).await.unwrap());
+
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_tokens_rate_limited_total",
+                &[("type", "encrypted_token"), ("reason", "capacity")],
+            ),
             1.0
         );
     }

@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lru::LruCache;
@@ -40,11 +41,18 @@ pub const DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR: u32 = 30_000;
 /// Maximum entries to scan per cleanup cycle.
 const CLEANUP_BATCH_SIZE: usize = 1000;
 
+/// Token identifying one admitted hit for identity-aware rollback.
+///
+/// IDs are unique within a limiter instance, including across entry eviction and
+/// recreation, so a delayed rollback cannot remove a newer hit for the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitReservation(u64);
+
 /// Result of a rate limit check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitResult {
     /// Request is allowed.
-    Allowed,
+    Allowed(RateLimitReservation),
     /// Exceeded per-minute limit.
     ExceededMinuteLimit,
     /// Exceeded per-hour limit.
@@ -53,21 +61,69 @@ pub enum RateLimitResult {
     ExceededCapacityLimit,
 }
 
+/// Outcome of [`RateLimiter::check_and_increment`], including admission side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitCheck {
+    result: RateLimitResult,
+    admission_evicted: bool,
+}
+
+impl RateLimitCheck {
+    /// Returns `true` if the request was allowed.
+    #[must_use]
+    pub fn is_allowed(self) -> bool {
+        self.result.is_allowed()
+    }
+
+    /// Returns the reason string for metrics/logging (if rate limited).
+    #[must_use]
+    pub fn limit_reason(self) -> Option<&'static str> {
+        self.result.limit_reason()
+    }
+
+    /// Returns `true` when a stale or below-limit entry was evicted to admit a new key.
+    #[must_use]
+    pub fn admission_evicted(self) -> bool {
+        self.admission_evicted
+    }
+
+    /// Returns the reservation for an allowed request.
+    #[must_use]
+    pub fn reservation(self) -> Option<RateLimitReservation> {
+        self.result.reservation()
+    }
+}
+
+impl PartialEq<RateLimitResult> for RateLimitCheck {
+    fn eq(&self, other: &RateLimitResult) -> bool {
+        self.result == *other
+    }
+}
+
 impl RateLimitResult {
     /// Returns `true` if the request was allowed.
     #[must_use]
     pub fn is_allowed(self) -> bool {
-        matches!(self, Self::Allowed)
+        matches!(self, Self::Allowed(_))
     }
 
     /// Returns the reason string for metrics/logging (if rate limited).
     #[must_use]
     pub fn limit_reason(self) -> Option<&'static str> {
         match self {
-            Self::Allowed => None,
+            Self::Allowed(_) => None,
             Self::ExceededMinuteLimit => Some("minute"),
             Self::ExceededHourLimit => Some("hour"),
             Self::ExceededCapacityLimit => Some("capacity"),
+        }
+    }
+
+    /// Returns the reservation for an allowed request.
+    #[must_use]
+    pub fn reservation(self) -> Option<RateLimitReservation> {
+        match self {
+            Self::Allowed(reservation) => Some(reservation),
+            _ => None,
         }
     }
 }
@@ -75,8 +131,8 @@ impl RateLimitResult {
 /// Entry tracking rate limit counters for a single key.
 #[derive(Debug, Clone)]
 struct RateLimitEntry {
-    minute_hits: VecDeque<Instant>,
-    hour_hits: VecDeque<Instant>,
+    minute_hits: VecDeque<(Instant, u64)>,
+    hour_hits: VecDeque<(Instant, u64)>,
 }
 
 impl RateLimitEntry {
@@ -102,12 +158,12 @@ impl RateLimitEntry {
     }
 }
 
-fn prune_hits(hits: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+fn prune_hits(hits: &mut VecDeque<(Instant, u64)>, now: Instant, window: Duration) {
     let old_len = hits.len();
 
     while hits
         .front()
-        .is_some_and(|hit| now.duration_since(*hit) >= window)
+        .is_some_and(|(hit, _)| now.duration_since(*hit) >= window)
     {
         hits.pop_front();
     }
@@ -159,30 +215,33 @@ impl Default for RateLimitConfig {
 
 /// Sliding-window rate limiter with per-minute and per-hour limits.
 ///
-/// Each active entry stores admitted request timestamps for true sliding-window
-/// enforcement, so memory scales with the number of admitted hits per key. With
-/// the defaults, a hot key can hold up to roughly 5,240 `Instant` values across
-/// the minute and hour windows before older hits are pruned.
+/// Each active entry stores admitted request hit records for true
+/// sliding-window enforcement, so memory scales with the number of admitted hits
+/// per key. With the defaults, a hot key can hold up to roughly 5,240 records
+/// across the minute and hour windows before older hits are pruned.
 ///
 /// The aggregate bound is the per-key bound multiplied by the configured cache
-/// size: `max_entries * (max_per_minute + max_per_hour)` timestamp values per
+/// size: `max_entries * (max_per_minute + max_per_hour)` hit records per
 /// limiter. With the default 100,000-key cache and 240/minute plus 5,000/hour
-/// limits, one fully saturated limiter can retain roughly 524,000,000 `Instant`
-/// values before pruning (about 8.4 GB at 16 bytes per timestamp, before
-/// `VecDeque` overhead). Production event processing owns separate encrypted-
-/// token and device-token limiters, so size `max_entries` and process memory for
-/// both caches.
+/// limits, one fully saturated limiter can retain roughly 524,000,000 records
+/// before pruning. Production event processing owns separate encrypted-token and
+/// device-token limiters, so size `max_entries` and process memory for both
+/// caches.
 ///
 /// Uses a bounded cache to limit tracked key cardinality. When the cache is
 /// full, admission first evicts the least-recently-used stale entry; if none is
 /// found in the bounded scan window, it falls back to a least-recently-used
 /// still-unlimited entry. This favors availability for legitimate new tokens
 /// over perfect accounting for below-limit keys under active cache pressure,
-/// while preserving counters for keys already at their rate limit.
+/// while preserving counters for keys already at their rate limit. Evicting a
+/// below-limit key resets its accumulated sliding-window hits; that weakens
+/// per-key precision but does not bypass limits because the global unwrap
+/// limiter still bounds total admission.
 pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
     entries: RwLock<LruCache<K, RateLimitEntry>>,
     max_per_minute: u32,
     max_per_hour: u32,
+    next_hit_id: AtomicU64,
 }
 
 impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
@@ -195,6 +254,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
             entries: RwLock::new(LruCache::new(size)),
             max_per_minute: config.max_per_minute,
             max_per_hour: config.max_per_hour,
+            next_hit_id: AtomicU64::new(0),
         }
     }
 
@@ -237,9 +297,10 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// - `ExceededHourLimit` if per-hour limit is reached
     /// - `ExceededCapacityLimit` if the cache is full and has no safe eviction
     ///   victim for the unknown key
-    pub async fn check_and_increment(&self, key: &K) -> RateLimitResult {
+    pub async fn check_and_increment(&self, key: &K) -> RateLimitCheck {
         let now = Instant::now();
         let mut entries = self.entries.write().await;
+        let mut admission_evicted = false;
 
         // Get or create entry (updates access position). At capacity, admit an
         // unknown key by evicting an old stale or still-unlimited entry. Entries
@@ -248,15 +309,20 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         let entry = if let Some(entry) = entries.get_mut(key) {
             entry
         } else {
-            if entries.len() >= entries.cap().get()
-                && !Self::evict_lru_admission_candidate(
+            if entries.len() >= entries.cap().get() {
+                if Self::evict_lru_admission_candidate(
                     &mut entries,
                     now,
                     self.max_per_minute,
                     self.max_per_hour,
-                )
-            {
-                return RateLimitResult::ExceededCapacityLimit;
+                ) {
+                    admission_evicted = true;
+                } else {
+                    return RateLimitCheck {
+                        result: RateLimitResult::ExceededCapacityLimit,
+                        admission_evicted: false,
+                    };
+                }
             }
             entries.put(key.clone(), RateLimitEntry::new());
             entries.get_mut(key).expect("just inserted")
@@ -266,32 +332,45 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
 
         // Check minute limit first (more likely to be hit)
         if entry.minute_hits.len() >= self.max_per_minute as usize {
-            return RateLimitResult::ExceededMinuteLimit;
+            return RateLimitCheck {
+                result: RateLimitResult::ExceededMinuteLimit,
+                admission_evicted,
+            };
         }
 
         // Check hour limit
         if entry.hour_hits.len() >= self.max_per_hour as usize {
-            return RateLimitResult::ExceededHourLimit;
+            return RateLimitCheck {
+                result: RateLimitResult::ExceededHourLimit,
+                admission_evicted,
+            };
         }
 
         // Increment counters
-        entry.minute_hits.push_back(now);
-        entry.hour_hits.push_back(now);
+        let hit_id = self.next_hit_id.fetch_add(1, Ordering::Relaxed);
+        entry.minute_hits.push_back((now, hit_id));
+        entry.hour_hits.push_back((now, hit_id));
 
-        RateLimitResult::Allowed
+        RateLimitCheck {
+            result: RateLimitResult::Allowed(RateLimitReservation(hit_id)),
+            admission_evicted,
+        }
     }
 
     /// Rolls back one previously allowed increment for a key.
     ///
     /// This is used when downstream admission fails after a rate-limit check
-    /// has already reserved capacity for work that will not run. If both
-    /// counters reach zero, the entry is removed so the failed admission leaves
-    /// no window-start trace for the next real request.
-    pub async fn rollback_increment(&self, key: &K) {
+    /// has already reserved capacity for work that will not run. The
+    /// [`RateLimitReservation`] returned by [`Self::check_and_increment`] must
+    /// be passed so concurrent admits for the same key cannot remove another
+    /// task's hit. If both counters reach zero, the entry is removed so the
+    /// failed admission leaves no window-start trace for the next real request.
+    pub async fn rollback_increment(&self, key: &K, reservation: RateLimitReservation) {
+        let hit_id = reservation.0;
         let mut entries = self.entries.write().await;
         let should_remove = if let Some(entry) = entries.get_mut(key) {
-            entry.minute_hits.pop_back();
-            entry.hour_hits.pop_back();
+            remove_hit(&mut entry.minute_hits, hit_id);
+            remove_hit(&mut entry.hour_hits, hit_id);
             entry.minute_hits.is_empty() && entry.hour_hits.is_empty()
         } else {
             false
@@ -319,7 +398,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
             .rev()
             .take(CLEANUP_BATCH_SIZE)
             .filter(|(_, entry)| match entry.hour_hits.back() {
-                Some(hit) => now.duration_since(*hit) >= hour,
+                Some((hit, _)) => now.duration_since(*hit) >= hour,
                 None => true,
             })
             .map(|(k, _)| k.clone())
@@ -351,6 +430,12 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     }
 }
 
+fn remove_hit(hits: &mut VecDeque<(Instant, u64)>, hit_id: u64) {
+    if let Some(pos) = hits.iter().position(|(_, id)| *id == hit_id) {
+        hits.remove(pos);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,10 +449,7 @@ mod tests {
         });
 
         for _ in 0..10 {
-            assert_eq!(
-                limiter.check_and_increment(&1u64).await,
-                RateLimitResult::Allowed
-            );
+            assert!(limiter.check_and_increment(&1u64).await.is_allowed());
         }
     }
 
@@ -400,13 +482,60 @@ mod tests {
             max_entries: 100,
         });
 
-        assert!(limiter.check_and_increment(&1u64).await.is_allowed());
+        let reservation = limiter
+            .check_and_increment(&1u64)
+            .await
+            .reservation()
+            .expect("first admit");
         assert!(!limiter.check_and_increment(&1u64).await.is_allowed());
 
-        limiter.rollback_increment(&1u64).await;
+        limiter.rollback_increment(&1u64, reservation).await;
 
         assert_eq!(limiter.len().await, 0);
         assert!(limiter.check_and_increment(&1u64).await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_rollback_increment_removes_only_reserved_hit() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: 100,
+        });
+
+        let first = limiter
+            .check_and_increment(&1u64)
+            .await
+            .reservation()
+            .expect("first admit");
+        assert!(limiter.check_and_increment(&1u64).await.is_allowed());
+
+        limiter.rollback_increment(&1u64, first).await;
+
+        assert_eq!(limiter.peek_counts(&1u64).await, Some((1, 1)));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_increment_ignores_recreated_entry_with_same_key() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: 1,
+        });
+
+        let first = limiter
+            .check_and_increment(&1u64)
+            .await
+            .reservation()
+            .expect("first admit");
+
+        assert!(limiter.check_and_increment(&2u64).await.is_allowed());
+        assert_eq!(limiter.peek_counts(&1u64).await, None);
+
+        assert!(limiter.check_and_increment(&1u64).await.is_allowed());
+        limiter.rollback_increment(&1u64, first).await;
+
+        assert_eq!(limiter.peek_counts(&1u64).await, Some((1, 1)));
     }
 
     #[tokio::test]
@@ -596,6 +725,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admission_eviction_reports_side_effect() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: 3,
+        });
+
+        for key in 1..=3 {
+            let check = limiter.check_and_increment(&key).await;
+            assert!(check.is_allowed());
+            assert!(!check.admission_evicted());
+        }
+
+        let check = limiter.check_and_increment(&4u64).await;
+        assert!(check.is_allowed());
+        assert!(check.admission_evicted());
+    }
+
+    #[tokio::test]
+    async fn test_capacity_limit_does_not_report_admission_eviction() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1,
+            max_per_hour: 100,
+            max_entries: 3,
+        });
+
+        for key in 1..=3 {
+            assert!(limiter.check_and_increment(&key).await.is_allowed());
+        }
+
+        let check = limiter.check_and_increment(&4u64).await;
+        assert_eq!(check, RateLimitResult::ExceededCapacityLimit);
+        assert!(!check.admission_evicted());
+    }
+
+    #[tokio::test]
     async fn test_cache_pressure_evicts_oldest_unlimited_key_for_new_key() {
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
@@ -608,10 +773,7 @@ mod tests {
         limiter.check_and_increment(&3u64).await;
         assert_eq!(limiter.len().await, 3);
 
-        assert_eq!(
-            limiter.check_and_increment(&4u64).await,
-            RateLimitResult::Allowed
-        );
+        assert!(limiter.check_and_increment(&4u64).await.is_allowed());
         assert_eq!(limiter.len().await, 3);
         assert_eq!(limiter.peek_counts(&1u64).await, None);
         assert_eq!(limiter.peek_counts(&2u64).await, Some((1, 1)));
@@ -625,11 +787,11 @@ mod tests {
             .checked_sub(Duration::from_secs(3601))
             .expect("test instant should support one-hour subtraction");
         let mut below_limit_entry = RateLimitEntry::new();
-        below_limit_entry.minute_hits.push_back(now);
-        below_limit_entry.hour_hits.push_back(now);
+        below_limit_entry.minute_hits.push_back((now, 0));
+        below_limit_entry.hour_hits.push_back((now, 0));
         let mut stale_entry = RateLimitEntry::new();
-        stale_entry.minute_hits.push_back(stale_hit);
-        stale_entry.hour_hits.push_back(stale_hit);
+        stale_entry.minute_hits.push_back((stale_hit, 1));
+        stale_entry.hour_hits.push_back((stale_hit, 1));
 
         let mut entries = LruCache::new(NonZeroUsize::new(3).expect("non-zero test capacity"));
         entries.put(1u64, below_limit_entry);
@@ -666,10 +828,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(3601)).await;
 
         let new_key = CLEANUP_BATCH_SIZE as u64 + 1;
-        assert_eq!(
-            limiter.check_and_increment(&new_key).await,
-            RateLimitResult::Allowed
-        );
+        assert!(limiter.check_and_increment(&new_key).await.is_allowed());
 
         assert_eq!(limiter.len().await, CLEANUP_BATCH_SIZE + 1);
         assert_eq!(limiter.peek_counts(&0u64).await, None);
@@ -709,19 +868,13 @@ mod tests {
             max_entries: 2,
         });
 
-        assert_eq!(
-            limiter.check_and_increment(&1u64).await,
-            RateLimitResult::Allowed
-        );
+        assert!(limiter.check_and_increment(&1u64).await.is_allowed());
         assert_eq!(
             limiter.check_and_increment(&1u64).await,
             RateLimitResult::ExceededMinuteLimit
         );
 
-        assert_eq!(
-            limiter.check_and_increment(&2u64).await,
-            RateLimitResult::Allowed
-        );
+        assert!(limiter.check_and_increment(&2u64).await.is_allowed());
         assert!(!limiter.check_and_increment(&3u64).await.is_allowed());
 
         assert_eq!(
@@ -732,12 +885,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_result_helpers() {
-        assert!(RateLimitResult::Allowed.is_allowed());
+        assert!(RateLimitResult::Allowed(RateLimitReservation(0)).is_allowed());
         assert!(!RateLimitResult::ExceededMinuteLimit.is_allowed());
         assert!(!RateLimitResult::ExceededHourLimit.is_allowed());
         assert!(!RateLimitResult::ExceededCapacityLimit.is_allowed());
 
-        assert_eq!(RateLimitResult::Allowed.limit_reason(), None);
+        assert_eq!(
+            RateLimitResult::Allowed(RateLimitReservation(0)).limit_reason(),
+            None
+        );
         assert_eq!(
             RateLimitResult::ExceededMinuteLimit.limit_reason(),
             Some("minute")

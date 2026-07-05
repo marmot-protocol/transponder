@@ -128,6 +128,10 @@ fn redacted_device_token_id(_device_token: &str) -> &'static str {
     "<redacted_device_token>"
 }
 
+fn device_token_url(base_url: &str, device_token: &str) -> Zeroizing<String> {
+    Zeroizing::new(format!("{base_url}/3/device/{device_token}"))
+}
+
 #[derive(Debug)]
 struct ApnsRequestParts {
     push_type: &'static str,
@@ -332,11 +336,11 @@ impl ApnsClient {
     /// sleeping retry does not occupy an in-flight concurrency slot.
     pub async fn send(
         &self,
-        device_token: &str,
+        device_token: Zeroizing<String>,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) -> Result<PushSendOutcome> {
         // Validate token format before sending
-        if !is_valid_device_token(device_token) {
+        if !is_valid_device_token(device_token.as_str()) {
             trace!(
                 token_len = device_token.len(),
                 "Invalid APNs device token format"
@@ -348,7 +352,7 @@ impl ApnsClient {
         retry::with_retry(
             &retry_config,
             "APNs",
-            || self.send_once(device_token),
+            || self.send_once(&device_token),
             backoff_permit,
             self.metrics.as_ref(),
         )
@@ -525,24 +529,24 @@ impl ApnsClient {
     /// Send a single push notification attempt without retry.
     ///
     /// Returns a `SendAttemptResult` indicating success, retriable error, or permanent error.
-    async fn send_once(&self, device_token: &str) -> SendAttemptResult {
+    async fn send_once(&self, device_token: &Zeroizing<String>) -> SendAttemptResult {
         self.send_once_with_transport_retry_config(device_token, &RetryConfig::transport())
             .await
     }
 
     async fn send_once_with_transport_retry_config(
         &self,
-        device_token: &str,
+        device_token: &Zeroizing<String>,
         transport_retry: &RetryConfig,
     ) -> SendAttemptResult {
-        let url = format!("{}/3/device/{}", self.config.base_url(), device_token);
+        let url = device_token_url(self.config.base_url(), device_token.as_str());
 
         debug!(
             payload_mode = %self.config.payload_mode,
             push_type = self.config.payload_mode.push_type(),
             priority = self.config.payload_mode.priority(),
             topic = %self.config.bundle_id,
-            device_token = redacted_device_token_id(device_token),
+            device_token = redacted_device_token_id(device_token.as_str()),
             "Sending APNs notification"
         );
 
@@ -562,7 +566,7 @@ impl ApnsClient {
                 // provider latency.
                 let start = Instant::now();
                 let response = self
-                    .build_request(&url, token.as_str(), &request_parts)
+                    .build_request(url.as_str(), token.as_str(), &request_parts)
                     .send()
                     .await
                     .map_err(Error::from)?;
@@ -642,6 +646,10 @@ mod tests {
         serde_json::from_slice(body).unwrap()
     }
 
+    fn zeroizing_token(token: &str) -> Zeroizing<String> {
+        Zeroizing::new(token.to_owned())
+    }
+
     #[test]
     fn test_apns_payload_serialization() {
         let payload = ApnsPayload::default();
@@ -659,6 +667,19 @@ mod tests {
         assert_eq!(
             redacted_device_token_id("ffeeddccbbaa99887766554433221100"),
             "<redacted_device_token>"
+        );
+    }
+
+    #[test]
+    fn test_device_token_url_buffer_is_zeroizing() {
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+
+        let url = device_token_url("https://api.push.apple.com", "aabbccdd11223344");
+
+        assert_zeroizing_string(&url);
+        assert_eq!(
+            url.as_str(),
+            "https://api.push.apple.com/3/device/aabbccdd11223344"
         );
     }
 
@@ -825,7 +846,10 @@ mod tests {
         };
 
         // Test with a token that contains non-hex characters
-        let result = client.send("tooshort", None).await.unwrap();
+        let result = client
+            .send(zeroizing_token("tooshort"), None)
+            .await
+            .unwrap();
         assert_eq!(
             result,
             PushSendOutcome::InvalidToken,
@@ -835,7 +859,7 @@ mod tests {
         // Test with token that has invalid characters
         let result = client
             .send(
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+                zeroizing_token("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"),
                 None,
             )
             .await
@@ -847,7 +871,7 @@ mod tests {
         );
 
         // Test with empty token
-        let result = client.send("", None).await.unwrap();
+        let result = client.send(zeroizing_token(""), None).await.unwrap();
         assert_eq!(
             result,
             PushSendOutcome::InvalidToken,
@@ -885,7 +909,10 @@ mod tests {
         };
 
         let result = client
-            .send_once_with_transport_retry_config("aabbccdd11223344", &retry_config)
+            .send_once_with_transport_retry_config(
+                &zeroizing_token("aabbccdd11223344"),
+                &retry_config,
+            )
             .await;
 
         assert!(matches!(

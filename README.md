@@ -432,8 +432,11 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 | `transponder_tokens_rate_limited_total` | Counter | `type`, `reason` | Tokens skipped due to rate limiting |
 | `transponder_rate_limit_cache_size` | Gauge | `type` | Current rate limit cache size in tracked keys, not stored timestamps |
 | `transponder_rate_limit_evictions_total` | Counter | `type` | Stale rate limit entries removed during cleanup |
+| `transponder_rate_limit_admission_evictions_total` | Counter | `type` | Rate limit entries evicted on the admission hot path to admit a new key |
 
 Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute`, `hour`, or `capacity`
+
+Under cache pressure, below-limit keys may be evicted to admit new keys. That resets their sliding-window hit counts (a precision trade-off, not a bypass); monitor `transponder_rate_limit_admission_evictions_total` and `transponder_tokens_rate_limited_total{reason="capacity"}` to size `max_rate_limit_cache_size`.
 
 `outcome` values vary by metric group:
 - Event processing: `processed`, `duplicate`, `failed`

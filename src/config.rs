@@ -20,6 +20,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
+use tokio::sync::Semaphore;
 use tracing::debug;
 use zeroize::Zeroizing;
 
@@ -349,6 +350,13 @@ pub struct RelayConfig {
 /// networks and Tor bootstrapping while keeping a misconfiguration from wedging
 /// the process, so anything larger is rejected at load time.
 const MAX_RELAY_DURATION_SECS: u64 = 300;
+
+/// Upper bound for [`ServerConfig::max_concurrent_event_processing`].
+///
+/// [`Semaphore::new`] panics when the permit count exceeds
+/// [`Semaphore::MAX_PERMITS`], so oversized values are rejected at load time
+/// rather than aborting startup.
+const MAX_CONCURRENT_EVENT_PROCESSING: usize = Semaphore::MAX_PERMITS;
 
 fn default_connection_timeout() -> u64 {
     30
@@ -871,14 +879,17 @@ impl AppConfig {
 
 impl ServerConfig {
     /// Rejects rate-limit count fields and the rate-limit cache size set to `0`,
-    /// and `shutdown_timeout_secs` set to `0`.
+    /// `shutdown_timeout_secs` set to `0`, and
+    /// `max_concurrent_event_processing` above [`MAX_CONCURRENT_EVENT_PROCESSING`].
     ///
     /// A `0` per-minute/per-hour limit blocks every request for that limiter
     /// dimension, and a `0` cache size is silently replaced by the default
     /// rather than honoured. A `0` `shutdown_timeout_secs` makes the graceful
     /// drain time out immediately, abandoning in-flight push notifications, so
-    /// it is rejected rather than silently skipping the drain. Each error names
-    /// the offending config field.
+    /// it is rejected rather than silently skipping the drain. An oversized
+    /// `max_concurrent_event_processing` would panic in `Semaphore::new` at
+    /// startup, so it is range-checked here. Each error names the offending
+    /// config field.
     fn validate(&self) -> std::result::Result<(), config::ConfigError> {
         if self.shutdown_timeout_secs == 0 {
             return Err(config::ConfigError::Message(
@@ -924,6 +935,12 @@ impl ServerConfig {
                     "{field} must be greater than 0"
                 )));
             }
+        }
+
+        if self.max_concurrent_event_processing > MAX_CONCURRENT_EVENT_PROCESSING {
+            return Err(config::ConfigError::Message(format!(
+                "server.max_concurrent_event_processing must be at most {MAX_CONCURRENT_EVENT_PROCESSING}"
+            )));
         }
 
         Ok(())
@@ -2137,6 +2154,59 @@ mod tests {
         assert_eq!(
             config.relays.reconnect_interval_secs,
             MAX_RELAY_DURATION_SECS
+        );
+    }
+
+    #[test]
+    fn test_oversized_max_concurrent_event_processing_rejected_from_env() {
+        let over = (MAX_CONCURRENT_EVENT_PROCESSING + 1).to_string();
+        let error = from_test_env(&[(
+            "TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING",
+            over.as_str(),
+        )])
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("server.max_concurrent_event_processing"),
+            "expected error to name `server.max_concurrent_event_processing`, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("at most {MAX_CONCURRENT_EVENT_PROCESSING}")),
+            "expected `at most {MAX_CONCURRENT_EVENT_PROCESSING}`, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_unbounded_max_concurrent_event_processing_rejected() {
+        // The degenerate `u64::MAX` from the issue must be rejected rather than
+        // panicking in `Semaphore::new` at startup.
+        let error = from_test_env(&[(
+            "TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING",
+            "18446744073709551615",
+        )])
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("server.max_concurrent_event_processing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_max_concurrent_event_processing_upper_bound_accepted() {
+        let cap = MAX_CONCURRENT_EVENT_PROCESSING.to_string();
+        let config = from_test_env(&[(
+            "TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING",
+            cap.as_str(),
+        )])
+        .unwrap();
+
+        assert_eq!(
+            config.server.max_concurrent_event_processing,
+            MAX_CONCURRENT_EVENT_PROCESSING
         );
     }
 }
