@@ -304,10 +304,28 @@ impl GiftWrapBuilder {
     /// Matches the Darkmatter / Marmot compatibility shape.
     #[must_use = "event must be used or creation effort is wasted"]
     pub async fn build_without_encoding_tag(&self, content: &str) -> Event {
-        self.build_with_tags(content, false).await
+        self.build_with_tags_and_created_at(content, false, None)
+            .await
+    }
+
+    /// Build a gift-wrapped notification request with a custom rumor timestamp.
+    #[must_use = "event must be used or creation effort is wasted"]
+    pub async fn build_with_created_at(&self, content: &str, created_at: Timestamp) -> Event {
+        self.build_with_tags_and_created_at(content, true, Some(created_at))
+            .await
     }
 
     async fn build_with_tags(&self, content: &str, include_encoding_tag: bool) -> Event {
+        self.build_with_tags_and_created_at(content, include_encoding_tag, None)
+            .await
+    }
+
+    async fn build_with_tags_and_created_at(
+        &self,
+        content: &str,
+        include_encoding_tag: bool,
+        created_at: Option<Timestamp>,
+    ) -> Event {
         let mut tags =
             vec![Tag::parse([TAG_VERSION, VERSION_MIP05_V1]).expect("valid version tag")];
         if include_encoding_tag {
@@ -315,8 +333,11 @@ impl GiftWrapBuilder {
         }
 
         // Create the kind 446 rumor (unsigned event)
-        let rumor_builder =
+        let mut rumor_builder =
             EventBuilder::new(Kind::Custom(KIND_NOTIFICATION_REQUEST), content).tags(tags);
+        if let Some(created_at) = created_at {
+            rumor_builder = rumor_builder.custom_created_at(created_at);
+        }
 
         // Build the unsigned event (rumor)
         let rumor = rumor_builder.build(self.sender_keys.public_key());

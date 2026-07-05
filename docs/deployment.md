@@ -4,7 +4,7 @@ This guide covers practical single-VM deployments of Transponder using either Do
 
 ## Recommended Machine Size
 
-Transponder is stateless and does not run a database, so it is relatively light. The main costs are:
+Transponder does not run a database or persist tokens/user data, so it is relatively light. The main costs are:
 
 - Nostr relay connections
 - token decryption and verification
@@ -23,6 +23,7 @@ Why these numbers make sense today:
 - the dispatcher allows up to 100 concurrent outbound push requests
 - the push queue is bounded at 10,000 pending notifications
 - the event deduplication and rate-limit caches default to 100,000 entries each
+- production deployments persist a small replay-suppression log containing only public gift-wrap event IDs and processing timestamps
 - rate-limit cache entries retain admitted-hit timestamps for sliding-window precision; worst-case timestamp storage is `max_rate_limit_cache_size × (per_minute + per_hour)` per limiter (about 8.4 GB at 16 bytes per timestamp with the defaults, before `VecDeque` overhead), and Transponder runs separate encrypted-token and device-token limiters
 - new rate-limit keys are rejected at capacity, so size these caches with headroom for legitimate unique devices, adversarial noise, and process memory limits
 - Tor adds noticeable memory and connection-management overhead, which is why the default build leaves it disabled
@@ -78,6 +79,7 @@ cp config/production.toml.example config/production.toml
 cp deploy/production.env.example deploy/production.env
 mkdir -p credentials secrets
 chmod 700 credentials secrets
+sudo install -d -m 0700 -o 65532 -g 65532 state
 ```
 
 2. Create the server private key secret file:
@@ -124,7 +126,7 @@ docker login dhi.io
 docker build --build-arg CARGO_FEATURES='--features tor' -t transponder:tor .
 ```
 
-The Dockerfile pins the DHI base images by digest, and `compose.prod.yml` runs only the Transponder container.
+The Dockerfile pins the DHI base images by digest, and `compose.prod.yml` runs only the Transponder container. The runtime image runs as UID/GID `65532`, so any bind-mounted `TRANSPONDER_STATE_DIR` must be writable by that UID/GID.
 
 Start the service:
 
@@ -138,7 +140,7 @@ The Compose stack publishes Transponder on `127.0.0.1:${TRANSPONDER_PUBLISHED_PO
 
 ## Native systemd Deployment
 
-For operators who do not want Docker at all, a native `systemd` deployment is a good fit. Transponder is a single stateless binary with a config file and a small set of credential files.
+For operators who do not want Docker at all, a native `systemd` deployment is a good fit. Transponder is a single binary with a config file, a small set of credential files, and a writable state directory for replay suppression.
 
 Example host layout:
 
@@ -147,15 +149,19 @@ Example host layout:
 - `/etc/transponder/secrets/server_private_key`
 - `/etc/transponder/credentials/AuthKey_XXXXXXXXXX.p8`
 - `/etc/transponder/credentials/service-account.json`
+- `/var/lib/transponder/dedup-events.log`
 
 Build and install the binary:
 
 ```bash
 cargo build --release
 install -m 0755 target/release/transponder /usr/local/bin/transponder
-install -d -m 0750 /etc/transponder /etc/transponder/secrets /etc/transponder/credentials
-install -m 0640 config/production.toml /etc/transponder/config.toml
-install -m 0640 secrets/server_private_key /etc/transponder/secrets/server_private_key
+getent group transponder >/dev/null || groupadd --system transponder
+id -u transponder >/dev/null 2>&1 || useradd --system --gid transponder --home-dir /var/lib/transponder --shell /usr/sbin/nologin transponder
+install -d -m 0750 -o root -g transponder /etc/transponder /etc/transponder/secrets /etc/transponder/credentials
+install -d -m 0750 -o transponder -g transponder /var/lib/transponder
+install -m 0640 -o root -g transponder config/production.toml /etc/transponder/config.toml
+install -m 0640 -o root -g transponder secrets/server_private_key /etc/transponder/secrets/server_private_key
 ```
 
 If you need onion relay support, build with:

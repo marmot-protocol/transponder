@@ -17,8 +17,10 @@ services:
     volumes:
       - ${TRANSPONDER_CONFIG_FILE:-./config/production.toml}:/etc/transponder/config.toml:ro
       - ${TRANSPONDER_CREDENTIALS_DIR:-./credentials}:/credentials:ro
+      - ${TRANSPONDER_STATE_DIR:-./state}:/var/lib/transponder:rw
     environment:
       TRANSPONDER_SERVER_PRIVATE_KEY_FILE: /run/secrets/transponder_private_key
+      TRANSPONDER_SERVER_DEDUP_STATE_PATH: /var/lib/transponder/dedup-events.log
       # The host port is bound to 127.0.0.1 above; this keeps Docker port
       # publishing reachable without exposing it on public host interfaces.
       TRANSPONDER_HEALTH_BIND_ADDRESS: "0.0.0.0:8080"

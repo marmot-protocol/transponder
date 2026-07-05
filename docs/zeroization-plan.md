@@ -8,7 +8,7 @@ This document outlines the implementation of secure memory zeroization for sensi
 
 ## Motivation
 
-Even though Transponder is stateless and doesn't persist tokens, sensitive data can remain in memory after use. This poses risks from:
+Even though Transponder doesn't persist tokens, keys, payloads, or user data, sensitive data can remain in memory after use. This poses risks from:
 
 - Memory dumps (crash dumps, debuggers)
 - Swap/hibernation writes to disk

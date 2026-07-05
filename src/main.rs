@@ -135,6 +135,24 @@ fn build_rate_limit_config(server: &config::ServerConfig) -> nostr::events::Toke
     }
 }
 
+fn build_replay_protection_config(
+    server: &config::ServerConfig,
+) -> nostr::events::ReplayProtectionConfig {
+    let dedup_state_path = if server.dedup_state_path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(server.dedup_state_path.clone())
+    };
+
+    nostr::events::ReplayProtectionConfig {
+        max_dedup_cache_size: server.max_dedup_cache_size,
+        dedup_state_path,
+        dedup_retention: Duration::from_secs(server.dedup_retention_secs),
+        max_notification_age: Duration::from_secs(server.max_notification_age_secs),
+        max_notification_future_skew: Duration::from_secs(server.max_notification_future_skew_secs),
+    }
+}
+
 fn parse_server_secret_key(server_private_key: &str) -> Result<SecretKey> {
     SecretKey::parse(server_private_key).context("Invalid server private key")
 }
@@ -351,16 +369,20 @@ async fn run(mut config: AppConfig) -> Result<()> {
         warn!(error = %e, "Failed to publish inbox relay list");
     }
 
-    // Create event processor with configured cache sizes and rate limiting
+    // Create event processor with configured replay protection and rate limiting
     let rate_limit_config = build_rate_limit_config(&config.server);
-    let event_processor = Arc::new(EventProcessor::with_full_config(
-        nip59_handler,
-        token_decryptor,
-        push_dispatcher.clone(),
-        config.server.max_dedup_cache_size,
-        rate_limit_config,
-        metrics.clone(),
-    ));
+    let replay_config = build_replay_protection_config(&config.server);
+    let event_processor = Arc::new(
+        EventProcessor::with_replay_config(
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher.clone(),
+            rate_limit_config,
+            replay_config,
+            metrics.clone(),
+        )
+        .context("Failed to initialize event replay protection")?,
+    );
 
     // Initialize shutdown handler
     let shutdown = ShutdownHandler::new();
@@ -889,6 +911,11 @@ mod tests {
             private_key_file: "/tmp/ignored".to_string(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
+            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+            max_notification_future_skew_secs:
+                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
             max_rate_limit_cache_size: 100_000,
             max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
@@ -917,6 +944,11 @@ mod tests {
             private_key_file: file.path().display().to_string(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
+            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+            max_notification_future_skew_secs:
+                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
             max_rate_limit_cache_size: 100_000,
             max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
@@ -944,6 +976,11 @@ mod tests {
             private_key_file: format!("  {}  ", file.path().display()),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
+            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+            max_notification_future_skew_secs:
+                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
             max_rate_limit_cache_size: 100_000,
             max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
@@ -968,6 +1005,11 @@ mod tests {
             private_key_file: String::new(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
+            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+            max_notification_future_skew_secs:
+                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
             max_rate_limit_cache_size: 100_000,
             max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
@@ -992,6 +1034,11 @@ mod tests {
             private_key_file: "/tmp/definitely-missing-transponder-key".to_string(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
+            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+            max_notification_future_skew_secs:
+                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
             max_rate_limit_cache_size: 100_000,
             max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
@@ -1096,6 +1143,11 @@ mod tests {
             private_key_file: file.path().display().to_string(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
+            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+            max_notification_future_skew_secs:
+                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
             max_rate_limit_cache_size: 100_000,
             max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
@@ -1120,6 +1172,11 @@ mod tests {
             private_key_file: String::new(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: crate::nostr::events::DEFAULT_DEDUP_RETENTION_SECS,
+            max_notification_age_secs: crate::nostr::events::DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+            max_notification_future_skew_secs:
+                crate::nostr::events::DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
             max_rate_limit_cache_size: 1234,
             max_tokens_per_event: 25,
             encrypted_token_rate_limit_per_minute: 111,
@@ -1141,5 +1198,67 @@ mod tests {
         assert_eq!(rate_limit_config.device_token_per_hour, 4444);
         assert_eq!(rate_limit_config.global_unwrap_per_minute, 555);
         assert_eq!(rate_limit_config.global_unwrap_per_hour, 6666);
+    }
+
+    #[test]
+    fn build_replay_protection_config_matches_server_settings() {
+        let state_path = PathBuf::from("/var/lib/transponder/dedup-events.log");
+        let server = config::ServerConfig {
+            private_key: Zeroizing::new(String::new()),
+            private_key_file: String::new(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 77,
+            dedup_state_path: state_path.clone(),
+            dedup_retention_secs: 88,
+            max_notification_age_secs: 99,
+            max_notification_future_skew_secs: 11,
+            max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
+        };
+
+        let replay_config = build_replay_protection_config(&server);
+
+        assert_eq!(replay_config.max_dedup_cache_size, 77);
+        assert_eq!(replay_config.dedup_state_path, Some(state_path));
+        assert_eq!(replay_config.dedup_retention, Duration::from_secs(88));
+        assert_eq!(replay_config.max_notification_age, Duration::from_secs(99));
+        assert_eq!(
+            replay_config.max_notification_future_skew,
+            Duration::from_secs(11)
+        );
+    }
+
+    #[test]
+    fn build_replay_protection_config_disables_empty_state_path() {
+        let server = config::ServerConfig {
+            private_key: Zeroizing::new(String::new()),
+            private_key_file: String::new(),
+            shutdown_timeout_secs: 10,
+            max_dedup_cache_size: 77,
+            dedup_state_path: PathBuf::new(),
+            dedup_retention_secs: 88,
+            max_notification_age_secs: 99,
+            max_notification_future_skew_secs: 11,
+            max_rate_limit_cache_size: 100_000,
+            max_tokens_per_event: crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT,
+            encrypted_token_rate_limit_per_minute: 240,
+            encrypted_token_rate_limit_per_hour: 5000,
+            device_token_rate_limit_per_minute: 240,
+            device_token_rate_limit_per_hour: 5000,
+            max_concurrent_event_processing: 64,
+            global_unwrap_rate_limit_per_minute: 600,
+            global_unwrap_rate_limit_per_hour: 30_000,
+        };
+
+        let replay_config = build_replay_protection_config(&server);
+
+        assert_eq!(replay_config.dedup_state_path, None);
     }
 }
