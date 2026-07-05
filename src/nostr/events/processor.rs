@@ -196,69 +196,6 @@ impl ReplayProtectionConfig {
 }
 
 impl EventProcessor {
-    /// Create a new event processor with default settings.
-    ///
-    /// Uses default cache sizes and rate limits. For production use,
-    /// prefer `with_full_config` to specify all parameters explicitly.
-    #[cfg(test)]
-    pub fn new(
-        nip59_handler: Nip59Handler,
-        token_decryptor: TokenDecryptor,
-        push_dispatcher: Arc<PushDispatcher>,
-    ) -> Self {
-        Self::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            TokenRateLimitConfig::default(),
-            Metrics::disabled(),
-        )
-    }
-
-    /// Create a new event processor with a custom dedup cache size.
-    #[cfg(test)]
-    pub fn with_cache_size(
-        nip59_handler: Nip59Handler,
-        token_decryptor: TokenDecryptor,
-        push_dispatcher: Arc<PushDispatcher>,
-        max_cache_size: usize,
-    ) -> Self {
-        Self::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            max_cache_size,
-            TokenRateLimitConfig::default(),
-            Metrics::disabled(),
-        )
-    }
-
-    /// Create a new event processor with full configuration.
-    #[cfg(test)]
-    pub fn with_full_config(
-        nip59_handler: Nip59Handler,
-        token_decryptor: TokenDecryptor,
-        push_dispatcher: Arc<PushDispatcher>,
-        max_dedup_cache_size: usize,
-        rate_limit_config: TokenRateLimitConfig,
-        metrics: Metrics,
-    ) -> Self {
-        Self::with_replay_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            rate_limit_config,
-            ReplayProtectionConfig {
-                max_dedup_cache_size: NonZeroUsize::new(max_dedup_cache_size)
-                    .expect("test dedup cache size must be non-zero"),
-                ..ReplayProtectionConfig::default()
-            },
-            metrics,
-        )
-        .expect("in-memory replay protection config cannot fail")
-    }
-
     /// Create a new event processor with full replay-protection configuration.
     pub fn with_replay_config(
         nip59_handler: Nip59Handler,
@@ -963,6 +900,71 @@ impl EventProcessor {
             .unwrap_or(0)
     }
 }
+
+/// Test-only fluent builder for [`EventProcessor`].
+///
+/// Production code should use [`EventProcessor::with_replay_config`] directly.
+#[cfg(test)]
+pub(crate) struct EventProcessorBuilder {
+    nip59_handler: Nip59Handler,
+    token_decryptor: TokenDecryptor,
+    push_dispatcher: Arc<PushDispatcher>,
+    rate_limit_config: TokenRateLimitConfig,
+    replay_config: ReplayProtectionConfig,
+    metrics: Metrics,
+}
+
+#[cfg(test)]
+impl EventProcessorBuilder {
+    pub(crate) fn new(
+        nip59_handler: Nip59Handler,
+        token_decryptor: TokenDecryptor,
+        push_dispatcher: Arc<PushDispatcher>,
+    ) -> Self {
+        Self {
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+            rate_limit_config: TokenRateLimitConfig::default(),
+            replay_config: ReplayProtectionConfig::default(),
+            metrics: Metrics::disabled(),
+        }
+    }
+
+    pub(crate) fn max_dedup_cache_size(mut self, size: usize) -> Self {
+        self.replay_config.max_dedup_cache_size =
+            NonZeroUsize::new(size).expect("dedup cache size must be non-zero");
+        self
+    }
+
+    pub(crate) fn rate_limit_config(mut self, config: TokenRateLimitConfig) -> Self {
+        self.rate_limit_config = config;
+        self
+    }
+
+    pub(crate) fn replay_config(mut self, config: ReplayProtectionConfig) -> Self {
+        self.replay_config = config;
+        self
+    }
+
+    pub(crate) fn metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub(crate) fn build(self) -> EventProcessor {
+        EventProcessor::with_replay_config(
+            self.nip59_handler,
+            self.token_decryptor,
+            self.push_dispatcher,
+            self.rate_limit_config,
+            self.replay_config,
+            self.metrics,
+        )
+        .expect("test EventProcessorBuilder config cannot fail")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,7 +1065,7 @@ mod tests {
             None,
             Metrics::disabled(),
         ));
-        EventProcessor::new(nip59_handler, token_decryptor, push_dispatcher)
+        EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher).build()
     }
 
     fn create_processor_with_cache_size(server_keys: &Keys, cache_size: usize) -> EventProcessor {
@@ -1077,7 +1079,9 @@ mod tests {
             None,
             Metrics::disabled(),
         ));
-        EventProcessor::with_cache_size(nip59_handler, token_decryptor, push_dispatcher, cache_size)
+        EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .max_dedup_cache_size(cache_size)
+            .build()
     }
 
     fn create_processor_with_replay_config(
@@ -1094,15 +1098,9 @@ mod tests {
             None,
             Metrics::disabled(),
         ));
-        EventProcessor::with_replay_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            TokenRateLimitConfig::default(),
-            replay_config,
-            Metrics::disabled(),
-        )
-        .expect("replay-protected processor")
+        EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .replay_config(replay_config)
+            .build()
     }
 
     fn create_processor_with_metrics(server_keys: &Keys) -> (EventProcessor, Metrics) {
@@ -1134,14 +1132,10 @@ mod tests {
             metrics.clone(),
         ));
         (
-            EventProcessor::with_full_config(
-                nip59_handler,
-                token_decryptor,
-                push_dispatcher,
-                DEFAULT_MAX_DEDUP_CACHE_SIZE,
-                rate_limit_config,
-                metrics.clone(),
-            ),
+            EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+                .rate_limit_config(rate_limit_config)
+                .metrics(metrics.clone())
+                .build(),
             metrics,
         )
     }
@@ -1183,14 +1177,10 @@ mod tests {
         push_dispatcher.wait_for_completion().await;
 
         (
-            EventProcessor::with_full_config(
-                nip59_handler,
-                token_decryptor,
-                push_dispatcher,
-                DEFAULT_MAX_DEDUP_CACHE_SIZE,
-                rate_limit_config,
-                metrics.clone(),
-            ),
+            EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+                .rate_limit_config(rate_limit_config)
+                .metrics(metrics.clone())
+                .build(),
             metrics,
         )
     }
@@ -2184,7 +2174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "test dedup cache size must be non-zero")]
+    #[should_panic(expected = "dedup cache size must be non-zero")]
     async fn test_cache_size_zero_is_rejected() {
         // A zero dedup cache size is no longer silently swapped for the default:
         // `ReplayProtectionConfig::max_dedup_cache_size` is `NonZeroUsize`, so a
@@ -2388,14 +2378,9 @@ mod tests {
             None,
             Metrics::disabled(),
         ));
-        EventProcessor::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            rate_limit_config,
-            Metrics::disabled(),
-        )
+        EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .rate_limit_config(rate_limit_config)
+            .build()
     }
 
     #[tokio::test]
@@ -2695,14 +2680,9 @@ mod tests {
             Some(FcmClient::mock(fcm_config, true)),
             metrics.clone(),
         ));
-        let processor = EventProcessor::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            TokenRateLimitConfig::default(),
-            metrics.clone(),
-        );
+        let processor = EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .metrics(metrics.clone())
+            .build();
 
         let encryptor = TokenEncryptor::from_keys(&server_keys);
         let encrypted = encryptor.encrypt(&TestToken::apns(
@@ -2780,14 +2760,9 @@ mod tests {
         ));
         // Retain a handle to inspect DeliveryHealth after processing.
         let dispatcher_handle = Arc::clone(&push_dispatcher);
-        let processor = EventProcessor::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            TokenRateLimitConfig::default(),
-            metrics.clone(),
-        );
+        let processor = EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .metrics(metrics.clone())
+            .build();
 
         // Seed a real hard-failure streak on FCM just below the flagging
         // threshold (a genuine prior outage), so we can prove a pre-filtered APNs
@@ -2874,14 +2849,9 @@ mod tests {
             Some(FcmClient::mock(fcm_config, true)),
             metrics.clone(),
         ));
-        let processor = EventProcessor::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            TokenRateLimitConfig::default(),
-            metrics.clone(),
-        );
+        let processor = EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .metrics(metrics.clone())
+            .build();
 
         // Build an FCM token whose device bytes are not valid UTF-8.
         let encryptor = TokenEncryptor::from_keys(&server_keys);

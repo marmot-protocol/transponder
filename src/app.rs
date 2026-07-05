@@ -851,6 +851,7 @@ pub fn init_logging(config: &crate::config::LoggingConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nostr::events::EventProcessorBuilder;
     use crate::test_support::{default_server_config, server_config_with};
     use axum::{Router, http::StatusCode, routing::get};
     use std::io::Write;
@@ -1044,11 +1045,9 @@ mod tests {
                 .expect("valid secret key");
         let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        Arc::new(EventProcessor::new(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-        ))
+        Arc::new(
+            EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher).build(),
+        )
     }
 
     fn test_event_notification() -> RelayPoolNotification {
