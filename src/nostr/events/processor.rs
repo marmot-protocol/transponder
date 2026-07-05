@@ -1,505 +1,34 @@
-//! Event processing for incoming Nostr events.
-//!
-//! Handles deduplication and processing of gift-wrapped notification requests,
-//! including rate limiting to prevent spam and replay attacks.
+//! Gift-wrapped notification event processing.
 
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions as StdOpenOptions};
 use std::num::NonZeroUsize;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Duration;
 
-use lru::LruCache;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
-use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
-use crate::crypto::{Nip59Handler, Platform, TokenDecryptor, TokenPayload};
+use super::admission::{
+    AdmissionGuard, AdmittedCharges, InFlightEventGuard, ProcessOutcome, StageTimer,
+    platform_metric_label,
+};
+use super::dedup::{DEDUP_WINDOW, PersistentDedupState, SeenEvent, SeenEventStore};
+use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
+use crate::defaults::{
+    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
+    DEFAULT_MAX_TOKENS_PER_EVENT, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
+};
+use crate::defaults::{
+    DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+    DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+};
 use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
-use crate::rate_limiter::{
-    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
-    DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE, RateLimitConfig,
-    RateLimitReservation, RateLimiter,
-};
-
-/// Maximum NIP-59 timestamp randomization window for gift wraps.
-///
-/// Relays must still be queried with this full lookback because compliant gift
-/// wraps randomize their outer `created_at`; durable replay state and inner
-/// rumor freshness bound what we will actually dispatch from that backlog.
-const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end;
-
-/// Default maximum age for the unwrapped kind:446 notification request rumor.
-///
-/// Outer gift-wrap timestamps are deliberately randomized by NIP-59 and are not
-/// freshness signals. The inner notification rumor timestamp is the only
-/// stateless bound available before dispatching a replayed backlog event.
-pub const DEFAULT_MAX_NOTIFICATION_AGE_SECS: u64 = 3_600;
-
-/// Default tolerated clock skew for future-dated notification rumors.
-pub const DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS: u64 = 300;
-
-/// Default duration to keep processed gift-wrap event IDs in replay state.
-pub const DEFAULT_DEDUP_RETENTION_SECS: u64 =
-    NIP59_TIMESTAMP_TWEAK_WINDOW_SECS + DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS;
-
-/// Duration to keep event IDs for deduplication.
-///
-/// The cache must cover the relay subscription lookback; otherwise a restart or
-/// reconnect can re-deliver backlog entries after the old 5-minute in-memory
-/// window expires.
-const DEDUP_WINDOW: Duration = Duration::from_secs(DEFAULT_DEDUP_RETENTION_SECS);
-
-/// Maximum number of volatile LRU entries to scan per cleanup cycle.
-///
-/// Durable replay state scans the retained set so retention, not LRU capacity,
-/// remains the source of truth for restart/reconnect duplicate suppression.
-const CLEANUP_BATCH_SIZE: usize = 1000;
-
-/// Default maximum size for the volatile deduplication cache.
-pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
-
-#[derive(Clone, Copy)]
-struct SeenEvent {
-    seen_at: Instant,
-    terminal: bool,
-}
-
-impl SeenEvent {
-    fn reservation(seen_at: Instant) -> Self {
-        Self {
-            seen_at,
-            terminal: false,
-        }
-    }
-
-    fn terminal(seen_at: Instant) -> Self {
-        Self {
-            seen_at,
-            terminal: true,
-        }
-    }
-}
-
-enum SeenEventStore {
-    Bounded(LruCache<EventId, SeenEvent>),
-    Retained(HashMap<EventId, SeenEvent>),
-}
-
-impl SeenEventStore {
-    fn bounded(cache_size: NonZeroUsize) -> Self {
-        Self::Bounded(LruCache::new(cache_size))
-    }
-
-    fn retained() -> Self {
-        Self::Retained(HashMap::new())
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::Bounded(seen) => seen.len(),
-            Self::Retained(seen) => seen.len(),
-        }
-    }
-
-    fn contains(&self, event_id: &EventId) -> bool {
-        match self {
-            Self::Bounded(seen) => seen.contains(event_id),
-            Self::Retained(seen) => seen.contains_key(event_id),
-        }
-    }
-
-    fn put(&mut self, event_id: EventId, seen_event: SeenEvent) {
-        match self {
-            Self::Bounded(seen) => {
-                seen.put(event_id, seen_event);
-            }
-            Self::Retained(seen) => {
-                seen.insert(event_id, seen_event);
-            }
-        }
-    }
-
-    fn pop(&mut self, event_id: &EventId) {
-        match self {
-            Self::Bounded(seen) => {
-                seen.pop(event_id);
-            }
-            Self::Retained(seen) => {
-                seen.remove(event_id);
-            }
-        }
-    }
-
-    /// Refresh an existing reservation into a terminal entry in place.
-    ///
-    /// On the success hot path the ID is already present from `try_reserve`, so
-    /// this mutates its `SeenEvent` (new `seen_at`, `terminal = true`) instead of
-    /// re-inserting a fresh value. Returns `true` when the set size changed
-    /// (i.e. the entry was absent and had to be inserted — e.g. an entry evicted
-    /// by LRU pressure between reservation and completion), so the caller only
-    /// pays a `dedup_cache_size` gauge write when the length actually moved. This
-    /// removes the redundant second gauge update the double-lock success path
-    /// carried (#197) while preserving the completion-timestamp-refresh and
-    /// terminal-flip semantics `mark_seen` provided.
-    fn mark_terminal(&mut self, event_id: EventId, seen_at: Instant) -> bool {
-        match self {
-            Self::Bounded(seen) => {
-                if let Some(existing) = seen.peek_mut(&event_id) {
-                    *existing = SeenEvent::terminal(seen_at);
-                    // Promote to most-recently-used to match the prior `put`
-                    // behavior, which refreshed LRU position on completion.
-                    seen.promote(&event_id);
-                    false
-                } else {
-                    seen.put(event_id, SeenEvent::terminal(seen_at));
-                    true
-                }
-            }
-            Self::Retained(seen) => seen
-                .insert(event_id, SeenEvent::terminal(seen_at))
-                .is_none(),
-        }
-    }
-
-    fn expired_keys(&self, now: Instant, retention: Duration) -> Vec<EventId> {
-        match self {
-            Self::Bounded(seen) => seen
-                .iter()
-                .rev()
-                .take(CLEANUP_BATCH_SIZE)
-                .filter(|(_, seen_event)| now.duration_since(seen_event.seen_at) >= retention)
-                .map(|(id, _)| *id)
-                .collect(),
-            Self::Retained(seen) => seen
-                .iter()
-                .filter(|(_, seen_event)| now.duration_since(seen_event.seen_at) >= retention)
-                .map(|(id, _)| *id)
-                .collect(),
-        }
-    }
-
-    fn terminal_entries(&self, now_wall: u64, now_instant: Instant) -> Vec<(EventId, u64)> {
-        match self {
-            Self::Bounded(seen) => seen
-                .iter()
-                .filter_map(|(event_id, seen_event)| {
-                    if seen_event.terminal {
-                        Some((
-                            *event_id,
-                            instant_to_unix_secs(seen_event.seen_at, now_wall, now_instant),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            Self::Retained(seen) => seen
-                .iter()
-                .filter_map(|(event_id, seen_event)| {
-                    if seen_event.terminal {
-                        Some((
-                            *event_id,
-                            instant_to_unix_secs(seen_event.seen_at, now_wall, now_instant),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-        }
-    }
-}
-
-struct PersistentDedupState {
-    path: PathBuf,
-    write_lock: Mutex<()>,
-}
-
-impl PersistentDedupState {
-    fn new(path: PathBuf) -> Result<Self> {
-        Self::prepare_path(&path)?;
-        Ok(Self {
-            path,
-            write_lock: Mutex::new(()),
-        })
-    }
-
-    fn prepare_path(path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut options = StdOpenOptions::new();
-        options.create(true).append(true).read(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let _file = options.open(path)?;
-
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-
-    fn load_seen_events(path: &Path, retention: Duration) -> Result<SeenEventStore> {
-        Self::prepare_path(path)?;
-
-        let now_wall = Timestamp::now().as_secs();
-        let now_instant = Instant::now();
-        let mut seen = SeenEventStore::retained();
-        let contents = fs::read_to_string(path)?;
-
-        for line in contents.lines() {
-            let mut fields = line.split_whitespace();
-            let (Some(event_id_hex), Some(seen_at_secs), None) =
-                (fields.next(), fields.next(), fields.next())
-            else {
-                continue;
-            };
-            let Ok(event_id) = EventId::from_hex(event_id_hex) else {
-                continue;
-            };
-            let Ok(seen_at_secs) = seen_at_secs.parse::<u64>() else {
-                continue;
-            };
-            let age = now_wall.saturating_sub(seen_at_secs);
-            if age > retention.as_secs() {
-                continue;
-            }
-            let seen_at = now_instant
-                .checked_sub(Duration::from_secs(age))
-                .unwrap_or(now_instant);
-            seen.put(event_id, SeenEvent::terminal(seen_at));
-        }
-
-        Ok(seen)
-    }
-
-    async fn append_seen_locked(
-        &self,
-        event_id: EventId,
-        seen_at_secs: u64,
-    ) -> std::io::Result<()> {
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
-        #[cfg(unix)]
-        tokio::fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).await?;
-        file.write_all(format!("{} {}\n", event_id.to_hex(), seen_at_secs).as_bytes())
-            .await?;
-        file.flush().await
-    }
-
-    async fn rewrite_locked(&self, entries: &[(EventId, u64)]) -> std::io::Result<()> {
-        let tmp_path = self.path.with_extension("tmp");
-        let mut contents = String::new();
-        for (event_id, seen_at_secs) in entries {
-            use std::fmt::Write as _;
-            let _ = writeln!(&mut contents, "{} {}", event_id.to_hex(), seen_at_secs);
-        }
-        tokio::fs::write(&tmp_path, contents).await?;
-        #[cfg(unix)]
-        tokio::fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).await?;
-        tokio::fs::rename(&tmp_path, &self.path).await
-    }
-}
-
-fn instant_to_unix_secs(seen_at: Instant, now_wall: u64, now_instant: Instant) -> u64 {
-    let age = now_instant
-        .checked_duration_since(seen_at)
-        .unwrap_or_default()
-        .as_secs();
-    now_wall.saturating_sub(age)
-}
-
-#[must_use]
-struct InFlightEventGuard<'a> {
-    metrics: Option<&'a Metrics>,
-}
-
-impl<'a> InFlightEventGuard<'a> {
-    fn new(metrics: Option<&'a Metrics>) -> Self {
-        if let Some(m) = metrics {
-            m.inc_events_in_flight();
-        }
-
-        Self { metrics }
-    }
-}
-
-impl Drop for InFlightEventGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(m) = self.metrics {
-            m.dec_events_in_flight();
-        }
-    }
-}
-
-struct StageTimer(StdInstant);
-
-impl StageTimer {
-    fn start() -> Self {
-        Self(StdInstant::now())
-    }
-
-    fn elapsed_secs(&self) -> f64 {
-        self.0.elapsed().as_secs_f64()
-    }
-}
-
-/// Outcome of [`EventProcessor::process_inner`].
-///
-/// Distinguishes a terminal result (notifications admitted, or the event
-/// genuinely carried nothing dispatchable) from a purely transient per-token
-/// rate-limit shed, which must be treated like the global-limiter shed:
-/// retryable, not marked terminally seen, and not counted as processed.
-enum ProcessOutcome {
-    /// The event reached a terminal state: its admitted notifications (possibly
-    /// zero when every token was invalid or targeted an unconfigured platform)
-    /// were handed to the dispatcher; the per-event count is recorded via
-    /// `observe_notifications_admitted_per_event`. Replays should
-    /// short-circuit as duplicates.
-    Admitted,
-    /// Every token the event carried was shed purely by the per-token rate
-    /// limiters, admitting zero notifications and dropping nothing terminally.
-    /// This is transient back-pressure: the event stays retryable once budget
-    /// recovers.
-    RateLimitedShed,
-}
-
-/// A per-token admission charge that must be explicitly resolved.
-///
-/// Created after the encrypted-token limiter admits a token, and (once the
-/// device-token limiter also admits) after that charge too. It makes the
-/// charge/refund lifecycle transactional so no admission path can silently
-/// strand a spent rate-limit increment (the class of bug behind #170 and #177):
-///
-/// - [`commit`](AdmissionGuard::commit) — the token was fully admitted and
-///   handed toward the dispatcher; the charges are handed off to the caller's
-///   dispatch-failure rollback ledger. Returns the keys and reservations.
-/// - [`refund`](AdmissionGuard::refund) — the token is being dropped *after*
-///   being charged (device-limiter reject per #170, or an undispatchable
-///   platform / non-UTF-8 token discovered post-decrypt per #177). Every charge
-///   the guard holds is rolled back so the drop leaves no spent budget.
-/// - [`keep_charge`](AdmissionGuard::keep_charge) — the token is dropped but its
-///   charge is *intentionally retained* (decrypt failure: an invalid encrypted
-///   blob must still spend replay/spam budget, documented in #170).
-///
-/// The `Drop` impl asserts the guard was resolved. Because the limiter refund is
-/// `async` (the stripe lock is a tokio `RwLock`), a `Drop`-time auto-refund
-/// would have to block; the guard is therefore an explicit-consume guard rather
-/// than a fire-and-forget RAII one. This keeps the refund decision in exactly
-/// one place per exit path while remaining `async`-correct — the trade the
-/// tracker calls out as acceptable when a blocking Drop is not.
-#[must_use = "an AdmissionGuard must be committed, refunded, or explicitly kept"]
-struct AdmissionGuard<'a> {
-    encrypted_limiter: &'a RateLimiter<[u8; 32]>,
-    device_limiter: &'a RateLimiter<[u8; 32]>,
-    encrypted_key: [u8; 32],
-    encrypted_reservation: RateLimitReservation,
-    /// Present once the device-token limiter has also admitted the token.
-    device: Option<([u8; 32], RateLimitReservation)>,
-    resolved: bool,
-}
-
-impl<'a> AdmissionGuard<'a> {
-    /// Record the encrypted-token charge just made for a token.
-    fn new(
-        encrypted_limiter: &'a RateLimiter<[u8; 32]>,
-        device_limiter: &'a RateLimiter<[u8; 32]>,
-        encrypted_key: [u8; 32],
-        encrypted_reservation: RateLimitReservation,
-    ) -> Self {
-        Self {
-            encrypted_limiter,
-            device_limiter,
-            encrypted_key,
-            encrypted_reservation,
-            device: None,
-            resolved: false,
-        }
-    }
-
-    /// Record the device-token charge for the same token.
-    fn add_device_charge(&mut self, device_key: [u8; 32], reservation: RateLimitReservation) {
-        self.device = Some((device_key, reservation));
-    }
-
-    /// Roll back every charge this guard holds (encrypted, and device if any).
-    ///
-    /// Used on every drop-after-charge path: a device-limiter reject (#170) and
-    /// a post-decrypt undispatchable/non-UTF-8 drop (#177).
-    async fn refund(mut self) {
-        self.encrypted_limiter
-            .rollback_increment(&self.encrypted_key, self.encrypted_reservation)
-            .await;
-        if let Some((device_key, reservation)) = self.device {
-            self.device_limiter
-                .rollback_increment(&device_key, reservation)
-                .await;
-        }
-        self.resolved = true;
-    }
-
-    /// Intentionally keep the charge(s) — the drop is a deliberate budget spend.
-    fn keep_charge(mut self) {
-        self.resolved = true;
-    }
-
-    /// Hand off the fully-admitted charges to the caller's rollback ledger.
-    fn commit(mut self) -> AdmittedCharges {
-        self.resolved = true;
-        let (device_key, device_reservation) = self
-            .device
-            .expect("commit requires a device-token charge to have been recorded");
-        AdmittedCharges {
-            encrypted_key: self.encrypted_key,
-            encrypted_reservation: self.encrypted_reservation,
-            device_key,
-            device_reservation,
-        }
-    }
-}
-
-impl Drop for AdmissionGuard<'_> {
-    fn drop(&mut self) {
-        debug_assert!(
-            self.resolved,
-            "AdmissionGuard dropped without commit/refund/keep_charge — a rate-limit charge would be stranded"
-        );
-    }
-}
-
-/// Fully-admitted rate-limit charges for one token, recorded so a later
-/// dispatch-admission failure can roll back exactly the increments it spent.
-struct AdmittedCharges {
-    encrypted_key: [u8; 32],
-    encrypted_reservation: RateLimitReservation,
-    device_key: [u8; 32],
-    device_reservation: RateLimitReservation,
-}
-
-/// Metrics label for a push platform (matches the dispatcher's `platform`
-/// label values so drop counters aggregate with send counters).
-fn platform_metric_label(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Apns => "apns",
-        Platform::Fcm => "fcm",
-    }
-}
+use crate::rate_limiter::{RateLimitConfig, RateLimiter};
 
 /// Event processor for handling incoming gift-wrapped notifications.
 pub struct EventProcessor {
@@ -529,7 +58,7 @@ pub struct EventProcessor {
     device_token_limiter: RateLimiter<[u8; 32]>,
     /// Maximum encrypted tokens accepted in a single event.
     max_tokens_per_event: usize,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 /// Configuration for token rate limiting.
@@ -572,6 +101,27 @@ impl Default for TokenRateLimitConfig {
             device_token_per_hour: DEFAULT_RATE_LIMIT_PER_HOUR,
             global_unwrap_per_minute: DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE,
             global_unwrap_per_hour: DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR,
+        }
+    }
+}
+
+impl TokenRateLimitConfig {
+    /// Build from a validated [`crate::config::ServerConfig`].
+    ///
+    /// Size fields are validated as non-zero at config load time.
+    #[must_use]
+    pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
+        Self {
+            max_cache_size: NonZeroUsize::new(server.max_rate_limit_cache_size)
+                .expect("server.max_rate_limit_cache_size validated non-zero"),
+            max_tokens_per_event: NonZeroUsize::new(server.max_tokens_per_event)
+                .expect("server.max_tokens_per_event validated non-zero"),
+            encrypted_token_per_minute: server.encrypted_token_rate_limit_per_minute,
+            encrypted_token_per_hour: server.encrypted_token_rate_limit_per_hour,
+            device_token_per_minute: server.device_token_rate_limit_per_minute,
+            device_token_per_hour: server.device_token_rate_limit_per_hour,
+            global_unwrap_per_minute: server.global_unwrap_rate_limit_per_minute,
+            global_unwrap_per_hour: server.global_unwrap_rate_limit_per_hour,
         }
     }
 }
@@ -622,70 +172,30 @@ impl Default for ReplayProtectionConfig {
     }
 }
 
+impl ReplayProtectionConfig {
+    /// Build from a validated [`crate::config::ServerConfig`].
+    #[must_use]
+    pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
+        let dedup_state_path = if server.dedup_state_path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(server.dedup_state_path.clone())
+        };
+
+        Self {
+            max_dedup_cache_size: NonZeroUsize::new(server.max_dedup_cache_size)
+                .expect("server.max_dedup_cache_size validated non-zero"),
+            dedup_state_path,
+            dedup_retention: Duration::from_secs(server.dedup_retention_secs),
+            max_notification_age: Duration::from_secs(server.max_notification_age_secs),
+            max_notification_future_skew: Duration::from_secs(
+                server.max_notification_future_skew_secs,
+            ),
+        }
+    }
+}
+
 impl EventProcessor {
-    /// Create a new event processor with default settings.
-    ///
-    /// Uses default cache sizes and rate limits. For production use,
-    /// prefer `with_full_config` to specify all parameters explicitly.
-    #[cfg(test)]
-    pub fn new(
-        nip59_handler: Nip59Handler,
-        token_decryptor: TokenDecryptor,
-        push_dispatcher: Arc<PushDispatcher>,
-    ) -> Self {
-        Self::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            TokenRateLimitConfig::default(),
-            None,
-        )
-    }
-
-    /// Create a new event processor with a custom dedup cache size.
-    #[cfg(test)]
-    pub fn with_cache_size(
-        nip59_handler: Nip59Handler,
-        token_decryptor: TokenDecryptor,
-        push_dispatcher: Arc<PushDispatcher>,
-        max_cache_size: usize,
-    ) -> Self {
-        Self::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            max_cache_size,
-            TokenRateLimitConfig::default(),
-            None,
-        )
-    }
-
-    /// Create a new event processor with full configuration.
-    #[cfg(test)]
-    pub fn with_full_config(
-        nip59_handler: Nip59Handler,
-        token_decryptor: TokenDecryptor,
-        push_dispatcher: Arc<PushDispatcher>,
-        max_dedup_cache_size: usize,
-        rate_limit_config: TokenRateLimitConfig,
-        metrics: Option<Metrics>,
-    ) -> Self {
-        Self::with_replay_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            rate_limit_config,
-            ReplayProtectionConfig {
-                max_dedup_cache_size: NonZeroUsize::new(max_dedup_cache_size)
-                    .expect("test dedup cache size must be non-zero"),
-                ..ReplayProtectionConfig::default()
-            },
-            metrics,
-        )
-        .expect("in-memory replay protection config cannot fail")
-    }
-
     /// Create a new event processor with full replay-protection configuration.
     pub fn with_replay_config(
         nip59_handler: Nip59Handler,
@@ -693,7 +203,7 @@ impl EventProcessor {
         push_dispatcher: Arc<PushDispatcher>,
         rate_limit_config: TokenRateLimitConfig,
         replay_config: ReplayProtectionConfig,
-        metrics: Option<Metrics>,
+        metrics: Metrics,
     ) -> Result<Self> {
         // `max_dedup_cache_size` is `NonZeroUsize`, so the previous silent
         // zero-to-default substitution is unrepresentable.
@@ -751,13 +261,11 @@ impl EventProcessor {
     /// failed and the failure was logged/recorded. Processing failures are not
     /// propagated so the event loop can continue with later events.
     pub async fn process(&self, event: &Event) -> Result<bool> {
-        let _in_flight = InFlightEventGuard::new(self.metrics.as_ref());
+        let _in_flight = InFlightEventGuard::new(&self.metrics);
         let started_at = StageTimer::start();
 
         // Record event received
-        if let Some(ref m) = self.metrics {
-            m.record_event_received();
-        }
+        self.metrics.record_event_received();
 
         // Logged at trace, not info: the kind:1059 event ID is a stable,
         // public correlation handle. Emitting it per-event at info would
@@ -777,13 +285,12 @@ impl EventProcessor {
         // prior "not marked seen on transient failure" semantics.
         if !self.try_reserve(event.id).await {
             trace!("Skipping duplicate event");
-            if let Some(ref m) = self.metrics {
-                m.record_event_deduplicated();
-                m.observe_event_processing_duration(
-                    EventOutcome::Duplicate,
-                    started_at.elapsed_secs(),
-                );
-            }
+            self.metrics.record_event_deduplicated();
+            self.metrics.observe_event_processing_duration(
+                EventOutcome::Duplicate,
+                started_at.elapsed_secs(),
+            );
+
             return Ok(false);
         }
 
@@ -806,10 +313,10 @@ impl EventProcessor {
                 reason = admission.limit_reason(),
                 "Shed event before unwrap (global admission control)"
             );
-            if let Some(ref m) = self.metrics {
-                m.record_event_shed();
-                m.observe_event_processing_duration(EventOutcome::Shed, started_at.elapsed_secs());
-            }
+            self.metrics.record_event_shed();
+            self.metrics
+                .observe_event_processing_duration(EventOutcome::Shed, started_at.elapsed_secs());
+
             return Ok(false);
         }
 
@@ -828,13 +335,12 @@ impl EventProcessor {
                 // Prometheus via `observe_notifications_admitted_per_event`.
                 trace!("Processed notification event");
 
-                if let Some(ref m) = self.metrics {
-                    m.record_event_processed();
-                    m.observe_event_processing_duration(
-                        EventOutcome::Processed,
-                        started_at.elapsed_secs(),
-                    );
-                }
+                self.metrics.record_event_processed();
+                self.metrics.observe_event_processing_duration(
+                    EventOutcome::Processed,
+                    started_at.elapsed_secs(),
+                );
+
                 Ok(true)
             }
             Ok(ProcessOutcome::RateLimitedShed) => {
@@ -845,13 +351,12 @@ impl EventProcessor {
                 // duplicate, and do NOT count it as processed.
                 self.release_reservation(&event.id).await;
                 trace!("Shed event (all tokens per-token rate limited)");
-                if let Some(ref m) = self.metrics {
-                    m.record_event_rate_limited();
-                    m.observe_event_processing_duration(
-                        EventOutcome::RateLimited,
-                        started_at.elapsed_secs(),
-                    );
-                }
+                self.metrics.record_event_rate_limited();
+                self.metrics.observe_event_processing_duration(
+                    EventOutcome::RateLimited,
+                    started_at.elapsed_secs(),
+                );
+
                 Ok(false)
             }
             Err(e) => {
@@ -867,13 +372,12 @@ impl EventProcessor {
 
                 // Log but don't propagate - we want to continue processing other events
                 warn!(error = %e, "Failed to process event");
-                if let Some(ref m) = self.metrics {
-                    m.record_event_failed();
-                    m.observe_event_processing_duration(
-                        EventOutcome::Failed,
-                        started_at.elapsed_secs(),
-                    );
-                }
+                self.metrics.record_event_failed();
+                self.metrics.observe_event_processing_duration(
+                    EventOutcome::Failed,
+                    started_at.elapsed_secs(),
+                );
+
                 Ok(false)
             }
         }
@@ -925,21 +429,19 @@ impl EventProcessor {
         let unwrap_started_at = StageTimer::start();
         let notification = match self.nip59_handler.unwrap(event).await {
             Ok(notification) => {
-                if let Some(ref m) = self.metrics {
-                    m.observe_gift_wrap_unwrap_duration(
-                        OperationOutcome::Success,
-                        unwrap_started_at.elapsed_secs(),
-                    );
-                }
+                self.metrics.observe_gift_wrap_unwrap_duration(
+                    OperationOutcome::Success,
+                    unwrap_started_at.elapsed_secs(),
+                );
+
                 notification
             }
             Err(e) => {
-                if let Some(ref m) = self.metrics {
-                    m.observe_gift_wrap_unwrap_duration(
-                        OperationOutcome::Failed,
-                        unwrap_started_at.elapsed_secs(),
-                    );
-                }
+                self.metrics.observe_gift_wrap_unwrap_duration(
+                    OperationOutcome::Failed,
+                    unwrap_started_at.elapsed_secs(),
+                );
+
                 return Err(e);
             }
         };
@@ -952,23 +454,22 @@ impl EventProcessor {
         let parse_started_at = StageTimer::start();
         let token_bytes = match notification.parse_tokens_with_limit(self.max_tokens_per_event) {
             Ok(token_bytes) => {
-                if let Some(ref m) = self.metrics {
-                    m.observe_notification_parse_duration(
-                        OperationOutcome::Success,
-                        parse_started_at.elapsed_secs(),
-                    );
-                    m.observe_tokens_per_event(token_bytes.len());
-                    m.observe_notification_content_size_bytes(notification.content.len());
-                }
+                self.metrics.observe_notification_parse_duration(
+                    OperationOutcome::Success,
+                    parse_started_at.elapsed_secs(),
+                );
+                self.metrics.observe_tokens_per_event(token_bytes.len());
+                self.metrics
+                    .observe_notification_content_size_bytes(notification.content.len());
+
                 token_bytes
             }
             Err(e) => {
-                if let Some(ref m) = self.metrics {
-                    m.observe_notification_parse_duration(
-                        OperationOutcome::Failed,
-                        parse_started_at.elapsed_secs(),
-                    );
-                }
+                self.metrics.observe_notification_parse_duration(
+                    OperationOutcome::Failed,
+                    parse_started_at.elapsed_secs(),
+                );
+
                 return Err(e);
             }
         };
@@ -1001,10 +502,9 @@ impl EventProcessor {
                 .encrypted_token_limiter
                 .check_and_increment(&encrypted_key)
                 .await;
-            if encrypted_result.admission_evicted()
-                && let Some(ref m) = self.metrics
-            {
-                m.record_rate_limit_admission_eviction("encrypted_token");
+            if encrypted_result.admission_evicted() {
+                self.metrics
+                    .record_rate_limit_admission_eviction("encrypted_token");
             }
             self.publish_rate_limit_gauge("encrypted_token", encrypted_result.sampled_cache_len());
             if !encrypted_result.is_allowed() {
@@ -1013,9 +513,9 @@ impl EventProcessor {
                     reason = encrypted_result.limit_reason(),
                     "Rate limited encrypted token"
                 );
-                if let Some(ref m) = self.metrics {
-                    m.record_rate_limited("encrypted_token", encrypted_result.limit_reason());
-                }
+                self.metrics
+                    .record_rate_limited("encrypted_token", encrypted_result.limit_reason());
+
                 continue;
             }
             let encrypted_reservation = encrypted_result
@@ -1036,13 +536,12 @@ impl EventProcessor {
             let decrypt_started_at = StageTimer::start();
             let payload = match self.token_decryptor.decrypt_bytes(&bytes) {
                 Ok(p) => {
-                    if let Some(ref m) = self.metrics {
-                        m.record_token_decrypted();
-                        m.observe_token_decrypt_duration(
-                            OperationOutcome::Success,
-                            decrypt_started_at.elapsed_secs(),
-                        );
-                    }
+                    self.metrics.record_token_decrypted();
+                    self.metrics.observe_token_decrypt_duration(
+                        OperationOutcome::Success,
+                        decrypt_started_at.elapsed_secs(),
+                    );
+
                     p
                 }
                 Err(e) => {
@@ -1054,13 +553,12 @@ impl EventProcessor {
                     guard.keep_charge();
                     terminally_dropped_any = true;
                     trace!(error = %e, "Failed to decrypt token (ignoring)");
-                    if let Some(ref m) = self.metrics {
-                        m.record_token_decryption_failed();
-                        m.observe_token_decrypt_duration(
-                            OperationOutcome::Failed,
-                            decrypt_started_at.elapsed_secs(),
-                        );
-                    }
+                    self.metrics.record_token_decryption_failed();
+                    self.metrics.observe_token_decrypt_duration(
+                        OperationOutcome::Failed,
+                        decrypt_started_at.elapsed_secs(),
+                    );
+
                     continue;
                 }
             };
@@ -1077,9 +575,8 @@ impl EventProcessor {
                 terminally_dropped_any = true;
                 let platform = platform_metric_label(payload.platform);
                 trace!(platform, "Dropping token: platform not configured");
-                if let Some(ref m) = self.metrics {
-                    m.record_push_failed(platform, "unconfigured");
-                }
+                self.metrics.record_push_failed(platform, "unconfigured");
+
                 continue;
             }
             if !PushDispatcher::token_is_encodable(&payload) {
@@ -1087,9 +584,9 @@ impl EventProcessor {
                 terminally_dropped_any = true;
                 let platform = platform_metric_label(payload.platform);
                 trace!(platform, "Dropping token: device token not encodable");
-                if let Some(ref m) = self.metrics {
-                    m.record_push_failed(platform, "invalid_encoding");
-                }
+                self.metrics
+                    .record_push_failed(platform, "invalid_encoding");
+
                 continue;
             }
 
@@ -1099,10 +596,9 @@ impl EventProcessor {
                 .device_token_limiter
                 .check_and_increment(&device_key)
                 .await;
-            if device_result.admission_evicted()
-                && let Some(ref m) = self.metrics
-            {
-                m.record_rate_limit_admission_eviction("device_token");
+            if device_result.admission_evicted() {
+                self.metrics
+                    .record_rate_limit_admission_eviction("device_token");
             }
             self.publish_rate_limit_gauge("device_token", device_result.sampled_cache_len());
             if !device_result.is_allowed() {
@@ -1117,9 +613,9 @@ impl EventProcessor {
                     reason = device_result.limit_reason(),
                     "Rate limited device token"
                 );
-                if let Some(ref m) = self.metrics {
-                    m.record_rate_limited("device_token", device_result.limit_reason());
-                }
+                self.metrics
+                    .record_rate_limited("device_token", device_result.limit_reason());
+
                 continue;
             }
             let device_reservation = device_result
@@ -1134,9 +630,8 @@ impl EventProcessor {
         }
 
         if payloads.is_empty() {
-            if let Some(ref m) = self.metrics {
-                m.observe_notifications_admitted_per_event(0);
-            }
+            self.metrics.observe_notifications_admitted_per_event(0);
+
             // Distinguish a pure per-token rate-limit shed (retryable) from an
             // event that genuinely carried no dispatchable token (terminal). The
             // shed path only applies when at least one token was rate-limited and
@@ -1151,13 +646,12 @@ impl EventProcessor {
         let dispatch_started_at = StageTimer::start();
         match self.push_dispatcher.dispatch(payloads).await {
             Ok(count) => {
-                if let Some(ref m) = self.metrics {
-                    m.observe_push_dispatch_admission_duration(
-                        OperationOutcome::Success,
-                        dispatch_started_at.elapsed_secs(),
-                    );
-                    m.observe_notifications_admitted_per_event(count);
-                }
+                self.metrics.observe_push_dispatch_admission_duration(
+                    OperationOutcome::Success,
+                    dispatch_started_at.elapsed_secs(),
+                );
+                self.metrics.observe_notifications_admitted_per_event(count);
+
                 Ok(ProcessOutcome::Admitted)
             }
             Err(e) => {
@@ -1170,13 +664,12 @@ impl EventProcessor {
                         .await;
                 }
 
-                if let Some(ref m) = self.metrics {
-                    m.observe_push_dispatch_admission_duration(
-                        OperationOutcome::Failed,
-                        dispatch_started_at.elapsed_secs(),
-                    );
-                    m.observe_notifications_admitted_per_event(0);
-                }
+                self.metrics.observe_push_dispatch_admission_duration(
+                    OperationOutcome::Failed,
+                    dispatch_started_at.elapsed_secs(),
+                );
+                self.metrics.observe_notifications_admitted_per_event(0);
+
                 Err(e)
             }
         }
@@ -1191,8 +684,8 @@ impl EventProcessor {
     /// cleanup tick — while keeping the metric's existing per-`cache_type`
     /// label shape and paying a gauge write only on sampled calls.
     fn publish_rate_limit_gauge(&self, cache_type: &str, sampled_len: Option<usize>) {
-        if let (Some(len), Some(m)) = (sampled_len, self.metrics.as_ref()) {
-            m.set_rate_limit_cache_size(cache_type, len);
+        if let Some(len) = sampled_len {
+            self.metrics.set_rate_limit_cache_size(cache_type, len);
         }
     }
 
@@ -1243,9 +736,8 @@ impl EventProcessor {
         seen.put(event_id, SeenEvent::reservation(Instant::now()));
 
         // Update cache size metric
-        if let Some(ref m) = self.metrics {
-            m.set_dedup_cache_size(seen.len());
-        }
+        self.metrics.set_dedup_cache_size(seen.len());
+
         true
     }
 
@@ -1261,9 +753,7 @@ impl EventProcessor {
         seen.pop(event_id);
 
         // Update cache size metric
-        if let Some(ref m) = self.metrics {
-            m.set_dedup_cache_size(seen.len());
-        }
+        self.metrics.set_dedup_cache_size(seen.len());
     }
 
     /// Refresh the seen timestamp for an already-reserved event.
@@ -1284,8 +774,8 @@ impl EventProcessor {
             // touched on the rare path where the entry was evicted between
             // reservation and completion and had to be re-inserted.
             let size_changed = seen.mark_terminal(event_id, now);
-            if size_changed && let Some(ref m) = self.metrics {
-                m.set_dedup_cache_size(seen.len());
+            if size_changed {
+                self.metrics.set_dedup_cache_size(seen.len());
             }
         }
 
@@ -1351,11 +841,9 @@ impl EventProcessor {
             }
         }
 
-        if let Some(ref m) = self.metrics {
-            m.set_dedup_cache_size(remaining);
-            if evicted > 0 {
-                m.record_dedup_evictions(evicted);
-            }
+        self.metrics.set_dedup_cache_size(remaining);
+        if evicted > 0 {
+            self.metrics.record_dedup_evictions(evicted);
         }
         if evicted > 0 {
             debug!(
@@ -1372,11 +860,11 @@ impl EventProcessor {
 
         // Clean encrypted token rate limiter cache
         let encrypted_stats = self.encrypted_token_limiter.cleanup().await;
-        if let Some(ref m) = self.metrics {
-            m.set_rate_limit_cache_size("encrypted_token", encrypted_stats.remaining);
-            if encrypted_stats.evicted > 0 {
-                m.record_rate_limit_evictions("encrypted_token", encrypted_stats.evicted);
-            }
+        self.metrics
+            .set_rate_limit_cache_size("encrypted_token", encrypted_stats.remaining);
+        if encrypted_stats.evicted > 0 {
+            self.metrics
+                .record_rate_limit_evictions("encrypted_token", encrypted_stats.evicted);
         }
         if encrypted_stats.evicted > 0 {
             debug!(
@@ -1388,11 +876,11 @@ impl EventProcessor {
 
         // Clean device token rate limiter cache
         let device_stats = self.device_token_limiter.cleanup().await;
-        if let Some(ref m) = self.metrics {
-            m.set_rate_limit_cache_size("device_token", device_stats.remaining);
-            if device_stats.evicted > 0 {
-                m.record_rate_limit_evictions("device_token", device_stats.evicted);
-            }
+        self.metrics
+            .set_rate_limit_cache_size("device_token", device_stats.remaining);
+        if device_stats.evicted > 0 {
+            self.metrics
+                .record_rate_limit_evictions("device_token", device_stats.evicted);
         }
         if device_stats.evicted > 0 {
             debug!(
@@ -1413,18 +901,152 @@ impl EventProcessor {
     }
 }
 
+/// Test-only fluent builder for [`EventProcessor`].
+///
+/// Production code should use [`EventProcessor::with_replay_config`] directly.
+#[cfg(test)]
+pub(crate) struct EventProcessorBuilder {
+    nip59_handler: Nip59Handler,
+    token_decryptor: TokenDecryptor,
+    push_dispatcher: Arc<PushDispatcher>,
+    rate_limit_config: TokenRateLimitConfig,
+    replay_config: ReplayProtectionConfig,
+    metrics: Metrics,
+}
+
+#[cfg(test)]
+impl EventProcessorBuilder {
+    pub(crate) fn new(
+        nip59_handler: Nip59Handler,
+        token_decryptor: TokenDecryptor,
+        push_dispatcher: Arc<PushDispatcher>,
+    ) -> Self {
+        Self {
+            nip59_handler,
+            token_decryptor,
+            push_dispatcher,
+            rate_limit_config: TokenRateLimitConfig::default(),
+            replay_config: ReplayProtectionConfig::default(),
+            metrics: Metrics::disabled(),
+        }
+    }
+
+    pub(crate) fn max_dedup_cache_size(mut self, size: usize) -> Self {
+        self.replay_config.max_dedup_cache_size =
+            NonZeroUsize::new(size).expect("dedup cache size must be non-zero");
+        self
+    }
+
+    pub(crate) fn rate_limit_config(mut self, config: TokenRateLimitConfig) -> Self {
+        self.rate_limit_config = config;
+        self
+    }
+
+    pub(crate) fn replay_config(mut self, config: ReplayProtectionConfig) -> Self {
+        self.replay_config = config;
+        self
+    }
+
+    pub(crate) fn metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub(crate) fn build(self) -> EventProcessor {
+        EventProcessor::with_replay_config(
+            self.nip59_handler,
+            self.token_decryptor,
+            self.push_dispatcher,
+            self.rate_limit_config,
+            self.replay_config,
+            self.metrics,
+        )
+        .expect("test EventProcessorBuilder config cannot fail")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ApnsConfig;
+    use crate::crypto::Platform;
     use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
+    use crate::defaults::{
+        DEFAULT_MAX_NOTIFICATION_AGE_SECS, DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+        DEFAULT_MAX_TOKENS_PER_EVENT,
+    };
     use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
+    use crate::nostr::events::dedup::{CLEANUP_BATCH_SIZE, DEDUP_WINDOW, instant_to_unix_secs};
     use crate::push::{ApnsClient, PushDispatcher};
     use crate::test_metrics::{
         counter_value, gauge_value as metric_gauge_value,
         histogram_sample_count as histogram_count, histogram_sample_sum,
     };
+    use crate::test_support::{default_server_config, server_config_with};
     use crate::test_vectors::scenarios;
+
+    #[test]
+    fn token_rate_limit_config_from_server_config_matches_settings() {
+        let server = server_config_with(default_server_config(), |server| {
+            server.max_rate_limit_cache_size = 1234;
+            server.max_tokens_per_event = 25;
+            server.encrypted_token_rate_limit_per_minute = 111;
+            server.encrypted_token_rate_limit_per_hour = 2222;
+            server.device_token_rate_limit_per_minute = 333;
+            server.device_token_rate_limit_per_hour = 4444;
+            server.max_concurrent_event_processing = 7;
+            server.global_unwrap_rate_limit_per_minute = 555;
+            server.global_unwrap_rate_limit_per_hour = 6666;
+        });
+
+        let rate_limit_config = TokenRateLimitConfig::from_server_config(&server);
+
+        assert_eq!(rate_limit_config.max_cache_size.get(), 1234);
+        assert_eq!(rate_limit_config.max_tokens_per_event.get(), 25);
+        assert_eq!(rate_limit_config.encrypted_token_per_minute, 111);
+        assert_eq!(rate_limit_config.encrypted_token_per_hour, 2222);
+        assert_eq!(rate_limit_config.device_token_per_minute, 333);
+        assert_eq!(rate_limit_config.device_token_per_hour, 4444);
+        assert_eq!(rate_limit_config.global_unwrap_per_minute, 555);
+        assert_eq!(rate_limit_config.global_unwrap_per_hour, 6666);
+    }
+
+    #[test]
+    fn replay_protection_config_from_server_config_matches_settings() {
+        let state_path = PathBuf::from("/var/lib/transponder/dedup-events.log");
+        let server = server_config_with(default_server_config(), |server| {
+            server.max_dedup_cache_size = 77;
+            server.dedup_state_path = state_path.clone();
+            server.dedup_retention_secs = 88;
+            server.max_notification_age_secs = 99;
+            server.max_notification_future_skew_secs = 11;
+        });
+
+        let replay_config = ReplayProtectionConfig::from_server_config(&server);
+
+        assert_eq!(replay_config.max_dedup_cache_size.get(), 77);
+        assert_eq!(replay_config.dedup_state_path, Some(state_path));
+        assert_eq!(replay_config.dedup_retention, Duration::from_secs(88));
+        assert_eq!(replay_config.max_notification_age, Duration::from_secs(99));
+        assert_eq!(
+            replay_config.max_notification_future_skew,
+            Duration::from_secs(11)
+        );
+    }
+
+    #[test]
+    fn replay_protection_config_from_server_config_disables_empty_state_path() {
+        let server = server_config_with(default_server_config(), |server| {
+            server.max_dedup_cache_size = 77;
+            server.dedup_retention_secs = 88;
+            server.max_notification_age_secs = 99;
+            server.max_notification_future_skew_secs = 11;
+        });
+
+        let replay_config = ReplayProtectionConfig::from_server_config(&server);
+
+        assert_eq!(replay_config.dedup_state_path, None);
+    }
 
     fn gauge_value(metrics: &Metrics, name: &str) -> f64 {
         metric_gauge_value(metrics, name, &[])
@@ -1436,8 +1058,12 @@ mod tests {
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
         let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
-        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        EventProcessor::new(nip59_handler, token_decryptor, push_dispatcher)
+        let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
+            None,
+            None,
+            Metrics::disabled(),
+        ));
+        EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher).build()
     }
 
     fn create_processor_with_cache_size(server_keys: &Keys, cache_size: usize) -> EventProcessor {
@@ -1446,8 +1072,14 @@ mod tests {
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
         let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
-        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        EventProcessor::with_cache_size(nip59_handler, token_decryptor, push_dispatcher, cache_size)
+        let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
+            None,
+            None,
+            Metrics::disabled(),
+        ));
+        EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .max_dedup_cache_size(cache_size)
+            .build()
     }
 
     fn create_processor_with_replay_config(
@@ -1459,16 +1091,14 @@ mod tests {
             secp256k1::SecretKey::from_slice(&server_keys.secret_key().to_secret_bytes())
                 .expect("valid secret key");
         let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
-        let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        EventProcessor::with_replay_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            TokenRateLimitConfig::default(),
-            replay_config,
+        let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
             None,
-        )
-        .expect("replay-protected processor")
+            None,
+            Metrics::disabled(),
+        ));
+        EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .replay_config(replay_config)
+            .build()
     }
 
     fn create_processor_with_metrics(server_keys: &Keys) -> (EventProcessor, Metrics) {
@@ -1497,17 +1127,13 @@ mod tests {
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
             Some(ApnsClient::mock(apns_config, true)),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         ));
         (
-            EventProcessor::with_full_config(
-                nip59_handler,
-                token_decryptor,
-                push_dispatcher,
-                DEFAULT_MAX_DEDUP_CACHE_SIZE,
-                rate_limit_config,
-                Some(metrics.clone()),
-            ),
+            EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+                .rate_limit_config(rate_limit_config)
+                .metrics(metrics.clone())
+                .build(),
             metrics,
         )
     }
@@ -1544,19 +1170,15 @@ mod tests {
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
             Some(ApnsClient::mock(apns_config, true)),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         ));
         push_dispatcher.wait_for_completion().await;
 
         (
-            EventProcessor::with_full_config(
-                nip59_handler,
-                token_decryptor,
-                push_dispatcher,
-                DEFAULT_MAX_DEDUP_CACHE_SIZE,
-                rate_limit_config,
-                Some(metrics.clone()),
-            ),
+            EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+                .rate_limit_config(rate_limit_config)
+                .metrics(metrics.clone())
+                .build(),
             metrics,
         )
     }
@@ -2339,7 +1961,7 @@ mod tests {
                 .await,
             Some((0, 0))
         );
-        assert_eq!(processor.device_token_limiter.len().await, 0);
+        assert!(processor.device_token_limiter.is_empty().await);
         assert_eq!(
             counter_value(&metrics, "transponder_events_processed_total", &[]),
             0.0
@@ -2550,7 +2172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "test dedup cache size must be non-zero")]
+    #[should_panic(expected = "dedup cache size must be non-zero")]
     async fn test_cache_size_zero_is_rejected() {
         // A zero dedup cache size is no longer silently swapped for the default:
         // `ReplayProtectionConfig::max_dedup_cache_size` is `NonZeroUsize`, so a
@@ -2749,18 +2371,14 @@ mod tests {
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
         };
-        let push_dispatcher = Arc::new(PushDispatcher::new(
+        let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
             Some(ApnsClient::mock(apns_config, true)),
             None,
+            Metrics::disabled(),
         ));
-        EventProcessor::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            rate_limit_config,
-            None,
-        )
+        EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .rate_limit_config(rate_limit_config)
+            .build()
     }
 
     #[tokio::test]
@@ -3058,16 +2676,11 @@ mod tests {
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
             None,
             Some(FcmClient::mock(fcm_config, true)),
-            Some(metrics.clone()),
+            metrics.clone(),
         ));
-        let processor = EventProcessor::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            TokenRateLimitConfig::default(),
-            Some(metrics.clone()),
-        );
+        let processor = EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .metrics(metrics.clone())
+            .build();
 
         let encryptor = TokenEncryptor::from_keys(&server_keys);
         let encrypted = encryptor.encrypt(&TestToken::apns(
@@ -3095,7 +2708,7 @@ mod tests {
             "unconfigured-platform drop must refund the encrypted charge"
         );
         // The device limiter was never charged (drop happens before it).
-        assert_eq!(processor.device_token_limiter.len().await, 0);
+        assert!(processor.device_token_limiter.is_empty().await);
         // The drop is recorded by a real metric.
         assert_eq!(
             counter_value(
@@ -3141,18 +2754,13 @@ mod tests {
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
             None,
             Some(FcmClient::mock(fcm_config, true)),
-            Some(metrics.clone()),
+            metrics.clone(),
         ));
         // Retain a handle to inspect DeliveryHealth after processing.
         let dispatcher_handle = Arc::clone(&push_dispatcher);
-        let processor = EventProcessor::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            TokenRateLimitConfig::default(),
-            Some(metrics.clone()),
-        );
+        let processor = EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .metrics(metrics.clone())
+            .build();
 
         // Seed a real hard-failure streak on FCM just below the flagging
         // threshold (a genuine prior outage), so we can prove a pre-filtered APNs
@@ -3237,16 +2845,11 @@ mod tests {
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
             None,
             Some(FcmClient::mock(fcm_config, true)),
-            Some(metrics.clone()),
+            metrics.clone(),
         ));
-        let processor = EventProcessor::with_full_config(
-            nip59_handler,
-            token_decryptor,
-            push_dispatcher,
-            DEFAULT_MAX_DEDUP_CACHE_SIZE,
-            TokenRateLimitConfig::default(),
-            Some(metrics.clone()),
-        );
+        let processor = EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher)
+            .metrics(metrics.clone())
+            .build();
 
         // Build an FCM token whose device bytes are not valid UTF-8.
         let encryptor = TokenEncryptor::from_keys(&server_keys);
@@ -3274,7 +2877,7 @@ mod tests {
             None,
             "non-UTF-8 FCM drop must refund the encrypted charge"
         );
-        assert_eq!(processor.device_token_limiter.len().await, 0);
+        assert!(processor.device_token_limiter.is_empty().await);
         assert_eq!(
             counter_value(
                 &metrics,

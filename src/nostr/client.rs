@@ -13,18 +13,13 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::config::RelayConfig;
+use crate::defaults::NIP59_TIMESTAMP_TWEAK_WINDOW_SECS;
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 
 // Type alias to avoid confusion with our RelayStatus
 use nostr_sdk::RelayStatus as NostrRelayStatus;
 
-/// Maximum NIP-59 timestamp randomization window for gift wraps.
-///
-/// NIP-59 gift wraps intentionally randomize `created_at` into the past to
-/// reduce timing correlation. Relay subscriptions must look back by the same
-/// window or relays will filter out compliant gift wraps before delivery.
-const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end;
 const INBOX_RELAY_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(feature = "tor")]
@@ -186,22 +181,18 @@ pub struct RelayClient {
     /// in [`RelayClient::connect`]. Used by [`RelayClient::refresh_status`] to
     /// classify connected relays by origin list instead of URL shape.
     origins: Mutex<BTreeMap<RelayUrl, RelayKind>>,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 impl RelayClient {
     /// Create a new relay client with the given keys and configuration.
     #[allow(dead_code)]
     pub async fn new(keys: Keys, config: RelayConfig) -> Result<Self> {
-        Self::with_metrics(keys, config, None).await
+        Self::with_metrics(keys, config, Metrics::disabled()).await
     }
 
     /// Create a new relay client with metrics.
-    pub async fn with_metrics(
-        keys: Keys,
-        config: RelayConfig,
-        metrics: Option<Metrics>,
-    ) -> Result<Self> {
+    pub async fn with_metrics(keys: Keys, config: RelayConfig, metrics: Metrics) -> Result<Self> {
         validate_relay_config(&config)?;
 
         let reconnect_attempt_limiter = ReconnectAttemptLimiter::new(config.max_reconnect_attempts);
@@ -216,10 +207,8 @@ impl RelayClient {
 
         let total = config.clearnet.len() + config.onion.len();
 
-        if let Some(metrics) = &metrics {
-            metrics.set_relay_counts(config.clearnet.len(), config.onion.len());
-            metrics.set_relay_subscription_lookback(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS);
-        }
+        metrics.set_relay_counts(config.clearnet.len(), config.onion.len());
+        metrics.set_relay_subscription_lookback(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS);
 
         Ok(Self {
             client,
@@ -364,7 +353,7 @@ impl RelayClient {
     /// This is the only place the cached [`RelayStatus`] and the
     /// `transponder_relays_connected` gauges are written: it enumerates the
     /// relay pool, classifies each connected relay by the configured list it
-    /// came from (see [`classify_relay_kind`]), and stores the result. It is
+    /// came from (see `classify_relay_kind`), and stores the result. It is
     /// driven by `connect()` while polling for the first connection and by
     /// the periodic status-refresher task in `main` — never by the read paths
     /// ([`Self::get_status`]/[`Self::is_connected`]), so readiness probes are
@@ -388,10 +377,8 @@ impl RelayClient {
             }
         }
 
-        if let Some(metrics) = &self.metrics {
-            metrics.set_relays_connected("clearnet", clearnet);
-            metrics.set_relays_connected("onion", tor);
-        }
+        self.metrics.set_relays_connected("clearnet", clearnet);
+        self.metrics.set_relays_connected("onion", tor);
 
         let mut status = self.status.write().await;
         status.clearnet_connected = clearnet;
@@ -512,9 +499,7 @@ impl RelayClient {
     }
 
     fn record_inbox_relay_publish_failed(&self) {
-        if let Some(metrics) = &self.metrics {
-            metrics.record_inbox_relay_publish_failed();
-        }
+        self.metrics.record_inbox_relay_publish_failed();
     }
 
     /// The configured relay URLs to advertise, as raw config strings.
@@ -875,7 +860,7 @@ mod tests {
         let config = test_relay_config(vec![relay_url.to_string()]);
         let metrics = Metrics::new().unwrap();
 
-        let client = RelayClient::with_metrics(keys, config, Some(metrics.clone()))
+        let client = RelayClient::with_metrics(keys, config, metrics.clone())
             .await
             .unwrap();
         client.client.add_relay(&relay_url).await.unwrap();
@@ -1460,7 +1445,7 @@ mod tests {
         let config = test_relay_config(vec![relay_url.to_string()]);
         let metrics = Metrics::new().unwrap();
 
-        let client = RelayClient::with_metrics(keys, config, Some(metrics.clone()))
+        let client = RelayClient::with_metrics(keys, config, metrics.clone())
             .await
             .unwrap();
         client.client.add_relay(&relay_url).await.unwrap();

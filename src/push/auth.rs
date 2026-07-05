@@ -6,12 +6,12 @@
 //! owns the caching/invalidation semantics once so the two clients cannot
 //! drift (issue #158):
 //!
-//! - [`AuthTokenGenerator`] is the provider-specific mint step.
-//! - [`TokenCache`] wraps a generator with a read-lock fast path and a
+//! - `AuthTokenGenerator` is the provider-specific mint step.
+//! - `TokenCache` wraps a generator with a read-lock fast path and a
 //!   single-flight refresh that runs *outside* the cache write lock, so
 //!   readers keep serving a still-valid token while a refresh is in flight
 //!   (issue #86) and concurrent misses coalesce into a single mint.
-//! - [`TokenCache::invalidate_if_matches`] evicts a provider-rejected
+//! - `TokenCache::invalidate_if_matches` evicts a provider-rejected
 //!   credential only while it is still the cached one. *Whether* a rejection
 //!   is credential-related is decided by the caller: APNs must parse the 403
 //!   `reason` first and evict only for provider-token reasons (issue #145),

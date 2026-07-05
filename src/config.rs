@@ -39,17 +39,15 @@ use tokio::sync::Semaphore;
 use tracing::debug;
 use zeroize::Zeroizing;
 
-use crate::crypto::nip59::DEFAULT_MAX_TOKENS_PER_EVENT;
-use crate::error::Result;
-use crate::nostr::events::{
-    DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+use crate::defaults::{
+    DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR,
+    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING,
+    DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_NOTIFICATION_AGE_SECS,
     DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+    DEFAULT_MAX_SIZE as DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE, DEFAULT_MAX_TOKENS_PER_EVENT,
+    DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
 };
-use crate::rate_limiter::{
-    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE,
-    DEFAULT_MAX_SIZE as DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE, DEFAULT_RATE_LIMIT_PER_HOUR,
-    DEFAULT_RATE_LIMIT_PER_MINUTE,
-};
+use crate::error::Result;
 
 /// Root configuration structure.
 #[derive(Debug, Clone, Deserialize)]
@@ -79,17 +77,8 @@ pub struct AppConfig {
     pub glitchtip: GlitchtipConfig,
 }
 
-/// Default maximum size for the deduplication cache.
-const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
 const DEFAULT_HEALTH_BIND_ADDRESS: &str = "127.0.0.1:8080";
 const ENV_PREFIX: &str = "TRANSPONDER_";
-
-/// Default maximum number of events processed concurrently.
-///
-/// Caps the total in-flight gift-wrap unwrap (ECDH) work so a flood cannot
-/// spawn unbounded crypto tasks, while still draining the relay broadcast
-/// channel quickly enough to avoid `Lagged` overflow.
-const DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING: usize = 64;
 
 fn default_max_dedup_cache_size() -> usize {
     DEFAULT_MAX_DEDUP_CACHE_SIZE

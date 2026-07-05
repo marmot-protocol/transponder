@@ -261,7 +261,7 @@ pub(crate) struct FcmTokenGenerator {
     http_client: Client,
     service_account: Option<ServiceAccount>,
     encoding_key: Option<EncodingKey>,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
     /// Test-only override for the OAuth token endpoint URL.
     #[cfg(test)]
     test_oauth_token_url: Option<String>,
@@ -384,9 +384,7 @@ impl AuthTokenGenerator for FcmTokenGenerator {
 
         let ttl = token_cache_lifetime(token_response.expires_in);
 
-        if let Some(metrics) = &self.metrics {
-            metrics.record_auth_token_refresh("fcm_oauth");
-        }
+        self.metrics.record_auth_token_refresh("fcm_oauth");
 
         trace!("Refreshed FCM access token");
         Ok(MintedToken {
@@ -401,7 +399,7 @@ pub struct FcmClient {
     pub(crate) config: FcmConfig,
     pub(crate) http_client: Client,
     pub(crate) token_cache: TokenCache<FcmTokenGenerator>,
-    pub(crate) metrics: Option<Metrics>,
+    pub(crate) metrics: Metrics,
     /// Test-only override for the FCM v1 API base URL (scheme + host + port).
     #[cfg(test)]
     pub(crate) test_fcm_api_base_url: Option<String>,
@@ -411,11 +409,11 @@ impl FcmClient {
     /// Create a new FCM client.
     #[allow(dead_code)]
     pub async fn new(config: FcmConfig) -> Result<Self> {
-        Self::with_metrics(config, None).await
+        Self::with_metrics(config, Metrics::disabled()).await
     }
 
     /// Create a new FCM client with metrics.
-    pub async fn with_metrics(config: FcmConfig, metrics: Option<Metrics>) -> Result<Self> {
+    pub async fn with_metrics(config: FcmConfig, metrics: Metrics) -> Result<Self> {
         let http_client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
         // Load service account if configured
@@ -529,12 +527,12 @@ impl FcmClient {
             "FCM",
             || self.send_once(&device_token),
             backoff_permit,
-            self.metrics.as_ref(),
+            self.metrics.clone(),
         )
         .await;
-        if let Some(metrics) = &self.metrics {
-            metrics.observe_push_duration("fcm", start.elapsed().as_secs_f64());
-        }
+        self.metrics
+            .observe_push_duration("fcm", start.elapsed().as_secs_f64());
+
         result
     }
 
@@ -639,9 +637,8 @@ impl FcmClient {
     ) -> SendAttemptResult {
         let status = response.status();
 
-        if let Some(metrics) = &self.metrics {
-            metrics.record_push_response_status("fcm", status.as_u16());
-        }
+        self.metrics
+            .record_push_response_status("fcm", status.as_u16());
 
         match status.as_u16() {
             200 => {
@@ -756,7 +753,7 @@ impl FcmClient {
                     // transport errors never carry a target into logs (#172).
                     .map_err(|e| Error::from(e).redact_transport_url())
             },
-            self.metrics.as_ref(),
+            &self.metrics,
         )
         .await
         {
@@ -848,7 +845,7 @@ impl FcmClient {
             http_client: http_client.clone(),
             service_account,
             encoding_key,
-            metrics: None,
+            metrics: Metrics::disabled(),
             test_oauth_token_url: None,
         });
 
@@ -856,7 +853,7 @@ impl FcmClient {
             config,
             http_client,
             token_cache,
-            metrics: None,
+            metrics: Metrics::disabled(),
             test_fcm_api_base_url: None,
         }
     }
@@ -1329,7 +1326,7 @@ mod tests {
             project_id: "test-project".to_string(),
         };
         let mut client = FcmClient::mock(config, false);
-        client.metrics = Some(metrics.clone());
+        client.metrics = metrics.clone();
 
         let response = Client::new()
             .post(format!(
@@ -1388,7 +1385,7 @@ mod tests {
             project_id: "test-project".to_string(),
         };
         let mut client = FcmClient::mock(config, true);
-        client.metrics = Some(metrics.clone());
+        client.metrics = metrics.clone();
         client.test_fcm_api_base_url = Some(mock_server.uri());
         client
             .seed_token("cached", SystemTime::now() + Duration::from_secs(3600))
@@ -2688,7 +2685,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
             http_client: http_client.clone(),
             service_account: Some(sa),
             encoding_key: Some(encoding_key),
-            metrics: None,
+            metrics: Metrics::disabled(),
             test_oauth_token_url: None,
         });
 
@@ -2696,7 +2693,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
             config,
             http_client,
             token_cache,
-            metrics: None,
+            metrics: Metrics::disabled(),
             test_fcm_api_base_url: None,
         }
     }
@@ -2786,7 +2783,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
                 .expect("http client"),
             service_account: Some(sa),
             encoding_key: Some(encoding_key),
-            metrics: None,
+            metrics: Metrics::disabled(),
             test_oauth_token_url: None,
         }
     }

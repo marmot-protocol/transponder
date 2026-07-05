@@ -17,9 +17,8 @@
 //! request serialization.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -63,72 +62,11 @@ const MAX_LIVE_SEND_TASKS: usize = MAX_CONCURRENT_PUSHES * LIVE_TASK_MULTIPLIER;
 /// new notification batches are rejected to protect against DoS attacks.
 const MAX_PENDING_QUEUE_SIZE: usize = 10_000;
 
-/// Number of consecutive hard delivery failures after which a provider is
-/// reported as not delivering (see [`DeliveryHealth`]).
-///
-/// "Hard" failures are outcomes indicating the provider itself is refusing or
-/// failing requests: permanent send errors (which include authentication
-/// rejections such as a revoked APNs signing key or an expired FCM service
-/// account) and exhausted retry budgets. Invalid device tokens do NOT count —
-/// a definitive invalid-token verdict proves the provider authenticated and
-/// processed the request. The threshold trades detection speed against
-/// flapping: five hard failures in a row with no intervening success is a
-/// sustained outage signal, not an isolated transient blip.
-pub const DELIVERY_FAILURE_STREAK_THRESHOLD: u32 = 5;
+mod health;
+mod inflight;
 
-/// Passive per-provider delivery-health signal derived from real send
-/// outcomes.
-///
-/// Tracks, for each push provider, the current streak of *consecutive* hard
-/// send failures. The streak grows on permanent errors and exhausted retries,
-/// and resets to zero whenever the provider demonstrably processes a request
-/// (successful send or a definitive invalid-token verdict). The readiness
-/// endpoint uses [`DeliveryHealth::is_delivering`] to gate `/ready` on live
-/// delivery capability instead of static configuration alone.
-///
-/// The signal is passive: it observes outcomes of real traffic and never
-/// probes the providers. If push traffic stops entirely, the last observed
-/// state is retained until the next send.
-#[derive(Debug, Default)]
-pub struct DeliveryHealth {
-    apns_hard_failure_streak: AtomicU32,
-    fcm_hard_failure_streak: AtomicU32,
-}
-
-impl DeliveryHealth {
-    fn streak(&self, platform: Platform) -> &AtomicU32 {
-        match platform {
-            Platform::Apns => &self.apns_hard_failure_streak,
-            Platform::Fcm => &self.fcm_hard_failure_streak,
-        }
-    }
-
-    /// Record that the provider processed a request (successful send, or a
-    /// definitive invalid-token verdict), ending any hard-failure streak.
-    pub(crate) fn record_processed(&self, platform: Platform) {
-        self.streak(platform).store(0, Ordering::SeqCst);
-    }
-
-    /// Record a hard send failure (permanent error or exhausted retries).
-    ///
-    /// Saturates instead of wrapping so an arbitrarily long outage can never
-    /// roll the streak back over to "delivering".
-    pub(crate) fn record_hard_failure(&self, platform: Platform) {
-        let _ = self
-            .streak(platform)
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |streak| {
-                Some(streak.saturating_add(1))
-            });
-    }
-
-    /// Whether the provider is currently considered to be delivering: its
-    /// consecutive hard-failure streak is below
-    /// [`DELIVERY_FAILURE_STREAK_THRESHOLD`].
-    #[must_use]
-    pub fn is_delivering(&self, platform: Platform) -> bool {
-        self.streak(platform).load(Ordering::SeqCst) < DELIVERY_FAILURE_STREAK_THRESHOLD
-    }
-}
+pub use health::{DELIVERY_FAILURE_STREAK_THRESHOLD, DeliveryHealth};
+pub(crate) use inflight::InFlightTracker;
 
 /// Metrics/logging label for a push platform.
 fn platform_label(platform: Platform) -> &'static str {
@@ -139,93 +77,17 @@ fn platform_label(platform: Platform) -> &'static str {
 }
 
 /// Internal message for the push queue.
-///
-/// # Security
-///
-/// The token field is wrapped in `Zeroizing<String>` while queued and is moved
-/// intact into the provider client when the message is sent.
 enum PushMessage {
-    /// Send a notification to the given platform with the given token.
     Send {
         platform: Platform,
         token: Zeroizing<String>,
     },
-    /// Shutdown signal for the dispatcher task.
     Shutdown,
 }
 
 struct QueuedPushMessage {
     platform: Platform,
     token: Zeroizing<String>,
-}
-
-/// Tracks the number of spawned send tasks that have not yet finished, so that
-/// graceful shutdown can wait for them to complete.
-///
-/// This is deliberately decoupled from the concurrency [`Semaphore`]: a send
-/// task that is in a retry backoff sleep releases its concurrency permit (see
-/// [`crate::push::retry::BackoffPermit`]) so the slot can be reused, but the
-/// task is still alive and may re-acquire a permit and send again. Counting
-/// permits is therefore *not* a sound proof that all send tasks have finished.
-/// This tracker counts task lifetimes end-to-end instead.
-struct InFlightTracker {
-    count: AtomicUsize,
-    idle: Notify,
-}
-
-impl InFlightTracker {
-    fn new() -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-            idle: Notify::new(),
-        }
-    }
-
-    /// Register a newly spawned send task. The returned guard decrements the
-    /// in-flight count when dropped (i.e. when the send task finishes) and
-    /// wakes any shutdown waiter once the count reaches zero.
-    fn enter(self: &Arc<Self>) -> InFlightGuard {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        InFlightGuard {
-            tracker: self.clone(),
-        }
-    }
-
-    /// Wait until no send tasks are in flight.
-    ///
-    /// Uses the register-before-check pattern so a task that finishes between
-    /// the count load and observing the notification cannot be missed: the
-    /// `Notified` future is *enabled* (waiter registered) before the count is
-    /// read. `notify_waiters()` does not store a permit, so the waiter must be
-    /// registered first; `Notified::enable()` registers it eagerly without
-    /// awaiting, which closes the lost-wakeup window.
-    async fn wait_idle(&self) {
-        loop {
-            let notified = self.idle.notified();
-            tokio::pin!(notified);
-            // Register this waiter before reading the count.
-            notified.as_mut().enable();
-            if self.count.load(Ordering::SeqCst) == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-/// RAII guard returned by [`InFlightTracker::enter`]; decrements the in-flight
-/// count and signals idle when the last in-flight task finishes.
-struct InFlightGuard {
-    tracker: Arc<InFlightTracker>,
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if self.tracker.count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            // Transitioned to zero in-flight tasks; wake any shutdown waiter.
-            self.tracker.idle.notify_waiters();
-        }
-    }
 }
 
 /// Cloneable shared state handed to the queue-draining dispatcher loop and, in
@@ -242,7 +104,7 @@ struct DispatchWorkerContext {
     inflight: Arc<InFlightTracker>,
     /// Passive per-provider delivery-health signal (see [`DeliveryHealth`]).
     delivery_health: Arc<DeliveryHealth>,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 /// Push notification dispatcher.
@@ -265,7 +127,7 @@ pub struct PushDispatcher {
     dispatcher_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     inflight: Arc<InFlightTracker>,
     delivery_health: Arc<DeliveryHealth>,
-    metrics: Option<Metrics>,
+    metrics: Metrics,
 }
 
 impl PushDispatcher {
@@ -274,7 +136,7 @@ impl PushDispatcher {
     /// This spawns a dispatcher task that processes the bounded queue of notifications.
     #[allow(dead_code)]
     pub fn new(apns_client: Option<ApnsClient>, fcm_client: Option<FcmClient>) -> Self {
-        Self::with_metrics(apns_client, fcm_client, None)
+        Self::with_metrics(apns_client, fcm_client, Metrics::disabled())
     }
 
     /// Create a new push dispatcher with metrics.
@@ -283,7 +145,7 @@ impl PushDispatcher {
     pub fn with_metrics(
         apns_client: Option<ApnsClient>,
         fcm_client: Option<FcmClient>,
-        metrics: Option<Metrics>,
+        metrics: Metrics,
     ) -> Self {
         let apns_client = apns_client.map(Arc::new);
         let fcm_client = fcm_client.map(Arc::new);
@@ -296,12 +158,10 @@ impl PushDispatcher {
         let delivery_health = Arc::new(DeliveryHealth::default());
 
         // Initialize push capacity metrics
-        if let Some(ref m) = metrics {
-            m.set_push_queue_size(0);
-            m.set_push_queue_capacity(MAX_PENDING_QUEUE_SIZE);
-            m.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
-            m.set_push_concurrency_limit(MAX_CONCURRENT_PUSHES);
-        }
+        metrics.set_push_queue_size(0);
+        metrics.set_push_queue_capacity(MAX_PENDING_QUEUE_SIZE);
+        metrics.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
+        metrics.set_push_concurrency_limit(MAX_CONCURRENT_PUSHES);
 
         // Spawn the queue dispatcher task.
         let worker_context = DispatchWorkerContext {
@@ -332,10 +192,8 @@ impl PushDispatcher {
         }
     }
 
-    fn update_queue_size_metric(metrics: &Option<Metrics>, queue_depth: &AtomicUsize) {
-        if let Some(metrics) = metrics {
-            metrics.set_push_queue_size(queue_depth.load(Ordering::SeqCst));
-        }
+    fn update_queue_size_metric(metrics: &Metrics, queue_depth: &AtomicUsize) {
+        metrics.set_push_queue_size(queue_depth.load(Ordering::SeqCst));
     }
 
     fn increment_queue_depth(queue_depth: &AtomicUsize, count: usize) {
@@ -348,15 +206,13 @@ impl PushDispatcher {
         });
     }
 
-    fn update_semaphore_available_metric(metrics: &Option<Metrics>, semaphore: &Semaphore) {
-        if let Some(metrics) = metrics {
-            metrics.set_push_semaphore_available(semaphore.available_permits());
-        }
+    fn update_semaphore_available_metric(metrics: &Metrics, semaphore: &Semaphore) {
+        metrics.set_push_semaphore_available(semaphore.available_permits());
     }
 
     async fn acquire_push_permit(
         semaphore: Arc<Semaphore>,
-        metrics: &Option<Metrics>,
+        metrics: &Metrics,
     ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
         let permit = semaphore.clone().acquire_owned().await?;
         Self::update_semaphore_available_metric(metrics, &semaphore);
@@ -367,7 +223,7 @@ impl PushDispatcher {
         service_name: &str,
         platform: Platform,
         outcome: PushSendOutcome,
-        metrics: &Option<Metrics>,
+        metrics: &Metrics,
         delivery_health: &DeliveryHealth,
     ) {
         let platform_str = platform_label(platform);
@@ -375,9 +231,7 @@ impl PushDispatcher {
             PushSendOutcome::Sent => {
                 delivery_health.record_processed(platform);
                 trace!(service = service_name, "push notification sent");
-                if let Some(m) = metrics {
-                    m.record_push_success(platform_str);
-                }
+                metrics.record_push_success(platform_str);
             }
             PushSendOutcome::InvalidToken => {
                 // A definitive invalid-token verdict proves the provider
@@ -388,9 +242,7 @@ impl PushDispatcher {
                     service = service_name,
                     "push notification failed (invalid token)"
                 );
-                if let Some(m) = metrics {
-                    m.record_push_failed(platform_str, "invalid_token");
-                }
+                metrics.record_push_failed(platform_str, "invalid_token");
             }
             PushSendOutcome::RetriesExhausted => {
                 delivery_health.record_hard_failure(platform);
@@ -398,9 +250,7 @@ impl PushDispatcher {
                     service = service_name,
                     "push notification failed (retries exhausted)"
                 );
-                if let Some(m) = metrics {
-                    m.record_push_failed(platform_str, "retries_exhausted");
-                }
+                metrics.record_push_failed(platform_str, "retries_exhausted");
             }
         }
     }
@@ -410,7 +260,7 @@ impl PushDispatcher {
         token: Zeroizing<String>,
         apns_client: Option<Arc<ApnsClient>>,
         fcm_client: Option<Arc<FcmClient>>,
-        metrics: Option<Metrics>,
+        metrics: Metrics,
         delivery_health: &DeliveryHealth,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) {
@@ -439,9 +289,7 @@ impl PushDispatcher {
                             // path already strips it, but redact again here so
                             // this log sink is safe regardless.
                             debug!(error = %e.redact_transport_url(), "APNs send error");
-                            if let Some(ref m) = metrics {
-                                m.record_push_failed(platform_str, "error");
-                            }
+                            metrics.record_push_failed(platform_str, "error");
                         }
                     }
                 }
@@ -467,9 +315,7 @@ impl PushDispatcher {
                             // logging (#172). FCM's URL carries no token, but
                             // keeping the redaction uniform is defense-in-depth.
                             debug!(error = %e.redact_transport_url(), "FCM send error");
-                            if let Some(ref m) = metrics {
-                                m.record_push_failed(platform_str, "error");
-                            }
+                            metrics.record_push_failed(platform_str, "error");
                         }
                     }
                 }
@@ -643,9 +489,9 @@ impl PushDispatcher {
         // Check shutdown after platform/token filtering so post-shutdown requests
         // always fail while the rejection metric only counts admissible messages.
         if self.shutting_down.load(Ordering::SeqCst) {
-            if let Some(ref m) = self.metrics {
-                m.record_push_queue_rejected(message_count as u64);
-            }
+            self.metrics
+                .record_push_queue_rejected(message_count as u64);
+
             debug!("Dispatcher shutting down, ignoring dispatch request");
             return Err(Error::Dispatch("Dispatcher is shutting down".to_string()));
         }
@@ -659,9 +505,9 @@ impl PushDispatcher {
                 .try_reserve_many(message_count)
                 .map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => {
-                        if let Some(ref m) = self.metrics {
-                            m.record_push_queue_rejected(message_count as u64);
-                        }
+                        self.metrics
+                            .record_push_queue_rejected(message_count as u64);
+
                         warn!(
                             requested = message_count,
                             available = self.sender.capacity(),
@@ -672,9 +518,9 @@ impl PushDispatcher {
                         ))
                     }
                     mpsc::error::TrySendError::Closed(_) => {
-                        if let Some(ref m) = self.metrics {
-                            m.record_push_queue_rejected(message_count as u64);
-                        }
+                        self.metrics
+                            .record_push_queue_rejected(message_count as u64);
+
                         warn!("Push queue closed, rejecting notification batch");
                         Error::Dispatch("Push queue closed".to_string())
                     }
@@ -703,9 +549,7 @@ impl PushDispatcher {
                 token: message.token,
             });
 
-            if let Some(ref m) = self.metrics {
-                m.record_push_dispatched(platform_str);
-            }
+            self.metrics.record_push_dispatched(platform_str);
         }
 
         Ok(message_count)
@@ -837,10 +681,9 @@ impl PushDispatcher {
         self.inflight.wait_idle().await;
 
         self.queue_depth.store(0, Ordering::SeqCst);
-        if let Some(ref m) = self.metrics {
-            m.set_push_queue_size(0);
-            m.set_push_semaphore_available(self.semaphore.available_permits());
-        }
+        self.metrics.set_push_queue_size(0);
+        self.metrics
+            .set_push_semaphore_available(self.semaphore.available_permits());
 
         debug!("All queued push notifications drained");
     }
@@ -937,7 +780,7 @@ mod tests {
             service_account_path: String::new(),
             project_id: "test-project".to_string(),
         };
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
 
         let delivery_health = DeliveryHealth::default();
 
@@ -946,7 +789,7 @@ mod tests {
             Zeroizing::new("".to_string()),
             None,
             Some(Arc::new(FcmClient::mock(fcm_config, true))),
-            Some(metrics.clone()),
+            metrics.clone(),
             &delivery_health,
             None,
         )
@@ -960,29 +803,29 @@ mod tests {
 
     #[test]
     fn test_send_outcome_metrics_distinguish_invalid_token_and_retries_exhausted() {
-        let metrics = crate::metrics::Metrics::default();
-        let metrics_opt = Some(metrics.clone());
+        let metrics = crate::metrics::Metrics::new().unwrap();
+        let metrics = metrics.clone();
         let delivery_health = DeliveryHealth::default();
 
         PushDispatcher::record_send_outcome(
             "APNs",
             Platform::Apns,
             PushSendOutcome::InvalidToken,
-            &metrics_opt,
+            &metrics,
             &delivery_health,
         );
         PushDispatcher::record_send_outcome(
             "APNs",
             Platform::Apns,
             PushSendOutcome::RetriesExhausted,
-            &metrics_opt,
+            &metrics,
             &delivery_health,
         );
         PushDispatcher::record_send_outcome(
             "FCM",
             Platform::Fcm,
             PushSendOutcome::Sent,
-            &metrics_opt,
+            &metrics,
             &delivery_health,
         );
 
@@ -1046,7 +889,7 @@ mod tests {
 
     #[test]
     fn record_send_outcome_updates_delivery_health() {
-        let metrics_opt = None;
+        let metrics = Metrics::disabled();
         let delivery_health = DeliveryHealth::default();
 
         for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
@@ -1054,7 +897,7 @@ mod tests {
                 "APNs",
                 Platform::Apns,
                 PushSendOutcome::RetriesExhausted,
-                &metrics_opt,
+                &metrics,
                 &delivery_health,
             );
         }
@@ -1069,7 +912,7 @@ mod tests {
             "APNs",
             Platform::Apns,
             PushSendOutcome::InvalidToken,
-            &metrics_opt,
+            &metrics,
             &delivery_health,
         );
         assert!(delivery_health.is_delivering(Platform::Apns));
@@ -1323,12 +1166,9 @@ mod tests {
         };
         let fcm_client = FcmClient::mock(fcm_config, true);
 
-        let metrics = Metrics::default();
-        let dispatcher = PushDispatcher::with_metrics(
-            Some(apns_client),
-            Some(fcm_client),
-            Some(metrics.clone()),
-        );
+        let metrics = Metrics::new().unwrap();
+        let dispatcher =
+            PushDispatcher::with_metrics(Some(apns_client), Some(fcm_client), metrics.clone());
 
         // Dispatch both APNs and FCM payloads
         let payloads = vec![
@@ -1389,11 +1229,11 @@ mod tests {
             payload_mode: Default::default(),
         };
 
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         let dispatcher = PushDispatcher::with_metrics(
             Some(ApnsClient::mock(apns_config, true)),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         );
 
         let permits = dispatcher
@@ -1535,8 +1375,8 @@ mod tests {
     async fn test_capacity_metrics_initialized() {
         use crate::metrics::Metrics;
 
-        let metrics = Metrics::default();
-        let _dispatcher = PushDispatcher::with_metrics(None, None, Some(metrics.clone()));
+        let metrics = Metrics::new().unwrap();
+        let _dispatcher = PushDispatcher::with_metrics(None, None, metrics.clone());
 
         assert_eq!(queue_size_metric_value(&metrics), 0);
         assert_eq!(
@@ -1557,13 +1397,13 @@ mod tests {
     async fn test_semaphore_available_metric_updates_on_permit_acquire() {
         use crate::metrics::Metrics;
 
-        let metrics = Metrics::default();
-        let metrics_opt = Some(metrics.clone());
+        let metrics = Metrics::new().unwrap();
+        let metrics = metrics.clone();
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PUSHES));
 
         metrics.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
 
-        let permit = PushDispatcher::acquire_push_permit(semaphore.clone(), &metrics_opt)
+        let permit = PushDispatcher::acquire_push_permit(semaphore.clone(), &metrics)
             .await
             .expect("permit should be acquired");
 
@@ -1573,7 +1413,7 @@ mod tests {
         );
 
         drop(permit);
-        PushDispatcher::update_semaphore_available_metric(&metrics_opt, &semaphore);
+        PushDispatcher::update_semaphore_available_metric(&metrics, &semaphore);
 
         assert_eq!(
             gauge_metric_value(&metrics, "transponder_push_semaphore_available"),
@@ -1587,7 +1427,7 @@ mod tests {
         use crate::metrics::Metrics;
         use crate::push::ApnsClient;
 
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         let dispatcher = PushDispatcher::with_metrics(
             Some(ApnsClient::mock(
                 ApnsConfig {
@@ -1602,7 +1442,7 @@ mod tests {
                 true,
             )),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         );
 
         dispatcher.wait_for_completion().await;
@@ -1626,7 +1466,7 @@ mod tests {
         use crate::metrics::Metrics;
         use crate::push::ApnsClient;
 
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         let dispatcher = PushDispatcher::with_metrics(
             Some(ApnsClient::mock(
                 ApnsConfig {
@@ -1641,7 +1481,7 @@ mod tests {
                 true,
             )),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         );
 
         dispatcher.wait_for_completion().await;
@@ -1832,9 +1672,8 @@ mod tests {
             payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
-        let metrics = Metrics::default();
-        let dispatcher =
-            PushDispatcher::with_metrics(Some(apns_client), None, Some(metrics.clone()));
+        let metrics = Metrics::new().unwrap();
+        let dispatcher = PushDispatcher::with_metrics(Some(apns_client), None, metrics.clone());
 
         let payloads = repeated_apns_payloads(MAX_PENDING_QUEUE_SIZE + 1);
 
@@ -1889,11 +1728,11 @@ mod tests {
             payload_mode: Default::default(),
         };
 
-        let metrics = Metrics::default();
+        let metrics = Metrics::new().unwrap();
         let dispatcher = PushDispatcher::with_metrics(
             Some(ApnsClient::mock(apns_config, true)),
             None,
-            Some(metrics.clone()),
+            metrics.clone(),
         );
 
         // Many small batches maximize the number of opportunities for a worker
@@ -1930,7 +1769,7 @@ mod tests {
 
         // Hold a guard, then assert wait_idle does NOT return until it is dropped.
         let guard = tracker.enter();
-        assert_eq!(tracker.count.load(Ordering::SeqCst), 1);
+        assert_eq!(tracker.in_flight_count(), 1);
 
         let waiter_tracker = tracker.clone();
         let waiter = tokio::spawn(async move { waiter_tracker.wait_idle().await });
@@ -1948,7 +1787,7 @@ mod tests {
             .expect("wait_idle should complete after the last guard is dropped")
             .expect("waiter task should not panic");
 
-        assert_eq!(tracker.count.load(Ordering::SeqCst), 0);
+        assert_eq!(tracker.in_flight_count(), 0);
     }
 
     /// Regression for transponder#65: graceful shutdown must wait for send tasks
@@ -2007,7 +1846,7 @@ mod tests {
                     }
                 },
                 Some(&mut backoff_permit),
-                None,
+                Metrics::disabled(),
             )
             .await;
             assert!(matches!(result, Ok(PushSendOutcome::Sent)));

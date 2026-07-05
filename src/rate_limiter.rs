@@ -14,31 +14,9 @@ use lru::LruCache;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-/// Default maximum cache size (100,000 entries).
-pub const DEFAULT_MAX_SIZE: usize = 100_000;
-
-/// Default rate limit per minute (240 = 4 per second).
-pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 240;
-
-/// Default rate limit per hour.
-pub const DEFAULT_RATE_LIMIT_PER_HOUR: u32 = 5000;
-
-/// Default global pre-unwrap admission limit per minute.
-///
-/// This caps how many gift wraps the server is willing to unwrap (ECDH + seal
-/// decryption) per minute across all senders. The server pubkey is public, so
-/// anyone can flood it with valid kind-1059 gift wraps; this budget sheds that
-/// traffic before spending asymmetric-crypto cycles. 600/minute (10/second) is
-/// far above any legitimate single-server load while still bounding attacker
-/// CPU cost.
-pub const DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE: u32 = 600;
-
-/// Default global pre-unwrap admission limit per hour.
-///
-/// Companion to [`DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE`]; bounds sustained
-/// flooding over a longer window.
-pub const DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR: u32 = 30_000;
-
+pub use crate::defaults::{
+    DEFAULT_MAX_SIZE, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
+};
 /// Maximum entries to scan per cleanup cycle.
 const CLEANUP_BATCH_SIZE: usize = 1000;
 
@@ -142,7 +120,7 @@ impl RateLimitCheck {
     /// Returns a sampled total-entry count for opportunistic gauge updates.
     ///
     /// `Some(len)` on the sampled fraction of admissions (see
-    /// [`GAUGE_SAMPLE_INTERVAL`]); `None` otherwise. Lets the caller keep the
+    /// `GAUGE_SAMPLE_INTERVAL`); `None` otherwise. Lets the caller keep the
     /// `transponder_rate_limit_cache_size` gauge fresh as the cache grows
     /// toward capacity without a metric write per check.
     #[must_use]
@@ -577,6 +555,12 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         self.total_len().await
     }
 
+    /// Returns whether the rate limiter has no entries.
+    #[cfg(test)]
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
     /// Checks the current count without incrementing.
     #[cfg(test)]
     pub async fn peek_counts(&self, key: &K) -> Option<(u32, u32)> {
@@ -652,8 +636,21 @@ mod tests {
 
         limiter.rollback_increment(&1u64, reservation).await;
 
-        assert_eq!(limiter.len().await, 0);
+        assert!(limiter.is_empty().await);
         assert!(limiter.check_and_increment(&1u64).await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_is_empty_reports_false_with_entries() {
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: entries(100),
+        });
+
+        assert!(limiter.is_empty().await);
+        limiter.check_and_increment(&1u64).await;
+        assert!(!limiter.is_empty().await);
     }
 
     #[tokio::test]
