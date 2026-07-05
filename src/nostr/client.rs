@@ -90,31 +90,39 @@ impl AdmitPolicy for ReconnectAttemptLimiter {
 }
 
 fn spawn_reconnect_attempt_monitor(monitor: Monitor, limiter: ReconnectAttemptLimiter) {
-    let mut notifications = monitor.subscribe();
-    std::mem::drop(tokio::spawn(async move {
-        loop {
-            match notifications.recv().await {
-                Ok(MonitorNotification::StatusChanged { relay_url, status }) => match status {
-                    NostrRelayStatus::Connected => limiter.reset(&relay_url),
-                    NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
-                        limiter.remove(&relay_url);
-                    }
-                    NostrRelayStatus::Initialized
-                    | NostrRelayStatus::Pending
-                    | NostrRelayStatus::Connecting
-                    | NostrRelayStatus::Disconnected
-                    | NostrRelayStatus::Sleeping => {}
-                },
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(
-                        skipped,
-                        "Relay reconnect attempt monitor lagged; attempt counters may reset late"
-                    );
+    let notifications = monitor.subscribe();
+    std::mem::drop(tokio::spawn(run_reconnect_attempt_monitor(
+        notifications,
+        limiter,
+    )));
+}
+
+async fn run_reconnect_attempt_monitor(
+    mut notifications: broadcast::Receiver<MonitorNotification>,
+    limiter: ReconnectAttemptLimiter,
+) {
+    loop {
+        match notifications.recv().await {
+            Ok(MonitorNotification::StatusChanged { relay_url, status }) => match status {
+                NostrRelayStatus::Connected => limiter.reset(&relay_url),
+                NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
+                    limiter.remove(&relay_url);
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                NostrRelayStatus::Initialized
+                | NostrRelayStatus::Pending
+                | NostrRelayStatus::Connecting
+                | NostrRelayStatus::Disconnected
+                | NostrRelayStatus::Sleeping => {}
+            },
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "Relay reconnect attempt monitor lagged; attempt counters may reset late"
+                );
             }
+            Err(broadcast::error::RecvError::Closed) => break,
         }
-    }));
+    }
 }
 
 fn relay_options_for_config(config: &RelayConfig, relay_url: &str) -> RelayOptions {
@@ -700,6 +708,118 @@ mod tests {
             limiter.admit_relay_connection(&relay_url),
             AdmitStatus::Success,
             "successful relay connection should reset the reconnect-attempt counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admit_policy_rejects_after_exhausting_attempts() {
+        let limiter = ReconnectAttemptLimiter::new(0);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        // Exercise the AdmitPolicy trait entry point the relay pool calls.
+        let first = AdmitPolicy::admit_connection(&limiter, &relay_url)
+            .await
+            .unwrap();
+        assert_eq!(first, AdmitStatus::Success);
+
+        let second = AdmitPolicy::admit_connection(&limiter, &relay_url)
+            .await
+            .unwrap();
+        assert!(
+            matches!(second, AdmitStatus::Rejected { .. }),
+            "attempt beyond the initial connection must be rejected at max_reconnect_attempts = 0"
+        );
+    }
+
+    #[test]
+    fn test_reconnect_attempt_limiter_remove_clears_tracked_state() {
+        let limiter = ReconnectAttemptLimiter::new(0);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        assert_eq!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Success
+        );
+        assert!(matches!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Rejected { .. }
+        ));
+
+        limiter.remove(&relay_url);
+        assert!(
+            !limiter.attempts_since_connection().contains_key(&relay_url),
+            "remove must drop the relay's entry so the map cannot grow unbounded"
+        );
+        assert_eq!(
+            limiter.admit_relay_connection(&relay_url),
+            AdmitStatus::Success,
+            "a removed relay starts over with a fresh attempt budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_attempt_monitor_resets_and_removes_counters() {
+        let limiter = ReconnectAttemptLimiter::new(0);
+        let connected_url = RelayUrl::parse("wss://connected.example.com").unwrap();
+        let terminated_url = RelayUrl::parse("wss://terminated.example.com").unwrap();
+
+        // Exhaust both relays' budgets so the monitor's effect is observable.
+        for url in [&connected_url, &terminated_url] {
+            assert_eq!(limiter.admit_relay_connection(url), AdmitStatus::Success);
+            assert!(matches!(
+                limiter.admit_relay_connection(url),
+                AdmitStatus::Rejected { .. }
+            ));
+        }
+
+        let (sender, receiver) = broadcast::channel(8);
+        let monitor_task = tokio::spawn(run_reconnect_attempt_monitor(receiver, limiter.clone()));
+
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: connected_url.clone(),
+                status: NostrRelayStatus::Connected,
+            })
+            .unwrap();
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: terminated_url.clone(),
+                status: NostrRelayStatus::Terminated,
+            })
+            .unwrap();
+        // Ignored transitions must not disturb the counters.
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: connected_url.clone(),
+                status: NostrRelayStatus::Connecting,
+            })
+            .unwrap();
+        drop(sender);
+
+        // Channel closed -> the monitor loop exits; all sends were processed.
+        tokio::time::timeout(Duration::from_secs(5), monitor_task)
+            .await
+            .expect("monitor task must exit when the channel closes")
+            .unwrap();
+
+        assert_eq!(
+            limiter.attempts_since_connection().get(&connected_url),
+            Some(&0),
+            "Connected must reset the counter to zero"
+        );
+        assert!(
+            !limiter
+                .attempts_since_connection()
+                .contains_key(&terminated_url),
+            "Terminated must remove the relay's entry"
+        );
+        assert_eq!(
+            limiter.admit_relay_connection(&connected_url),
+            AdmitStatus::Success
+        );
+        assert_eq!(
+            limiter.admit_relay_connection(&terminated_url),
+            AdmitStatus::Success
         );
     }
 
