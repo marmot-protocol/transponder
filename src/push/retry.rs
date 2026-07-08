@@ -304,12 +304,14 @@ fn retry_sleep_base(
         // Honor the provider hint, but clamp it: floored so a tiny value
         // cannot produce hot-loop retries, and capped so an untrusted header
         // cannot pin the task (and its decrypted token) arbitrarily long
-        // across the logical push (issue #244).
+        // across the logical push (issue #244). The actual sleep still uses at
+        // least the current local fallback backoff, so persistently tiny
+        // non-zero hints degrade with the exponential curve (issue #269).
         Some(server_delay) if retry_after_budget_remaining > Duration::ZERO => {
             let provider_base = server_delay
                 .clamp(MIN_RETRY_BACKOFF, MAX_RETRY_AFTER)
                 .min(retry_after_budget_remaining);
-            (provider_base, true, provider_base)
+            (provider_base.max(fallback), true, provider_base)
         }
         // Once provider-controlled delay budget is spent, continue with local
         // fallback backoff so the retry budget still behaves predictably.
@@ -644,14 +646,22 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_sleep_duration_floors_tiny_nonzero_retry_after_without_fallback() {
+    fn test_retry_sleep_duration_tiny_nonzero_retry_after_uses_fallback_backoff() {
         let sleep = retry_sleep_duration(Some(Duration::from_millis(1)), Duration::from_secs(60));
 
-        assert_duration_between(
-            sleep,
-            MIN_RETRY_BACKOFF,
-            MIN_RETRY_BACKOFF + max_retry_jitter(MIN_RETRY_BACKOFF),
+        assert_duration_between(sleep, MAX_BACKOFF, MAX_BACKOFF + MAX_RETRY_JITTER);
+    }
+
+    #[test]
+    fn test_tiny_retry_after_counts_only_provider_floor_against_budget() {
+        let sleep = retry_sleep_duration_with_budget(
+            Some(Duration::from_millis(1)),
+            Duration::from_secs(60),
+            MAX_RETRY_AFTER,
         );
+
+        assert_eq!(sleep.retry_after_budget_used, MIN_RETRY_BACKOFF);
+        assert_duration_between(sleep.duration, MAX_BACKOFF, MAX_BACKOFF + MAX_RETRY_JITTER);
     }
 
     #[test]
@@ -1064,7 +1074,7 @@ mod tests {
     async fn test_with_retry_uses_retry_after_header() {
         let config = RetryConfig {
             max_retries: 1,
-            initial_backoff: Duration::from_secs(100), // Long backoff that we won't use
+            initial_backoff: Duration::from_millis(1),
         };
 
         let start = std::time::Instant::now();
@@ -1081,7 +1091,7 @@ mod tests {
                     if attempts == 1 {
                         SendAttemptResult::Retriable {
                             status_code: 429,
-                            retry_after: Some(Duration::from_millis(10)), // Short retry-after
+                            retry_after: Some(Duration::from_millis(10)),
                         }
                     } else {
                         SendAttemptResult::Success(true)
@@ -1094,7 +1104,8 @@ mod tests {
         .await;
 
         let elapsed = start.elapsed();
-        // Should have used the short retry-after, not the long initial_backoff
+        // Should have honored the provider hint without falling into the
+        // default 100ms floor used for sub-floor Retry-After values.
         assert!(elapsed < Duration::from_secs(1));
     }
 
