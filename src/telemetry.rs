@@ -9,10 +9,14 @@
 //! mechanical redaction backstop in `scrub_event` (see [`crate::redaction`]).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sentry::integrations::tracing::EventFilter;
-use sentry::protocol::{Context as SentryContext, Value};
+use sentry::protocol::{
+    Breadcrumb, Context as SentryContext, Envelope, EnvelopeItem, ItemContainer, Log, Request,
+    Span, Transaction, Value,
+};
 use sentry::{Transport, TransportFactory, TransportOptions};
 use tracing::{Level, Subscriber};
 use tracing_subscriber::Layer;
@@ -70,11 +74,36 @@ struct GlitchtipTransportFactory;
 
 impl TransportFactory for GlitchtipTransportFactory {
     fn create_transport_with_options(&self, options: TransportOptions) -> Arc<dyn Transport> {
-        Arc::new(
-            sentry::transports::ReqwestHttpTransportOptions::from(options)
-                .with_client(glitchtip_http_client())
-                .build(),
-        )
+        let transport = sentry::transports::ReqwestHttpTransportOptions::from(options)
+            .with_client(glitchtip_http_client())
+            .build();
+        Arc::new(ScrubbingTransport::new(Arc::new(transport)))
+    }
+}
+
+/// Final outbound redaction guard for envelope item types that do not pass
+/// through `before_send`, such as performance transactions.
+struct ScrubbingTransport {
+    inner: Arc<dyn Transport>,
+}
+
+impl ScrubbingTransport {
+    fn new(inner: Arc<dyn Transport>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Transport for ScrubbingTransport {
+    fn send_envelope(&self, envelope: Envelope) {
+        self.inner.send_envelope(scrub_envelope(envelope));
+    }
+
+    fn flush(&self, timeout: Duration) -> bool {
+        self.inner.flush(timeout)
+    }
+
+    fn shutdown(&self, timeout: Duration) -> bool {
+        self.inner.shutdown(timeout)
     }
 }
 
@@ -163,7 +192,16 @@ fn is_first_party_target(target: &str) -> bool {
 fn scrub_event(
     mut event: sentry::protocol::Event<'static>,
 ) -> Option<sentry::protocol::Event<'static>> {
+    scrub_event_fields(&mut event);
+    Some(event)
+}
+
+fn scrub_event_fields(event: &mut sentry::protocol::Event<'static>) {
     event.server_name = None;
+
+    if let Some(transaction) = event.transaction.as_mut() {
+        redaction::redact_in_place(transaction);
+    }
 
     if let Some(message) = event.message.as_mut() {
         redaction::redact_in_place(message);
@@ -172,9 +210,7 @@ fn scrub_event(
     if let Some(logentry) = event.logentry.as_mut() {
         redaction::redact_in_place(&mut logentry.message);
         for param in &mut logentry.params {
-            if let sentry::protocol::Value::String(text) = param {
-                redaction::redact_in_place(text);
-            }
+            redact_value(param);
         }
     }
 
@@ -184,19 +220,134 @@ fn scrub_event(
         }
     }
 
-    for tag in event.tags.values_mut() {
-        redaction::redact_in_place(tag);
+    for breadcrumb in &mut event.breadcrumbs.values {
+        scrub_breadcrumb(breadcrumb);
     }
 
-    for context in event.contexts.values_mut() {
+    if let Some(request) = event.request.as_mut() {
+        scrub_request(request);
+    }
+
+    scrub_tags(&mut event.tags);
+    scrub_contexts(&mut event.contexts);
+    scrub_values(&mut event.extra);
+}
+
+fn scrub_envelope(envelope: Envelope) -> Envelope {
+    if envelope.items().next().is_none() {
+        return envelope;
+    }
+
+    let headers = envelope.headers().clone();
+    let mut scrubbed = Envelope::new().with_headers(headers);
+    for item in envelope.into_items() {
+        scrubbed.add_item(scrub_envelope_item(item));
+    }
+    scrubbed
+}
+
+fn scrub_envelope_item(item: EnvelopeItem) -> EnvelopeItem {
+    match item {
+        EnvelopeItem::Event(mut event) => {
+            scrub_event_fields(&mut event);
+            EnvelopeItem::Event(event)
+        }
+        EnvelopeItem::Transaction(mut transaction) => {
+            scrub_transaction(&mut transaction);
+            EnvelopeItem::Transaction(transaction)
+        }
+        EnvelopeItem::ItemContainer(ItemContainer::Logs(mut logs)) => {
+            for log in &mut logs {
+                scrub_log(log);
+            }
+            EnvelopeItem::ItemContainer(ItemContainer::Logs(logs))
+        }
+        other => other,
+    }
+}
+
+fn scrub_transaction(transaction: &mut Transaction<'static>) {
+    transaction.server_name = None;
+
+    if let Some(name) = transaction.name.as_mut() {
+        redaction::redact_in_place(name);
+    }
+
+    if let Some(request) = transaction.request.as_mut() {
+        scrub_request(request);
+    }
+
+    scrub_tags(&mut transaction.tags);
+    scrub_contexts(&mut transaction.contexts);
+    scrub_values(&mut transaction.extra);
+
+    for span in &mut transaction.spans {
+        scrub_span(span);
+    }
+}
+
+fn scrub_span(span: &mut Span) {
+    if let Some(op) = span.op.as_mut() {
+        redaction::redact_in_place(op);
+    }
+    if let Some(description) = span.description.as_mut() {
+        redaction::redact_in_place(description);
+    }
+
+    scrub_tags(&mut span.tags);
+    scrub_values(&mut span.data);
+}
+
+fn scrub_breadcrumb(breadcrumb: &mut Breadcrumb) {
+    redaction::redact_in_place(&mut breadcrumb.ty);
+    if let Some(category) = breadcrumb.category.as_mut() {
+        redaction::redact_in_place(category);
+    }
+    if let Some(message) = breadcrumb.message.as_mut() {
+        redaction::redact_in_place(message);
+    }
+
+    scrub_values(&mut breadcrumb.data);
+}
+
+fn scrub_log(log: &mut Log) {
+    redaction::redact_in_place(&mut log.body);
+    for attribute in log.attributes.values_mut() {
+        redact_value(&mut attribute.0);
+    }
+}
+
+fn scrub_request(request: &mut Request) {
+    if let Some(data) = request.data.as_mut() {
+        redaction::redact_in_place(data);
+    }
+    if let Some(query_string) = request.query_string.as_mut() {
+        redaction::redact_in_place(query_string);
+    }
+    if let Some(cookies) = request.cookies.as_mut() {
+        redaction::redact_in_place(cookies);
+    }
+
+    scrub_tags(&mut request.headers);
+    scrub_tags(&mut request.env);
+}
+
+fn scrub_tags(tags: &mut sentry::protocol::Map<String, String>) {
+    for value in tags.values_mut() {
+        redaction::redact_in_place(value);
+    }
+}
+
+fn scrub_contexts(contexts: &mut sentry::protocol::Map<String, SentryContext>) {
+    for context in contexts.values_mut() {
         redact_context(context);
     }
+}
 
-    for value in event.extra.values_mut() {
+fn scrub_values(values: &mut sentry::protocol::Map<String, Value>) {
+    for value in values.values_mut() {
         redact_value(value);
     }
-
-    Some(event)
 }
 
 fn redact_context(context: &mut SentryContext) {
@@ -352,8 +503,29 @@ mod tests {
                 params: vec![
                     sentry::protocol::Value::String("key nsec1qs0v6yz2mwqzzz9".into()),
                     sentry::protocol::Value::from(42),
+                    sentry::protocol::Value::Object({
+                        let mut fields = sentry::protocol::value::Map::new();
+                        fields.insert(
+                            "relays".to_string(),
+                            sentry::protocol::Value::Array(vec![sentry::protocol::Value::String(
+                                "wss://nestedrelay23456789.onion".into(),
+                            )]),
+                        );
+                        fields
+                    }),
                 ],
             }),
+            breadcrumbs: sentry::protocol::Values {
+                values: vec![sentry::protocol::Breadcrumb {
+                    message: Some("sent via wss://breadcrumb23456789.onion".into()),
+                    data: sentry::protocol::Map::from_iter([(
+                        "key".to_string(),
+                        sentry::protocol::Value::String("nsec1qqqqqqqqqqqqqqq".into()),
+                    )]),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
             exception: sentry::protocol::Values {
                 values: vec![sentry::protocol::Exception {
                     ty: "panic".into(),
@@ -376,6 +548,19 @@ mod tests {
         );
         // Non-string params pass through untouched.
         assert_eq!(logentry.params[1], sentry::protocol::Value::from(42));
+        assert_eq!(
+            logentry.params[2],
+            sentry::protocol::Value::Object({
+                let mut fields = sentry::protocol::value::Map::new();
+                fields.insert(
+                    "relays".to_string(),
+                    sentry::protocol::Value::Array(vec![sentry::protocol::Value::String(
+                        "wss://[REDACTED]".into(),
+                    )]),
+                );
+                fields
+            })
+        );
 
         let exception = &scrubbed.exception.values[0];
         let value = exception.value.as_deref().expect("the value is kept");
@@ -383,6 +568,16 @@ mod tests {
         assert!(!value.contains(&hex_token));
         assert!(value.contains("[REDACTED].onion"));
         assert!(value.contains("[REDACTED-HEX]"));
+
+        let breadcrumb = &scrubbed.breadcrumbs.values[0];
+        assert_eq!(
+            breadcrumb.message.as_deref(),
+            Some("sent via wss://[REDACTED]")
+        );
+        assert_eq!(
+            breadcrumb.data.get("key"),
+            Some(&sentry::protocol::Value::String("[REDACTED-NSEC]".into()))
+        );
     }
 
     #[test]
@@ -465,6 +660,99 @@ mod tests {
             &sentry::protocol::Value::String(
                 "https://api.push.apple.com/3/device/[REDACTED]".into()
             )
+        );
+    }
+
+    #[test]
+    fn scrub_envelope_redacts_transaction_and_span_payloads() {
+        let mut span = sentry::protocol::Span::new();
+        span.op = Some("connect wss://span-op23456789.onion".into());
+        span.description = Some("relay wss://span-description23456789.onion".into());
+        span.tags = sentry::protocol::Map::from_iter([(
+            "relay".to_string(),
+            "wss://span-tag23456789.onion".to_string(),
+        )]);
+        span.data = sentry::protocol::Map::from_iter([(
+            "nested".to_string(),
+            sentry::protocol::Value::Array(vec![sentry::protocol::Value::String(
+                "nsec1spansecret".into(),
+            )]),
+        )]);
+
+        let mut context_fields = sentry::protocol::Map::new();
+        context_fields.insert(
+            "relay".to_string(),
+            sentry::protocol::Value::String("wss://transaction-context23456789.onion".into()),
+        );
+
+        let transaction = sentry::protocol::Transaction {
+            name: Some("publish wss://transaction-name23456789.onion".into()),
+            tags: sentry::protocol::Map::from_iter([(
+                "relay".to_string(),
+                "wss://transaction-tag23456789.onion".to_string(),
+            )]),
+            extra: sentry::protocol::Map::from_iter([(
+                "request".to_string(),
+                sentry::protocol::Value::String(
+                    "https://api.push.apple.com/3/device/0a1b2c3d4e5f60718293a4b5c6d7e8f9".into(),
+                ),
+            )]),
+            spans: vec![span],
+            contexts: sentry::protocol::Map::from_iter([(
+                "Rust Tracing Fields".to_string(),
+                sentry::protocol::Context::Other(context_fields),
+            )]),
+            server_name: Some("internal-host-01".into()),
+            ..Default::default()
+        };
+
+        let scrubbed = scrub_envelope(transaction.into());
+        let mut items = scrubbed.into_items();
+        let Some(sentry::protocol::EnvelopeItem::Transaction(transaction)) = items.next() else {
+            panic!("the scrubbed envelope should retain the transaction item");
+        };
+        assert!(items.next().is_none());
+
+        assert!(transaction.server_name.is_none());
+        assert_eq!(
+            transaction.name.as_deref(),
+            Some("publish wss://[REDACTED]")
+        );
+        assert_eq!(
+            transaction.tags.get("relay"),
+            Some(&"wss://[REDACTED]".to_string())
+        );
+        assert_eq!(
+            transaction.extra.get("request"),
+            Some(&sentry::protocol::Value::String(
+                "https://api.push.apple.com/3/device/[REDACTED]".into()
+            ))
+        );
+
+        let sentry::protocol::Context::Other(fields) = transaction
+            .contexts
+            .get("Rust Tracing Fields")
+            .expect("the transaction context is kept")
+        else {
+            panic!("transaction context should stay in an Other context");
+        };
+        assert_eq!(
+            fields.get("relay"),
+            Some(&sentry::protocol::Value::String("wss://[REDACTED]".into()))
+        );
+
+        let span = &transaction.spans[0];
+        assert_eq!(span.op.as_deref(), Some("connect wss://[REDACTED]"));
+        assert_eq!(span.description.as_deref(), Some("relay wss://[REDACTED]"));
+        assert_eq!(
+            span.tags.get("relay"),
+            Some(&"wss://[REDACTED]".to_string())
+        );
+        assert_eq!(
+            span.data.get("nested"),
+            Some(&sentry::protocol::Value::Array(vec![
+                sentry::protocol::Value::String("[REDACTED-NSEC]".into())
+            ]))
         );
     }
 
