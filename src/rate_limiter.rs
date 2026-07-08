@@ -421,7 +421,6 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// - `ExceededCapacityLimit` if the cache is full and has no safe eviction
     ///   victim for the unknown key
     pub async fn check_and_increment(&self, key: &K) -> RateLimitCheck {
-        let mutated;
         let (result, admission_evicted) = {
             let mut entries = self.stripe_for(key).write().await;
             // Timestamp after acquiring the stripe lock so hits for one key
@@ -483,7 +482,6 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
             let hit_id = self.next_hit_id.fetch_add(1, Ordering::Relaxed);
             entry.minute_hits.push_back((now, hit_id));
             entry.hour_hits.push_back((now, hit_id));
-            mutated = true;
 
             (
                 RateLimitResult::Allowed(RateLimitReservation(hit_id)),
@@ -494,11 +492,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         // Opportunistically refresh the live size gauge outside the stripe lock
         // just taken. Only sampled admissions read the (cross-stripe) length so
         // the hot path stays cheap (#125).
-        let sampled_cache_len = if mutated {
-            self.sampled_total_len()
-        } else {
-            None
-        };
+        let sampled_cache_len = self.sampled_total_len();
 
         RateLimitCheck {
             result,
