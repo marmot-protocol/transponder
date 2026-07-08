@@ -596,7 +596,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
 }
 
 fn remove_hit(hits: &mut VecDeque<(Instant, u64)>, hit_id: u64) {
-    if let Some(pos) = hits.iter().position(|(_, id)| *id == hit_id) {
+    if let Some(pos) = hits.iter().rposition(|(_, id)| *id == hit_id) {
         hits.remove(pos);
     }
 }
@@ -695,6 +695,17 @@ mod tests {
         limiter.rollback_increment(&1u64, first).await;
 
         assert_eq!(limiter.peek_counts(&1u64).await, Some((1, 1)));
+    }
+
+    #[test]
+    fn test_remove_hit_prefers_recent_back_match() {
+        let now = Instant::now();
+        let mut hits = VecDeque::from([(now, 7), (now, 8), (now, 7)]);
+
+        remove_hit(&mut hits, 7);
+
+        let remaining: Vec<u64> = hits.iter().map(|(_, id)| *id).collect();
+        assert_eq!(remaining, vec![7, 8]);
     }
 
     #[tokio::test]
