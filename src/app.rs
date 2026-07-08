@@ -197,6 +197,27 @@ fn supervise_critical_task<E: std::fmt::Display>(
     }
 }
 
+/// Await a spawned critical task and trigger shutdown if it fails, panics, or
+/// is cancelled.
+async fn supervise_critical_task_handle<E: std::fmt::Display>(
+    task: &'static str,
+    handle: tokio::task::JoinHandle<std::result::Result<(), E>>,
+    shutdown_trigger: ShutdownTrigger,
+) {
+    match handle.await {
+        Ok(result) => supervise_critical_task(task, result, &shutdown_trigger),
+        Err(error) => {
+            error!(
+                task,
+                task_panic = error.is_panic(),
+                task_cancelled = error.is_cancelled(),
+                "Critical task join failed; triggering shutdown"
+            );
+            shutdown_trigger.trigger();
+        }
+    }
+}
+
 /// Drain relay notifications and process events with bounded concurrency.
 ///
 /// Each admitted event is processed in its own task spawned onto `event_tasks`,
@@ -483,10 +504,13 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
     // running with no external health signal.
     let health_shutdown = shutdown.subscribe();
     let health_trigger = shutdown.trigger_handle();
-    let health_handle = tokio::spawn(async move {
-        let result = health_server.serve(health_listener, health_shutdown).await;
-        supervise_critical_task("health server", result, &health_trigger);
-    });
+    let health_task =
+        tokio::spawn(async move { health_server.serve(health_listener, health_shutdown).await });
+    let health_handle = tokio::spawn(supervise_critical_task_handle(
+        "health server",
+        health_task,
+        health_trigger,
+    ));
 
     // Connect to relays, but bail out immediately if a shutdown signal (or an
     // internal trigger from a supervised task) arrives while we are still
@@ -539,7 +563,7 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
     let event_tasks = TaskTracker::new();
     let event_shutdown = shutdown.subscribe();
     let event_trigger = shutdown.trigger_handle();
-    let event_handle = {
+    let event_task = {
         let processor = event_processor.clone();
         let event_tasks = event_tasks.clone();
         let event_metrics = metrics.clone();
@@ -553,13 +577,14 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
                 event_metrics,
             )
             .await;
-            supervise_critical_task(
-                "event loop",
-                event_loop_exit_to_supervision_result(exit),
-                &event_trigger,
-            );
+            event_loop_exit_to_supervision_result(exit)
         })
     };
+    let event_handle = tokio::spawn(supervise_critical_task_handle(
+        "event loop",
+        event_task,
+        event_trigger,
+    ));
 
     // Subscribe to events
     relay_client
@@ -1111,6 +1136,21 @@ mod tests {
         supervise_critical_task("test task", Ok::<(), &str>(()), &handler.trigger_handle());
 
         assert!(!*receiver.borrow());
+    }
+
+    #[tokio::test]
+    async fn supervise_critical_task_handle_triggers_shutdown_on_panic() {
+        let handler = ShutdownHandler::new();
+        let receiver = handler.subscribe();
+        let task = tokio::spawn(async {
+            panic!("simulated critical task panic");
+            #[allow(unreachable_code)]
+            Ok::<(), &str>(())
+        });
+
+        supervise_critical_task_handle("test task", task, handler.trigger_handle()).await;
+
+        assert!(*receiver.borrow());
     }
 
     #[tokio::test]
