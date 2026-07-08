@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sentry::integrations::tracing::EventFilter;
+use sentry::protocol::{Context as SentryContext, Value};
 use sentry::{Transport, TransportFactory, TransportOptions};
 use tracing::{Level, Subscriber};
 use tracing_subscriber::Layer;
@@ -151,8 +152,8 @@ fn is_first_party_target(target: &str) -> bool {
 /// This runs for both tracing-captured errors and panic events, so it is the one
 /// choke point that sees everything leaving the process. It drops the hostname
 /// (which can reveal deployment topology) and mechanically redacts secret-shaped
-/// substrings (see [`crate::redaction`]) from the fields panics populate: the
-/// message, the log-entry message and string params, and each exception value.
+/// substrings (see [`crate::redaction`]) from the event message, log-entry
+/// fields, exception values, tags, generic contexts, and extra values.
 ///
 /// The redaction is a backstop, not the primary guarantee: first-party sites
 /// still must never put secrets in `error!`/`panic!`/`expect`/`unwrap` messages
@@ -183,7 +184,44 @@ fn scrub_event(
         }
     }
 
+    for tag in event.tags.values_mut() {
+        redaction::redact_in_place(tag);
+    }
+
+    for context in event.contexts.values_mut() {
+        redact_context(context);
+    }
+
+    for value in event.extra.values_mut() {
+        redact_value(value);
+    }
+
     Some(event)
+}
+
+fn redact_context(context: &mut SentryContext) {
+    if let SentryContext::Other(fields) = context {
+        for value in fields.values_mut() {
+            redact_value(value);
+        }
+    }
+}
+
+fn redact_value(value: &mut Value) {
+    match value {
+        Value::String(text) => redaction::redact_in_place(text),
+        Value::Array(values) => {
+            for value in values {
+                redact_value(value);
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values_mut() {
+                redact_value(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +383,89 @@ mod tests {
         assert!(!value.contains(&hex_token));
         assert!(value.contains("[REDACTED].onion"));
         assert!(value.contains("[REDACTED-HEX]"));
+    }
+
+    #[test]
+    fn scrub_event_redacts_structured_tags_contexts_and_extra_values() {
+        let mut context_fields = sentry::protocol::Map::new();
+        context_fields.insert(
+            "relay".to_string(),
+            sentry::protocol::Value::String("wss://secretrelay23456789.onion".into()),
+        );
+        context_fields.insert(
+            "nested".to_string(),
+            sentry::protocol::Value::Array(vec![sentry::protocol::Value::Object({
+                let mut fields = sentry::protocol::value::Map::new();
+                fields.insert(
+                    "key".to_string(),
+                    sentry::protocol::Value::String("nsec1qs0v6yz2mwqzzz9".into()),
+                );
+                fields
+            })]),
+        );
+
+        let mut extra = sentry::protocol::Map::new();
+        extra.insert(
+            "transport".to_string(),
+            sentry::protocol::Value::String(
+                "https://api.push.apple.com/3/device/0a1b2c3d4e5f60718293a4b5c6d7e8f9".into(),
+            ),
+        );
+
+        let event = sentry::protocol::Event {
+            tags: sentry::protocol::Map::from_iter([(
+                "relay".to_string(),
+                "wss://tagrelay23456789.onion".to_string(),
+            )]),
+            contexts: sentry::protocol::Map::from_iter([(
+                "Rust Tracing Fields".to_string(),
+                sentry::protocol::Context::Other(context_fields),
+            )]),
+            extra,
+            ..Default::default()
+        };
+
+        let scrubbed = scrub_event(event).expect("the scrubber keeps the event");
+
+        let tag = scrubbed.tags.get("relay").expect("the tag is kept");
+        assert_eq!(tag, "wss://[REDACTED]");
+
+        let sentry::protocol::Context::Other(fields) = scrubbed
+            .contexts
+            .get("Rust Tracing Fields")
+            .expect("the context is kept")
+        else {
+            panic!("structured tracing fields should stay in an Other context");
+        };
+        assert_eq!(
+            fields.get("relay"),
+            Some(&sentry::protocol::Value::String("wss://[REDACTED]".into()))
+        );
+        let nested = fields
+            .get("nested")
+            .expect("the nested context value is kept");
+        assert_eq!(
+            nested,
+            &sentry::protocol::Value::Array(vec![sentry::protocol::Value::Object({
+                let mut fields = sentry::protocol::value::Map::new();
+                fields.insert(
+                    "key".to_string(),
+                    sentry::protocol::Value::String("[REDACTED-NSEC]".into()),
+                );
+                fields
+            })])
+        );
+
+        let extra_value = scrubbed
+            .extra
+            .get("transport")
+            .expect("the extra value is kept");
+        assert_eq!(
+            extra_value,
+            &sentry::protocol::Value::String(
+                "https://api.push.apple.com/3/device/[REDACTED]".into()
+            )
+        );
     }
 
     #[test]
