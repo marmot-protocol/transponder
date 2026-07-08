@@ -297,17 +297,11 @@ impl EventProcessor {
         // shipping) — exactly what this privacy-preserving server avoids.
         trace!(event_id = %event.id, "Received Nostr notification event");
 
-        // Check for duplicates and atomically reserve the event ID.
-        //
-        // The reservation (check-and-mark) happens under a single write-lock
-        // critical section so concurrent deliveries of the same event ID — now
-        // possible because the event loop in `main.rs` processes events in
-        // bounded-concurrency spawned tasks — cannot both pass the dedup gate
-        // and dispatch duplicate notifications. The reservation is rolled back
-        // (`release_reservation`) on admission shedding and on transient
-        // failures so those events remain eligible for retry, preserving the
-        // prior "not marked seen on transient failure" semantics.
-        if !self.try_reserve(event.id).await {
+        // Cheap duplicate fast path before the global admission gate. This
+        // preserves duplicate-vs-shed metric fidelity without making a unique
+        // flood take the event-dedup write lock before the cheap global
+        // throttle.
+        if self.contains_seen(&event.id).await {
             trace!("Skipping duplicate event");
             self.metrics.record_event_deduplicated();
             self.metrics.observe_event_processing_duration(
@@ -321,18 +315,13 @@ impl EventProcessor {
         // Global pre-unwrap admission control.
         //
         // Checked BEFORE the expensive NIP-59 gift-wrap unwrap (ECDH + seal
-        // decryption). The per-token limiters run only AFTER unwrap, so they
-        // cannot protect against a flood of valid-but-junk gift wraps. The
-        // server pubkey is public and gift wraps are sender-anonymous, so a
-        // cheap GLOBAL throttle is the correct admission control here. When the
-        // budget is exceeded we shed the event without unwrapping. The event is
-        // NOT marked seen: shedding is transient back-pressure, not a permanent
-        // failure, so the event may be processed later once budget recovers.
-        // The reservation taken above is released so the retry is not treated
-        // as a duplicate.
+        // decryption) and before the event-ID write reservation. The server
+        // pubkey is public and gift wraps are sender-anonymous, so a cheap
+        // GLOBAL throttle is the correct first write-free admission control for
+        // unique-ID floods. When the budget is exceeded we shed the event
+        // without unwrapping and without touching dedup state.
         let admission = self.global_unwrap_limiter.check_and_increment(&()).await;
         if !admission.is_allowed() {
-            self.release_reservation(&event.id).await;
             trace!(
                 reason = admission.limit_reason(),
                 "Shed event before unwrap (global admission control)"
@@ -340,6 +329,29 @@ impl EventProcessor {
             self.metrics.record_event_shed();
             self.metrics
                 .observe_event_processing_duration(EventOutcome::Shed, started_at.elapsed_secs());
+
+            return Ok(false);
+        }
+
+        // Atomically reserve the event ID after admission.
+        //
+        // The reservation (check-and-mark) happens under a single write-lock
+        // critical section so concurrent deliveries of the same event ID — now
+        // possible because the event loop in `main.rs` processes events in
+        // bounded-concurrency spawned tasks — cannot both pass the dedup gate
+        // and dispatch duplicate notifications. A concurrent duplicate can
+        // still race past the read-only fast path above; this reserve remains
+        // the authoritative check. The reservation is rolled back
+        // (`release_reservation`) on transient failures so those events remain
+        // eligible for retry, preserving the prior "not marked seen on
+        // transient failure" semantics.
+        if !self.try_reserve(event.id).await {
+            trace!("Skipping duplicate event");
+            self.metrics.record_event_deduplicated();
+            self.metrics.observe_event_processing_duration(
+                EventOutcome::Duplicate,
+                started_at.elapsed_secs(),
+            );
 
             return Ok(false);
         }
@@ -774,11 +786,16 @@ impl EventProcessor {
         hasher.finalize().into()
     }
 
-    /// Check if an event has been seen recently.
-    #[cfg(test)]
-    async fn is_duplicate(&self, event_id: &EventId) -> bool {
+    /// Read-only check for event replay state.
+    async fn contains_seen(&self, event_id: &EventId) -> bool {
         let seen = self.seen_events.read().await;
         seen.contains(event_id)
+    }
+
+    /// Test-facing duplicate check.
+    #[cfg(test)]
+    async fn is_duplicate(&self, event_id: &EventId) -> bool {
+        self.contains_seen(event_id).await
     }
 
     /// Atomically reserve an event ID for processing.
