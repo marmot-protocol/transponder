@@ -290,17 +290,22 @@ impl ApnsClient {
 
         // Load encoding key for token auth
         let encoding_key = if !config.private_key_path.is_empty() {
-            let key_data = tokio::fs::read(&config.private_key_path)
-                .await
-                .map_err(|e| {
-                    Error::Apns(format!(
-                        "Failed to read APNs key file '{}': {e}",
-                        config.private_key_path
-                    ))
-                })?;
+            let key_data = Zeroizing::new(
+                tokio::fs::read(&config.private_key_path)
+                    .await
+                    .map_err(|e| {
+                        Error::Apns(format!(
+                            "Failed to read APNs key file '{}': {e}",
+                            config.private_key_path
+                        ))
+                    })?,
+            );
 
+            // `jsonwebtoken::EncodingKey` owns parsed key material internally
+            // and exposes no zeroize hook; the avoidable local PEM buffer above
+            // is wiped on drop.
             Some(
-                EncodingKey::from_ec_pem(&key_data)
+                EncodingKey::from_ec_pem(key_data.as_slice())
                     .map_err(|e| Error::Apns(format!("Failed to parse APNs key: {e}")))?,
             )
         } else {
@@ -405,12 +410,13 @@ impl ApnsClient {
         auth_token: &str,
         request_parts: &ApnsRequestParts,
     ) -> reqwest::RequestBuilder {
+        let authorization = Zeroizing::new(format!("bearer {auth_token}"));
         self.http_client
             .post(url)
             .header("apns-push-type", request_parts.push_type)
             .header("apns-priority", request_parts.priority)
             .header("apns-topic", &self.config.bundle_id)
-            .header("authorization", format!("bearer {auth_token}"))
+            .header("authorization", authorization.as_str())
             .json(&request_parts.payload)
     }
 

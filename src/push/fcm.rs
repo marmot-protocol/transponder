@@ -432,6 +432,9 @@ impl FcmClient {
             let sa: ServiceAccount = serde_json::from_str(data.as_str())
                 .map_err(|e| Error::Fcm(format!("Failed to parse service account JSON: {e}")))?;
 
+            // The raw JSON and parsed private-key string are zeroizing; the
+            // `jsonwebtoken::EncodingKey` copy is dependency-owned and has no
+            // zeroize hook short of replacing the signer.
             let key = EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
                 .map_err(|e| Error::Fcm(format!("Failed to parse service account key: {e}")))?;
 
@@ -552,9 +555,10 @@ impl FcmClient {
         access_token: &str,
         request: &FcmRequest<'_>,
     ) -> reqwest::RequestBuilder {
+        let authorization = Zeroizing::new(format!("Bearer {access_token}"));
         self.http_client
             .post(url)
-            .header("authorization", format!("Bearer {access_token}"))
+            .header("authorization", authorization.as_str())
             .json(request)
     }
 

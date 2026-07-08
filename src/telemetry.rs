@@ -381,7 +381,7 @@ mod tests {
 
     fn config_with_dsn(dsn: &str) -> GlitchtipConfig {
         GlitchtipConfig {
-            dsn: dsn.to_string(),
+            dsn: zeroize::Zeroizing::new(dsn.to_string()),
             environment: "test".to_string(),
             traces_sample_rate: 0.0,
         }

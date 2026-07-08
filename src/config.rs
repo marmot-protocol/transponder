@@ -19,12 +19,12 @@
 //! reaches those serde defaults even when a section is absent from every
 //! source.
 //!
-//! The server private key is special-cased for secret hygiene: an inline
-//! `server.private_key` (TOML) or `TRANSPONDER_SERVER_PRIVATE_KEY` (env) value
-//! is extracted through a dedicated [`Zeroizing`] path *before* the remaining
-//! configuration is handed to the `config` crate, so the secret never sits in
-//! the crate's un-zeroized `Value` tree. Prefer `server.private_key_file` in
-//! production; the file must not be group/other readable.
+//! The server private key and GlitchTip DSN are special-cased for secret
+//! hygiene: inline TOML values or matching env overrides are extracted through
+//! dedicated [`Zeroizing`] paths *before* the remaining configuration is handed
+//! to the `config` crate, so those secrets never sit in the crate's
+//! un-zeroized `Value` tree. Prefer `server.private_key_file` in production;
+//! the file must not be group/other readable.
 
 use config::{Config, ConfigBuilder, File, FileFormat, builder::DefaultState};
 use serde::{Deserialize, Deserializer};
@@ -601,6 +601,10 @@ fn default_log_format() -> LogFormat {
     LogFormat::Json
 }
 
+fn default_glitchtip_dsn() -> Zeroizing<String> {
+    Zeroizing::new(String::new())
+}
+
 /// GlitchTip (Sentry-compatible) error-reporting configuration.
 ///
 /// Reporting is enabled by the presence of a non-empty `dsn`; there is no
@@ -609,8 +613,12 @@ fn default_log_format() -> LogFormat {
 #[derive(Clone, Deserialize)]
 pub struct GlitchtipConfig {
     /// GlitchTip DSN. Empty disables error reporting.
-    #[serde(default)]
-    pub dsn: String,
+    ///
+    /// Like `server.private_key`, this is extracted before the config document
+    /// reaches the un-zeroized `config` value tree because the DSN embeds a
+    /// write-auth key.
+    #[serde(skip_deserializing, default = "default_glitchtip_dsn")]
+    pub dsn: Zeroizing<String>,
 
     /// Deployment environment tag attached to every event (e.g. "production").
     #[serde(default = "default_glitchtip_environment")]
@@ -675,20 +683,26 @@ fn base_config_builder() -> Result<ConfigBuilder<DefaultState>> {
     Ok(builder)
 }
 
+#[derive(Default)]
+struct SensitiveConfigValues {
+    private_key: Option<Zeroizing<String>>,
+    glitchtip_dsn: Option<Zeroizing<String>>,
+}
+
 /// Apply `TRANSPONDER_*` environment overrides to the builder.
 ///
-/// Returns the updated builder plus the raw `TRANSPONDER_SERVER_PRIVATE_KEY`
-/// value, if present. The private key is intercepted here — never stored in
-/// the builder — so the secret stays in a [`Zeroizing`] buffer instead of the
-/// `config` crate's un-zeroized `Value` tree.
+/// Returns the updated builder plus raw sensitive values, if present. These are
+/// intercepted here — never stored in the builder — so they stay in
+/// [`Zeroizing`] buffers instead of the `config` crate's un-zeroized `Value`
+/// tree.
 fn apply_env_overrides<I>(
     mut builder: ConfigBuilder<DefaultState>,
     env_iter: I,
-) -> Result<(ConfigBuilder<DefaultState>, Option<Zeroizing<String>>)>
+) -> Result<(ConfigBuilder<DefaultState>, SensitiveConfigValues)>
 where
     I: IntoIterator<Item = (OsString, OsString)>,
 {
-    let mut private_key: Option<Zeroizing<String>> = None;
+    let mut sensitive = SensitiveConfigValues::default();
 
     for (key, value) in env_iter {
         let Some((env_key, config_key)) = env_var_to_config_key(key)? else {
@@ -702,7 +716,12 @@ where
         })?;
 
         if config_key == PRIVATE_KEY_CONFIG_KEY {
-            private_key = Some(Zeroizing::new(value));
+            sensitive.private_key = Some(Zeroizing::new(value));
+            continue;
+        }
+
+        if config_key == GLITCHTIP_DSN_CONFIG_KEY {
+            sensitive.glitchtip_dsn = Some(Zeroizing::new(value));
             continue;
         }
 
@@ -713,10 +732,11 @@ where
         };
     }
 
-    Ok((builder, private_key))
+    Ok((builder, sensitive))
 }
 
 const PRIVATE_KEY_CONFIG_KEY: &str = "server.private_key";
+const GLITCHTIP_DSN_CONFIG_KEY: &str = "glitchtip.dsn";
 
 /// Remove an inline `server.private_key` from a parsed TOML document, moving
 /// the secret into a [`Zeroizing`] buffer.
@@ -737,6 +757,25 @@ fn extract_inline_private_key(
         Some(toml::Value::String(key)) => Ok(Some(Zeroizing::new(key))),
         Some(other) => Err(config::ConfigError::Message(format!(
             "server.private_key must be a string, got a TOML {}",
+            other.type_str()
+        ))),
+    }
+}
+
+/// Remove an inline `glitchtip.dsn` from a parsed TOML document, moving the
+/// write-auth key into a [`Zeroizing`] buffer before the `config` crate sees it.
+fn extract_inline_glitchtip_dsn(
+    doc: &mut toml::Table,
+) -> std::result::Result<Option<Zeroizing<String>>, config::ConfigError> {
+    let Some(glitchtip) = doc.get_mut("glitchtip").and_then(toml::Value::as_table_mut) else {
+        return Ok(None);
+    };
+
+    match glitchtip.remove("dsn") {
+        None => Ok(None),
+        Some(toml::Value::String(dsn)) => Ok(Some(Zeroizing::new(dsn))),
+        Some(other) => Err(config::ConfigError::Message(format!(
+            "glitchtip.dsn must be a string, got a TOML {}",
             other.type_str()
         ))),
     }
@@ -870,10 +909,10 @@ impl AppConfig {
     {
         let path = path.as_ref();
 
-        // Read and parse the TOML ourselves so an inline `server.private_key`
-        // can be moved into a `Zeroizing` buffer before the document reaches
-        // the `config` crate's un-zeroized `Value` tree. The raw file contents
-        // (which may contain the secret) are zeroized on drop.
+        // Read and parse the TOML ourselves so inline sensitive values can be
+        // moved into `Zeroizing` buffers before the document reaches the
+        // `config` crate's un-zeroized `Value` tree. The raw file contents
+        // (which may contain secrets) are zeroized on drop.
         let raw = Zeroizing::new(fs::read_to_string(path).map_err(|error| {
             config::ConfigError::Message(format!(
                 "failed to read config file {}: {error}",
@@ -887,6 +926,7 @@ impl AppConfig {
             ))
         })?;
         let file_private_key = extract_inline_private_key(&mut doc)?;
+        let file_glitchtip_dsn = extract_inline_glitchtip_dsn(&mut doc)?;
         let sanitized = toml::to_string(&doc).map_err(|error| {
             config::ConfigError::Message(format!(
                 "failed to re-encode config file {}: {error}",
@@ -896,12 +936,19 @@ impl AppConfig {
 
         let builder =
             base_config_builder()?.add_source(File::from_str(&sanitized, FileFormat::Toml));
-        let (builder, env_private_key) = apply_env_overrides(builder, env_iter)?;
+        let (builder, env_sensitive) = apply_env_overrides(builder, env_iter)?;
         let config = builder.build()?;
 
         let mut config: Self = config.try_deserialize()?;
         // Environment overrides file config, matching every other key.
-        config.server.private_key = env_private_key.or(file_private_key).unwrap_or_default();
+        config.server.private_key = env_sensitive
+            .private_key
+            .or(file_private_key)
+            .unwrap_or_default();
+        config.glitchtip.dsn = env_sensitive
+            .glitchtip_dsn
+            .or(file_glitchtip_dsn)
+            .unwrap_or_default();
         config.validate()?;
         Ok(config)
     }
@@ -910,11 +957,12 @@ impl AppConfig {
     where
         I: IntoIterator<Item = (OsString, OsString)>,
     {
-        let (builder, env_private_key) = apply_env_overrides(base_config_builder()?, env_iter)?;
+        let (builder, env_sensitive) = apply_env_overrides(base_config_builder()?, env_iter)?;
         let config = builder.build()?;
 
         let mut config: Self = config.try_deserialize()?;
-        config.server.private_key = env_private_key.unwrap_or_default();
+        config.server.private_key = env_sensitive.private_key.unwrap_or_default();
+        config.glitchtip.dsn = env_sensitive.glitchtip_dsn.unwrap_or_default();
         config.validate()?;
         Ok(config)
     }
@@ -1752,7 +1800,7 @@ mod tests {
     #[test]
     fn test_glitchtip_config_debug_redacts_dsn() {
         let config = GlitchtipConfig {
-            dsn: "https://public@glitch.example/1".to_string(),
+            dsn: Zeroizing::new("https://public@glitch.example/1".to_string()),
             environment: "production".to_string(),
             traces_sample_rate: 0.0,
         };
@@ -1766,7 +1814,7 @@ mod tests {
     #[test]
     fn test_glitchtip_config_debug_shows_empty_dsn_as_disabled() {
         let config = GlitchtipConfig {
-            dsn: String::new(),
+            dsn: Zeroizing::new(String::new()),
             environment: "production".to_string(),
             traces_sample_rate: 0.0,
         };
@@ -1780,7 +1828,7 @@ mod tests {
     fn test_glitchtip_defaults_disable_reporting() {
         let config = from_test_env(&[]).unwrap();
 
-        assert_eq!(config.glitchtip.dsn, "");
+        assert_eq!(config.glitchtip.dsn.as_str(), "");
         assert_eq!(config.glitchtip.environment, "production");
         assert_eq!(config.glitchtip.traces_sample_rate, 0.0);
     }
@@ -1796,7 +1844,10 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(config.glitchtip.dsn, "https://key@glitch.example/1");
+        assert_eq!(
+            config.glitchtip.dsn.as_str(),
+            "https://key@glitch.example/1"
+        );
         assert_eq!(config.glitchtip.environment, "staging");
         assert_eq!(config.glitchtip.traces_sample_rate, 0.25);
     }
@@ -2612,6 +2663,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.server.private_key.as_str(), "env-secret-key");
+    }
+
+    #[test]
+    fn test_inline_glitchtip_dsn_resolved_from_file() {
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+
+            [glitchtip]
+            dsn = "https://file-key@glitch.example/1"
+        "#,
+        );
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+
+        fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+        assert_zeroizing_string(&config.glitchtip.dsn);
+        assert_eq!(
+            config.glitchtip.dsn.as_str(),
+            "https://file-key@glitch.example/1"
+        );
+    }
+
+    #[test]
+    fn test_env_glitchtip_dsn_overrides_inline_file_value() {
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+
+            [glitchtip]
+            dsn = "https://file-key@glitch.example/1"
+        "#,
+        );
+        let config = load_with_test_env(
+            file.path(),
+            &[(
+                "TRANSPONDER_GLITCHTIP_DSN",
+                "https://env-key@glitch.example/1",
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.glitchtip.dsn.as_str(),
+            "https://env-key@glitch.example/1"
+        );
+    }
+
+    #[test]
+    fn test_non_string_inline_glitchtip_dsn_rejected() {
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+
+            [glitchtip]
+            dsn = 12345
+        "#,
+        );
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        assert!(error.to_string().contains("glitchtip.dsn"), "{error}");
     }
 
     #[test]
