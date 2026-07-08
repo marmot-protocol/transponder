@@ -421,10 +421,12 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// - `ExceededCapacityLimit` if the cache is full and has no safe eviction
     ///   victim for the unknown key
     pub async fn check_and_increment(&self, key: &K) -> RateLimitCheck {
-        let now = Instant::now();
         let mutated;
         let (result, admission_evicted) = {
             let mut entries = self.stripe_for(key).write().await;
+            // Timestamp after acquiring the stripe lock so hits for one key
+            // are appended in monotonic lock-acquisition order.
+            let now = Instant::now();
             let mut admission_evicted = false;
 
             // Get or create entry (updates access position). At capacity, admit
@@ -755,6 +757,39 @@ mod tests {
         tokio::time::advance(Duration::from_secs(61)).await;
 
         assert!(limiter.check_and_increment(&1u64).await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_admission_timestamp_is_captured_after_stripe_lock_wait() {
+        use std::sync::Arc;
+
+        tokio::time::pause();
+
+        let key = 1u64;
+        let limiter: Arc<RateLimiter<u64>> = Arc::new(RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1,
+            max_per_hour: 100,
+            max_entries: entries(100),
+        }));
+
+        let blocked = limiter.stripe_for(&key).write().await;
+        let task_limiter = Arc::clone(&limiter);
+        let handle = tokio::spawn(async move { task_limiter.check_and_increment(&key).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        drop(blocked);
+
+        assert!(
+            handle
+                .await
+                .expect("admission task should not panic")
+                .is_allowed()
+        );
+        assert_eq!(
+            limiter.check_and_increment(&key).await,
+            RateLimitResult::ExceededMinuteLimit
+        );
     }
 
     #[tokio::test]
