@@ -296,6 +296,51 @@ async fn run_event_loop(
     }
 }
 
+async fn run_periodic_cleanup(
+    mut shutdown: watch::Receiver<bool>,
+    event_processor: Arc<EventProcessor>,
+) -> std::result::Result<(), &'static str> {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+
+    loop {
+        tokio::select! {
+            biased;
+
+            changed = shutdown.changed() => {
+                return changed
+                    .map(|_| ())
+                    .map_err(|_| "shutdown channel closed before cleanup task observed shutdown");
+            }
+            _ = interval.tick() => {
+                event_processor.cleanup().await;
+            }
+        }
+    }
+}
+
+async fn run_relay_status_refresher(
+    mut shutdown: watch::Receiver<bool>,
+    relay_client: Arc<RelayClient>,
+) -> std::result::Result<(), &'static str> {
+    let mut interval = tokio::time::interval(RELAY_STATUS_REFRESH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            changed = shutdown.changed() => {
+                return changed
+                    .map(|_| ())
+                    .map_err(|_| "shutdown channel closed before relay status refresher observed shutdown");
+            }
+            _ = interval.tick() => {
+                relay_client.refresh_status().await;
+            }
+        }
+    }
+}
+
 /// Tear down the pipeline in dependency order, producers before consumers.
 ///
 /// The stage order is load-bearing (#173, #84):
@@ -598,46 +643,36 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
     }
 
     // Start periodic cleanup task
-    let mut cleanup_shutdown = shutdown.subscribe();
+    let cleanup_shutdown = shutdown.subscribe();
     let event_processor_cleanup = event_processor.clone();
-
-    let cleanup_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-
-        loop {
-            tokio::select! {
-                _ = cleanup_shutdown.changed() => {
-                    break;
-                }
-                _ = interval.tick() => {
-                    event_processor_cleanup.cleanup().await;
-                }
-            }
-        }
-    });
+    let cleanup_trigger = shutdown.trigger_handle();
+    let cleanup_task = tokio::spawn(run_periodic_cleanup(
+        cleanup_shutdown,
+        event_processor_cleanup,
+    ));
+    let cleanup_handle = tokio::spawn(supervise_critical_task_handle(
+        "cleanup task",
+        cleanup_task,
+        cleanup_trigger,
+    ));
 
     // Start the background relay-status refresher. After startup it is the
     // only writer of the cached relay status (and the relays_connected
     // gauges): `/ready` and other readers consume the snapshot without
     // recomputing it, so unauthenticated probes cannot drive lock or gauge
     // churn (see RelayClient::refresh_status).
-    let mut status_refresh_shutdown = shutdown.subscribe();
+    let status_refresh_shutdown = shutdown.subscribe();
     let status_refresh_client = relay_client.clone();
-    let status_refresh_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(RELAY_STATUS_REFRESH_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                _ = status_refresh_shutdown.changed() => {
-                    break;
-                }
-                _ = interval.tick() => {
-                    status_refresh_client.refresh_status().await;
-                }
-            }
-        }
-    });
+    let status_refresh_trigger = shutdown.trigger_handle();
+    let status_refresh_task = tokio::spawn(run_relay_status_refresher(
+        status_refresh_shutdown,
+        status_refresh_client,
+    ));
+    let status_refresh_handle = tokio::spawn(supervise_critical_task_handle(
+        "relay status refresher",
+        status_refresh_task,
+        status_refresh_trigger,
+    ));
 
     info!("Transponder running");
 
@@ -949,6 +984,78 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(semaphore.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn periodic_cleanup_exits_cleanly_on_shutdown() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_periodic_cleanup(shutdown_rx, test_event_processor()),
+        )
+        .await
+        .expect("cleanup task must observe shutdown");
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn periodic_cleanup_reports_closed_shutdown_channel() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        drop(shutdown_tx);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_periodic_cleanup(shutdown_rx, test_event_processor()),
+        )
+        .await
+        .expect("cleanup task must observe closed channel")
+        .expect_err("closed shutdown channel is unexpected");
+
+        assert!(error.contains("shutdown channel closed"));
+    }
+
+    #[tokio::test]
+    async fn relay_status_refresher_exits_cleanly_on_shutdown() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        let relay_client = Arc::new(
+            RelayClient::new(Keys::generate(), test_relay_client_config())
+                .await
+                .unwrap(),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_relay_status_refresher(shutdown_rx, relay_client),
+        )
+        .await
+        .expect("relay status refresher must observe shutdown");
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn relay_status_refresher_reports_closed_shutdown_channel() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        drop(shutdown_tx);
+        let relay_client = Arc::new(
+            RelayClient::new(Keys::generate(), test_relay_client_config())
+                .await
+                .unwrap(),
+        );
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_relay_status_refresher(shutdown_rx, relay_client),
+        )
+        .await
+        .expect("relay status refresher must observe closed channel")
+        .expect_err("closed shutdown channel is unexpected");
+
+        assert!(error.contains("shutdown channel closed"));
     }
 
     #[tokio::test]
