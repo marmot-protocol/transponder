@@ -1114,6 +1114,12 @@ impl ServerConfig {
             }
         }
 
+        if self.dedup_retention_secs < self.max_notification_age_secs {
+            return Err(config::ConfigError::Message(
+                "server.dedup_retention_secs must be greater than or equal to server.max_notification_age_secs".to_string(),
+            ));
+        }
+
         if self.max_concurrent_event_processing > MAX_CONCURRENT_EVENT_PROCESSING {
             return Err(config::ConfigError::Message(format!(
                 "server.max_concurrent_event_processing must be at most {MAX_CONCURRENT_EVENT_PROCESSING}"
@@ -1640,6 +1646,46 @@ mod tests {
         assert_eq!(
             default_max_notification_future_skew_secs(),
             DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS
+        );
+    }
+
+    #[test]
+    fn test_dedup_retention_shorter_than_notification_age_rejected() {
+        let error = from_test_env(&[
+            ("TRANSPONDER_SERVER_DEDUP_RETENTION_SECS", "60"),
+            ("TRANSPONDER_SERVER_MAX_NOTIFICATION_AGE_SECS", "120"),
+        ])
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("server.dedup_retention_secs"), "{message}");
+        assert!(
+            message.contains("server.max_notification_age_secs"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_retention_equal_to_notification_age_accepted() {
+        let config = from_test_env(&[
+            ("TRANSPONDER_SERVER_DEDUP_RETENTION_SECS", "120"),
+            ("TRANSPONDER_SERVER_MAX_NOTIFICATION_AGE_SECS", "120"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.server.dedup_retention_secs, 120);
+        assert_eq!(config.server.max_notification_age_secs, 120);
+    }
+
+    #[test]
+    fn test_zero_notification_age_does_not_require_zero_dedup_retention() {
+        let config =
+            from_test_env(&[("TRANSPONDER_SERVER_MAX_NOTIFICATION_AGE_SECS", "0")]).unwrap();
+
+        assert_eq!(config.server.max_notification_age_secs, 0);
+        assert_eq!(
+            config.server.dedup_retention_secs,
+            DEFAULT_DEDUP_RETENTION_SECS
         );
     }
 
