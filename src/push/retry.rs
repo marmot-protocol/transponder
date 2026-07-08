@@ -72,16 +72,18 @@ pub const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum backoff duration cap.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
-/// Upper bound on an honored provider-supplied `Retry-After` value.
+/// Cumulative upper bound on honored provider-supplied `Retry-After` base
+/// delay per logical push.
 ///
-/// The header is provider/network-controlled input. Without a ceiling, a
-/// misbehaving or compromised endpoint could pin a send task — which holds a
-/// decrypted device token and an in-flight guard that blocks graceful-shutdown
-/// drain — in a backoff sleep for an arbitrary duration (issue #162). 60
-/// seconds comfortably covers genuine provider backpressure (APNs/FCM hints
-/// are typically single-digit seconds) while bounding how long an untrusted
-/// header can pin a task. Deliberately larger than [`MAX_BACKOFF`], which only
-/// caps locally-computed exponential backoff.
+/// The header is provider/network-controlled input. Without a cumulative
+/// ceiling, a misbehaving or compromised endpoint could pin a send task —
+/// which holds a decrypted device token and an in-flight guard that blocks
+/// graceful-shutdown drain — across multiple retry sleeps for an arbitrary
+/// duration (issue #244). 60 seconds comfortably covers genuine provider
+/// backpressure (APNs/FCM hints are typically single-digit seconds) while
+/// bounding provider-controlled residency per logical push. Additive jitter is
+/// separate and bounded by [`MAX_RETRY_JITTER`] per retry. Deliberately larger
+/// than [`MAX_BACKOFF`], which only caps locally-computed exponential backoff.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// Minimum server-requested backoff duration.
@@ -186,6 +188,7 @@ where
 {
     let mut retries = 0;
     let mut backoff = config.initial_backoff;
+    let mut retry_after_budget_remaining = MAX_RETRY_AFTER;
     // One-shot budget for retrying after a provider auth rejection with a
     // freshly minted credential (issue #85). Tracked separately from the
     // transient-retry budget so an auth recovery does not consume (or get
@@ -232,7 +235,14 @@ where
                 // and jitter every sleep so concurrent failures do not retry
                 // in synchronized waves. Locally-computed exponential backoff
                 // is capped separately at MAX_BACKOFF.
-                let wait_duration = retry_sleep_duration(retry_after, backoff);
+                let sleep_plan = retry_sleep_duration_with_budget(
+                    retry_after,
+                    backoff,
+                    retry_after_budget_remaining,
+                );
+                retry_after_budget_remaining =
+                    retry_after_budget_remaining.saturating_sub(sleep_plan.retry_after_budget_used);
+                let wait_duration = sleep_plan.duration;
 
                 warn!(
                     service = service_name,
@@ -277,29 +287,60 @@ where
     }
 }
 
-fn retry_sleep_base(retry_after: Option<Duration>, backoff: Duration) -> (Duration, bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetrySleepPlan {
+    duration: Duration,
+    retry_after_budget_used: Duration,
+}
+
+fn retry_sleep_base(
+    retry_after: Option<Duration>,
+    backoff: Duration,
+    retry_after_budget_remaining: Duration,
+) -> (Duration, bool, Duration) {
     let fallback = backoff.min(MAX_BACKOFF);
     match retry_after {
-        Some(Duration::ZERO) => (MIN_RETRY_BACKOFF.max(fallback), true),
+        Some(Duration::ZERO) => (MIN_RETRY_BACKOFF.max(fallback), true, Duration::ZERO),
         // Honor the provider hint, but clamp it: floored so a tiny value
         // cannot produce hot-loop retries, and capped so an untrusted header
         // cannot pin the task (and its decrypted token) arbitrarily long
-        // (issue #162).
-        Some(server_delay) => (server_delay.clamp(MIN_RETRY_BACKOFF, MAX_RETRY_AFTER), true),
-        None => (fallback, false),
+        // across the logical push (issue #244).
+        Some(server_delay) if retry_after_budget_remaining > Duration::ZERO => {
+            let provider_base = server_delay
+                .clamp(MIN_RETRY_BACKOFF, MAX_RETRY_AFTER)
+                .min(retry_after_budget_remaining);
+            (provider_base, true, provider_base)
+        }
+        // Once provider-controlled delay budget is spent, continue with local
+        // fallback backoff so the retry budget still behaves predictably.
+        Some(_) | None => (fallback, false, Duration::ZERO),
     }
 }
 
-fn retry_sleep_duration(retry_after: Option<Duration>, backoff: Duration) -> Duration {
-    let (base, retry_after_supplied) = retry_sleep_base(retry_after, backoff);
+fn retry_sleep_duration_with_budget(
+    retry_after: Option<Duration>,
+    backoff: Duration,
+    retry_after_budget_remaining: Duration,
+) -> RetrySleepPlan {
+    let (base, retry_after_supplied, retry_after_budget_used) =
+        retry_sleep_base(retry_after, backoff, retry_after_budget_remaining);
     let jitter = random_retry_jitter(base);
-    if retry_after_supplied {
+    let duration = if retry_after_supplied {
         // Retry-After is a provider-requested minimum, so jitter is additive:
         // this may wait up to one bounded-jitter window longer, but never less.
         base.saturating_add(jitter)
     } else {
         base.saturating_sub(jitter)
+    };
+    RetrySleepPlan {
+        duration,
+        retry_after_budget_used,
     }
+}
+
+#[cfg(test)]
+fn retry_sleep_duration(retry_after: Option<Duration>, backoff: Duration) -> Duration {
+    retry_sleep_duration_with_budget(retry_after, backoff, MAX_RETRY_AFTER).duration
 }
 
 fn random_retry_jitter(base: Duration) -> Duration {
@@ -667,6 +708,46 @@ mod tests {
         let sleep = retry_sleep_duration(Some(MAX_RETRY_AFTER), Duration::from_millis(100));
 
         assert_duration_between(sleep, MAX_RETRY_AFTER, MAX_RETRY_AFTER + MAX_RETRY_JITTER);
+    }
+
+    #[test]
+    fn test_retry_after_budget_is_cumulative_per_logical_push() {
+        let first = retry_sleep_duration_with_budget(
+            Some(MAX_RETRY_AFTER),
+            Duration::from_millis(100),
+            MAX_RETRY_AFTER,
+        );
+        assert_eq!(first.retry_after_budget_used, MAX_RETRY_AFTER);
+        assert_duration_between(
+            first.duration,
+            MAX_RETRY_AFTER,
+            MAX_RETRY_AFTER + MAX_RETRY_JITTER,
+        );
+
+        let second = retry_sleep_duration_with_budget(
+            Some(MAX_RETRY_AFTER),
+            Duration::from_millis(200),
+            MAX_RETRY_AFTER.saturating_sub(first.retry_after_budget_used),
+        );
+        assert_eq!(second.retry_after_budget_used, Duration::ZERO);
+        assert_duration_between(
+            second.duration,
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+    }
+
+    #[test]
+    fn test_retry_after_budget_honors_only_remaining_provider_delay() {
+        let remaining = Duration::from_secs(5);
+        let sleep = retry_sleep_duration_with_budget(
+            Some(MAX_RETRY_AFTER),
+            Duration::from_millis(100),
+            remaining,
+        );
+
+        assert_eq!(sleep.retry_after_budget_used, remaining);
+        assert_duration_between(sleep.duration, remaining, remaining + MAX_RETRY_JITTER);
     }
 
     #[tokio::test]
