@@ -55,8 +55,8 @@ const MAX_SHARDS: usize = 32;
 /// The gauge is refreshed on roughly one in `GAUGE_SAMPLE_INTERVAL` admissions
 /// that mutate a stripe, so cache-saturation onset is visible within a few
 /// dozen admissions instead of only at the 60s cleanup tick (#125), without
-/// paying a metric write on every hot-path check. Must be a power of two so the
-/// sampling test is a cheap bit-mask.
+/// paying a metric write on every hot-path check. The sampling check uses
+/// `is_multiple_of`, so the interval does not need to be a power of two.
 const GAUGE_SAMPLE_INTERVAL: u64 = 64;
 
 /// Token identifying one admitted hit for identity-aware rollback.
