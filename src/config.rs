@@ -781,6 +781,39 @@ fn extract_inline_glitchtip_dsn(
     }
 }
 
+fn toml_parse_error_message(path: &Path, raw: &str, error: &toml::de::Error) -> String {
+    let location = error
+        .span()
+        .map(|span| line_col_for_byte_offset(raw, span.start))
+        .map(|(line, column)| format!(" at line {line}, column {column}"))
+        .unwrap_or_default();
+
+    format!(
+        "failed to parse config file {}{location}: {}",
+        path.display(),
+        error.message()
+    )
+}
+
+fn line_col_for_byte_offset(input: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(input.len());
+    let mut line = 1;
+    let mut line_start = 0;
+
+    for (index, ch) in input.char_indices() {
+        if index >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = index + ch.len_utf8();
+        }
+    }
+
+    let column = input[line_start..offset].chars().count() + 1;
+    (line, column)
+}
+
 // Preserve underscores in field names by splitting only once after the section.
 //
 // Prefixed variables that are malformed (no second underscore, empty section or
@@ -920,10 +953,7 @@ impl AppConfig {
             ))
         })?);
         let mut doc: toml::Table = toml::from_str(&raw).map_err(|error| {
-            config::ConfigError::Message(format!(
-                "failed to parse config file {}: {error}",
-                path.display()
-            ))
+            config::ConfigError::Message(toml_parse_error_message(path, raw.as_str(), &error))
         })?;
         let file_private_key = extract_inline_private_key(&mut doc)?;
         let file_glitchtip_dsn = extract_inline_glitchtip_dsn(&mut doc)?;
@@ -1473,6 +1503,26 @@ mod tests {
         let file = create_temp_config(config_content);
         let result = load_with_test_env(file.path(), &[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_malformed_inline_private_key_parse_error_does_not_leak_secret_line() {
+        let secret = "SECRET-PRIVATE-KEY-PREFIX";
+        let file = create_temp_config(&format!(
+            r#"
+            [server]
+            private_key = "{secret}
+        "#
+        ));
+
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("failed to parse config file"), "{message}");
+        assert!(message.contains("line"), "{message}");
+        assert!(message.contains("column"), "{message}");
+        assert!(!message.contains(secret), "{message}");
+        assert!(!message.contains("private_key ="), "{message}");
     }
 
     #[test]
