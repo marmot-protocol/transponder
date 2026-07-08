@@ -11,6 +11,7 @@
 //! leaking — and cover the secret shapes transponder handles:
 //!
 //! - APNs device-token URL paths (`/3/device/<hex>`)
+//! - FCM registration tokens (`<app-instance>:<opaque-token>`)
 //! - Nostr bech32 secret keys (`nsec1…`)
 //! - `wss://` relay URLs (the host can identify a private relay)
 //! - `.onion` hostnames
@@ -52,23 +53,59 @@ static REDACTIONS: LazyLock<[(Regex, &'static str); 5]> = LazyLock::new(|| {
     ]
 });
 
+/// Candidate FCM registration tokens.
+///
+/// FCM tokens are opaque, but the registration-token shape accepted by the push
+/// client is ASCII token punctuation with a colon separator. Keep the expensive
+/// "contains a colon" check outside the regex because Rust regexes deliberately
+/// do not support look-ahead.
+static FCM_REGISTRATION_TOKEN_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[A-Za-z0-9_.:-]{100,}").expect("static redaction regex is valid")
+});
+
 /// Redact secret-shaped substrings from `input`.
 ///
 /// Returns the input untouched (borrowed, no allocation) when no pattern
 /// matches — the common case for ordinary error and panic messages.
 pub(crate) fn redact(input: &str) -> Cow<'_, str> {
-    if !REDACTIONS
+    let has_simple_redaction = REDACTIONS
         .iter()
-        .any(|(pattern, _)| pattern.is_match(input))
-    {
+        .any(|(pattern, _)| pattern.is_match(input));
+    let has_fcm_token = contains_fcm_registration_token(input);
+    if !has_simple_redaction && !has_fcm_token {
         return Cow::Borrowed(input);
     }
 
     let mut output = input.to_owned();
+    if has_fcm_token {
+        output = redact_fcm_registration_tokens(&output);
+    }
     for (pattern, replacement) in REDACTIONS.iter() {
         output = pattern.replace_all(&output, *replacement).into_owned();
     }
     Cow::Owned(output)
+}
+
+fn contains_fcm_registration_token(input: &str) -> bool {
+    FCM_REGISTRATION_TOKEN_CANDIDATE
+        .find_iter(input)
+        .any(|candidate| candidate.as_str().contains(':'))
+}
+
+fn redact_fcm_registration_tokens(input: &str) -> String {
+    FCM_REGISTRATION_TOKEN_CANDIDATE
+        .replace_all(input, |captures: &regex::Captures<'_>| {
+            let candidate = captures
+                .get(0)
+                .expect("the full regex match is always present")
+                .as_str();
+            if candidate.contains(':') {
+                "[REDACTED-FCM]".to_string()
+            } else {
+                candidate.to_string()
+            }
+        })
+        .into_owned()
 }
 
 /// Redact secret-shaped substrings in place, leaving clean strings untouched.
@@ -126,6 +163,38 @@ mod tests {
             output,
             "https://api.push.apple.com/3/device/[REDACTED] -> 410"
         );
+    }
+
+    #[test]
+    fn fcm_registration_tokens_are_redacted() {
+        let token = format!("{}:APA91{}", "fzd".repeat(12), "AbC_-.123".repeat(8));
+        assert!(token.len() >= 100);
+        let input = format!("panic while sending to FCM token {token}");
+
+        let output = redact(&input);
+
+        assert!(!output.contains(&token));
+        assert_eq!(output, "panic while sending to FCM token [REDACTED-FCM]");
+    }
+
+    #[test]
+    fn long_token_shaped_text_without_fcm_separator_passes_through() {
+        let input = format!("opaque id {}", "abcDEF0123_-.".repeat(8));
+
+        let output = redact(&input);
+
+        assert!(matches!(output, Cow::Borrowed(_)));
+        assert_eq!(output, input.as_str());
+    }
+
+    #[test]
+    fn short_colon_separated_text_passes_through() {
+        let input = "retry policy tiny:example stayed debuggable";
+
+        let output = redact(input);
+
+        assert!(matches!(output, Cow::Borrowed(_)));
+        assert_eq!(output, input);
     }
 
     #[test]
