@@ -225,16 +225,18 @@ pub struct RateLimitConfig {
     pub max_per_minute: u32,
     /// Maximum requests per hour.
     pub max_per_hour: u32,
-    /// Maximum entries in the cache.
+    /// Maximum aggregate entries in the cache.
     ///
-    /// This caps the number of tracked keys, not the total number of stored
-    /// timestamps. Each key may retain up to `max_per_minute + max_per_hour`
-    /// admitted-hit timestamps until its windows expire, so worst-case
-    /// timestamp storage per limiter is `max_entries * (max_per_minute +
-    /// max_per_hour)`. When this key capacity is reached, admission first looks
-    /// for a least-recently-used stale entry to evict, then falls back to the
-    /// least-recently-used entry that is still below its own rate limits; if no
-    /// safe victim is found, the unknown key is rejected.
+    /// This caps the total number of tracked keys across all stripes, not the
+    /// total number of stored timestamps. Each key may retain up to
+    /// `max_per_minute + max_per_hour` admitted-hit timestamps until its
+    /// windows expire, so worst-case timestamp storage per limiter is
+    /// `max_entries * (max_per_minute + max_per_hour)`. For caches large
+    /// enough to shard, the aggregate budget is divided across stripes and
+    /// admission is stripe-local: a key can be rejected when its routed stripe
+    /// has no stale or below-limit victim, even if other stripes still have
+    /// free entries. This preserves hot-path locality and avoids cross-stripe
+    /// scans in the capacity-failure path.
     ///
     /// `NonZeroUsize` so a zero capacity is unrepresentable here: production
     /// config rejects `server.max_rate_limit_cache_size = 0` at load time with
@@ -260,23 +262,28 @@ impl Default for RateLimitConfig {
 /// per key. With the defaults, a hot key can hold up to roughly 5,240 records
 /// across the minute and hour windows before older hits are pruned.
 ///
-/// The aggregate bound is the per-key bound multiplied by the configured cache
-/// size: `max_entries * (max_per_minute + max_per_hour)` hit records per
+/// The aggregate memory bound is the per-key bound multiplied by the configured
+/// cache size: `max_entries * (max_per_minute + max_per_hour)` hit records per
 /// limiter. With the default 100,000-key cache and 240/minute plus 5,000/hour
 /// limits, one fully saturated limiter can retain roughly 524,000,000 records
 /// before pruning. Production event processing owns separate encrypted-token and
 /// device-token limiters, so size `max_entries` and process memory for both
 /// caches.
 ///
-/// Uses a bounded cache to limit tracked key cardinality. When the cache is
-/// full, admission first evicts the least-recently-used stale entry; if none is
-/// found in the bounded scan window, it falls back to a least-recently-used
-/// still-unlimited entry. This favors availability for legitimate new tokens
-/// over perfect accounting for below-limit keys under active cache pressure,
-/// while preserving counters for keys already at their rate limit. Evicting a
-/// below-limit key resets its accumulated sliding-window hits; that weakens
-/// per-key precision but does not bypass limits because the global unwrap
-/// limiter still bounds total admission.
+/// Uses a bounded, striped cache to limit tracked key cardinality. The
+/// configured `max_entries` is a hard aggregate budget divided across stripes,
+/// but admission and eviction remain local to the stripe selected by the key
+/// hash. When that stripe is full, admission first evicts a
+/// least-recently-used stale entry from the same stripe; if none is found in
+/// the bounded scan window, it falls back to a least-recently-used
+/// still-unlimited entry from that stripe. A key can therefore receive
+/// `ExceededCapacityLimit` when its stripe has no safe victim even if sibling
+/// stripes have unused capacity. This favors hot-path locality under
+/// cardinality pressure over global LRU behavior.
+///
+/// Evicting a below-limit key resets its accumulated sliding-window hits; that
+/// weakens per-key precision but does not bypass limits because the global
+/// unwrap limiter still bounds total admission.
 pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
     /// Independent LRU stripes, each behind its own `RwLock`. A key is routed
     /// to `stripes[hash(key) % stripes.len()]`, so admission checks for keys in
@@ -329,13 +336,17 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         }
     }
 
+    /// Returns the stripe index for a key by stable hash.
+    fn stripe_index(&self, key: &K) -> usize {
+        if self.stripes.len() == 1 {
+            return 0;
+        }
+        (self.hasher.hash_one(key) as usize) % self.stripes.len()
+    }
+
     /// Routes a key to its stripe by stable hash.
     fn stripe_for(&self, key: &K) -> &RwLock<LruCache<K, RateLimitEntry>> {
-        if self.stripes.len() == 1 {
-            return &self.stripes[0];
-        }
-        let idx = (self.hasher.hash_one(key) as usize) % self.stripes.len();
-        &self.stripes[idx]
+        &self.stripes[self.stripe_index(key)]
     }
 
     fn evict_lru_admission_candidate(
@@ -1186,6 +1197,55 @@ mod tests {
             summed += stripe.read().await.cap().get();
         }
         assert_eq!(summed, max);
+    }
+
+    #[tokio::test]
+    async fn test_sharded_capacity_rejection_is_stripe_local() {
+        // The configured max_entries is an aggregate memory/cardinality budget,
+        // but admission does not borrow from sibling stripes. A full target
+        // stripe whose entries are all at-limit rejects a new key routed there
+        // while another stripe can still admit its own key.
+        let max = MIN_ENTRIES_PER_SHARD * 2;
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 1,
+            max_per_hour: 100,
+            max_entries: entries(max),
+        });
+        assert_eq!(limiter.stripes.len(), 2);
+
+        let target_stripe = 0usize;
+        let other_stripe = 1usize;
+        let target_capacity = limiter.stripes[target_stripe].read().await.cap().get();
+        assert!(target_capacity < max, "test must leave aggregate headroom");
+
+        let mut target_keys = Vec::with_capacity(target_capacity + 1);
+        let mut other_key = None;
+        let mut candidate = 0u64;
+        while target_keys.len() < target_capacity + 1 || other_key.is_none() {
+            match limiter.stripe_index(&candidate) {
+                idx if idx == target_stripe => target_keys.push(candidate),
+                idx if idx == other_stripe && other_key.is_none() => other_key = Some(candidate),
+                _ => {}
+            }
+            candidate += 1;
+        }
+
+        for key in target_keys.iter().take(target_capacity) {
+            assert!(limiter.check_and_increment(key).await.is_allowed());
+        }
+        assert_eq!(limiter.len().await, target_capacity);
+
+        assert_eq!(
+            limiter
+                .check_and_increment(&target_keys[target_capacity])
+                .await,
+            RateLimitResult::ExceededCapacityLimit
+        );
+        assert_eq!(limiter.len().await, target_capacity);
+
+        let other_key = other_key.expect("found a key for the other stripe");
+        assert!(limiter.check_and_increment(&other_key).await.is_allowed());
+        assert_eq!(limiter.len().await, target_capacity + 1);
     }
 
     #[tokio::test]

@@ -200,6 +200,12 @@ limiter (about 8.4 GB at 16 bytes per timestamp, before `VecDeque` overhead),
 and the same bound again for the device-token limiter. Lower
 `max_rate_limit_cache_size` on memory-constrained deployments.
 
+`max_rate_limit_cache_size` is an aggregate key budget per limiter. Large
+caches are sharded for lock locality, and a new key can be rejected when its
+routed shard has no stale or below-limit victim even if sibling shards still
+have free entries. Size the cache with that stripe-local admission behavior in
+mind.
+
 ### Environment Variables
 
 Override any config value using environment variables with the pattern `TRANSPONDER_<SECTION>_<KEY>`.
@@ -457,7 +463,7 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 
 Label values: `type` = `encrypted_token` or `device_token`; `reason` = `minute`, `hour`, or `capacity`
 
-Under cache pressure, below-limit keys may be evicted to admit new keys. That resets their sliding-window hit counts (a precision trade-off, not a bypass); monitor `transponder_rate_limit_admission_evictions_total` and `transponder_tokens_rate_limited_total{reason="capacity"}` to size `max_rate_limit_cache_size`.
+Under cache pressure, below-limit keys may be evicted to admit new keys. That resets their sliding-window hit counts (a precision trade-off, not a bypass). Capacity is enforced per routed shard, so a key can be rejected with `reason="capacity"` while other shards still have room; monitor `transponder_rate_limit_admission_evictions_total` and `transponder_tokens_rate_limited_total{reason="capacity"}` to size `max_rate_limit_cache_size`.
 
 `outcome` values vary by metric group:
 - Event processing: `processed`, `duplicate`, `failed`

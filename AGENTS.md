@@ -111,6 +111,11 @@ src/
 - Silently ignores invalid tokens per MIP-05 spec
 - Concurrent push dispatch (doesn't wait for completion)
 
+### Rate Limiting (rate_limiter.rs)
+- Uses per-minute and per-hour sliding windows with bounded key cardinality
+- `max_rate_limit_cache_size` is an aggregate tracked-key budget per limiter
+- Large caches are sharded for lock locality; admission is stripe-local, so a key can be rejected when its stripe has no safe victim even if sibling stripes have free capacity
+
 ### Push Dispatcher (push/dispatcher.rs)
 - Semaphore limits concurrent outbound requests to 100
 - Spawns tasks for each notification (fire-and-forget)

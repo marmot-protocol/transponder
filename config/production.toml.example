@@ -32,8 +32,10 @@ dedup_state_path = "/var/lib/transponder/dedup-events.log"
 # timestamps per limiter are max_rate_limit_cache_size * (per_minute + per_hour),
 # or ~524M Instant values with the defaults (~8.4 GB at 16 B/timestamp before
 # overhead); Transponder has two limiters.
-# At capacity, new keys evict stale or below-limit entries when possible.
-# If no safe eviction candidate exists, the new key is rate limited.
+# Large caches are sharded for lock locality. At shard capacity, new keys evict
+# stale or below-limit entries from their routed shard when possible. If no safe
+# same-shard eviction candidate exists, the new key is rate limited even if
+# another shard has room.
 # max_rate_limit_cache_size = 100000
 # max_tokens_per_event = 100
 # encrypted_token_rate_limit_per_minute = 240

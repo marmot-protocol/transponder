@@ -25,7 +25,7 @@ Why these numbers make sense today:
 - the event deduplication and rate-limit caches default to 100,000 entries each
 - production deployments persist a small replay-suppression log containing only public gift-wrap event IDs and processing timestamps
 - rate-limit cache entries retain admitted-hit timestamps for sliding-window precision; worst-case timestamp storage is `max_rate_limit_cache_size × (per_minute + per_hour)` per limiter (about 8.4 GB at 16 bytes per timestamp with the defaults, before `VecDeque` overhead), and Transponder runs separate encrypted-token and device-token limiters
-- under cache pressure, new rate-limit keys evict stale or below-limit entries when possible; if no safe victim exists they are rate limited, so size these caches with headroom and monitor `transponder_rate_limit_admission_evictions_total` plus `transponder_tokens_rate_limited_total{reason="capacity"}`
+- under cache pressure, new rate-limit keys evict stale or below-limit entries from their routed shard when possible; if no safe same-shard victim exists they are rate limited even when other shards have room, so size these caches with headroom and monitor `transponder_rate_limit_admission_evictions_total` plus `transponder_tokens_rate_limited_total{reason="capacity"}`
 - Tor adds noticeable memory and connection-management overhead, which is why the default build leaves it disabled
 
 If you need to run on a smaller VM, lower the cache sizes in `config/production.toml`.
