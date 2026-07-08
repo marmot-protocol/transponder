@@ -1126,6 +1126,14 @@ impl ServerConfig {
             )));
         }
 
+        if self.dedup_state_path.as_os_str().is_empty()
+            && self.max_dedup_cache_size < self.max_concurrent_event_processing
+        {
+            return Err(config::ConfigError::Message(
+                "server.max_dedup_cache_size must be greater than or equal to server.max_concurrent_event_processing when server.dedup_state_path is unset".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -1687,6 +1695,43 @@ mod tests {
             config.server.dedup_retention_secs,
             DEFAULT_DEDUP_RETENTION_SECS
         );
+    }
+
+    #[test]
+    fn test_bounded_dedup_cache_smaller_than_event_concurrency_rejected() {
+        let error = from_test_env(&[
+            ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "2"),
+            ("TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING", "3"),
+        ])
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("server.max_dedup_cache_size"), "{message}");
+        assert!(
+            message.contains("server.max_concurrent_event_processing"),
+            "{message}"
+        );
+        assert!(message.contains("server.dedup_state_path"), "{message}");
+    }
+
+    #[test]
+    fn test_durable_replay_state_allows_small_volatile_dedup_cache() {
+        let config = from_test_env(&[
+            (
+                "TRANSPONDER_SERVER_DEDUP_STATE_PATH",
+                "/tmp/transponder-dedup.log",
+            ),
+            ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "2"),
+            ("TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING", "3"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.server.dedup_state_path,
+            PathBuf::from("/tmp/transponder-dedup.log")
+        );
+        assert_eq!(config.server.max_dedup_cache_size, 2);
+        assert_eq!(config.server.max_concurrent_event_processing, 3);
     }
 
     #[test]
@@ -2608,10 +2653,13 @@ mod tests {
     #[test]
     fn test_max_concurrent_event_processing_upper_bound_accepted() {
         let cap = MAX_CONCURRENT_EVENT_PROCESSING.to_string();
-        let config = from_test_env(&[(
-            "TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING",
-            cap.as_str(),
-        )])
+        let config = from_test_env(&[
+            (
+                "TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING",
+                cap.as_str(),
+            ),
+            ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", cap.as_str()),
+        ])
         .unwrap();
 
         assert_eq!(
@@ -2751,11 +2799,13 @@ mod tests {
             ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "1"),
             ("TRANSPONDER_SERVER_MAX_TOKENS_PER_EVENT", "1"),
             ("TRANSPONDER_SERVER_MAX_RATE_LIMIT_CACHE_SIZE", "1"),
+            ("TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING", "1"),
         ])
         .unwrap();
         assert_eq!(config.server.max_dedup_cache_size, 1);
         assert_eq!(config.server.max_tokens_per_event, 1);
         assert_eq!(config.server.max_rate_limit_cache_size, 1);
+        assert_eq!(config.server.max_concurrent_event_processing, 1);
     }
 
     // ---- #150 / #142: LogFormat enum ----
