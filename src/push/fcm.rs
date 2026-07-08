@@ -215,14 +215,20 @@ fn fcm_error_summary(error: &FcmError) -> String {
 
 /// Classify an OAuth token HTTP-error response for retry handling.
 ///
-/// A `429` or `5xx` from the token endpoint is transient (retriable); every
-/// other status is a permanent OAuth rejection carrying only the status text
-/// (never the body — see [`oauth_failure_message`]).
+/// A `408`, `425`, `429`, or `5xx` from the token endpoint is transient
+/// (retriable); every other status is a permanent OAuth rejection carrying
+/// only the status text (never the body — see [`oauth_failure_message`]).
 fn oauth_error_from_status(
     status: reqwest::StatusCode,
     retry_after: Option<Duration>,
 ) -> TokenAcquisitionError {
-    if status == 429 || status.is_server_error() {
+    if matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_EARLY
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
+    {
         TokenAcquisitionError::Retriable {
             status_code: status.as_u16(),
             retry_after,
@@ -2713,7 +2719,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
 
     #[test]
     fn test_oauth_token_http_status_classifies_transient_failures_as_retriable() {
-        for status_code in [429_u16, 500, 503] {
+        for status_code in [408_u16, 425, 429, 500, 503] {
             let status = reqwest::StatusCode::from_u16(status_code).unwrap();
             let failure = oauth_error_from_status(status, None);
             assert!(
