@@ -374,13 +374,22 @@ impl AuthTokenGenerator for FcmTokenGenerator {
 
         // Bounded, zeroizing read of the success body (issue #154).
         let token_response: TokenResponse =
-            crate::push::parse_bounded_json_body(response, MAX_OAUTH_BODY_BYTES)
-                .await
-                .ok_or_else(|| {
-                    TokenAcquisitionError::permanent(Error::Fcm(
-                        "OAuth token response was unreadable or exceeded the size cap".to_string(),
-                    ))
-                })?;
+            match crate::push::parse_bounded_json_body(response, MAX_OAUTH_BODY_BYTES).await {
+                Ok(token_response) => token_response,
+                Err(crate::push::BoundedJsonBodyError::Read(error)) => {
+                    return Err(oauth_error_from_transport(error));
+                }
+                Err(crate::push::BoundedJsonBodyError::TooLarge) => {
+                    return Err(TokenAcquisitionError::permanent(Error::Fcm(
+                        "OAuth token response exceeded the size cap".to_string(),
+                    )));
+                }
+                Err(crate::push::BoundedJsonBodyError::Parse) => {
+                    return Err(TokenAcquisitionError::permanent(Error::Fcm(
+                        "OAuth token response was malformed JSON".to_string(),
+                    )));
+                }
+            };
 
         let ttl = token_cache_lifetime(token_response.expires_in);
 
@@ -2917,8 +2926,39 @@ LTP/MQIxLydQxT4+jx2NBu0=
         let Err(TokenAcquisitionError::Permanent(Error::Fcm(message))) = result else {
             panic!("expected a permanent OAuth error for the oversized body");
         };
-        assert!(message.contains("unreadable or exceeded the size cap"));
+        assert!(message.contains("exceeded the size cap"));
         assert!(!message.contains(&padding));
+    }
+
+    #[tokio::test]
+    async fn test_mint_oauth_success_body_read_error_is_retriable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\n\r\n{\"access_token\":\"partial",
+                )
+                .await
+                .unwrap();
+        });
+
+        let generator = generator_with_token_uri(&format!("http://{addr}/token"));
+        let result = generator.mint().await;
+        server.await.unwrap();
+
+        assert!(matches!(
+            result,
+            Err(TokenAcquisitionError::Retriable {
+                status_code: 0,
+                retry_after: None
+            })
+        ));
     }
 
     #[tokio::test]
