@@ -33,6 +33,9 @@ use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
 use crate::rate_limiter::{RateLimitConfig, RateLimiter};
 
+const FUTURE_NOTIFICATION_ERROR: &str = "Notification request timestamp is too far in the future";
+const STALE_NOTIFICATION_ERROR: &str = "Notification request timestamp is stale";
+
 /// Event processor for handling incoming gift-wrapped notifications.
 pub struct EventProcessor {
     nip59_handler: Nip59Handler,
@@ -407,7 +410,8 @@ impl EventProcessor {
     /// Returns true when an event failed in a way replaying it cannot fix.
     fn is_permanent_error(error: &Error) -> bool {
         match error {
-            Error::Crypto(_) | Error::InvalidToken(_) => true,
+            Error::Crypto(_) => true,
+            Error::InvalidToken(message) => message != FUTURE_NOTIFICATION_ERROR,
             Error::Config(_)
             | Error::Nostr(_)
             | Error::Apns(_)
@@ -426,17 +430,13 @@ impl EventProcessor {
         let now = Timestamp::now().as_secs();
         let created_at = created_at.as_secs();
         if created_at > now.saturating_add(self.max_notification_future_skew.as_secs()) {
-            return Err(Error::InvalidToken(
-                "Notification request timestamp is too far in the future".to_string(),
-            ));
+            return Err(Error::InvalidToken(FUTURE_NOTIFICATION_ERROR.to_string()));
         }
 
         if !self.max_notification_age.is_zero()
             && now.saturating_sub(created_at) > self.max_notification_age.as_secs()
         {
-            return Err(Error::InvalidToken(
-                "Notification request timestamp is stale".to_string(),
-            ));
+            return Err(Error::InvalidToken(STALE_NOTIFICATION_ERROR.to_string()));
         }
 
         Ok(())
@@ -1483,8 +1483,21 @@ mod tests {
         );
         assert_eq!(
             processor.cache_len(),
-            1,
-            "future-dated replays are terminal"
+            0,
+            "future-dated replays must stay retryable"
+        );
+
+        let replay = processor.process(&event).await;
+        assert!(replay.is_ok());
+        assert!(!replay.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_failed_total", &[]),
+            2.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
+            0.0,
+            "future-dated retry must not short-circuit as a duplicate"
         );
     }
 
@@ -1660,6 +1673,16 @@ mod tests {
         );
 
         assert!(processor.process(&event).await.unwrap());
+    }
+
+    #[test]
+    fn future_freshness_error_is_retryable_but_stale_is_permanent() {
+        assert!(!EventProcessor::is_permanent_error(&Error::InvalidToken(
+            FUTURE_NOTIFICATION_ERROR.to_string()
+        )));
+        assert!(EventProcessor::is_permanent_error(&Error::InvalidToken(
+            STALE_NOTIFICATION_ERROR.to_string()
+        )));
     }
 
     #[tokio::test]
