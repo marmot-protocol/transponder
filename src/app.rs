@@ -341,6 +341,19 @@ async fn run_relay_status_refresher(
     }
 }
 
+async fn finish_relay_startup(relay_client: Arc<RelayClient>, public_key: PublicKey) -> Result<()> {
+    relay_client
+        .subscribe(public_key)
+        .await
+        .context("Failed to subscribe to events")?;
+
+    if let Err(e) = relay_client.publish_inbox_relays().await {
+        warn!(error = %e, "Failed to publish inbox relay list");
+    }
+
+    Ok(())
+}
+
 /// Tear down the pipeline in dependency order, producers before consumers.
 ///
 /// The stage order is load-bearing (#173, #84):
@@ -631,15 +644,39 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
         event_trigger,
     ));
 
-    // Subscribe to events
-    relay_client
-        .subscribe(keys.public_key())
-        .await
-        .context("Failed to subscribe to events")?;
-
-    // Publish inbox relay list
-    if let Err(e) = relay_client.publish_inbox_relays().await {
-        warn!(error = %e, "Failed to publish inbox relay list");
+    // Finish relay startup, but keep a shutdown listener registered across the
+    // subscribe and inbox-relay publication awaits. If a signal arrives here,
+    // the event loop and health server are already running, so use the normal
+    // staged teardown to drain any work admitted while startup was completing.
+    match run_startup_or_shutdown(
+        finish_relay_startup(relay_client.clone(), keys.public_key()),
+        shutdown.wait_for_signal_or_trigger(),
+    )
+    .await
+    {
+        StartupOutcome::Connected(result) => {
+            result?;
+        }
+        StartupOutcome::ShutdownRequested(reason) => {
+            info!("Shutdown signal received during relay startup; stopping before run loop");
+            crate::shutdown::graceful_shutdown(
+                || {
+                    staged_teardown(
+                        event_handle,
+                        event_tasks,
+                        push_dispatcher,
+                        relay_client,
+                        health_handle,
+                        tokio::spawn(async {}),
+                        tokio::spawn(async {}),
+                    )
+                },
+                config.server.shutdown_timeout_secs,
+            )
+            .await;
+            info!("Transponder stopped");
+            return shutdown_result(reason);
+        }
     }
 
     // Start periodic cleanup task
