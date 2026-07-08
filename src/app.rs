@@ -84,12 +84,11 @@ fn parse_server_secret_key(server_private_key: &str) -> Result<SecretKey> {
 
 /// Number of permits to use for the event-processing semaphore.
 ///
-/// Bounds total in-flight gift-wrap unwrap (ECDH) work. A configured value of
-/// zero would deadlock the event loop (no permit could ever be acquired), so it
-/// is clamped up to a single permit, preserving sequential processing.
+/// Bounds total in-flight gift-wrap unwrap (ECDH) work. Load-time config
+/// validation rejects zero, so this preserves the operator's configured cap.
 #[must_use]
 fn event_processing_permits(max_concurrent_event_processing: usize) -> usize {
-    max_concurrent_event_processing.max(1)
+    max_concurrent_event_processing
 }
 
 /// Outcome of racing relay startup against a shutdown signal.
@@ -861,12 +860,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
-    fn event_processing_permits_clamps_zero_to_one() {
-        assert_eq!(event_processing_permits(0), 1);
-    }
-
-    #[test]
-    fn event_processing_permits_preserves_positive_values() {
+    fn event_processing_permits_preserves_configured_values() {
+        assert_eq!(event_processing_permits(0), 0);
         assert_eq!(event_processing_permits(1), 1);
         assert_eq!(event_processing_permits(64), 64);
         assert_eq!(event_processing_permits(1000), 1000);

@@ -1040,8 +1040,8 @@ impl AppConfig {
 impl ServerConfig {
     /// Rejects rate-limit count fields, the cache sizes, and
     /// `max_tokens_per_event` set to `0`, `shutdown_timeout_secs` set to `0`,
-    /// and `max_concurrent_event_processing` above
-    /// [`MAX_CONCURRENT_EVENT_PROCESSING`].
+    /// `max_concurrent_event_processing` set to `0`, and
+    /// `max_concurrent_event_processing` above [`MAX_CONCURRENT_EVENT_PROCESSING`].
     ///
     /// A `0` per-minute/per-hour limit blocks every request for that limiter
     /// dimension, a `0` `max_tokens_per_event` rejects every notification
@@ -1050,10 +1050,11 @@ impl ServerConfig {
     /// constructors now take `NonZeroUsize`, so the zero is rejected here with
     /// a named-field error instead. A `0` `shutdown_timeout_secs` makes the
     /// graceful drain time out immediately, abandoning in-flight push
-    /// notifications, so it is rejected rather than silently skipping the
-    /// drain. An oversized `max_concurrent_event_processing` would panic in
-    /// `Semaphore::new` at startup, so it is range-checked here. Each error
-    /// names the offending config field.
+    /// notifications, so it is rejected rather than silently skipping the drain.
+    /// A `0` `max_concurrent_event_processing` would silently force sequential
+    /// event processing, while an oversized value would panic in
+    /// `Semaphore::new` at startup, so the field is range-checked here. Each
+    /// error names the offending config field.
     fn validate(&self) -> std::result::Result<(), config::ConfigError> {
         if self.shutdown_timeout_secs == 0 {
             return Err(config::ConfigError::Message(
@@ -1097,6 +1098,10 @@ impl ServerConfig {
             (
                 "server.max_tokens_per_event",
                 self.max_tokens_per_event as u64,
+            ),
+            (
+                "server.max_concurrent_event_processing",
+                self.max_concurrent_event_processing as u64,
             ),
             ("server.dedup_retention_secs", self.dedup_retention_secs),
         ];
@@ -2264,8 +2269,8 @@ mod tests {
         assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 7200);
     }
 
-    /// Config fields that must reject a `0` value at load time, paired with the
-    /// TOML key used to set them.
+    /// Server config fields that must reject a `0` value at load time, paired
+    /// with the TOML key used to set them.
     const ZERO_REJECTED_FIELDS: &[&str] = &[
         "encrypted_token_rate_limit_per_minute",
         "encrypted_token_rate_limit_per_hour",
@@ -2274,10 +2279,11 @@ mod tests {
         "global_unwrap_rate_limit_per_minute",
         "global_unwrap_rate_limit_per_hour",
         "max_rate_limit_cache_size",
+        "max_concurrent_event_processing",
     ];
 
     #[test]
-    fn test_zero_rate_limit_count_fields_rejected_from_file() {
+    fn test_zero_server_fields_rejected_from_file() {
         for field in ZERO_REJECTED_FIELDS {
             let config_content = format!(
                 r#"
@@ -2303,7 +2309,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_rate_limit_count_fields_rejected_from_env() {
+    fn test_zero_server_fields_rejected_from_env() {
         for field in ZERO_REJECTED_FIELDS {
             let env_key = format!("TRANSPONDER_SERVER_{}", field.to_ascii_uppercase());
             let error = from_test_env(&[(env_key.as_str(), "0")]).unwrap_err();
@@ -2321,7 +2327,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nonzero_rate_limit_count_fields_accepted() {
+    fn test_nonzero_server_fields_accepted() {
         // Defaults (no overrides) plus a minimal `1` for every guarded field
         // must both pass validation, so valid custom values keep working.
         assert!(from_test_env(&[]).is_ok());
@@ -2343,6 +2349,7 @@ mod tests {
             ),
             ("TRANSPONDER_SERVER_GLOBAL_UNWRAP_RATE_LIMIT_PER_HOUR", "1"),
             ("TRANSPONDER_SERVER_MAX_RATE_LIMIT_CACHE_SIZE", "1"),
+            ("TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING", "1"),
         ])
         .unwrap();
 
@@ -2353,6 +2360,7 @@ mod tests {
         assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 1);
         assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 1);
         assert_eq!(config.server.max_rate_limit_cache_size, 1);
+        assert_eq!(config.server.max_concurrent_event_processing, 1);
     }
 
     #[test]
