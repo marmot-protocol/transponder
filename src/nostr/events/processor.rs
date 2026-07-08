@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lru::LruCache;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -15,7 +16,9 @@ use super::admission::{
     AdmissionGuard, AdmittedCharges, InFlightEventGuard, ProcessOutcome, StageTimer,
     platform_metric_label,
 };
-use super::dedup::{DEDUP_WINDOW, PersistentDedupState, SeenEvent, SeenEventStore};
+use super::dedup::{
+    CLEANUP_BATCH_SIZE, DEDUP_WINDOW, PersistentDedupState, SeenEvent, SeenEventStore,
+};
 use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
 use crate::defaults::{
     DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
@@ -37,6 +40,11 @@ pub struct EventProcessor {
     push_dispatcher: Arc<PushDispatcher>,
     /// Event ID replay-protection state.
     seen_events: Arc<RwLock<SeenEventStore>>,
+    /// Volatile per-token terminal replay state keyed by event ID plus the
+    /// encrypted-token hash. This lets a mixed event stay retryable for tokens
+    /// that were transiently shed while skipping siblings that already reached
+    /// terminal local processing.
+    terminal_tokens: Arc<RwLock<LruCache<[u8; 32], Instant>>>,
     /// Optional durable event-ID replay state.
     dedup_persistence: Option<Arc<PersistentDedupState>>,
     /// How long event IDs remain in replay state.
@@ -59,6 +67,11 @@ pub struct EventProcessor {
     /// Maximum encrypted tokens accepted in a single event.
     max_tokens_per_event: usize,
     metrics: Metrics,
+}
+
+struct AdmittedToken {
+    charges: AdmittedCharges,
+    replay_key: [u8; 32],
 }
 
 /// Configuration for token rate limiting.
@@ -208,6 +221,13 @@ impl EventProcessor {
         // `max_dedup_cache_size` is `NonZeroUsize`, so the previous silent
         // zero-to-default substitution is unrepresentable.
         let cache_size = replay_config.max_dedup_cache_size;
+        let terminal_token_cache_size = NonZeroUsize::new(
+            cache_size
+                .get()
+                .saturating_mul(rate_limit_config.max_tokens_per_event.get())
+                .max(1),
+        )
+        .expect("token replay cache size is non-zero");
 
         let (seen_events, dedup_persistence) = if let Some(path) = replay_config.dedup_state_path {
             let seen =
@@ -228,6 +248,7 @@ impl EventProcessor {
             token_decryptor,
             push_dispatcher,
             seen_events,
+            terminal_tokens: Arc::new(RwLock::new(LruCache::new(terminal_token_cache_size))),
             dedup_persistence,
             dedup_retention: replay_config.dedup_retention,
             max_notification_age: replay_config.max_notification_age,
@@ -482,20 +503,21 @@ impl EventProcessor {
         // Rate limiting happens BEFORE decryption intentionally:
         // Prevents wasting CPU on tokens we'll immediately rate-limit anyway.
         let mut payloads = Vec::with_capacity(token_bytes.len());
-        let mut admitted_rate_limit_keys: Vec<AdmittedCharges> =
-            Vec::with_capacity(token_bytes.len());
-        // Track whether a zero-admission outcome is purely a transient per-token
-        // rate-limit shed. `rate_limited_any` records that at least one token was
-        // dropped by a limiter; `terminally_dropped_any` records that at least one
-        // token was dropped for a permanent reason (undecryptable per MIP-05, or
-        // targeting an unconfigured platform / carrying a non-encodable token per
-        // #177), so the event genuinely carried undispatchable tokens rather than
-        // momentarily over-budget ones.
+        let mut admitted_tokens: Vec<AdmittedToken> = Vec::with_capacity(token_bytes.len());
+        // Track whether any token remains retryable due to transient per-token
+        // rate limiting. Terminal sibling tokens are recorded in
+        // `terminal_tokens` and skipped on redelivery, so they no longer force
+        // the whole event into terminal event-ID dedup state.
         let mut rate_limited_any = false;
-        let mut terminally_dropped_any = false;
         for bytes in token_bytes {
-            // Rate limit check 1: encrypted token (replay protection)
             let encrypted_key = Self::hash_bytes(&bytes);
+            let token_replay_key = Self::token_replay_key(&event.id, &encrypted_key);
+            if self.token_is_terminal(&token_replay_key).await {
+                trace!("Skipping token already terminal for this event");
+                continue;
+            }
+
+            // Rate limit check 1: encrypted token (replay protection)
             let encrypted_result = self
                 .encrypted_token_limiter
                 .check_and_increment(&encrypted_key)
@@ -546,10 +568,10 @@ impl EventProcessor {
                     // Silently ignore invalid tokens per MIP-05 spec.
                     // Keep the encrypted-token rate-limit increment: invalid
                     // encrypted blobs should still spend replay/spam budget.
-                    // A decrypt failure is permanent, so a zero-admission event
-                    // that hit one is terminal, not a retryable rate shed.
+                    // A decrypt failure is permanent for this token, but not
+                    // for transiently-shed siblings in the same event.
                     guard.keep_charge();
-                    terminally_dropped_any = true;
+                    self.mark_token_terminal(token_replay_key).await;
                     trace!(error = %e, "Failed to decrypt token (ignoring)");
                     self.metrics.record_token_decryption_failed();
                     self.metrics.observe_token_decrypt_duration(
@@ -570,7 +592,7 @@ impl EventProcessor {
             // it silently after both limiters were charged.
             if !self.push_dispatcher.accepts(payload.platform) {
                 guard.refund().await;
-                terminally_dropped_any = true;
+                self.mark_token_terminal(token_replay_key).await;
                 let platform = platform_metric_label(payload.platform);
                 trace!(platform, "Dropping token: platform not configured");
                 self.metrics.record_push_failed(platform, "unconfigured");
@@ -579,7 +601,7 @@ impl EventProcessor {
             }
             if !PushDispatcher::token_is_encodable(&payload) {
                 guard.refund().await;
-                terminally_dropped_any = true;
+                self.mark_token_terminal(token_replay_key).await;
                 let platform = platform_metric_label(payload.platform);
                 trace!(platform, "Dropping token: device token not encodable");
                 self.metrics
@@ -624,17 +646,19 @@ impl EventProcessor {
             payloads.push(payload);
             // Keep this paired with `payloads`: dispatch admission failure
             // rolls back exactly the rate-limit increments for admitted work.
-            admitted_rate_limit_keys.push(guard.commit());
+            admitted_tokens.push(AdmittedToken {
+                charges: guard.commit(),
+                replay_key: token_replay_key,
+            });
         }
 
         if payloads.is_empty() {
             self.metrics.observe_notifications_admitted_per_event(0);
 
-            // Distinguish a pure per-token rate-limit shed (retryable) from an
-            // event that genuinely carried no dispatchable token (terminal). The
-            // shed path only applies when at least one token was rate-limited and
-            // none was dropped for a permanent reason.
-            if rate_limited_any && !terminally_dropped_any {
+            // Any transiently rate-limited token keeps the event retryable. Any
+            // terminal siblings have token-level terminal state and will be
+            // skipped on redelivery.
+            if rate_limited_any {
                 return Ok(ProcessOutcome::RateLimitedShed);
             }
             return Ok(ProcessOutcome::Admitted);
@@ -650,10 +674,19 @@ impl EventProcessor {
                 );
                 self.metrics.observe_notifications_admitted_per_event(count);
 
-                Ok(ProcessOutcome::Admitted)
+                for admitted in &admitted_tokens {
+                    self.mark_token_terminal(admitted.replay_key).await;
+                }
+
+                if rate_limited_any {
+                    Ok(ProcessOutcome::RateLimitedShed)
+                } else {
+                    Ok(ProcessOutcome::Admitted)
+                }
             }
             Err(e) => {
-                for charges in &admitted_rate_limit_keys {
+                for admitted in &admitted_tokens {
+                    let charges = &admitted.charges;
                     self.encrypted_token_limiter
                         .rollback_increment(&charges.encrypted_key, charges.encrypted_reservation)
                         .await;
@@ -692,6 +725,24 @@ impl EventProcessor {
         let mut hasher = Sha256::new();
         hasher.update(data);
         hasher.finalize().into()
+    }
+
+    /// Hash `(event_id, encrypted_token_hash)` into a bounded-cache key.
+    fn token_replay_key(event_id: &EventId, encrypted_key: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(event_id.to_hex().as_bytes());
+        hasher.update(encrypted_key);
+        hasher.finalize().into()
+    }
+
+    async fn token_is_terminal(&self, replay_key: &[u8; 32]) -> bool {
+        let terminal_tokens = self.terminal_tokens.read().await;
+        terminal_tokens.contains(replay_key)
+    }
+
+    async fn mark_token_terminal(&self, replay_key: [u8; 32]) {
+        let mut terminal_tokens = self.terminal_tokens.write().await;
+        terminal_tokens.put(replay_key, Instant::now());
     }
 
     /// Hash device token key (platform || device_token) for rate limiting.
@@ -849,6 +900,21 @@ impl EventProcessor {
                 remaining = remaining,
                 "Cleaned up event deduplication cache"
             );
+        }
+
+        {
+            let mut terminal_tokens = self.terminal_tokens.write().await;
+            let now = Instant::now();
+            let expired_keys: Vec<_> = terminal_tokens
+                .iter()
+                .rev()
+                .take(CLEANUP_BATCH_SIZE)
+                .filter(|(_, seen_at)| now.duration_since(**seen_at) >= self.dedup_retention)
+                .map(|(key, _)| *key)
+                .collect();
+            for key in &expired_keys {
+                terminal_tokens.pop(key);
+            }
         }
 
         // Clean global pre-unwrap admission limiter cache.
@@ -3318,14 +3384,16 @@ mod tests {
     }
 
     /// When an event carries a mix of rate-limited and invalid tokens and admits
-    /// none, the presence of a permanently invalid token makes it terminal: the
-    /// event genuinely carried a bad token, so it is not a pure rate shed.
+    /// none, the rate-limited token keeps the event retryable. The invalid
+    /// sibling is terminal at token granularity and is skipped on redelivery.
     #[tokio::test]
-    async fn test_mixed_rate_limited_and_invalid_zero_admission_is_terminal() {
+    async fn test_mixed_rate_limited_and_invalid_zero_admission_retries_shed_token() {
         use crate::test_vectors::{
             GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
         };
         use base64::prelude::*;
+
+        tokio::time::pause();
 
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
@@ -3362,16 +3430,116 @@ mod tests {
             .build(&content)
             .await;
 
-        // Zero admitted, but one token was permanently invalid, so terminal.
-        assert!(processor.process(&event).await.unwrap());
-        assert!(processor.is_duplicate(&event.id).await);
+        // Zero admitted, but one token was transiently rate-limited, so the
+        // event stays retryable despite its permanently invalid sibling.
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.is_duplicate(&event.id).await);
         assert_eq!(
             counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
-            0.0
+            1.0
         );
         assert_eq!(
             counter_value(&metrics, "transponder_events_processed_total", &[]),
+            1.0 // only `warmup`
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_tokens_decryption_failed_total", &[]),
+            1.0
+        );
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        // The replay skips the invalid sibling already marked terminal and
+        // admits the formerly rate-limited token.
+        assert!(processor.process(&event).await.unwrap());
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
             2.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_tokens_decryption_failed_total", &[]),
+            1.0,
+            "terminal invalid sibling must not be decrypted again on replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mixed_rate_limited_and_admitted_tokens_retries_only_shed_token() {
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+
+        tokio::time::pause();
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let rate_limited_device =
+            "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+        let admitted_device = "bbccddaa22334455bbccddaa22334455bbccddaa22334455bbccddaa22334455";
+
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            TokenRateLimitConfig {
+                max_cache_size: NonZeroUsize::new(100).unwrap(),
+                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
+                encrypted_token_per_minute: 100,
+                encrypted_token_per_hour: 1000,
+                device_token_per_minute: 1,
+                device_token_per_hour: 100,
+                global_unwrap_per_minute: 1000,
+                global_unwrap_per_hour: 10000,
+            },
+        );
+
+        let warmup =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, rate_limited_device)
+                .await;
+        assert!(processor.process(&warmup).await.unwrap());
+
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let rate_limited_b64 = encryptor.encrypt_base64(&TestToken::apns(rate_limited_device));
+        let admitted_b64 = encryptor.encrypt_base64(&TestToken::apns(admitted_device));
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(rate_limited_b64)
+            .with_raw_token(admitted_b64)
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
+            .build(&content)
+            .await;
+
+        // One sibling is admitted, but the event remains retryable for the
+        // transiently shed token.
+        assert!(!processor.process(&event).await.unwrap());
+        assert!(!processor.is_duplicate(&event.id).await);
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_dispatched_total",
+                &[("platform", "apns")],
+            ),
+            2.0 // warmup + admitted sibling
+        );
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        // The admitted sibling is terminal and skipped; only the formerly shed
+        // token is admitted on replay.
+        assert!(processor.process(&event).await.unwrap());
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_dispatched_total",
+                &[("platform", "apns")],
+            ),
+            3.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_processed_total", &[]),
+            2.0 // warmup + replay
         );
     }
 
