@@ -39,6 +39,9 @@ const TOKEN_REFRESH_SAFETY_MARGIN_SECS: u64 = 60;
 /// refresh safety margin.
 const TOKEN_LIFETIME_MIN: Duration = Duration::from_secs(30);
 
+/// Maximum cache lifetime accepted from provider-reported OAuth token expiry.
+const TOKEN_LIFETIME_MAX: Duration = Duration::from_secs(60 * 60);
+
 /// Upper bound on FCM registration token length.
 ///
 /// FCM tokens are opaque and have historically been ~150-200 characters, but
@@ -111,6 +114,7 @@ fn token_cache_lifetime(expires_in: Option<u64>) -> Duration {
         .map(|seconds| {
             Duration::from_secs(seconds.saturating_sub(TOKEN_REFRESH_SAFETY_MARGIN_SECS))
                 .max(TOKEN_LIFETIME_MIN)
+                .min(TOKEN_LIFETIME_MAX)
         })
         .unwrap_or(TOKEN_LIFETIME)
 }
@@ -407,9 +411,15 @@ impl AuthTokenGenerator for FcmTokenGenerator {
         self.metrics.record_auth_token_refresh("fcm_oauth");
 
         trace!("Refreshed FCM access token");
+        let expires_at = SystemTime::now().checked_add(ttl).ok_or_else(|| {
+            TokenAcquisitionError::permanent(Error::Fcm(
+                "OAuth token expiry overflowed system time".to_string(),
+            ))
+        })?;
+
         Ok(MintedToken {
             token: token_response.access_token,
-            expires_at: SystemTime::now() + ttl,
+            expires_at,
         })
     }
 }
@@ -987,6 +997,11 @@ mod tests {
             token_cache_lifetime(Some(TOKEN_REFRESH_SAFETY_MARGIN_SECS)),
             TOKEN_LIFETIME_MIN
         );
+    }
+
+    #[test]
+    fn test_token_cache_lifetime_clamps_huge_provider_expiry_to_maximum() {
+        assert_eq!(token_cache_lifetime(Some(u64::MAX)), TOKEN_LIFETIME_MAX);
     }
 
     #[test]
@@ -2919,6 +2934,29 @@ LTP/MQIxLydQxT4+jx2NBu0=
             .expect("expiry in the future");
         assert!(remaining <= Duration::from_secs(60));
         assert!(remaining >= Duration::from_secs(50));
+    }
+
+    #[tokio::test]
+    async fn test_mint_clamps_pathologically_large_provider_expiry() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-token",
+                "expires_in": u64::MAX
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let generator = generator_with_token_uri(&mock_server.uri());
+        let minted = generator.mint().await.expect("mint should not panic");
+        let remaining = minted
+            .expires_at
+            .duration_since(SystemTime::now())
+            .expect("expiry in the future");
+
+        assert!(remaining <= TOKEN_LIFETIME_MAX);
+        assert!(remaining >= TOKEN_LIFETIME_MAX - Duration::from_secs(10));
     }
 
     #[tokio::test]
