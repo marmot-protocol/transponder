@@ -167,16 +167,16 @@ enum Apns400Classification {
 /// Classify an APNs `400` `reason` as either a dead device token or a
 /// permanent provider/configuration error.
 ///
-/// Only `BadDeviceToken`, `DeviceTokenNotForTopic`, and `Unregistered` indicate
-/// that the device token itself is invalid. Every other reason (and any
-/// unrecognised reason) is a permanent error so callers do not evict an
-/// otherwise-healthy token.
+/// Only `BadDeviceToken` and `Unregistered` unambiguously indicate that the
+/// device token itself is invalid. `DeviceTokenNotForTopic` can also mean this
+/// server is sending every request with the wrong `apns-topic`/bundle ID, so it
+/// is treated as a permanent provider/configuration error rather than evicting
+/// otherwise-healthy tokens. Every other reason (and any unrecognised reason)
+/// is also a permanent error.
 #[must_use]
 fn classify_apns_400(reason: &str) -> Apns400Classification {
     match reason {
-        "BadDeviceToken" | "DeviceTokenNotForTopic" | "Unregistered" => {
-            Apns400Classification::TokenDead
-        }
+        "BadDeviceToken" | "Unregistered" => Apns400Classification::TokenDead,
         _ => Apns400Classification::Permanent,
     }
 }
@@ -975,10 +975,6 @@ mod tests {
             Apns400Classification::TokenDead
         );
         assert_eq!(
-            classify_apns_400("DeviceTokenNotForTopic"),
-            Apns400Classification::TokenDead
-        );
-        assert_eq!(
             classify_apns_400("Unregistered"),
             Apns400Classification::TokenDead
         );
@@ -990,6 +986,7 @@ mod tests {
         for reason in [
             "BadTopic",
             "MissingTopic",
+            "DeviceTokenNotForTopic",
             "TopicDisallowed",
             "BadPriority",
             "BadExpirationDate",
@@ -1142,9 +1139,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_response_400_device_token_not_for_topic_is_token_dead() {
+    async fn test_handle_response_400_device_token_not_for_topic_is_permanent_error() {
         let result = apns_400_result("DeviceTokenNotForTopic").await;
-        assert!(matches!(result, SendAttemptResult::Success(false)));
+        assert!(matches!(
+            result,
+            SendAttemptResult::Permanent(Error::Apns(ref message))
+                if message.contains("DeviceTokenNotForTopic")
+        ));
     }
 
     #[tokio::test]
