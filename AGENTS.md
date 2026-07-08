@@ -103,7 +103,7 @@ src/
 - Uses ECDH with secp256k1 for key agreement
 - HKDF-SHA256 with salt "mip05-v1" and info "mip05-token-encryption"
 - ChaCha20-Poly1305 for authenticated encryption
-- PKCS#7 padding removal from decrypted payload
+- Length-prefixed plaintext: platform byte, u16 big-endian token length, device token, ignored random padding
 - Platform byte: 0x01 = APNs, 0x02 = FCM
 
 ### Event Processing (nostr/events.rs)

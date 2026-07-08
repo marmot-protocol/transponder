@@ -811,7 +811,7 @@ impl Metrics {
         self.tokens_per_event.observe(count as f64);
     }
 
-    /// Observe the size in bytes of the base64-decoded encrypted token blob.
+    /// Observe the as-received size in bytes of the raw base64 token content.
     pub fn observe_notification_content_size_bytes(&self, size: usize) {
         if !self.enabled {
             return;
