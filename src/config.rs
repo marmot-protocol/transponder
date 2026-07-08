@@ -1164,7 +1164,8 @@ impl RelayConfig {
 }
 
 impl HealthConfig {
-    /// Rejects a `bind_address` that does not parse as a socket address.
+    /// Rejects a `bind_address` that does not parse as a socket address or
+    /// asks the OS to choose an ephemeral port.
     ///
     /// The health server binds this address at startup; without a load-time
     /// check, a typo (e.g. a hostname like `localhost:8080`, or an out-of-range
@@ -1172,15 +1173,24 @@ impl HealthConfig {
     /// health server is disabled so a dormant misconfiguration cannot hide
     /// until the endpoint is re-enabled.
     fn validate(&self) -> std::result::Result<(), config::ConfigError> {
-        self.bind_address
+        let addr = self
+            .bind_address
             .parse::<SocketAddr>()
             .map_err(|error| {
                 config::ConfigError::Message(format!(
                     "health.bind_address \"{}\" is not a valid socket address (expected IP:port, e.g. \"127.0.0.1:8080\"): {error}",
                     self.bind_address
                 ))
-            })
-            .map(|_| ())
+            })?;
+
+        if addr.port() == 0 {
+            return Err(config::ConfigError::Message(format!(
+                "health.bind_address \"{}\" must not use port 0",
+                self.bind_address
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -2798,6 +2808,15 @@ mod tests {
         let error =
             from_test_env(&[("TRANSPONDER_HEALTH_BIND_ADDRESS", "127.0.0.1:99999")]).unwrap_err();
         assert!(error.to_string().contains("health.bind_address"), "{error}");
+    }
+
+    #[test]
+    fn test_health_bind_address_zero_port_rejected() {
+        let error = from_test_env(&[("TRANSPONDER_HEALTH_BIND_ADDRESS", "0.0.0.0:0")]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("health.bind_address"), "{message}");
+        assert!(message.contains("port 0"), "{message}");
     }
 
     #[test]
