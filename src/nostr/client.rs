@@ -84,17 +84,51 @@ impl AdmitPolicy for ReconnectAttemptLimiter {
     }
 }
 
-fn spawn_reconnect_attempt_monitor(monitor: Monitor, limiter: ReconnectAttemptLimiter) {
+fn spawn_reconnect_attempt_monitor(
+    monitor: Monitor,
+    limiter: ReconnectAttemptLimiter,
+    client: Client,
+) {
     let notifications = monitor.subscribe();
     std::mem::drop(tokio::spawn(run_reconnect_attempt_monitor(
         notifications,
         limiter,
+        client,
     )));
+}
+
+fn resync_reconnect_attempts<I>(limiter: &ReconnectAttemptLimiter, relays: I)
+where
+    I: IntoIterator<Item = (RelayUrl, NostrRelayStatus)>,
+{
+    for (relay_url, status) in relays {
+        match status {
+            NostrRelayStatus::Connected => limiter.reset(&relay_url),
+            NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
+                limiter.remove(&relay_url);
+            }
+            NostrRelayStatus::Initialized
+            | NostrRelayStatus::Pending
+            | NostrRelayStatus::Connecting
+            | NostrRelayStatus::Disconnected
+            | NostrRelayStatus::Sleeping => {}
+        }
+    }
+}
+
+async fn resync_reconnect_attempts_from_client(client: &Client, limiter: &ReconnectAttemptLimiter) {
+    let relays = client
+        .relays()
+        .await
+        .into_iter()
+        .map(|(relay_url, relay)| (relay_url, relay.status()));
+    resync_reconnect_attempts(limiter, relays);
 }
 
 async fn run_reconnect_attempt_monitor(
     mut notifications: broadcast::Receiver<MonitorNotification>,
     limiter: ReconnectAttemptLimiter,
+    client: Client,
 ) {
     loop {
         match notifications.recv().await {
@@ -112,8 +146,9 @@ async fn run_reconnect_attempt_monitor(
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 warn!(
                     skipped,
-                    "Relay reconnect attempt monitor lagged; attempt counters may reset late"
+                    "Relay reconnect attempt monitor lagged; resynchronizing attempt counters from current relay status"
                 );
+                resync_reconnect_attempts_from_client(&client, &limiter).await;
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
@@ -197,13 +232,17 @@ impl RelayClient {
 
         let reconnect_attempt_limiter = ReconnectAttemptLimiter::new(config.max_reconnect_attempts);
         let relay_monitor = Monitor::new(RELAY_MONITOR_CHANNEL_SIZE);
-        spawn_reconnect_attempt_monitor(relay_monitor.clone(), reconnect_attempt_limiter.clone());
 
         let client = Client::builder()
             .signer(keys)
-            .admit_policy(reconnect_attempt_limiter)
-            .monitor(relay_monitor)
+            .admit_policy(reconnect_attempt_limiter.clone())
+            .monitor(relay_monitor.clone())
             .build();
+        spawn_reconnect_attempt_monitor(
+            relay_monitor.clone(),
+            reconnect_attempt_limiter.clone(),
+            client.clone(),
+        );
 
         let total = config.clearnet.len() + config.onion.len();
 
@@ -1027,7 +1066,11 @@ mod tests {
         }
 
         let (sender, receiver) = broadcast::channel(8);
-        let monitor_task = tokio::spawn(run_reconnect_attempt_monitor(receiver, limiter.clone()));
+        let monitor_task = tokio::spawn(run_reconnect_attempt_monitor(
+            receiver,
+            limiter.clone(),
+            Client::default(),
+        ));
 
         sender
             .send(MonitorNotification::StatusChanged {
@@ -1074,6 +1117,50 @@ mod tests {
         assert_eq!(
             limiter.admit_relay_connection(&terminated_url),
             AdmitStatus::Success
+        );
+    }
+
+    #[test]
+    fn test_reconnect_attempt_lag_resyncs_current_relay_statuses() {
+        let limiter = ReconnectAttemptLimiter::new(0);
+        let connected_url = RelayUrl::parse("wss://connected.example.com").unwrap();
+        let terminated_url = RelayUrl::parse("wss://terminated.example.com").unwrap();
+        let disconnected_url = RelayUrl::parse("wss://disconnected.example.com").unwrap();
+
+        for url in [&connected_url, &terminated_url, &disconnected_url] {
+            assert_eq!(limiter.admit_relay_connection(url), AdmitStatus::Success);
+            assert!(matches!(
+                limiter.admit_relay_connection(url),
+                AdmitStatus::Rejected { .. }
+            ));
+        }
+
+        resync_reconnect_attempts(
+            &limiter,
+            [
+                (connected_url.clone(), NostrRelayStatus::Connected),
+                (terminated_url.clone(), NostrRelayStatus::Terminated),
+                (disconnected_url.clone(), NostrRelayStatus::Disconnected),
+            ],
+        );
+
+        assert_eq!(
+            limiter.attempts_since_connection().get(&connected_url),
+            Some(&0),
+            "lag resync must repair a missed Connected reset"
+        );
+        assert!(
+            !limiter
+                .attempts_since_connection()
+                .contains_key(&terminated_url),
+            "lag resync must remove terminal relay state"
+        );
+        assert!(
+            matches!(
+                limiter.admit_relay_connection(&disconnected_url),
+                AdmitStatus::Rejected { .. }
+            ),
+            "lag resync must not erase counters for still-disconnected relays"
         );
     }
 
