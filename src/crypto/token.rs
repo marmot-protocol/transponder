@@ -255,12 +255,9 @@ impl TokenPayload {
 }
 
 /// Token decryptor using server's private key.
-#[derive(Clone)]
 pub struct TokenDecryptor {
     // secp256k1::SecretKey is Copy and does not zeroize on drop in 0.29.x.
     secret_key: Zeroizing<[u8; SECRET_KEY_SIZE]>,
-    #[allow(dead_code)]
-    secp: Secp256k1<secp256k1::All>,
 }
 
 struct ZeroizingSecretKey(SecretKey);
@@ -308,7 +305,6 @@ impl TokenDecryptor {
 
         Self {
             secret_key: secret_key_bytes,
-            secp: Secp256k1::new(),
         }
     }
 
@@ -397,7 +393,8 @@ impl TokenDecryptor {
     pub fn public_key(&self) -> PublicKey {
         let secret_key = ZeroizingSecretKey::from_bytes(&self.secret_key)
             .expect("TokenDecryptor stores a validated secp256k1 secret key");
-        PublicKey::from_secret_key(&self.secp, secret_key.as_ref())
+        let secp = Secp256k1::signing_only();
+        PublicKey::from_secret_key(&secp, secret_key.as_ref())
     }
 
     /// Get the public key as a hex string (x-only, 32 bytes).
