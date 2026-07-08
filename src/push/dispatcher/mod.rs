@@ -270,6 +270,20 @@ impl PushDispatcher {
         }
     }
 
+    fn record_missing_client(
+        platform: Platform,
+        metrics: &Metrics,
+        delivery_health: &DeliveryHealth,
+    ) {
+        let platform_str = platform_label(platform);
+        delivery_health.record_hard_failure(platform);
+        warn!(
+            platform = platform_str,
+            "Push task reached send path without a configured provider client"
+        );
+        metrics.record_push_failed(platform_str, "missing_client");
+    }
+
     async fn send_push(
         platform: Platform,
         token: Zeroizing<String>,
@@ -307,6 +321,8 @@ impl PushDispatcher {
                             metrics.record_push_failed(platform_str, "error");
                         }
                     }
+                } else {
+                    Self::record_missing_client(platform, &metrics, delivery_health);
                 }
             }
             Platform::Fcm => {
@@ -333,6 +349,8 @@ impl PushDispatcher {
                             metrics.record_push_failed(platform_str, "error");
                         }
                     }
+                } else {
+                    Self::record_missing_client(platform, &metrics, delivery_health);
                 }
             }
         }
@@ -828,6 +846,50 @@ mod tests {
 
         assert_eq!(
             push_failed_metric_value(&metrics, "fcm", "invalid_token"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn send_push_records_missing_client_failures() {
+        let metrics = crate::metrics::Metrics::new().unwrap();
+        let delivery_health = DeliveryHealth::default();
+
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+            PushDispatcher::send_push(
+                Platform::Apns,
+                Zeroizing::new("deadbeef".to_string()),
+                None,
+                None,
+                metrics.clone(),
+                &delivery_health,
+                None,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            push_failed_metric_value(&metrics, "apns", "missing_client"),
+            DELIVERY_FAILURE_STREAK_THRESHOLD as u64
+        );
+        assert!(
+            !delivery_health.is_delivering(Platform::Apns),
+            "missing APNs client should count as a hard delivery failure"
+        );
+
+        PushDispatcher::send_push(
+            Platform::Fcm,
+            Zeroizing::new("fcm-token".to_string()),
+            None,
+            None,
+            metrics.clone(),
+            &delivery_health,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            push_failed_metric_value(&metrics, "fcm", "missing_client"),
             1
         );
     }
