@@ -402,10 +402,6 @@ impl EventProcessor {
     }
 
     fn validate_notification_freshness(&self, created_at: Timestamp) -> Result<()> {
-        if self.max_notification_age.is_zero() {
-            return Ok(());
-        }
-
         let now = Timestamp::now().as_secs();
         let created_at = created_at.as_secs();
         if created_at > now.saturating_add(self.max_notification_future_skew.as_secs()) {
@@ -414,7 +410,9 @@ impl EventProcessor {
             ));
         }
 
-        if now.saturating_sub(created_at) > self.max_notification_age.as_secs() {
+        if !self.max_notification_age.is_zero()
+            && now.saturating_sub(created_at) > self.max_notification_age.as_secs()
+        {
             return Err(Error::InvalidToken(
                 "Notification request timestamp is stale".to_string(),
             ));
@@ -1596,6 +1594,37 @@ mod tests {
         );
 
         assert!(processor.process(&event).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_disabled_notification_age_still_rejects_future_rumor() {
+        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_apns_token("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678")
+            .build();
+        let future_created_at = Timestamp::from_secs(
+            Timestamp::now()
+                .as_secs()
+                .saturating_add(DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS + 3600),
+        );
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build_with_created_at(&content, future_created_at)
+            .await;
+        let processor = create_processor_with_replay_config(
+            &server_keys,
+            ReplayProtectionConfig {
+                max_notification_age: Duration::ZERO,
+                ..ReplayProtectionConfig::default()
+            },
+        );
+
+        assert!(
+            !processor.process(&event).await.unwrap(),
+            "future skew validation must stay active when stale-age validation is disabled"
+        );
     }
 
     #[test]
