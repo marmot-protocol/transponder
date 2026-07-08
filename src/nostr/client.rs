@@ -30,6 +30,7 @@ const TOR_FEATURE_ENABLED: bool = true;
 #[cfg(not(feature = "tor"))]
 const TOR_FEATURE_ENABLED: bool = false;
 const RELAY_MONITOR_CHANNEL_SIZE: usize = 64;
+const DEGRADED_RELAY_CLASS_WARNING_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
 struct SubscriptionLookbackConfig {
@@ -542,22 +543,32 @@ impl RelayClient {
             self.refresh_status().await;
             let status = self.status.read().await;
             let connected = status.clearnet_connected + status.tor_connected;
+            let elapsed = start.elapsed();
 
-            if connected > 0 {
+            if relay_startup_ready(&self.config, &status, elapsed) {
                 info!(
                     clearnet = status.clearnet_connected,
                     tor = status.tor_connected,
                     total = status.total_configured,
-                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    elapsed_ms = elapsed.as_millis() as u64,
                     "Connected to relays"
                 );
 
                 warn_on_degraded_relay_classes(&self.config, &status);
 
                 return Ok(());
+            } else if connected > 0 {
+                debug!(
+                    clearnet = status.clearnet_connected,
+                    tor = status.tor_connected,
+                    total = status.total_configured,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    grace_ms = relay_class_warning_grace(&self.config).as_millis() as u64,
+                    "Waiting briefly for slower configured relay classes before startup degraded warning"
+                );
             }
 
-            if start.elapsed() >= timeout {
+            if elapsed >= timeout {
                 warn!(
                     timeout_secs = self.config.connection_timeout_secs,
                     total_configured = status.total_configured,
@@ -818,6 +829,20 @@ fn should_publish_inbox_relay_event(current: Result<bool>) -> bool {
     }
 }
 
+fn relay_class_warning_grace(config: &RelayConfig) -> Duration {
+    Duration::from_secs(config.connection_timeout_secs).min(DEGRADED_RELAY_CLASS_WARNING_GRACE)
+}
+
+fn relay_startup_ready(config: &RelayConfig, status: &RelayStatus, elapsed: Duration) -> bool {
+    let connected = status.clearnet_connected + status.tor_connected;
+    if connected == 0 {
+        return false;
+    }
+
+    let (clearnet_degraded, tor_degraded) = degraded_relay_classes(config, status);
+    !(clearnet_degraded || tor_degraded) || elapsed >= relay_class_warning_grace(config)
+}
+
 /// Normalize an iterator of config relay strings into a canonical set.
 ///
 /// Returns an error if any entry fails to parse; config URLs are validated at
@@ -1039,6 +1064,55 @@ mod tests {
             assert_eq!(degraded_relay_classes(&config, &status), expected);
             warn_on_degraded_relay_classes(&config, &status);
         }
+    }
+
+    #[test]
+    fn test_relay_startup_waits_before_warning_for_missing_configured_class() {
+        let config = RelayConfig {
+            clearnet: vec!["wss://relay.example.com".to_string()],
+            allow_unencrypted_clearnet_relays: false,
+            onion: vec!["wss://example.onion".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 30,
+        };
+        let clearnet_only = RelayStatus {
+            clearnet_connected: 1,
+            tor_connected: 0,
+            total_configured: 2,
+        };
+        let all_classes = RelayStatus {
+            clearnet_connected: 1,
+            tor_connected: 1,
+            total_configured: 2,
+        };
+
+        assert!(
+            !relay_startup_ready(&config, &clearnet_only, Duration::from_secs(1)),
+            "first clearnet connection should not immediately emit a Tor-degraded warning"
+        );
+        assert!(
+            relay_startup_ready(&config, &all_classes, Duration::from_secs(1)),
+            "startup can finish immediately once every configured relay class is represented"
+        );
+        assert!(
+            relay_startup_ready(&config, &clearnet_only, DEGRADED_RELAY_CLASS_WARNING_GRACE),
+            "startup should eventually proceed with a real degraded-class warning"
+        );
+    }
+
+    #[test]
+    fn test_relay_startup_grace_is_capped_by_connection_timeout() {
+        let config = RelayConfig {
+            clearnet: vec!["wss://relay.example.com".to_string()],
+            allow_unencrypted_clearnet_relays: false,
+            onion: vec!["wss://example.onion".to_string()],
+            reconnect_interval_secs: 5,
+            max_reconnect_attempts: 10,
+            connection_timeout_secs: 2,
+        };
+
+        assert_eq!(relay_class_warning_grace(&config), Duration::from_secs(2));
     }
 
     #[test]
