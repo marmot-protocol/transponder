@@ -13,7 +13,10 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::config::RelayConfig;
-use crate::defaults::NIP59_TIMESTAMP_TWEAK_WINDOW_SECS;
+use crate::defaults::{
+    DEFAULT_MAX_NOTIFICATION_AGE_SECS, DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+    NIP59_TIMESTAMP_TWEAK_WINDOW_SECS,
+};
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 
@@ -27,6 +30,30 @@ const TOR_FEATURE_ENABLED: bool = true;
 #[cfg(not(feature = "tor"))]
 const TOR_FEATURE_ENABLED: bool = false;
 const RELAY_MONITOR_CHANNEL_SIZE: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+struct SubscriptionLookbackConfig {
+    max_notification_age_secs: u64,
+    max_notification_future_skew_secs: u64,
+}
+
+impl SubscriptionLookbackConfig {
+    fn from_server_config(server: &crate::config::ServerConfig) -> Self {
+        Self {
+            max_notification_age_secs: server.max_notification_age_secs,
+            max_notification_future_skew_secs: server.max_notification_future_skew_secs,
+        }
+    }
+}
+
+impl Default for SubscriptionLookbackConfig {
+    fn default() -> Self {
+        Self {
+            max_notification_age_secs: DEFAULT_MAX_NOTIFICATION_AGE_SECS,
+            max_notification_future_skew_secs: DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ReconnectAttemptLimiter {
@@ -125,6 +152,166 @@ async fn resync_reconnect_attempts_from_client(client: &Client, limiter: &Reconn
     resync_reconnect_attempts(limiter, relays);
 }
 
+fn initial_subscription_since(now: u64) -> Timestamp {
+    Timestamp::from_secs(now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS))
+}
+
+fn reconnect_subscription_since(
+    disconnect_started_at: u64,
+    now: u64,
+    config: SubscriptionLookbackConfig,
+) -> Timestamp {
+    let earliest_relevant_publish = if config.max_notification_age_secs == 0 {
+        disconnect_started_at
+    } else {
+        disconnect_started_at.max(now.saturating_sub(config.max_notification_age_secs))
+    };
+
+    Timestamp::from_secs(
+        earliest_relevant_publish
+            .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+            .saturating_sub(config.max_notification_future_skew_secs),
+    )
+}
+
+fn gift_wrap_subscription_filter(server_pubkey: PublicKey, since: Timestamp) -> Filter {
+    Filter::new()
+        .kind(Kind::GiftWrap)
+        .pubkey(server_pubkey)
+        .since(since)
+}
+
+async fn refresh_gift_wrap_subscription(
+    client: &Client,
+    metrics: &Metrics,
+    subscription_id: &SubscriptionId,
+    server_pubkey: PublicKey,
+    since: Timestamp,
+) -> Result<()> {
+    let filter = gift_wrap_subscription_filter(server_pubkey, since);
+    client
+        .subscribe_with_id(subscription_id.clone(), filter, None)
+        .await
+        .map_err(|e| Error::Nostr(format!("Failed to subscribe: {e}")))?;
+
+    let now = Timestamp::now().as_secs();
+    metrics.set_relay_subscription_lookback(now.saturating_sub(since.as_secs()));
+    Ok(())
+}
+
+fn mark_disconnected_if_needed(
+    disconnected_since: &mut BTreeMap<RelayUrl, u64>,
+    relay_url: RelayUrl,
+    now: u64,
+) {
+    disconnected_since.entry(relay_url).or_insert(now);
+}
+
+async fn run_subscription_refresh_monitor(
+    mut notifications: broadcast::Receiver<MonitorNotification>,
+    client: Client,
+    metrics: Metrics,
+    subscription_id: SubscriptionId,
+    server_pubkey: PublicKey,
+    lookback_config: SubscriptionLookbackConfig,
+) {
+    let process_started_at = Timestamp::now().as_secs();
+    let mut disconnected_since = BTreeMap::new();
+
+    loop {
+        match notifications.recv().await {
+            Ok(MonitorNotification::StatusChanged { relay_url, status }) => {
+                let now = Timestamp::now().as_secs();
+                match status {
+                    NostrRelayStatus::Connected => {
+                        if let Some(disconnected_at) = disconnected_since.remove(&relay_url) {
+                            let since =
+                                reconnect_subscription_since(disconnected_at, now, lookback_config);
+                            if let Err(e) = refresh_gift_wrap_subscription(
+                                &client,
+                                &metrics,
+                                &subscription_id,
+                                server_pubkey,
+                                since,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "Failed to refresh gift-wrap subscription after relay reconnect");
+                            }
+                        }
+                    }
+                    NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
+                        disconnected_since.remove(&relay_url);
+                    }
+                    NostrRelayStatus::Initialized
+                    | NostrRelayStatus::Pending
+                    | NostrRelayStatus::Connecting
+                    | NostrRelayStatus::Disconnected
+                    | NostrRelayStatus::Sleeping => {
+                        mark_disconnected_if_needed(&mut disconnected_since, relay_url, now);
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                let now = Timestamp::now().as_secs();
+                warn!(
+                    skipped,
+                    "Relay subscription refresh monitor lagged; conservatively refreshing gift-wrap subscription"
+                );
+
+                let current_relays = client.relays().await;
+                let mut refresh_from: Option<u64> = None;
+                for (relay_url, relay) in &current_relays {
+                    match relay.status() {
+                        NostrRelayStatus::Connected => {
+                            if let Some(disconnected_at) = disconnected_since.remove(relay_url) {
+                                refresh_from =
+                                    Some(refresh_from.map_or(disconnected_at, |oldest| {
+                                        oldest.min(disconnected_at)
+                                    }));
+                            }
+                        }
+                        NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
+                            disconnected_since.remove(relay_url);
+                        }
+                        NostrRelayStatus::Initialized
+                        | NostrRelayStatus::Pending
+                        | NostrRelayStatus::Connecting
+                        | NostrRelayStatus::Disconnected
+                        | NostrRelayStatus::Sleeping => {
+                            disconnected_since
+                                .entry(relay_url.clone())
+                                .or_insert(process_started_at);
+                        }
+                    }
+                }
+
+                let oldest_disconnect = refresh_from
+                    .into_iter()
+                    .chain(disconnected_since.values().copied())
+                    .min();
+
+                if let Some(oldest_disconnect) = oldest_disconnect {
+                    let since =
+                        reconnect_subscription_since(oldest_disconnect, now, lookback_config);
+                    if let Err(e) = refresh_gift_wrap_subscription(
+                        &client,
+                        &metrics,
+                        &subscription_id,
+                        server_pubkey,
+                        since,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "Failed to refresh gift-wrap subscription after relay monitor lag");
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 async fn run_reconnect_attempt_monitor(
     mut notifications: broadcast::Receiver<MonitorNotification>,
     limiter: ReconnectAttemptLimiter,
@@ -211,11 +398,13 @@ fn classify_relay_kind(url: &RelayUrl, origins: &BTreeMap<RelayUrl, RelayKind>) 
 pub struct RelayClient {
     client: Client,
     config: RelayConfig,
+    monitor: Monitor,
     status: Arc<RwLock<RelayStatus>>,
     /// Provenance of each configured relay, recorded when the relay is added
     /// in [`RelayClient::connect`]. Used by [`RelayClient::refresh_status`] to
     /// classify connected relays by origin list instead of URL shape.
     origins: Mutex<BTreeMap<RelayUrl, RelayKind>>,
+    subscription_lookback: SubscriptionLookbackConfig,
     metrics: Metrics,
 }
 
@@ -228,6 +417,36 @@ impl RelayClient {
 
     /// Create a new relay client with metrics.
     pub async fn with_metrics(keys: Keys, config: RelayConfig, metrics: Metrics) -> Result<Self> {
+        Self::with_metrics_and_subscription_lookback(
+            keys,
+            config,
+            metrics,
+            SubscriptionLookbackConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn with_metrics_and_server_config(
+        keys: Keys,
+        config: RelayConfig,
+        metrics: Metrics,
+        server: &crate::config::ServerConfig,
+    ) -> Result<Self> {
+        Self::with_metrics_and_subscription_lookback(
+            keys,
+            config,
+            metrics,
+            SubscriptionLookbackConfig::from_server_config(server),
+        )
+        .await
+    }
+
+    async fn with_metrics_and_subscription_lookback(
+        keys: Keys,
+        config: RelayConfig,
+        metrics: Metrics,
+        subscription_lookback: SubscriptionLookbackConfig,
+    ) -> Result<Self> {
         validate_relay_config(&config)?;
 
         let reconnect_attempt_limiter = ReconnectAttemptLimiter::new(config.max_reconnect_attempts);
@@ -252,12 +471,14 @@ impl RelayClient {
         Ok(Self {
             client,
             config,
+            monitor: relay_monitor,
             status: Arc::new(RwLock::new(RelayStatus {
                 clearnet_connected: 0,
                 tor_connected: 0,
                 total_configured: total,
             })),
             origins: Mutex::new(BTreeMap::new()),
+            subscription_lookback,
             metrics,
         })
     }
@@ -355,17 +576,8 @@ impl RelayClient {
 
     /// Subscribe to gift-wrapped events for the server's public key.
     pub async fn subscribe(&self, server_pubkey: PublicKey) -> Result<()> {
-        let since = Timestamp::from_secs(
-            Timestamp::now()
-                .as_secs()
-                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS),
-        );
-
-        // Create filter for kind 1059 (gift wrap) events addressed to us
-        let filter = Filter::new()
-            .kind(Kind::GiftWrap)
-            .pubkey(server_pubkey)
-            .since(since);
+        let since = initial_subscription_since(Timestamp::now().as_secs());
+        let subscription_id = SubscriptionId::generate();
 
         debug!(
             pubkey = %server_pubkey,
@@ -373,10 +585,23 @@ impl RelayClient {
             "Subscribing to gift wrap events"
         );
 
-        self.client
-            .subscribe(filter, None)
-            .await
-            .map_err(|e| Error::Nostr(format!("Failed to subscribe: {e}")))?;
+        refresh_gift_wrap_subscription(
+            &self.client,
+            &self.metrics,
+            &subscription_id,
+            server_pubkey,
+            since,
+        )
+        .await?;
+
+        std::mem::drop(tokio::spawn(run_subscription_refresh_monitor(
+            self.monitor.subscribe(),
+            self.client.clone(),
+            self.metrics.clone(),
+            subscription_id,
+            server_pubkey,
+            self.subscription_lookback,
+        )));
 
         info!("Subscribed to gift wrap events");
         Ok(())
@@ -1353,6 +1578,119 @@ mod tests {
             NIP59_TIMESTAMP_TWEAK_WINDOW_SECS, 172_800,
             "lookback must cover NIP-59's 2-day timestamp tweak window"
         );
+    }
+
+    #[test]
+    fn test_reconnect_subscription_since_uses_disconnect_for_short_outage() {
+        let now = 1_000_000;
+        let disconnected_at = now - 60;
+        let config = SubscriptionLookbackConfig {
+            max_notification_age_secs: 3_600,
+            max_notification_future_skew_secs: 30,
+        };
+
+        let since = reconnect_subscription_since(disconnected_at, now, config);
+
+        assert_eq!(
+            since.as_secs(),
+            disconnected_at
+                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+                .saturating_sub(30)
+        );
+    }
+
+    #[test]
+    fn test_reconnect_subscription_since_caps_long_outage_to_freshness_window() {
+        let now = 1_000_000;
+        let disconnected_at = now - 100_000;
+        let config = SubscriptionLookbackConfig {
+            max_notification_age_secs: 3_600,
+            max_notification_future_skew_secs: 30,
+        };
+
+        let since = reconnect_subscription_since(disconnected_at, now, config);
+
+        assert_eq!(
+            since.as_secs(),
+            now.saturating_sub(3_600)
+                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+                .saturating_sub(30)
+        );
+    }
+
+    #[test]
+    fn test_reconnect_subscription_since_zero_age_uses_disconnect_start() {
+        let now = 1_000_000;
+        let disconnected_at = now - 100_000;
+        let config = SubscriptionLookbackConfig {
+            max_notification_age_secs: 0,
+            max_notification_future_skew_secs: 30,
+        };
+
+        let since = reconnect_subscription_since(disconnected_at, now, config);
+
+        assert_eq!(
+            since.as_secs(),
+            disconnected_at
+                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+                .saturating_sub(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_gift_wrap_subscription_reuses_subscription_id() {
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+        let client = Client::default();
+        client.add_relay(&relay_url).await.unwrap();
+        client.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let metrics = Metrics::disabled();
+        let subscription_id = SubscriptionId::generate();
+        let server_pubkey = Keys::generate().public_key();
+        let first_since = Timestamp::from_secs(1_000);
+        let second_since = Timestamp::from_secs(2_000);
+
+        refresh_gift_wrap_subscription(
+            &client,
+            &metrics,
+            &subscription_id,
+            server_pubkey,
+            first_since,
+        )
+        .await
+        .unwrap();
+        refresh_gift_wrap_subscription(
+            &client,
+            &metrics,
+            &subscription_id,
+            server_pubkey,
+            second_since,
+        )
+        .await
+        .unwrap();
+
+        let subscriptions = client.subscriptions().await;
+        let filters_by_relay = subscriptions
+            .get(&subscription_id)
+            .expect("subscription id should be reused");
+        assert_eq!(
+            subscriptions.len(),
+            1,
+            "refreshing must not accumulate extra subscription IDs"
+        );
+
+        let filters = filters_by_relay
+            .values()
+            .next()
+            .expect("mock relay should have the subscription");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].since, Some(second_since));
+
+        client.disconnect().await;
     }
 
     #[tokio::test]

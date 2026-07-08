@@ -531,9 +531,14 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
 
     // Initialize relay client
     let relay_client = Arc::new(
-        RelayClient::with_metrics(keys.clone(), config.relays.clone(), metrics.clone())
-            .await
-            .context("Failed to create relay client")?,
+        RelayClient::with_metrics_and_server_config(
+            keys.clone(),
+            config.relays.clone(),
+            metrics.clone(),
+            &config.server,
+        )
+        .await
+        .context("Failed to create relay client")?,
     );
 
     // Initialize shutdown handler before connecting so a SIGTERM/SIGINT during
