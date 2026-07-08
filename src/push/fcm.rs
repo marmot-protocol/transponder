@@ -35,6 +35,10 @@ const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
 /// Safety margin subtracted from provider-reported OAuth token lifetimes.
 const TOKEN_REFRESH_SAFETY_MARGIN_SECS: u64 = 60;
 
+/// Minimum cache lifetime for provider-reported OAuth tokens after applying the
+/// refresh safety margin.
+const TOKEN_LIFETIME_MIN: Duration = Duration::from_secs(30);
+
 /// Upper bound on FCM registration token length.
 ///
 /// FCM tokens are opaque and have historically been ~150-200 characters, but
@@ -106,6 +110,7 @@ fn token_cache_lifetime(expires_in: Option<u64>) -> Duration {
     expires_in
         .map(|seconds| {
             Duration::from_secs(seconds.saturating_sub(TOKEN_REFRESH_SAFETY_MARGIN_SECS))
+                .max(TOKEN_LIFETIME_MIN)
         })
         .unwrap_or(TOKEN_LIFETIME)
 }
@@ -976,8 +981,12 @@ mod tests {
     }
 
     #[test]
-    fn test_token_cache_lifetime_saturates_short_provider_expiry() {
-        assert_eq!(token_cache_lifetime(Some(30)), Duration::from_secs(0));
+    fn test_token_cache_lifetime_clamps_short_provider_expiry_to_minimum() {
+        assert_eq!(token_cache_lifetime(Some(30)), TOKEN_LIFETIME_MIN);
+        assert_eq!(
+            token_cache_lifetime(Some(TOKEN_REFRESH_SAFETY_MARGIN_SECS)),
+            TOKEN_LIFETIME_MIN
+        );
     }
 
     #[test]
