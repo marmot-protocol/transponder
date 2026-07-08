@@ -1,7 +1,7 @@
 //! Server startup, event loop, and operational wiring.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -719,14 +719,15 @@ pub fn generate_keys(output: Option<&Path>, show_private_key: bool) -> Result<()
 /// token, so a group/world-readable key file is a standing compromise. Failing
 /// startup makes the exposure visible instead of silently loading the key.
 #[cfg(unix)]
-pub fn verify_private_key_file_permissions(path: &Path) -> Result<()> {
+pub fn verify_private_key_file_permissions(file: &File, path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    // A missing or unreadable file falls through to the read below, which
-    // reports the canonical "Failed to read server private key file" error.
-    let Ok(metadata) = fs::metadata(path) else {
-        return Ok(());
-    };
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "Failed to inspect server private key file {}",
+            path.display()
+        )
+    })?;
 
     let mode = metadata.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
@@ -738,6 +739,19 @@ pub fn verify_private_key_file_permissions(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_server_private_key_file(path: &Path) -> Result<Zeroizing<String>> {
+    let mut file = File::open(path)
+        .with_context(|| format!("Failed to read server private key file {}", path.display()))?;
+
+    #[cfg(unix)]
+    verify_private_key_file_permissions(&file, path)?;
+
+    let mut key = Zeroizing::new(String::new());
+    file.read_to_string(&mut key)
+        .with_context(|| format!("Failed to read server private key file {}", path.display()))?;
+    Ok(key)
 }
 
 /// Resolve the server private key from config or a mounted secret file.
@@ -761,16 +775,7 @@ pub fn resolve_server_private_key(
     }
 
     let key_path = Path::new(private_key_file);
-
-    #[cfg(unix)]
-    verify_private_key_file_permissions(key_path)?;
-
-    let key = Zeroizing::new(fs::read_to_string(key_path).with_context(|| {
-        format!(
-            "Failed to read server private key file {}",
-            key_path.display()
-        )
-    })?);
+    let key = read_server_private_key_file(key_path)?;
 
     if key.trim().len() == key.len() {
         Ok(key)
@@ -1667,14 +1672,16 @@ mod tests {
     #[test]
     fn verify_private_key_file_permissions_accepts_0600() {
         let file = write_key_file_with_mode(0o600);
-        assert!(verify_private_key_file_permissions(file.path()).is_ok());
+        let handle = File::open(file.path()).unwrap();
+        assert!(verify_private_key_file_permissions(&handle, file.path()).is_ok());
     }
 
     #[cfg(unix)]
     #[test]
     fn verify_private_key_file_permissions_rejects_group_readable() {
         let file = write_key_file_with_mode(0o640);
-        let error = verify_private_key_file_permissions(file.path())
+        let handle = File::open(file.path()).unwrap();
+        let error = verify_private_key_file_permissions(&handle, file.path())
             .expect_err("group-readable key file must be rejected");
         assert!(error.to_string().contains("group/other access"), "{error}");
     }
@@ -1683,7 +1690,8 @@ mod tests {
     #[test]
     fn verify_private_key_file_permissions_rejects_world_readable() {
         let file = write_key_file_with_mode(0o644);
-        let error = verify_private_key_file_permissions(file.path())
+        let handle = File::open(file.path()).unwrap();
+        let error = verify_private_key_file_permissions(&handle, file.path())
             .expect_err("world-readable key file must be rejected");
         assert!(error.to_string().contains("group/other access"), "{error}");
     }
