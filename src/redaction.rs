@@ -13,7 +13,7 @@
 //! - APNs device-token URL paths (`/3/device/<hex>`)
 //! - FCM registration tokens (`<app-instance>:<opaque-token>`)
 //! - Nostr bech32 secret keys (`nsec1…`)
-//! - `wss://` relay URLs (the host can identify a private relay)
+//! - `ws://` / `wss://` relay URLs (the host can identify a private relay)
 //! - `.onion` hostnames
 //! - Long hex runs (64+ chars: device tokens, keys, event ids)
 
@@ -26,7 +26,7 @@ use regex::Regex;
 ///
 /// Order matters: the APNs path pattern runs before the generic hex-run
 /// pattern so device tokens shorter than 64 hex chars are still caught when
-/// they appear in a request URL, and `wss://` runs before `.onion` so an onion
+/// they appear in a request URL, and `ws(s)://` runs before `.onion` so an onion
 /// relay URL is redacted as a whole.
 static REDACTIONS: LazyLock<[(Regex, &'static str); 5]> = LazyLock::new(|| {
     [
@@ -39,8 +39,8 @@ static REDACTIONS: LazyLock<[(Regex, &'static str); 5]> = LazyLock::new(|| {
             "[REDACTED-NSEC]",
         ),
         (
-            Regex::new(r#"(?i)wss://[^\s"']+"#).expect("static redaction regex is valid"),
-            "wss://[REDACTED]",
+            Regex::new(r#"(?i)(wss?)://[^\s"']+"#).expect("static redaction regex is valid"),
+            "$1://[REDACTED]",
         ),
         (
             Regex::new(r#"(?i)[^\s/:"']+\.onion"#).expect("static redaction regex is valid"),
@@ -205,6 +205,16 @@ mod tests {
 
         assert!(!output.contains("relay.example.com"));
         assert_eq!(output, "connect to wss://[REDACTED] timed out");
+    }
+
+    #[test]
+    fn plaintext_ws_relay_urls_are_redacted() {
+        let input = "connect to ws://relay.internal.example.com:4848 failed";
+
+        let output = redact(input);
+
+        assert!(!output.contains("relay.internal.example.com"));
+        assert_eq!(output, "connect to ws://[REDACTED] failed");
     }
 
     #[test]
