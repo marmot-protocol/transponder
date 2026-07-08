@@ -552,6 +552,27 @@ impl EventProcessor {
                 encrypted_reservation,
             );
 
+            // The pre-unwrap global limiter charges once per event before
+            // NIP-59 unwrap. Token decrypt also performs asymmetric ECDH, so
+            // charge the same global budget once per actual decrypt attempt as
+            // well. If the budget is exhausted, refund the encrypted-token
+            // charge for this token and leave this plus the remaining tokens
+            // retryable; distinct garbage blobs should not amplify one admitted
+            // event into unbounded token-decrypt CPU.
+            let decrypt_admission = self.global_unwrap_limiter.check_and_increment(&()).await;
+            if !decrypt_admission.is_allowed() {
+                guard.refund().await;
+                rate_limited_any = true;
+                trace!(
+                    reason = decrypt_admission.limit_reason(),
+                    "Rate limited token decrypt attempt"
+                );
+                self.metrics
+                    .record_rate_limited("global_decrypt", decrypt_admission.limit_reason());
+
+                break;
+            }
+
             // Decrypt the token
             let decrypt_started_at = StageTimer::start();
             let payload = match self.token_decryptor.decrypt_bytes(&bytes) {
@@ -3586,15 +3607,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_global_limiter_charges_each_token_decrypt_attempt() {
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+
+        tokio::time::pause();
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let first_device = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+        let second_device = "bbccddaa22334455bbccddaa22334455bbccddaa22334455bbccddaa22334455";
+
+        // Budget: one unit for gift-wrap unwrap and one unit for exactly one
+        // token decrypt. A second distinct token in the same event must be
+        // shed before decrypt rather than amplifying CPU past the global cap.
+        let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
+            &server_keys,
+            flood_rate_limit_config(2, 1000),
+        );
+
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(encryptor.encrypt_base64(&TestToken::apns(first_device)))
+            .with_raw_token(encryptor.encrypt_base64(&TestToken::apns(second_device)))
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
+            .build(&content)
+            .await;
+
+        assert!(
+            !processor.process(&event).await.unwrap(),
+            "event remains retryable for the token shed by the global decrypt budget"
+        );
+        assert!(!processor.is_duplicate(&event.id).await);
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_dispatched_total",
+                &[("platform", "apns")],
+            ),
+            1.0
+        );
+        assert_eq!(
+            counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_tokens_rate_limited_total",
+                &[("type", "global_decrypt"), ("reason", "minute")],
+            ),
+            1.0
+        );
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        assert!(
+            processor.process(&event).await.unwrap(),
+            "redelivery should skip the first terminal token and admit the previously shed token"
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_dispatched_total",
+                &[("platform", "apns")],
+            ),
+            2.0
+        );
+    }
+
+    #[tokio::test]
     async fn test_global_limiter_sheds_flood_before_unwrap() {
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
         let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
 
-        // Allow exactly 2 unwraps per minute. The third flood event must be shed.
+        // Allow exactly 2 single-token events per minute. Each consumes one
+        // global unit for unwrap and one for token decrypt; the third flood
+        // event must be shed before unwrap.
         let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
             &server_keys,
-            flood_rate_limit_config(2, 1000),
+            flood_rate_limit_config(4, 1000),
         );
 
         let limit = 2usize;
@@ -3654,10 +3749,10 @@ mod tests {
         let sender_keys = Keys::generate();
         let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
 
-        // Only 1 unwrap per minute allowed.
+        // Only 1 single-token event per minute allowed (unwrap + decrypt).
         let (processor, _metrics) = create_processor_with_metrics_and_rate_limits(
             &server_keys,
-            flood_rate_limit_config(1, 1000),
+            flood_rate_limit_config(2, 1000),
         );
 
         let event =
@@ -3690,7 +3785,7 @@ mod tests {
 
         let (processor, metrics) = create_processor_with_metrics_and_rate_limits(
             &server_keys,
-            flood_rate_limit_config(1, 1000),
+            flood_rate_limit_config(2, 1000),
         );
 
         let event1 =
