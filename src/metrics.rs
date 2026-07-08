@@ -120,6 +120,12 @@ pub struct Metrics {
     /// Maximum number of concurrent outbound push requests.
     pub push_concurrency_limit: IntGauge,
 
+    /// Number of available live send-task permits.
+    pub push_live_tasks_available: IntGauge,
+
+    /// Maximum number of simultaneously live send tasks.
+    pub push_live_tasks_limit: IntGauge,
+
     /// Total number of notifications rejected because the push queue was full,
     /// the dispatcher was shutting down, or the queue channel was closed.
     pub push_queue_rejected_total: IntCounter,
@@ -470,6 +476,18 @@ impl Metrics {
         ))?;
         registry.register(Box::new(push_concurrency_limit.clone()))?;
 
+        let push_live_tasks_available = IntGauge::with_opts(Opts::new(
+            "transponder_push_live_tasks_available",
+            "Number of available permits for live push send tasks, including tasks sleeping in retry backoff",
+        ))?;
+        registry.register(Box::new(push_live_tasks_available.clone()))?;
+
+        let push_live_tasks_limit = IntGauge::with_opts(Opts::new(
+            "transponder_push_live_tasks_limit",
+            "Maximum number of simultaneously live push send tasks",
+        ))?;
+        registry.register(Box::new(push_live_tasks_limit.clone()))?;
+
         let push_queue_rejected_total = IntCounter::with_opts(Opts::new(
             "transponder_push_queue_rejected_total",
             "Total number of notifications rejected because the push queue was full, the dispatcher was shutting down, or the queue channel was closed",
@@ -615,6 +633,8 @@ impl Metrics {
             push_queue_capacity,
             push_semaphore_available,
             push_concurrency_limit,
+            push_live_tasks_available,
+            push_live_tasks_limit,
             push_queue_rejected_total,
             push_dispatch_admission_duration_seconds,
             push_retries_total,
@@ -960,6 +980,22 @@ impl Metrics {
         set_usize_gauge(&self.push_concurrency_limit, limit);
     }
 
+    /// Update available live-task permits.
+    pub fn set_push_live_tasks_available(&self, available: usize) {
+        if !self.enabled {
+            return;
+        }
+        set_usize_gauge(&self.push_live_tasks_available, available);
+    }
+
+    /// Update the live-task limit.
+    pub fn set_push_live_tasks_limit(&self, limit: usize) {
+        if !self.enabled {
+            return;
+        }
+        set_usize_gauge(&self.push_live_tasks_limit, limit);
+    }
+
     /// Record a push queue rejection.
     pub fn record_push_queue_rejected(&self, count: u64) {
         if !self.enabled {
@@ -1217,6 +1253,8 @@ mod tests {
         metrics.set_push_queue_capacity(10_000);
         metrics.set_push_semaphore_available(95);
         metrics.set_push_concurrency_limit(100);
+        metrics.set_push_live_tasks_available(180);
+        metrics.set_push_live_tasks_limit(200);
         metrics.record_push_queue_rejected(2);
         metrics.observe_push_dispatch_admission_duration(OperationOutcome::Success, 0.001);
         metrics.observe_notifications_admitted_per_event(2);
@@ -1268,6 +1306,14 @@ mod tests {
         assert_eq!(
             gauge_value(&metrics, "transponder_push_concurrency_limit", &[]),
             100.0
+        );
+        assert_eq!(
+            gauge_value(&metrics, "transponder_push_live_tasks_available", &[]),
+            180.0
+        );
+        assert_eq!(
+            gauge_value(&metrics, "transponder_push_live_tasks_limit", &[]),
+            200.0
         );
         assert_eq!(
             counter_value(&metrics, "transponder_push_queue_rejected_total", &[]),

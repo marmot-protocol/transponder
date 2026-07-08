@@ -162,6 +162,8 @@ impl PushDispatcher {
         metrics.set_push_queue_capacity(MAX_PENDING_QUEUE_SIZE);
         metrics.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
         metrics.set_push_concurrency_limit(MAX_CONCURRENT_PUSHES);
+        metrics.set_push_live_tasks_available(MAX_LIVE_SEND_TASKS);
+        metrics.set_push_live_tasks_limit(MAX_LIVE_SEND_TASKS);
 
         // Spawn the queue dispatcher task.
         let worker_context = DispatchWorkerContext {
@@ -210,12 +212,25 @@ impl PushDispatcher {
         metrics.set_push_semaphore_available(semaphore.available_permits());
     }
 
+    fn update_live_task_available_metric(metrics: &Metrics, live_task_semaphore: &Semaphore) {
+        metrics.set_push_live_tasks_available(live_task_semaphore.available_permits());
+    }
+
     async fn acquire_push_permit(
         semaphore: Arc<Semaphore>,
         metrics: &Metrics,
     ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
         let permit = semaphore.clone().acquire_owned().await?;
         Self::update_semaphore_available_metric(metrics, &semaphore);
+        Ok(permit)
+    }
+
+    async fn acquire_live_task_permit(
+        live_task_semaphore: Arc<Semaphore>,
+        metrics: &Metrics,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        let permit = live_task_semaphore.clone().acquire_owned().await?;
+        Self::update_live_task_available_metric(metrics, &live_task_semaphore);
         Ok(permit)
     }
 
@@ -346,14 +361,18 @@ impl PushDispatcher {
                         // token-holding tasks to the queue size (#160). The
                         // recv loop blocks here once MAX_LIVE_SEND_TASKS tasks
                         // are alive, applying backpressure to the queue instead.
-                        let live_task_permit =
-                            match ctx.live_task_semaphore.clone().acquire_owned().await {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    debug!("Live-task semaphore closed, dispatcher exiting");
-                                    break;
-                                }
-                            };
+                        let live_task_permit = match Self::acquire_live_task_permit(
+                            ctx.live_task_semaphore.clone(),
+                            &metrics,
+                        )
+                        .await
+                        {
+                            Ok(p) => p,
+                            Err(_) => {
+                                debug!("Live-task semaphore closed, dispatcher exiting");
+                                break;
+                            }
+                        };
 
                         // Acquire a concurrency permit before spawning the send
                         // task. This semaphore, not a worker pool, is the
@@ -371,6 +390,11 @@ impl PushDispatcher {
                                 // The dispatcher never closes this semaphore today; if a
                                 // future change does, the dequeued token is zeroed as this
                                 // loop scope unwinds.
+                                drop(live_task_permit);
+                                Self::update_live_task_available_metric(
+                                    &metrics,
+                                    &ctx.live_task_semaphore,
+                                );
                                 debug!("Push semaphore closed, dispatcher exiting");
                                 break;
                             }
@@ -380,6 +404,7 @@ impl PushDispatcher {
                         let fcm_client = ctx.fcm_client.clone();
                         let task_metrics = metrics.clone();
                         let semaphore = ctx.semaphore.clone();
+                        let live_task_semaphore = ctx.live_task_semaphore.clone();
                         let delivery_health = ctx.delivery_health.clone();
 
                         // Register the send task as in-flight BEFORE spawning
@@ -394,10 +419,6 @@ impl PushDispatcher {
                             // Decrements the in-flight count when this task
                             // completes, signalling idle to any shutdown waiter.
                             let _inflight_guard = inflight_guard;
-                            // Held for the task's whole life (dropped last),
-                            // bounding live token-holding tasks even across
-                            // backoff sleeps (#160).
-                            let _live_task_permit = live_task_permit;
 
                             // Wrap the permit so the send's internal backoff
                             // can release the in-flight slot during sleeps and
@@ -421,6 +442,14 @@ impl PushDispatcher {
                             drop(backoff_permit);
 
                             Self::update_semaphore_available_metric(&task_metrics, &semaphore);
+                            // Held until the send task has finished all
+                            // attempts/backoff, bounding live token-holding
+                            // tasks even across backoff sleeps (#160).
+                            drop(live_task_permit);
+                            Self::update_live_task_available_metric(
+                                &task_metrics,
+                                &live_task_semaphore,
+                            );
                         });
                     }
                     Some(PushMessage::Shutdown) => {
@@ -684,6 +713,8 @@ impl PushDispatcher {
         self.metrics.set_push_queue_size(0);
         self.metrics
             .set_push_semaphore_available(self.semaphore.available_permits());
+        self.metrics
+            .set_push_live_tasks_available(self.live_task_semaphore.available_permits());
 
         debug!("All queued push notifications drained");
     }
@@ -1391,6 +1422,14 @@ mod tests {
             gauge_metric_value(&metrics, "transponder_push_concurrency_limit"),
             MAX_CONCURRENT_PUSHES as i64
         );
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_live_tasks_available"),
+            MAX_LIVE_SEND_TASKS as i64
+        );
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_live_tasks_limit"),
+            MAX_LIVE_SEND_TASKS as i64
+        );
     }
 
     #[tokio::test]
@@ -1418,6 +1457,71 @@ mod tests {
         assert_eq!(
             gauge_metric_value(&metrics, "transponder_push_semaphore_available"),
             MAX_CONCURRENT_PUSHES as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_task_available_metric_updates_on_permit_acquire() {
+        use crate::metrics::Metrics;
+
+        let metrics = Metrics::new().unwrap();
+        let metrics = metrics.clone();
+        let semaphore = Arc::new(Semaphore::new(MAX_LIVE_SEND_TASKS));
+
+        metrics.set_push_live_tasks_available(MAX_LIVE_SEND_TASKS);
+
+        let permit = PushDispatcher::acquire_live_task_permit(semaphore.clone(), &metrics)
+            .await
+            .expect("permit should be acquired");
+
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_live_tasks_available"),
+            (MAX_LIVE_SEND_TASKS - 1) as i64
+        );
+
+        drop(permit);
+        PushDispatcher::update_live_task_available_metric(&metrics, &semaphore);
+
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_live_tasks_available"),
+            MAX_LIVE_SEND_TASKS as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_task_metric_exposes_saturation_when_active_permits_are_idle() {
+        use crate::metrics::Metrics;
+
+        let metrics = Metrics::new().unwrap();
+        let live_task_semaphore = Arc::new(Semaphore::new(MAX_LIVE_SEND_TASKS));
+        let mut permits = Vec::with_capacity(MAX_LIVE_SEND_TASKS);
+
+        metrics.set_push_semaphore_available(MAX_CONCURRENT_PUSHES);
+        metrics.set_push_live_tasks_available(MAX_LIVE_SEND_TASKS);
+
+        for _ in 0..MAX_LIVE_SEND_TASKS {
+            permits.push(
+                PushDispatcher::acquire_live_task_permit(live_task_semaphore.clone(), &metrics)
+                    .await
+                    .expect("permit should be acquired"),
+            );
+        }
+
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_semaphore_available"),
+            MAX_CONCURRENT_PUSHES as i64,
+            "active HTTP permits can be fully available while live tasks are saturated"
+        );
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_live_tasks_available"),
+            0
+        );
+
+        drop(permits);
+        PushDispatcher::update_live_task_available_metric(&metrics, &live_task_semaphore);
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_live_tasks_available"),
+            MAX_LIVE_SEND_TASKS as i64
         );
     }
 
@@ -1937,7 +2041,12 @@ mod tests {
                 std::time::SystemTime::now() + Duration::from_secs(3600),
             )
             .await;
-        let dispatcher = Arc::new(PushDispatcher::new(Some(client), None));
+        let metrics = crate::metrics::Metrics::new().unwrap();
+        let dispatcher = Arc::new(PushDispatcher::with_metrics(
+            Some(client),
+            None,
+            metrics.clone(),
+        ));
 
         // Queue far more messages than the live-task ceiling.
         let batch = MAX_LIVE_SEND_TASKS + 300;
@@ -1961,6 +2070,11 @@ mod tests {
             dispatcher.available_live_task_permits(),
             0,
             "live-task semaphore should be fully consumed under the storm"
+        );
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_live_tasks_available"),
+            0,
+            "live-task metric should expose saturation while tasks sleep in backoff"
         );
 
         // The cap must hold: even though tasks keep releasing their concurrency
