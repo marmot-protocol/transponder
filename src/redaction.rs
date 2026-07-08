@@ -12,6 +12,7 @@
 //!
 //! - APNs device-token URL paths (`/3/device/<hex>`)
 //! - FCM registration tokens (`<app-instance>:<opaque-token>`)
+//! - Provider auth JWTs / bearer credentials (`eyJ…`.`…`.`…`)
 //! - Nostr bech32 secret keys (`nsec1…`)
 //! - `ws://` / `wss://` relay URLs (the host can identify a private relay)
 //! - `.onion` hostnames
@@ -28,7 +29,7 @@ use regex::Regex;
 /// pattern so device tokens shorter than 64 hex chars are still caught when
 /// they appear in a request URL, and `ws(s)://` runs before `.onion` so an onion
 /// relay URL is redacted as a whole.
-static REDACTIONS: LazyLock<[(Regex, &'static str); 5]> = LazyLock::new(|| {
+static REDACTIONS: LazyLock<[(Regex, &'static str); 6]> = LazyLock::new(|| {
     [
         (
             Regex::new(r"(?i)/3/device/[0-9a-f]+").expect("static redaction regex is valid"),
@@ -41,6 +42,11 @@ static REDACTIONS: LazyLock<[(Regex, &'static str); 5]> = LazyLock::new(|| {
         (
             Regex::new(r#"(?i)(wss?)://[^\s"']+"#).expect("static redaction regex is valid"),
             "$1://[REDACTED]",
+        ),
+        (
+            Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+                .expect("static redaction regex is valid"),
+            "[REDACTED-JWT]",
         ),
         (
             Regex::new(r#"(?i)[^\s/:"']+\.onion"#).expect("static redaction regex is valid"),
@@ -175,6 +181,32 @@ mod tests {
 
         assert!(!output.contains(&token));
         assert_eq!(output, "panic while sending to FCM token [REDACTED-FCM]");
+    }
+
+    #[test]
+    fn provider_auth_jwts_are_redacted() {
+        let jwt = "eyJhbGciOiJFUzI1NiIsImtpZCI6IkFCQ0QxMjM0NTYifQ.\
+                   eyJpc3MiOiJURUFNSUQxMjMiLCJpYXQiOjE3ODMzNTAwMDB9.\
+                   ZXhhbXBsZVNpZ25hdHVyZUJ5dGVzXzEyMzQ1Njc4OTA";
+        let input = format!("authorization: bearer {jwt}");
+
+        let output = redact(&input);
+
+        assert!(!output.contains(jwt));
+        assert_eq!(output, "authorization: bearer [REDACTED-JWT]");
+    }
+
+    #[test]
+    fn bare_oauth_access_jwts_are_redacted() {
+        let jwt = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.\
+                   eyJhdWQiOiJodHRwczovL29hdXRoMi5nb29nbGVhcGlzLmNvbS90b2tlbiJ9.\
+                   c2lnbmF0dXJlLXNoYXBlLWJhc2U2NHVybA";
+        let input = format!("dependency panic included token {jwt}");
+
+        let output = redact(&input);
+
+        assert!(!output.contains(jwt));
+        assert_eq!(output, "dependency panic included token [REDACTED-JWT]");
     }
 
     #[test]
