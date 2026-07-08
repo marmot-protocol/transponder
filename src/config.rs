@@ -1011,6 +1011,8 @@ impl AppConfig {
     fn validate(&self) -> Result<()> {
         self.server.validate()?;
         self.relays.validate()?;
+        self.apns.validate()?;
+        self.fcm.validate()?;
         self.health.validate()?;
         self.glitchtip.validate()?;
         Ok(())
@@ -1194,6 +1196,30 @@ impl GlitchtipConfig {
 }
 
 impl ApnsConfig {
+    /// Rejects enabled APNs configuration that is missing required credentials.
+    fn validate(&self) -> std::result::Result<(), config::ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let required_fields = [
+            ("apns.key_id", self.key_id.as_str()),
+            ("apns.team_id", self.team_id.as_str()),
+            ("apns.private_key_path", self.private_key_path.as_str()),
+            ("apns.bundle_id", self.bundle_id.as_str()),
+        ];
+
+        for (field, value) in required_fields {
+            if value.trim().is_empty() {
+                return Err(config::ConfigError::Message(format!(
+                    "{field} must be set when apns.enabled = true"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns true if targeting production APNs environment.
     #[must_use]
     pub fn is_production(&self) -> bool {
@@ -1208,6 +1234,33 @@ impl ApnsConfig {
         } else {
             "https://api.sandbox.push.apple.com"
         }
+    }
+}
+
+impl FcmConfig {
+    /// Rejects enabled FCM configuration that is missing required credentials.
+    fn validate(&self) -> std::result::Result<(), config::ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let required_fields = [
+            (
+                "fcm.service_account_path",
+                self.service_account_path.as_str(),
+            ),
+            ("fcm.project_id", self.project_id.as_str()),
+        ];
+
+        for (field, value) in required_fields {
+            if value.trim().is_empty() {
+                return Err(config::ConfigError::Message(format!(
+                    "{field} must be set when fcm.enabled = true"
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1439,6 +1492,85 @@ mod tests {
         assert!(config.metrics.enabled);
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.format, LogFormat::Pretty);
+    }
+
+    #[test]
+    fn test_apns_enabled_without_credentials_rejected() {
+        let complete_apns = [
+            ("TRANSPONDER_APNS_ENABLED", "true"),
+            ("TRANSPONDER_APNS_KEY_ID", "KEY123"),
+            ("TRANSPONDER_APNS_TEAM_ID", "TEAM123"),
+            ("TRANSPONDER_APNS_PRIVATE_KEY_PATH", "/keys/apns.p8"),
+            ("TRANSPONDER_APNS_BUNDLE_ID", "com.example.app"),
+        ];
+
+        for (field, env_key) in [
+            ("apns.key_id", "TRANSPONDER_APNS_KEY_ID"),
+            ("apns.team_id", "TRANSPONDER_APNS_TEAM_ID"),
+            ("apns.private_key_path", "TRANSPONDER_APNS_PRIVATE_KEY_PATH"),
+            ("apns.bundle_id", "TRANSPONDER_APNS_BUNDLE_ID"),
+        ] {
+            let vars = complete_apns
+                .iter()
+                .copied()
+                .filter(|(key, _)| *key != env_key)
+                .collect::<Vec<_>>();
+
+            let error = from_test_env(&vars).unwrap_err();
+            let message = error.to_string();
+
+            assert!(message.contains(field), "{message}");
+            assert!(
+                message.contains("apns.enabled = true"),
+                "expected error to mention enabled APNs, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apns_enabled_with_whitespace_credential_rejected() {
+        let error = from_test_env(&[
+            ("TRANSPONDER_APNS_ENABLED", "true"),
+            ("TRANSPONDER_APNS_KEY_ID", " "),
+            ("TRANSPONDER_APNS_TEAM_ID", "TEAM123"),
+            ("TRANSPONDER_APNS_PRIVATE_KEY_PATH", "/keys/apns.p8"),
+            ("TRANSPONDER_APNS_BUNDLE_ID", "com.example.app"),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("apns.key_id"), "{error}");
+    }
+
+    #[test]
+    fn test_fcm_enabled_without_credentials_rejected() {
+        let complete_fcm = [
+            ("TRANSPONDER_FCM_ENABLED", "true"),
+            ("TRANSPONDER_FCM_SERVICE_ACCOUNT_PATH", "/keys/fcm.json"),
+            ("TRANSPONDER_FCM_PROJECT_ID", "my-project"),
+        ];
+
+        for (field, env_key) in [
+            (
+                "fcm.service_account_path",
+                "TRANSPONDER_FCM_SERVICE_ACCOUNT_PATH",
+            ),
+            ("fcm.project_id", "TRANSPONDER_FCM_PROJECT_ID"),
+        ] {
+            let vars = complete_fcm
+                .iter()
+                .copied()
+                .filter(|(key, _)| *key != env_key)
+                .collect::<Vec<_>>();
+
+            let error = from_test_env(&vars).unwrap_err();
+            let message = error.to_string();
+
+            assert!(message.contains(field), "{message}");
+            assert!(
+                message.contains("fcm.enabled = true"),
+                "expected error to mention enabled FCM, got: {message}"
+            );
+        }
     }
 
     #[test]
@@ -1995,16 +2127,16 @@ mod tests {
             clearnet = ["wss://relay.example.com"]
 
             [apns]
-            enabled = true
+            enabled = false
             key_id = "MYKEY"
-            # Missing other fields - should get defaults
+            # Missing other fields still get defaults when the provider is disabled.
         "#;
 
         let file = create_temp_config(config_content);
         let config = load_with_test_env(file.path(), &[]).unwrap();
 
         assert_eq!(config.server.private_key.as_str(), "test-key");
-        assert!(config.apns.enabled);
+        assert!(!config.apns.enabled);
         assert_eq!(config.apns.key_id, "MYKEY");
         assert_eq!(config.apns.environment, ApnsEnvironment::Production); // default
         assert!(!config.fcm.enabled); // default
