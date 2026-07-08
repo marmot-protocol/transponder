@@ -120,19 +120,19 @@ async fn run_reconnect_attempt_monitor(
     }
 }
 
-fn relay_options_for_config(config: &RelayConfig, relay_url: &str) -> RelayOptions {
-    #[cfg(not(feature = "tor"))]
-    let _ = relay_url;
-
+fn relay_options_for_config(config: &RelayConfig, kind: RelayKind) -> RelayOptions {
     let opts =
         RelayOptions::default().retry_interval(Duration::from_secs(config.reconnect_interval_secs));
 
     #[cfg(feature = "tor")]
     {
-        if relay_url.contains(".onion") {
+        if matches!(kind, RelayKind::Onion) {
             return opts.connection_mode(ConnectionMode::tor());
         }
     }
+
+    #[cfg(not(feature = "tor"))]
+    let _ = kind;
 
     opts
 }
@@ -417,7 +417,7 @@ impl RelayClient {
         let added = self
             .client
             .pool()
-            .add_relay(url, relay_options_for_config(&self.config, url))
+            .add_relay(url, relay_options_for_config(&self.config, kind))
             .await
             .map_err(|e| e.to_string())?;
 
@@ -910,12 +910,32 @@ mod tests {
         let mut config = test_relay_config(vec![]);
         config.reconnect_interval_secs = 17;
 
-        let opts = relay_options_for_config(&config, "ws://127.0.0.1:12345");
+        let opts = relay_options_for_config(&config, RelayKind::Clearnet);
         let debug = format!("{opts:?}");
 
         assert!(
             debug.contains("retry_interval: 17s"),
             "relay options must use configured retry interval, got: {debug}"
+        );
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn test_relay_options_use_relay_kind_for_tor_mode() {
+        let config = test_relay_config(vec![]);
+
+        let clearnet_opts = relay_options_for_config(&config, RelayKind::Clearnet);
+        let onion_opts = relay_options_for_config(&config, RelayKind::Onion);
+        let clearnet_debug = format!("{clearnet_opts:?}");
+        let onion_debug = format!("{onion_opts:?}");
+
+        assert!(
+            !clearnet_debug.contains("Tor"),
+            "clearnet provenance must not be forced over Tor, got: {clearnet_debug}"
+        );
+        assert!(
+            onion_debug.contains("Tor"),
+            "onion provenance must select Tor connection mode, got: {onion_debug}"
         );
     }
 
