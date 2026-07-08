@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lru::LruCache;
@@ -301,6 +301,8 @@ pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
     next_hit_id: AtomicU64,
     /// Counts stripe-mutating admissions to drive the sampled gauge (#125).
     gauge_sample_counter: AtomicU64,
+    /// Exact aggregate entry count for lock-free gauge samples on the hot path.
+    entry_count: AtomicUsize,
 }
 
 impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
@@ -333,6 +335,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
             max_per_hour: config.max_per_hour,
             next_hit_id: AtomicU64::new(0),
             gauge_sample_counter: AtomicU64::new(0),
+            entry_count: AtomicUsize::new(0),
         }
     }
 
@@ -388,18 +391,19 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// Returns `Some(total_len)` roughly once per [`GAUGE_SAMPLE_INTERVAL`]
     /// stripe-mutating admissions, and `None` otherwise, so the caller refreshes
     /// the cache-size gauge frequently enough to catch saturation onset without
-    /// a metric write on every check. The total is summed across stripes to keep
-    /// the metric's existing per-`cache_type` label shape (one value per
-    /// limiter, not per stripe).
-    async fn sampled_total_len(&self) -> Option<usize> {
+    /// a metric write on every check. The total comes from an aggregate atomic
+    /// counter, not a cross-stripe read-lock sweep, so sampled admissions stay
+    /// local to the current stripe.
+    fn sampled_total_len(&self) -> Option<usize> {
         let n = self.gauge_sample_counter.fetch_add(1, Ordering::Relaxed);
         if !n.is_multiple_of(GAUGE_SAMPLE_INTERVAL) {
             return None;
         }
-        Some(self.total_len().await)
+        Some(self.entry_count.load(Ordering::Relaxed))
     }
 
     /// Sums the entry count across all stripes.
+    #[cfg(test)]
     async fn total_len(&self) -> usize {
         let mut total = 0;
         for stripe in &self.stripes {
@@ -447,6 +451,9 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
                     }
                 }
                 entries.put(key.clone(), RateLimitEntry::new());
+                if !admission_evicted {
+                    self.entry_count.fetch_add(1, Ordering::Relaxed);
+                }
                 entries.get_mut(key).expect("just inserted")
             };
 
@@ -486,7 +493,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         // just taken. Only sampled admissions read the (cross-stripe) length so
         // the hot path stays cheap (#125).
         let sampled_cache_len = if mutated {
-            self.sampled_total_len().await
+            self.sampled_total_len()
         } else {
             None
         };
@@ -517,8 +524,8 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
             false
         };
 
-        if should_remove {
-            entries.pop(key);
+        if should_remove && entries.pop(key).is_some() {
+            self.entry_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -549,12 +556,16 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
                 .map(|(k, _)| k.clone())
                 .collect();
 
-            for key in &stale {
-                entries.pop(key);
-            }
+            let removed = stale
+                .iter()
+                .filter(|key| entries.pop(key).is_some())
+                .count();
 
-            evicted += stale.len();
-            remaining += before - stale.len();
+            if removed > 0 {
+                self.entry_count.fetch_sub(removed, Ordering::Relaxed);
+            }
+            evicted += removed;
+            remaining += before - removed;
         }
 
         CleanupStats { evicted, remaining }
@@ -1355,6 +1366,30 @@ mod tests {
                 .sampled_cache_len()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn test_sampled_cache_size_does_not_lock_unrelated_stripes() {
+        let max = MIN_ENTRIES_PER_SHARD * 2;
+        let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
+            max_per_minute: 10,
+            max_per_hour: 100,
+            max_entries: entries(max),
+        });
+        assert_eq!(limiter.stripes.len(), 2);
+
+        let blocked_stripe = 0usize;
+        let key = (0u64..)
+            .find(|candidate| limiter.stripe_index(candidate) != blocked_stripe)
+            .expect("test key for unblocked stripe");
+
+        let _blocked = limiter.stripes[blocked_stripe].write().await;
+        let check = tokio::time::timeout(Duration::from_secs(1), limiter.check_and_increment(&key))
+            .await
+            .expect("sampled cache-size gauge must not wait on unrelated stripes");
+
+        assert!(check.is_allowed());
+        assert_eq!(check.sampled_cache_len(), Some(1));
     }
 
     #[tokio::test]
