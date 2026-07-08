@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::config::FcmConfig;
@@ -696,7 +696,7 @@ impl FcmClient {
                 // Project or service-account authorization failure. This is a
                 // provider-wide configuration outage, not a dead device token.
                 let error = Self::parse_error_response(response, 403, "PERMISSION_DENIED").await;
-                error!(
+                warn!(
                     status = %error.error.status,
                     fcm_error_code = fcm_provider_error_code(&error.error).unwrap_or("unknown"),
                     "FCM permission denied"
