@@ -719,18 +719,7 @@ impl RelayClient {
             return Ok(());
         }
 
-        let event_is_current = match self.inbox_relay_event_is_current(&relay_urls).await {
-            Ok(current) => current,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Skipping kind 10050 publish; could not verify existing inbox relay list"
-                );
-                return Ok(());
-            }
-        };
-
-        if event_is_current {
+        if !should_publish_inbox_relay_event(self.inbox_relay_event_is_current(&relay_urls).await) {
             info!("Skipping kind 10050 publish; inbox relay list unchanged");
             return Ok(());
         }
@@ -813,6 +802,19 @@ impl RelayClient {
         let published = normalize_relay_tags(newest);
 
         Ok(configured == published)
+    }
+}
+
+fn should_publish_inbox_relay_event(current: Result<bool>) -> bool {
+    match current {
+        Ok(is_current) => !is_current,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Publishing kind 10050 inbox relay list because existing relay list could not be verified"
+            );
+            true
+        }
     }
 }
 
@@ -1841,6 +1843,15 @@ mod tests {
         // Should return Ok even with no relays (just logs warning)
         let result = client.publish_inbox_relays().await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_inbox_relay_publish_required_when_freshness_fetch_errors() {
+        assert!(should_publish_inbox_relay_event(Err(Error::Nostr(
+            "fetch failed".to_string()
+        ))));
+        assert!(should_publish_inbox_relay_event(Ok(false)));
+        assert!(!should_publish_inbox_relay_event(Ok(true)));
     }
 
     #[tokio::test]
