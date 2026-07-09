@@ -517,14 +517,16 @@ mod tests {
             }),
             breadcrumbs: sentry::protocol::Values {
                 values: vec![sentry::protocol::Breadcrumb {
+                    timestamp: std::time::SystemTime::UNIX_EPOCH,
+                    ty: "default".into(),
+                    category: None,
+                    level: sentry::Level::Info,
                     message: Some("sent via wss://breadcrumb23456789.onion".into()),
                     data: sentry::protocol::Map::from_iter([(
                         "key".to_string(),
                         sentry::protocol::Value::String("nsec1qqqqqqqqqqqqqqq".into()),
                     )]),
-                    ..Default::default()
                 }],
-                ..Default::default()
             },
             exception: sentry::protocol::Values {
                 values: vec![sentry::protocol::Exception {

@@ -82,7 +82,7 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// duration (issue #244). 60 seconds comfortably covers genuine provider
 /// backpressure (APNs/FCM hints are typically single-digit seconds) while
 /// bounding provider-controlled residency per logical push. Additive jitter is
-/// separate and bounded by [`MAX_RETRY_JITTER`] per retry. Deliberately larger
+/// separate and bounded by `MAX_RETRY_JITTER` per retry. Deliberately larger
 /// than [`MAX_BACKOFF`], which only caps locally-computed exponential backoff.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
