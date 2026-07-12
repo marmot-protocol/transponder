@@ -141,9 +141,20 @@ environment = "production"
 # Your iOS app's bundle identifier (e.g., "com.example.myapp")
 bundle_id = ""
 
-# APNs payload mode: "silent" or "nse_prototype_alert"
-# Keep production silent. Use nse_prototype_alert only for staging NSE prototype testing.
+# APNs payload mode: "silent", "generic_alert", or "nse_prototype_alert"
+# - silent: background push only (invisible without an NSE or foreground work)
+# - generic_alert: visible alert with the configurable, content-free
+#   alert_title/alert_body below; requires no Notification Service Extension
+# - nse_prototype_alert: staging NSE prototype testing only
 payload_mode = "silent"
+
+# Alert copy for the generic_alert payload mode (keep it content-free)
+alert_title = "New activity"
+alert_body = "You have a new notification"
+
+# Optional apns-collapse-id header value (max 64 bytes); empty disables it.
+# When set, APNs coalesces undelivered notifications with the same id.
+collapse_id = ""
 
 [fcm]
 # Enable FCM for Android push notifications

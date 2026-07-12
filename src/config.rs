@@ -378,6 +378,10 @@ fn default_max_reconnect_attempts() -> u32 {
     10
 }
 
+/// Maximum length in bytes APNs accepts for the `apns-collapse-id` header;
+/// longer values are rejected per-send with a 400 `BadCollapseId`.
+const APNS_COLLAPSE_ID_MAX_BYTES: usize = 64;
+
 /// APNs push notification configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
@@ -409,6 +413,22 @@ pub struct ApnsConfig {
     /// APNs payload mode.
     #[serde(default)]
     pub payload_mode: ApnsPayloadMode,
+
+    /// Alert title for the `generic_alert` payload mode.
+    #[serde(default = "default_apns_alert_title")]
+    pub alert_title: String,
+
+    /// Alert body for the `generic_alert` payload mode.
+    #[serde(default = "default_apns_alert_body")]
+    pub alert_body: String,
+
+    /// Optional `apns-collapse-id` header value; empty disables the header.
+    ///
+    /// When set, APNs coalesces undelivered notifications carrying the same
+    /// collapse identifier, so a rapid burst surfaces as a single notification
+    /// instead of a stack.
+    #[serde(default)]
+    pub collapse_id: String,
 }
 
 /// APNs gateway environment.
@@ -448,20 +468,26 @@ pub enum ApnsPayloadMode {
 
     /// Alert payload for exercising the iOS Notification Service Extension prototype.
     NsePrototypeAlert,
+
+    /// Visible alert with configurable, content-free title and body
+    /// (`apns.alert_title` / `apns.alert_body`). Requires no Notification
+    /// Service Extension: the payload carries no `mutable-content` flag and
+    /// never reveals message content or sender identity.
+    GenericAlert,
 }
 
 impl ApnsPayloadMode {
     pub(crate) fn push_type(self) -> &'static str {
         match self {
             Self::Silent => "background",
-            Self::NsePrototypeAlert => "alert",
+            Self::NsePrototypeAlert | Self::GenericAlert => "alert",
         }
     }
 
     pub(crate) fn priority(self) -> &'static str {
         match self {
             Self::Silent => "5",
-            Self::NsePrototypeAlert => "10",
+            Self::NsePrototypeAlert | Self::GenericAlert => "10",
         }
     }
 }
@@ -471,12 +497,21 @@ impl std::fmt::Display for ApnsPayloadMode {
         match self {
             Self::Silent => f.write_str("silent"),
             Self::NsePrototypeAlert => f.write_str("nse_prototype_alert"),
+            Self::GenericAlert => f.write_str("generic_alert"),
         }
     }
 }
 
 fn default_apns_environment() -> ApnsEnvironment {
     ApnsEnvironment::Production
+}
+
+fn default_apns_alert_title() -> String {
+    "New activity".to_string()
+}
+
+fn default_apns_alert_body() -> String {
+    "You have a new notification".to_string()
 }
 
 /// FCM push notification configuration.
@@ -897,6 +932,9 @@ fn is_supported_config_key(config_key: &str) -> bool {
                 | "apns.environment"
                 | "apns.bundle_id"
                 | "apns.payload_mode"
+                | "apns.alert_title"
+                | "apns.alert_body"
+                | "apns.collapse_id"
                 | "fcm.enabled"
                 | "fcm.service_account_path"
                 | "fcm.project_id"
@@ -1225,7 +1263,9 @@ impl GlitchtipConfig {
 }
 
 impl ApnsConfig {
-    /// Rejects enabled APNs configuration that is missing required credentials.
+    /// Rejects enabled APNs configuration that is missing required credentials,
+    /// a `generic_alert` mode with nothing to display, or an over-length
+    /// collapse identifier.
     fn validate(&self) -> std::result::Result<(), config::ConfigError> {
         if !self.enabled {
             return Ok(());
@@ -1244,6 +1284,26 @@ impl ApnsConfig {
                     "{field} must be set when apns.enabled = true"
                 )));
             }
+        }
+
+        // A generic alert with neither a title nor a body renders nothing
+        // visible on the device, defeating the purpose of the mode.
+        if self.payload_mode == ApnsPayloadMode::GenericAlert
+            && self.alert_title.trim().is_empty()
+            && self.alert_body.trim().is_empty()
+        {
+            return Err(config::ConfigError::Message(
+                "apns.alert_title or apns.alert_body must be set when apns.payload_mode = \"generic_alert\"".to_string(),
+            ));
+        }
+
+        // APNs rejects `apns-collapse-id` values over 64 bytes with a 400
+        // BadCollapseId on every send; fail at startup instead.
+        if self.collapse_id.len() > APNS_COLLAPSE_ID_MAX_BYTES {
+            return Err(config::ConfigError::Message(format!(
+                "apns.collapse_id must be at most {APNS_COLLAPSE_ID_MAX_BYTES} bytes, got {}",
+                self.collapse_id.len()
+            )));
         }
 
         Ok(())
@@ -1426,6 +1486,9 @@ mod tests {
             environment: ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         assert!(config.is_production());
@@ -1442,6 +1505,9 @@ mod tests {
             environment: ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         assert!(!config.is_production());
@@ -1963,6 +2029,8 @@ mod tests {
     #[test]
     fn test_apns_config_defaults() {
         assert_eq!(default_apns_environment(), ApnsEnvironment::Production);
+        assert_eq!(default_apns_alert_title(), "New activity");
+        assert_eq!(default_apns_alert_body(), "You have a new notification");
     }
 
     #[test]
@@ -2003,6 +2071,85 @@ mod tests {
 
         assert!(error.to_string().contains("payload_mode"), "{error}");
         assert!(error.to_string().contains("loud_plaintext"), "{error}");
+    }
+
+    #[test]
+    fn test_apns_payload_mode_parses_generic_alert_with_default_copy() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+
+            [apns]
+            payload_mode = "generic_alert"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+
+        assert_eq!(config.apns.payload_mode, ApnsPayloadMode::GenericAlert);
+        assert_eq!(config.apns.alert_title, "New activity");
+        assert_eq!(config.apns.alert_body, "You have a new notification");
+        assert_eq!(config.apns.collapse_id, "");
+    }
+
+    #[test]
+    fn test_apns_generic_alert_custom_copy_and_collapse_id() {
+        let config_content = r#"
+            [server]
+            private_key = "test"
+
+            [apns]
+            payload_mode = "generic_alert"
+            alert_title = "Ping"
+            alert_body = "Something happened"
+            collapse_id = "ping"
+        "#;
+
+        let file = create_temp_config(config_content);
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+
+        assert_eq!(config.apns.alert_title, "Ping");
+        assert_eq!(config.apns.alert_body, "Something happened");
+        assert_eq!(config.apns.collapse_id, "ping");
+    }
+
+    #[test]
+    fn test_apns_generic_alert_without_title_or_body_rejected() {
+        // A generic alert with neither a title nor a body renders nothing
+        // visible, so an explicit double-blank is a startup error.
+        let error = from_test_env(&[
+            ("TRANSPONDER_APNS_ENABLED", "true"),
+            ("TRANSPONDER_APNS_KEY_ID", "KEY123"),
+            ("TRANSPONDER_APNS_TEAM_ID", "TEAM123"),
+            ("TRANSPONDER_APNS_PRIVATE_KEY_PATH", "/keys/apns.p8"),
+            ("TRANSPONDER_APNS_BUNDLE_ID", "com.example.app"),
+            ("TRANSPONDER_APNS_PAYLOAD_MODE", "generic_alert"),
+            ("TRANSPONDER_APNS_ALERT_TITLE", ""),
+            ("TRANSPONDER_APNS_ALERT_BODY", " "),
+        ])
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("apns.alert_title"), "{message}");
+        assert!(message.contains("generic_alert"), "{message}");
+    }
+
+    #[test]
+    fn test_apns_collapse_id_over_max_length_rejected() {
+        // APNs rejects over-length collapse ids per-send (400 BadCollapseId);
+        // the misconfiguration must fail loudly at startup instead.
+        let long_collapse_id = "x".repeat(APNS_COLLAPSE_ID_MAX_BYTES + 1);
+        let error = from_test_env(&[
+            ("TRANSPONDER_APNS_ENABLED", "true"),
+            ("TRANSPONDER_APNS_KEY_ID", "KEY123"),
+            ("TRANSPONDER_APNS_TEAM_ID", "TEAM123"),
+            ("TRANSPONDER_APNS_PRIVATE_KEY_PATH", "/keys/apns.p8"),
+            ("TRANSPONDER_APNS_BUNDLE_ID", "com.example.app"),
+            ("TRANSPONDER_APNS_COLLAPSE_ID", long_collapse_id.as_str()),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("apns.collapse_id"), "{error}");
     }
 
     #[test]
@@ -2204,6 +2351,9 @@ mod tests {
             environment: ApnsEnvironment::Production,
             bundle_id: String::new(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         assert!(config.is_production());
     }
@@ -2218,6 +2368,9 @@ mod tests {
             environment: ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         assert!(!config.is_production());
     }

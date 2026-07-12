@@ -1063,6 +1063,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_only = PushDispatcher::new(Some(ApnsClient::mock(apns_config, true)), None);
         assert!(apns_only.accepts(Platform::Apns));
@@ -1131,6 +1134,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let apns_client = ApnsClient::mock(config, true);
@@ -1198,6 +1204,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let dispatcher = PushDispatcher::new(Some(apns_client), None);
@@ -1249,6 +1258,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
 
@@ -1320,6 +1332,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let metrics = Metrics::new().unwrap();
@@ -1364,6 +1379,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
 
@@ -1395,6 +1413,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, false);
         let dispatcher = PushDispatcher::new(Some(apns_client), None);
@@ -1445,6 +1466,9 @@ mod tests {
                     environment: crate::config::ApnsEnvironment::Sandbox,
                     bundle_id: "com.example.app".to_string(),
                     payload_mode: Default::default(),
+                    alert_title: String::new(),
+                    alert_body: String::new(),
+                    collapse_id: String::new(),
                 },
                 true,
             )),
@@ -1604,6 +1628,9 @@ mod tests {
                     environment: crate::config::ApnsEnvironment::Sandbox,
                     bundle_id: "com.example.app".to_string(),
                     payload_mode: Default::default(),
+                    alert_title: String::new(),
+                    alert_body: String::new(),
+                    collapse_id: String::new(),
                 },
                 true,
             )),
@@ -1643,6 +1670,9 @@ mod tests {
                     environment: crate::config::ApnsEnvironment::Sandbox,
                     bundle_id: "com.example.app".to_string(),
                     payload_mode: Default::default(),
+                    alert_title: String::new(),
+                    alert_body: String::new(),
+                    collapse_id: String::new(),
                 },
                 true,
             )),
@@ -1700,6 +1730,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let dispatcher = PushDispatcher::new(Some(apns_client), None);
@@ -1722,6 +1755,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let dispatcher = Arc::new(PushDispatcher::new(
             Some(ApnsClient::mock(apns_config, true)),
@@ -1769,6 +1805,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let dispatcher = Arc::new(PushDispatcher::new(
             Some(ApnsClient::mock(apns_config, true)),
@@ -1836,6 +1875,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let metrics = Metrics::new().unwrap();
@@ -1892,6 +1934,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let metrics = Metrics::new().unwrap();
@@ -2094,6 +2139,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let mut client = ApnsClient::mock(apns_config, true);
         client.test_base_url = Some(mock_server.uri());

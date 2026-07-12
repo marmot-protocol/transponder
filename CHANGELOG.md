@@ -4,6 +4,7 @@
 
 ### Added
 
+- New `generic_alert` APNs payload mode: a visible alert whose title and body come from the new `apns.alert_title` / `apns.alert_body` configuration keys (content-free defaults), with no `mutable-content` flag, so deployments can show a notification without shipping a Notification Service Extension. An optional `apns.collapse_id` key sets the `apns-collapse-id` header (any payload mode) so rapid bursts coalesce into a single notification.
 - Optional error and panic reporting to a GlitchTip (Sentry-compatible) instance, enabled by setting `glitchtip.dsn` (or `TRANSPONDER_GLITCHTIP_DSN`). Only Transponder's own `ERROR` events and panics are sent, over a self-contained TLS transport (bundled roots, no system CA store dependency); dependency-crate errors and lower log levels are dropped, and Transponder never logs or panics with secret material.
 
 ### Fixed

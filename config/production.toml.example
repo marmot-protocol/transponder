@@ -72,7 +72,14 @@ team_id = ""
 private_key_path = "/credentials/AuthKey_XXXXXXXXXX.p8"
 environment = "production"
 bundle_id = ""
+# "silent", "generic_alert" (visible content-free alert, no NSE required),
+# or "nse_prototype_alert" (staging NSE prototype testing only).
 payload_mode = "silent"
+# Alert copy for the generic_alert payload mode (keep it content-free).
+alert_title = "New activity"
+alert_body = "You have a new notification"
+# Optional apns-collapse-id header value (max 64 bytes); empty disables it.
+collapse_id = ""
 
 [fcm]
 enabled = false

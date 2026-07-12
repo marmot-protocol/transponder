@@ -39,6 +39,7 @@ struct ApnsClaims {
 enum ApnsPayload {
     Silent(ApnsSilentPayload),
     NsePrototypeAlert(ApnsNsePrototypeAlertPayload),
+    GenericAlert(ApnsGenericAlertPayload),
 }
 
 #[derive(Debug, Serialize)]
@@ -62,13 +63,22 @@ impl Default for ApnsPayload {
     }
 }
 
-impl From<ApnsPayloadMode> for ApnsPayload {
-    fn from(mode: ApnsPayloadMode) -> Self {
-        match mode {
+impl ApnsPayload {
+    fn for_config(config: &ApnsConfig) -> Self {
+        match config.payload_mode {
             ApnsPayloadMode::Silent => Self::default(),
             ApnsPayloadMode::NsePrototypeAlert => {
                 Self::NsePrototypeAlert(ApnsNsePrototypeAlertPayload::default())
             }
+            ApnsPayloadMode::GenericAlert => Self::GenericAlert(ApnsGenericAlertPayload {
+                aps: ApnsGenericAlertAps {
+                    alert: ApnsGenericAlert {
+                        title: config.alert_title.clone(),
+                        body: config.alert_body.clone(),
+                    },
+                    sound: "default",
+                },
+            }),
         }
     }
 }
@@ -115,6 +125,31 @@ struct ApnsAlert {
     body: &'static str,
 }
 
+/// Payload for [`ApnsPayloadMode::GenericAlert`]: a visible alert carrying
+/// only the operator-configured title/body — no message content, no sender
+/// identity, and no `mutable-content` flag (no Notification Service Extension
+/// is required to display it).
+#[derive(Debug, Serialize)]
+struct ApnsGenericAlertPayload {
+    aps: ApnsGenericAlertAps,
+}
+
+#[derive(Debug, Serialize)]
+struct ApnsGenericAlertAps {
+    alert: ApnsGenericAlert,
+    sound: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ApnsGenericAlert {
+    /// Omitted from the payload when configured empty (body-only alert).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    title: String,
+    /// Omitted from the payload when configured empty (title-only alert).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    body: String,
+}
+
 fn redacted_device_token_id(_device_token: &str) -> &'static str {
     "<redacted_device_token>"
 }
@@ -127,15 +162,19 @@ fn device_token_url(base_url: &str, device_token: &str) -> Zeroizing<String> {
 struct ApnsRequestParts {
     push_type: &'static str,
     priority: &'static str,
+    /// `apns-collapse-id` header value; `None` leaves the header off.
+    collapse_id: Option<String>,
     payload: ApnsPayload,
 }
 
 impl ApnsRequestParts {
-    fn for_mode(mode: ApnsPayloadMode) -> Self {
+    fn for_config(config: &ApnsConfig) -> Self {
+        let mode = config.payload_mode;
         Self {
             push_type: mode.push_type(),
             priority: mode.priority(),
-            payload: ApnsPayload::from(mode),
+            collapse_id: (!config.collapse_id.is_empty()).then(|| config.collapse_id.clone()),
+            payload: ApnsPayload::for_config(config),
         }
     }
 }
@@ -364,7 +403,7 @@ impl ApnsClient {
         // device-token URL is a zeroizing buffer (issue #126); reqwest still
         // materializes the serialized body/headers into non-zeroized buffers
         // it owns, which is the accepted #126 posture (see build_request).
-        let request_parts = ApnsRequestParts::for_mode(self.config.payload_mode);
+        let request_parts = ApnsRequestParts::for_config(&self.config);
         let url = device_token_url(self.base_url(), device_token.as_str());
 
         debug!(
@@ -411,13 +450,17 @@ impl ApnsClient {
         request_parts: &ApnsRequestParts,
     ) -> reqwest::RequestBuilder {
         let authorization = Zeroizing::new(format!("bearer {auth_token}"));
-        self.http_client
+        let mut request = self
+            .http_client
             .post(url)
             .header("apns-push-type", request_parts.push_type)
             .header("apns-priority", request_parts.priority)
             .header("apns-topic", &self.config.bundle_id)
-            .header("authorization", authorization.as_str())
-            .json(&request_parts.payload)
+            .header("authorization", authorization.as_str());
+        if let Some(collapse_id) = request_parts.collapse_id.as_deref() {
+            request = request.header("apns-collapse-id", collapse_id);
+        }
+        request.json(&request_parts.payload)
     }
 
     async fn handle_response(
@@ -705,6 +748,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         }
     }
 
@@ -760,7 +806,7 @@ mod tests {
         config.payload_mode = ApnsPayloadMode::Silent;
         config.bundle_id = "dev.ipf.whitenoise.staging".to_string();
         let client = ApnsClient::mock(config, false);
-        let request_parts = ApnsRequestParts::for_mode(client.config.payload_mode);
+        let request_parts = ApnsRequestParts::for_config(&client.config);
 
         let request = client
             .build_request(
@@ -793,7 +839,7 @@ mod tests {
         config.payload_mode = ApnsPayloadMode::NsePrototypeAlert;
         config.bundle_id = "dev.ipf.whitenoise.staging".to_string();
         let client = ApnsClient::mock(config, false);
-        let request_parts = ApnsRequestParts::for_mode(client.config.payload_mode);
+        let request_parts = ApnsRequestParts::for_config(&client.config);
 
         let request = client
             .build_request(
@@ -826,6 +872,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_generic_alert_mode_builds_alert_headers_and_payload() {
+        let mut config = test_config();
+        config.payload_mode = ApnsPayloadMode::GenericAlert;
+        config.alert_title = "New activity".to_string();
+        config.alert_body = "You have a new notification".to_string();
+        let client = ApnsClient::mock(config, false);
+        let request_parts = ApnsRequestParts::for_config(&client.config);
+
+        let request = client
+            .build_request(
+                "https://api.push.apple.com/3/device/aabbccdd11223344",
+                "test-token",
+                &request_parts,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(header_value(&request, "apns-push-type"), "alert");
+        assert_eq!(header_value(&request, "apns-priority"), "10");
+        assert_eq!(header_value(&request, "apns-topic"), "com.example.app");
+        // No collapse id configured: the header must be absent entirely.
+        assert!(request.headers().get("apns-collapse-id").is_none());
+        // The exact payload: configured title/body only — in particular no
+        // `mutable-content` (no NSE required) and no prototype marker field.
+        assert_eq!(
+            request_json(&request),
+            serde_json::json!({
+                "aps": {
+                    "alert": {
+                        "title": "New activity",
+                        "body": "You have a new notification"
+                    },
+                    "sound": "default"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_generic_alert_mode_omits_empty_body_from_alert() {
+        let mut config = test_config();
+        config.payload_mode = ApnsPayloadMode::GenericAlert;
+        config.alert_title = "New activity".to_string();
+        config.alert_body = String::new();
+        let client = ApnsClient::mock(config, false);
+        let request_parts = ApnsRequestParts::for_config(&client.config);
+
+        let request = client
+            .build_request(
+                "https://api.push.apple.com/3/device/aabbccdd11223344",
+                "test-token",
+                &request_parts,
+            )
+            .build()
+            .unwrap();
+
+        // A title-only alert must not carry an empty "body" key.
+        assert_eq!(
+            request_json(&request),
+            serde_json::json!({
+                "aps": {
+                    "alert": {
+                        "title": "New activity"
+                    },
+                    "sound": "default"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_generic_alert_mode_sets_collapse_id_header_when_configured() {
+        let mut config = test_config();
+        config.payload_mode = ApnsPayloadMode::GenericAlert;
+        config.collapse_id = "new-activity".to_string();
+        let client = ApnsClient::mock(config, false);
+        let request_parts = ApnsRequestParts::for_config(&client.config);
+
+        let request = client
+            .build_request(
+                "https://api.push.apple.com/3/device/aabbccdd11223344",
+                "test-token",
+                &request_parts,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(header_value(&request, "apns-collapse-id"), "new-activity");
+    }
+
+    #[test]
+    fn test_collapse_id_header_applies_to_any_payload_mode() {
+        let mut config = test_config();
+        config.payload_mode = ApnsPayloadMode::Silent;
+        config.collapse_id = "sync".to_string();
+        let client = ApnsClient::mock(config, false);
+        let request_parts = ApnsRequestParts::for_config(&client.config);
+
+        let request = client
+            .build_request(
+                "https://api.push.apple.com/3/device/aabbccdd11223344",
+                "test-token",
+                &request_parts,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(header_value(&request, "apns-collapse-id"), "sync");
+    }
+
     #[tokio::test]
     async fn test_send_once_returns_transport_error_after_connect_retries() {
         let proxy_addr = {
@@ -853,7 +1010,7 @@ mod tests {
             initial_backoff: Duration::from_millis(1),
         };
 
-        let request_parts = ApnsRequestParts::for_mode(client.config.payload_mode);
+        let request_parts = ApnsRequestParts::for_config(&client.config);
         let url = device_token_url(client.config.base_url(), "aabbccdd11223344");
         let result = client
             .send_once_with_transport_retry_config(url.as_str(), &request_parts, &retry_config)
@@ -880,6 +1037,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::new(config).await.unwrap();
@@ -1557,6 +1717,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -1573,6 +1736,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -1589,6 +1755,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -1605,6 +1774,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: String::new(), // Missing
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -1621,6 +1793,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::mock(config, false); // No encoding key
@@ -1669,6 +1844,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::mock(config, false);
@@ -1688,6 +1866,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::mock(config, true);
@@ -1715,6 +1896,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         // Create a client without an encoding key to test the error case
@@ -1740,6 +1924,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::mock(config, false); // No encoding key
@@ -1767,6 +1954,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::new(config).await.unwrap();
@@ -1783,6 +1973,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let result = ApnsClient::new(config).await;
@@ -1860,6 +2053,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         // Client without encoding key - should fail when trying to generate
@@ -1895,6 +2091,9 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::new(config).await.unwrap();
@@ -1926,6 +2125,9 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let metrics = Metrics::new().unwrap();
@@ -2041,6 +2243,9 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r
             environment: crate::config::ApnsEnvironment::Production,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let client = ApnsClient::new(config).await.unwrap();
