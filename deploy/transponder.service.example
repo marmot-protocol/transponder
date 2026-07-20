@@ -23,9 +23,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 ReadOnlyPaths=/etc/transponder/config.toml /etc/transponder/secrets /etc/transponder/credentials
-ReadWritePaths=/var/lib/transponder
 Environment=TRANSPONDER_SERVER_PRIVATE_KEY_FILE=/etc/transponder/secrets/server_private_key
-Environment=TRANSPONDER_SERVER_DEDUP_STATE_PATH=/var/lib/transponder/dedup-events.log
 Environment=TRANSPONDER_LOGGING_LEVEL=info
 # RUST_LOG overrides TRANSPONDER_LOGGING_LEVEL when set.
 Environment=RUST_LOG=info,transponder=info,nostr_relay_pool=info,nostr_sdk=info,nostr=info,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,tower=warn,rustls=warn,tungstenite=warn,tokio_tungstenite=warn

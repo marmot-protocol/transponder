@@ -16,6 +16,8 @@ The adopted Marmot surface documents supersede the deprecated MIP-era documents.
 
 Transponder implements the adopted `marmot-push-v1` server interop surface: token keys use the normative HKDF domain separation, kind `446` rumors require the exact `["v", "marmot-push-v1"]` tag shape, content is standard padded base64, and duplicate suppression uses a short-lived `SHA-256` hash of decoded trigger content rather than the rewrappable outer event ID.
 
+The release-candidate protocol checklist and executable evidence are recorded in [Marmot Push v1 Conformance](docs/marmot-push-v1-conformance.md).
+
 The maintained MIP-05 implementation is preserved in the [`release/mip05-v1`](https://github.com/marmot-protocol/transponder/tree/release/mip05-v1) branch and the immutable [`transponder-mip05-v1.0.0`](https://github.com/marmot-protocol/transponder/releases/tag/transponder-mip05-v1.0.0) release. Existing MIP-05 services should build from that release line rather than from `master`; `master` is the forward-looking Marmot Push development line.
 
 ### Privacy Properties
@@ -301,20 +303,12 @@ docker run -d \
   -p 127.0.0.1:8080:8080 \
   -v /path/to/config.toml:/etc/transponder/config.toml:ro \
   -v /path/to/credentials:/credentials:ro \
-  -v /path/to/state:/var/lib/transponder:rw \
   -e TRANSPONDER_SERVER_PRIVATE_KEY="your-hex-key" \
-  -e TRANSPONDER_SERVER_DEDUP_STATE_PATH="/var/lib/transponder/dedup-events.log" \
   -e TRANSPONDER_HEALTH_BIND_ADDRESS="0.0.0.0:8080" \
   transponder
 ```
 
 Docker port publishing needs the service to listen on the container interface. The command above still binds the host side to `127.0.0.1`, keeping the endpoints local to the host by default.
-
-The container runs as UID/GID `65532`. If you bind-mount a host state directory, create it so that user can write the replay log:
-
-```bash
-sudo install -d -m 0700 -o 65532 -g 65532 /path/to/state
-```
 
 ### Docker Compose
 
@@ -335,8 +329,8 @@ Services and ports:
 - The production image now uses Docker Hardened Images for both build and runtime stages.
 - Base images are pinned by digest for reproducible deploys.
 - Docker health checks use `transponder healthcheck`, so the container does not need `wget` or `curl`.
-- The build context intentionally excludes local configs, credentials, and state via `.dockerignore`.
-- Mount `/var/lib/transponder` persistently in production so processed gift-wrap event IDs survive restarts and reconnects.
+- The build context intentionally excludes local configs and credentials via `.dockerignore`.
+- Marmot Push v1 replay suppression is deliberately volatile; do not add a persistent trigger or event-ID state mount.
 - Tor relay support is disabled in the default build and must be enabled explicitly with `--features tor`.
 
 ## Production Deployment
@@ -356,7 +350,6 @@ cp config/production.toml.example config/production.toml
 cp deploy/production.env.example deploy/production.env
 mkdir -p credentials secrets
 chmod 700 credentials secrets
-sudo install -d -m 0700 -o 65532 -g 65532 state
 
 ./target/release/transponder generate-keys --output secrets/server_private_key
 
@@ -365,7 +358,7 @@ docker build -t transponder:local .
 docker compose -f compose.prod.yml --env-file deploy/production.env up -d
 ```
 
-The production bundle uses `TRANSPONDER_SERVER_PRIVATE_KEY_FILE` so the server private key can be mounted as a file instead of injected directly as an environment variable. It also mounts `./state` at `/var/lib/transponder` for durable replay suppression state.
+The production bundle uses `TRANSPONDER_SERVER_PRIVATE_KEY_FILE` so the server private key can be mounted as a file instead of injected directly as an environment variable. Replay suppression remains an in-memory cache and resets on restart.
 
 If you plan to configure onion relays, build the image with `--build-arg CARGO_FEATURES='--features tor'` first and point `TRANSPONDER_IMAGE` at that Tor-enabled image tag.
 
@@ -535,7 +528,7 @@ To preserve the server's privacy guarantees, only `ERROR`-level events emitted b
 
 2. **Unwrap**: When an event arrives, it unwraps the NIP-59 gift wrap to extract the inner `kind:446` notification trigger.
 
-3. **Decrypt**: Each encrypted token in the request is decrypted using ECDH + HKDF + ChaCha20-Poly1305. The adopted domain-separation values are defined by the [Marmot push-notifications feature](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md); see [Protocol Status](#protocol-status) for the current compatibility gap.
+3. **Decrypt**: Each encrypted token in the request is decrypted using ECDH + HKDF + ChaCha20-Poly1305. The adopted domain-separation values are defined by the [Marmot push-notifications feature](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md); see [Protocol Status](#protocol-status) for the exact implemented surface.
 
 4. **Dispatch**: Tokens are routed to APNs or FCM based on platform identifier, sending silent push notifications.
 

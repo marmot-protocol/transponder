@@ -297,14 +297,6 @@ impl GiftWrapBuilder {
         self.build_with_created_at_option(content, None).await
     }
 
-    /// Build a gift-wrapped notification request without the `encoding` tag.
-    ///
-    /// Matches the Darkmatter / Marmot compatibility shape.
-    #[must_use = "event must be used or creation effort is wasted"]
-    pub async fn build_without_encoding_tag(&self, content: &str) -> Event {
-        self.build(content).await
-    }
-
     /// Build a gift-wrapped notification request with a custom rumor timestamp.
     #[must_use = "event must be used or creation effort is wasted"]
     pub async fn build_with_created_at(&self, content: &str, created_at: Timestamp) -> Event {
@@ -495,29 +487,6 @@ mod tests {
         // Verify it's addressed to the server
         let p_tag = event.tags.iter().find(|t| t.kind() == TagKind::p());
         assert!(p_tag.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_gift_wrap_unwrap_roundtrip_without_encoding_tag() {
-        use crate::crypto::Nip59Handler;
-
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-
-        let content = NotificationContentBuilder::new(&server_keys)
-            .with_apns_token("deadbeef1234567890abcdefdeadbeef1234567890abcdefdeadbeef12345678")
-            .build();
-
-        let gift_wrap = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build_without_encoding_tag(&content)
-            .await;
-
-        let handler = Nip59Handler::new(server_keys.clone());
-        let unwrapped = handler.unwrap(&gift_wrap).await.unwrap();
-
-        let tokens = unwrapped.parse_tokens().unwrap();
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].len(), ENCRYPTED_TOKEN_SIZE);
     }
 
     #[tokio::test]

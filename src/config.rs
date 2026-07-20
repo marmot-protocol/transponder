@@ -1606,49 +1606,6 @@ mod tests {
         assert_eq!(default_dedup_retention_secs(), DEFAULT_DEDUP_RETENTION_SECS);
     }
 
-    #[cfg(any())]
-    #[test]
-    fn test_dedup_retention_shorter_than_notification_age_rejected() {
-        let error = from_test_env(&[
-            ("TRANSPONDER_SERVER_DEDUP_RETENTION_SECS", "60"),
-            ("TRANSPONDER_SERVER_MAX_NOTIFICATION_AGE_SECS", "120"),
-        ])
-        .unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains("server.dedup_retention_secs"), "{message}");
-        assert!(
-            message.contains("server.max_notification_age_secs"),
-            "{message}"
-        );
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn test_dedup_retention_equal_to_notification_age_accepted() {
-        let config = from_test_env(&[
-            ("TRANSPONDER_SERVER_DEDUP_RETENTION_SECS", "120"),
-            ("TRANSPONDER_SERVER_MAX_NOTIFICATION_AGE_SECS", "120"),
-        ])
-        .unwrap();
-
-        assert_eq!(config.server.dedup_retention_secs, 120);
-        assert_eq!(config.server.max_notification_age_secs, 120);
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn test_zero_notification_age_does_not_require_zero_dedup_retention() {
-        let config =
-            from_test_env(&[("TRANSPONDER_SERVER_MAX_NOTIFICATION_AGE_SECS", "0")]).unwrap();
-
-        assert_eq!(config.server.max_notification_age_secs, 0);
-        assert_eq!(
-            config.server.dedup_retention_secs,
-            DEFAULT_DEDUP_RETENTION_SECS
-        );
-    }
-
     #[test]
     fn test_bounded_dedup_cache_smaller_than_event_concurrency_rejected() {
         let error = from_test_env(&[
@@ -1663,27 +1620,6 @@ mod tests {
             message.contains("server.max_concurrent_event_processing"),
             "{message}"
         );
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn test_durable_replay_state_allows_small_volatile_dedup_cache() {
-        let config = from_test_env(&[
-            (
-                "TRANSPONDER_SERVER_DEDUP_STATE_PATH",
-                "/tmp/transponder-dedup.log",
-            ),
-            ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "2"),
-            ("TRANSPONDER_SERVER_MAX_CONCURRENT_EVENT_PROCESSING", "3"),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            config.server.dedup_state_path,
-            PathBuf::from("/tmp/transponder-dedup.log")
-        );
-        assert_eq!(config.server.max_dedup_cache_size, 2);
-        assert_eq!(config.server.max_concurrent_event_processing, 3);
     }
 
     #[test]
