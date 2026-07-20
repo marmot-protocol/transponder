@@ -30,15 +30,8 @@ pub const DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR: u32 = 30_000;
 /// Default maximum size for the volatile deduplication cache.
 pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
 
-/// Default maximum age for the unwrapped kind:446 notification request rumor.
-pub const DEFAULT_MAX_NOTIFICATION_AGE_SECS: u64 = 3_600;
-
-/// Default tolerated clock skew for future-dated notification rumors.
-pub const DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS: u64 = 300;
-
-/// Default duration to keep processed gift-wrap event IDs in replay state.
-pub const DEFAULT_DEDUP_RETENTION_SECS: u64 =
-    NIP59_TIMESTAMP_TWEAK_WINDOW_SECS + DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS;
+/// Default duration to keep decoded trigger-content hashes in memory.
+pub const DEFAULT_DEDUP_RETENTION_SECS: u64 = 300;
 
 /// Default maximum number of encrypted tokens accepted in one notification event.
 pub const DEFAULT_MAX_TOKENS_PER_EVENT: usize = 100;
@@ -51,10 +44,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dedup_retention_matches_nip59_window_plus_skew() {
-        assert_eq!(
-            DEFAULT_DEDUP_RETENTION_SECS,
-            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS + DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS
-        );
+    fn dedup_retention_is_short_lived() {
+        assert_eq!(DEFAULT_DEDUP_RETENTION_SECS, 5 * 60);
     }
 }

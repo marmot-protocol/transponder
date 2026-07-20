@@ -300,7 +300,9 @@ async fn run_periodic_cleanup(
     mut shutdown: watch::Receiver<bool>,
     event_processor: Arc<EventProcessor>,
 ) -> std::result::Result<(), &'static str> {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let period = std::time::Duration::from_secs(60);
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -1208,6 +1210,10 @@ mod tests {
     }
 
     fn test_event_processor() -> Arc<EventProcessor> {
+        test_event_processor_with_keys().0
+    }
+
+    fn test_event_processor_with_keys() -> (Arc<EventProcessor>, Keys) {
         let keys = Keys::generate();
         let nip59_handler = Nip59Handler::new(keys.clone());
         let mut secp_secret_key =
@@ -1215,15 +1221,22 @@ mod tests {
                 .expect("valid secret key");
         let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        Arc::new(
-            EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher).build(),
+        (
+            Arc::new(
+                EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher).build(),
+            ),
+            keys,
         )
     }
 
-    fn test_event_notification() -> RelayPoolNotification {
-        let event = EventBuilder::text_note("task lifecycle test")
-            .sign_with_keys(&Keys::generate())
-            .expect("signable test event");
+    async fn test_event_notification(server_keys: &Keys) -> RelayPoolNotification {
+        let sender_keys = Keys::generate();
+        let event = crate::test_vectors::scenarios::single_apns_notification(
+            server_keys,
+            &sender_keys,
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        )
+        .await;
         RelayPoolNotification::Event {
             relay_url: RelayUrl::parse("ws://127.0.0.1:7777").unwrap(),
             subscription_id: SubscriptionId::new("test-sub"),
@@ -1353,7 +1366,7 @@ mod tests {
         let (notification_tx, notifications) = broadcast::channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let semaphore = Arc::new(Semaphore::new(2));
-        let processor = test_event_processor();
+        let (processor, server_keys) = test_event_processor_with_keys();
         let event_tasks = TaskTracker::new();
 
         let loop_handle = tokio::spawn(run_event_loop(
@@ -1365,7 +1378,9 @@ mod tests {
             Metrics::disabled(),
         ));
 
-        notification_tx.send(test_event_notification()).unwrap();
+        notification_tx
+            .send(test_event_notification(&server_keys).await)
+            .unwrap();
 
         assert!(
             wait_for_cache_len(&processor, 1).await,
@@ -1431,11 +1446,15 @@ mod tests {
         let (notification_tx, notifications) = broadcast::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let metrics = Metrics::new().unwrap();
-        let processor = test_event_processor();
+        let (processor, server_keys) = test_event_processor_with_keys();
         let event_tasks = TaskTracker::new();
 
-        notification_tx.send(test_event_notification()).unwrap();
-        notification_tx.send(test_event_notification()).unwrap();
+        notification_tx
+            .send(test_event_notification(&server_keys).await)
+            .unwrap();
+        notification_tx
+            .send(test_event_notification(&server_keys).await)
+            .unwrap();
 
         let loop_handle = tokio::spawn(run_event_loop(
             notifications,

@@ -1,33 +1,161 @@
-//! Event-ID deduplication and durable replay state.
+//! Short-lived Marmot Push trigger-content deduplication.
 
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions as StdOpenOptions};
 use std::num::NonZeroUsize;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use lru::LruCache;
-use nostr_sdk::prelude::*;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use nostr_sdk::prelude::EventId;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::defaults::DEFAULT_DEDUP_RETENTION_SECS;
-use crate::error::Result;
 
 pub(crate) const DEDUP_WINDOW: Duration = Duration::from_secs(DEFAULT_DEDUP_RETENTION_SECS);
-
 pub(crate) const CLEANUP_BATCH_SIZE: usize = 1000;
 
-#[derive(Clone, Copy)]
+/// Result of trying to reserve a decoded trigger-content hash.
+pub(crate) enum Reservation {
+    /// This caller owns processing for the content hash.
+    Acquired,
+    /// The content hash already reached a terminal local outcome.
+    Duplicate,
+    /// Another task is processing the same content hash. Waiting for the
+    /// receiver to change and then retrying avoids losing the trigger if that
+    /// owner later releases a transient reservation.
+    Wait(watch::Receiver<bool>),
+}
+
+enum EntryState {
+    InFlight(watch::Sender<bool>),
+    Terminal,
+}
+
+struct SeenTrigger {
+    seen_at: Instant,
+    state: EntryState,
+}
+
+/// Bounded, volatile content-hash state.
+///
+/// Keys use [`EventId`] only as a convenient validated 32-byte wrapper. They
+/// are SHA-256 hashes of decoded kind 446 content, never Nostr event IDs.
+pub(crate) struct SeenEventStore {
+    entries: LruCache<EventId, SeenTrigger>,
+}
+
+impl SeenEventStore {
+    pub(crate) fn bounded(cache_size: NonZeroUsize) -> Self {
+        Self {
+            entries: LruCache::new(cache_size),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_terminal(&self, content_hash: &EventId) -> bool {
+        self.entries
+            .peek(content_hash)
+            .is_some_and(|entry| matches!(entry.state, EntryState::Terminal))
+    }
+
+    pub(crate) fn reserve(&mut self, content_hash: EventId, now: Instant) -> Reservation {
+        if let Some(entry) = self.entries.peek(&content_hash) {
+            return match &entry.state {
+                EntryState::Terminal => Reservation::Duplicate,
+                EntryState::InFlight(completed) => Reservation::Wait(completed.subscribe()),
+            };
+        }
+
+        let (completed, _receiver) = watch::channel(false);
+        self.entries.put(
+            content_hash,
+            SeenTrigger {
+                seen_at: now,
+                state: EntryState::InFlight(completed),
+            },
+        );
+        Reservation::Acquired
+    }
+
+    pub(crate) fn release(&mut self, content_hash: &EventId) {
+        if let Some(entry) = self.entries.pop(content_hash)
+            && let EntryState::InFlight(completed) = entry.state
+        {
+            completed.send_replace(true);
+        }
+    }
+
+    /// Complete a reservation and wake every concurrent duplicate waiter.
+    ///
+    /// Returns `true` when the entry was absent and had to be inserted.
+    pub(crate) fn mark_terminal(&mut self, content_hash: EventId, now: Instant) -> bool {
+        if let Some(entry) = self.entries.peek_mut(&content_hash) {
+            let prior = std::mem::replace(&mut entry.state, EntryState::Terminal);
+            entry.seen_at = now;
+            self.entries.promote(&content_hash);
+            if let EntryState::InFlight(completed) = prior {
+                completed.send_replace(true);
+            }
+            false
+        } else {
+            self.entries.put(
+                content_hash,
+                SeenTrigger {
+                    seen_at: now,
+                    state: EntryState::Terminal,
+                },
+            );
+            true
+        }
+    }
+
+    pub(crate) fn expired_keys(&self, now: Instant, retention: Duration) -> Vec<EventId> {
+        self.entries
+            .iter()
+            .rev()
+            .take(CLEANUP_BATCH_SIZE)
+            .filter(|(_, entry)| {
+                matches!(entry.state, EntryState::Terminal)
+                    && now.duration_since(entry.seen_at) >= retention
+            })
+            .map(|(content_hash, _)| *content_hash)
+            .collect()
+    }
+
+    pub(crate) fn pop(&mut self, content_hash: &EventId) {
+        self.entries.pop(content_hash);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put(&mut self, content_hash: EventId, seen_event: SeenEvent) {
+        let state = if seen_event.terminal {
+            EntryState::Terminal
+        } else {
+            let (completed, _receiver) = watch::channel(false);
+            EntryState::InFlight(completed)
+        };
+        self.entries.put(
+            content_hash,
+            SeenTrigger {
+                seen_at: seen_event.seen_at,
+                state,
+            },
+        );
+    }
+}
+
+#[cfg(test)]
 pub(crate) struct SeenEvent {
     seen_at: Instant,
     terminal: bool,
 }
 
+#[cfg(test)]
 impl SeenEvent {
+    #[allow(dead_code)]
     pub(crate) fn reservation(seen_at: Instant) -> Self {
         Self {
             seen_at,
@@ -43,241 +171,60 @@ impl SeenEvent {
     }
 }
 
-pub(crate) enum SeenEventStore {
-    Bounded(LruCache<EventId, SeenEvent>),
-    Retained(HashMap<EventId, SeenEvent>),
-}
-
-impl SeenEventStore {
-    pub(crate) fn bounded(cache_size: NonZeroUsize) -> Self {
-        Self::Bounded(LruCache::new(cache_size))
-    }
-
-    pub(crate) fn retained() -> Self {
-        Self::Retained(HashMap::new())
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Bounded(seen) => seen.len(),
-            Self::Retained(seen) => seen.len(),
-        }
-    }
-
-    pub(crate) fn contains(&self, event_id: &EventId) -> bool {
-        match self {
-            Self::Bounded(seen) => seen.contains(event_id),
-            Self::Retained(seen) => seen.contains_key(event_id),
-        }
-    }
-
-    pub(crate) fn put(&mut self, event_id: EventId, seen_event: SeenEvent) {
-        match self {
-            Self::Bounded(seen) => {
-                seen.put(event_id, seen_event);
-            }
-            Self::Retained(seen) => {
-                seen.insert(event_id, seen_event);
-            }
-        }
-    }
-
-    pub(crate) fn pop(&mut self, event_id: &EventId) {
-        match self {
-            Self::Bounded(seen) => {
-                seen.pop(event_id);
-            }
-            Self::Retained(seen) => {
-                seen.remove(event_id);
-            }
-        }
-    }
-
-    /// Refresh an existing reservation into a terminal entry in place.
-    ///
-    /// On the success hot path the ID is already present from `try_reserve`, so
-    /// this mutates its `SeenEvent` (new `seen_at`, `terminal = true`) instead of
-    /// re-inserting a fresh value. Returns `true` when the set size changed
-    /// (i.e. the entry was absent and had to be inserted — e.g. an entry evicted
-    /// by LRU pressure between reservation and completion), so the caller only
-    /// pays a `dedup_cache_size` gauge write when the length actually moved. This
-    /// removes the redundant second gauge update the double-lock success path
-    /// carried (#197) while preserving the completion-timestamp-refresh and
-    /// terminal-flip semantics `mark_seen` provided.
-    pub(crate) fn mark_terminal(&mut self, event_id: EventId, seen_at: Instant) -> bool {
-        match self {
-            Self::Bounded(seen) => {
-                if let Some(existing) = seen.peek_mut(&event_id) {
-                    *existing = SeenEvent::terminal(seen_at);
-                    // Promote to most-recently-used to match the prior `put`
-                    // behavior, which refreshed LRU position on completion.
-                    seen.promote(&event_id);
-                    false
-                } else {
-                    seen.put(event_id, SeenEvent::terminal(seen_at));
-                    true
-                }
-            }
-            Self::Retained(seen) => seen
-                .insert(event_id, SeenEvent::terminal(seen_at))
-                .is_none(),
-        }
-    }
-
-    pub(crate) fn expired_keys(&self, now: Instant, retention: Duration) -> Vec<EventId> {
-        match self {
-            Self::Bounded(seen) => seen
-                .iter()
-                .rev()
-                .take(CLEANUP_BATCH_SIZE)
-                .filter(|(_, seen_event)| now.duration_since(seen_event.seen_at) >= retention)
-                .map(|(id, _)| *id)
-                .collect(),
-            Self::Retained(seen) => seen
-                .iter()
-                .filter(|(_, seen_event)| now.duration_since(seen_event.seen_at) >= retention)
-                .map(|(id, _)| *id)
-                .collect(),
-        }
-    }
-
-    pub(crate) fn terminal_entries(
-        &self,
-        now_wall: u64,
-        now_instant: Instant,
-    ) -> Vec<(EventId, u64)> {
-        match self {
-            Self::Bounded(seen) => seen
-                .iter()
-                .filter_map(|(event_id, seen_event)| {
-                    if seen_event.terminal {
-                        Some((
-                            *event_id,
-                            instant_to_unix_secs(seen_event.seen_at, now_wall, now_instant),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            Self::Retained(seen) => seen
-                .iter()
-                .filter_map(|(event_id, seen_event)| {
-                    if seen_event.terminal {
-                        Some((
-                            *event_id,
-                            instant_to_unix_secs(seen_event.seen_at, now_wall, now_instant),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-        }
-    }
-}
-
-pub(crate) struct PersistentDedupState {
-    pub(crate) path: PathBuf,
-    pub(crate) write_lock: Mutex<()>,
-}
-
-impl PersistentDedupState {
-    pub(crate) fn new(path: PathBuf) -> Result<Self> {
-        Self::prepare_path(&path)?;
-        Ok(Self {
-            path,
-            write_lock: Mutex::new(()),
-        })
-    }
-
-    pub(crate) fn prepare_path(path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut options = StdOpenOptions::new();
-        options.create(true).append(true).read(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let _file = options.open(path)?;
-
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-
-    pub(crate) fn load_seen_events(path: &Path, retention: Duration) -> Result<SeenEventStore> {
-        Self::prepare_path(path)?;
-
-        let now_wall = Timestamp::now().as_secs();
-        let now_instant = Instant::now();
-        let mut seen = SeenEventStore::retained();
-        let contents = fs::read_to_string(path)?;
-
-        for line in contents.lines() {
-            let mut fields = line.split_whitespace();
-            let (Some(event_id_hex), Some(seen_at_secs), None) =
-                (fields.next(), fields.next(), fields.next())
-            else {
-                continue;
-            };
-            let Ok(event_id) = EventId::from_hex(event_id_hex) else {
-                continue;
-            };
-            let Ok(seen_at_secs) = seen_at_secs.parse::<u64>() else {
-                continue;
-            };
-            let age = now_wall.saturating_sub(seen_at_secs);
-            if age > retention.as_secs() {
-                continue;
-            }
-            let seen_at = now_instant
-                .checked_sub(Duration::from_secs(age))
-                .unwrap_or(now_instant);
-            seen.put(event_id, SeenEvent::terminal(seen_at));
-        }
-
-        Ok(seen)
-    }
-
-    pub(crate) async fn append_seen_locked(
-        &self,
-        event_id: EventId,
-        seen_at_secs: u64,
-    ) -> std::io::Result<()> {
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
-        #[cfg(unix)]
-        tokio::fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).await?;
-        file.write_all(format!("{} {}\n", event_id.to_hex(), seen_at_secs).as_bytes())
-            .await?;
-        file.flush().await
-    }
-
-    pub(crate) async fn rewrite_locked(&self, entries: &[(EventId, u64)]) -> std::io::Result<()> {
-        let tmp_path = self.path.with_extension("tmp");
-        let mut contents = String::new();
-        for (event_id, seen_at_secs) in entries {
-            use std::fmt::Write as _;
-            let _ = writeln!(&mut contents, "{} {}", event_id.to_hex(), seen_at_secs);
-        }
-        tokio::fs::write(&tmp_path, contents).await?;
-        #[cfg(unix)]
-        tokio::fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).await?;
-        tokio::fs::rename(&tmp_path, &self.path).await
-    }
-}
-
+#[cfg(test)]
 pub(crate) fn instant_to_unix_secs(seen_at: Instant, now_wall: u64, now_instant: Instant) -> u64 {
-    let age = now_instant
-        .checked_duration_since(seen_at)
-        .unwrap_or_default()
-        .as_secs();
-    now_wall.saturating_sub(age)
+    if seen_at >= now_instant {
+        now_wall
+    } else {
+        now_wall.saturating_sub(now_instant.duration_since(seen_at).as_secs())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(byte: u8) -> EventId {
+        EventId::from_byte_array([byte; 32])
+    }
+
+    #[tokio::test]
+    async fn released_owner_wakes_waiter_for_retry() {
+        let mut store = SeenEventStore::bounded(NonZeroUsize::new(2).unwrap());
+        let key = hash(1);
+        assert!(matches!(
+            store.reserve(key, Instant::now()),
+            Reservation::Acquired
+        ));
+        let Reservation::Wait(mut waiter) = store.reserve(key, Instant::now()) else {
+            panic!("concurrent reservation must wait");
+        };
+
+        store.release(&key);
+        waiter.changed().await.unwrap();
+        assert!(matches!(
+            store.reserve(key, Instant::now()),
+            Reservation::Acquired
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_owner_wakes_waiter_as_duplicate() {
+        let mut store = SeenEventStore::bounded(NonZeroUsize::new(2).unwrap());
+        let key = hash(2);
+        assert!(matches!(
+            store.reserve(key, Instant::now()),
+            Reservation::Acquired
+        ));
+        let Reservation::Wait(mut waiter) = store.reserve(key, Instant::now()) else {
+            panic!("concurrent reservation must wait");
+        };
+
+        store.mark_terminal(key, Instant::now());
+        waiter.changed().await.unwrap();
+        assert!(matches!(
+            store.reserve(key, Instant::now()),
+            Reservation::Duplicate
+        ));
+    }
 }

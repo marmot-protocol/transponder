@@ -488,7 +488,7 @@ impl PushDispatcher {
     /// This queues notifications for processing by the dispatcher task. The batch is
     /// only accepted if enough queue capacity exists for all notifications, so
     /// callers can safely treat a successful return as "all notifications were
-    /// admitted locally". Invalid tokens are silently ignored per MIP-05 spec.
+    /// admitted locally". Invalid tokens are silently ignored as advisory push hygiene.
     pub async fn dispatch(&self, payloads: Vec<TokenPayload>) -> Result<usize> {
         let _admission_guard = self.admission_lock.lock().await;
         let requested_count = payloads.len();

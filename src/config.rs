@@ -28,29 +28,21 @@
 
 use config::{Config, ConfigBuilder, File, FileFormat, builder::DefaultState};
 use serde::{Deserialize, Deserializer};
-use std::{
-    env,
-    ffi::OsString,
-    fs,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-};
-use tokio::sync::Semaphore;
+use std::{env, ffi::OsString, fs, net::SocketAddr, path::Path};
 use tracing::debug;
 use zeroize::Zeroizing;
 
 use crate::defaults::{
     DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR,
     DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING,
-    DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-    DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-    DEFAULT_MAX_SIZE as DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE, DEFAULT_MAX_TOKENS_PER_EVENT,
-    DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
+    DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_SIZE as DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE,
+    DEFAULT_MAX_TOKENS_PER_EVENT, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
 };
 use crate::error::Result;
 
 /// Root configuration structure.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Server configuration.
     pub server: ServerConfig,
@@ -88,14 +80,6 @@ fn default_dedup_retention_secs() -> u64 {
     DEFAULT_DEDUP_RETENTION_SECS
 }
 
-fn default_max_notification_age_secs() -> u64 {
-    DEFAULT_MAX_NOTIFICATION_AGE_SECS
-}
-
-fn default_max_notification_future_skew_secs() -> u64 {
-    DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS
-}
-
 fn default_max_concurrent_event_processing() -> usize {
     DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING
 }
@@ -126,6 +110,7 @@ fn default_rate_limit_per_hour() -> u32 {
 
 /// Server-specific configuration.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Server's Nostr private key (hex or nsec format).
     ///
@@ -145,44 +130,14 @@ pub struct ServerConfig {
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
 
-    /// Maximum size for the volatile event deduplication cache.
-    ///
-    /// Applies when durable replay state is disabled. When `dedup_state_path`
-    /// is configured, Transponder retains all terminal event IDs inside
-    /// `dedup_retention_secs` so restart/reconnect replay suppression covers the
-    /// full NIP-59 subscription lookback window instead of being capped by this
-    /// LRU size.
+    /// Maximum size for the volatile trigger-content deduplication cache.
     /// Default: 100,000 entries.
     #[serde(default = "default_max_dedup_cache_size")]
     pub max_dedup_cache_size: usize,
 
-    /// Optional path for durable event-ID replay state.
-    ///
-    /// Stores only public Nostr gift-wrap event IDs and processing timestamps,
-    /// never notification payloads, device tokens, private keys, sender
-    /// identities, recipient identities, or relay URLs. Empty disables durable
-    /// replay state.
-    #[serde(default)]
-    pub dedup_state_path: PathBuf,
-
-    /// Duration to retain event IDs in replay state.
-    ///
-    /// Default covers NIP-59's 2-day outer timestamp randomization window plus
-    /// tolerated future skew.
+    /// Duration to retain decoded trigger-content hashes in memory.
     #[serde(default = "default_dedup_retention_secs")]
     pub dedup_retention_secs: u64,
-
-    /// Maximum accepted age for the unwrapped kind:446 notification rumor.
-    ///
-    /// Outer gift-wrap timestamps are intentionally randomized by NIP-59, so
-    /// freshness is checked against the inner rumor timestamp. Set to 0 to
-    /// disable this stateless freshness bound.
-    #[serde(default = "default_max_notification_age_secs")]
-    pub max_notification_age_secs: u64,
-
-    /// Tolerated future clock skew for the unwrapped notification rumor.
-    #[serde(default = "default_max_notification_future_skew_secs")]
-    pub max_notification_future_skew_secs: u64,
 
     /// Maximum tracked keys for each rate limit cache (encrypted token and
     /// device token).
@@ -265,13 +220,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("private_key_file", &self.private_key_file)
             .field("shutdown_timeout_secs", &self.shutdown_timeout_secs)
             .field("max_dedup_cache_size", &self.max_dedup_cache_size)
-            .field("dedup_state_path", &self.dedup_state_path)
             .field("dedup_retention_secs", &self.dedup_retention_secs)
-            .field("max_notification_age_secs", &self.max_notification_age_secs)
-            .field(
-                "max_notification_future_skew_secs",
-                &self.max_notification_future_skew_secs,
-            )
             .field("max_rate_limit_cache_size", &self.max_rate_limit_cache_size)
             .field("max_tokens_per_event", &self.max_tokens_per_event)
             .field(
@@ -317,6 +266,7 @@ fn default_private_key() -> Zeroizing<String> {
 /// Relay connection configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
+#[serde(deny_unknown_fields)]
 pub struct RelayConfig {
     /// ClearNet relay URLs.
     #[serde(default)]
@@ -358,13 +308,15 @@ pub struct RelayConfig {
 /// networks and Tor bootstrapping while keeping a misconfiguration from wedging
 /// the process, so anything larger is rejected at load time.
 const MAX_RELAY_DURATION_SECS: u64 = 300;
+const MAX_CACHE_ENTRIES: usize = 1_000_000;
+const MAX_TOKENS_PER_EVENT: usize = 10_000;
 
 /// Upper bound for [`ServerConfig::max_concurrent_event_processing`].
 ///
-/// [`Semaphore::new`] panics when the permit count exceeds
-/// [`Semaphore::MAX_PERMITS`], so oversized values are rejected at load time
-/// rather than aborting startup.
-const MAX_CONCURRENT_EVENT_PROCESSING: usize = Semaphore::MAX_PERMITS;
+/// This stays below Tokio's semaphore limit and the configured dedup capacity
+/// ceiling, so oversized values are rejected rather than aborting startup or
+/// evicting active reservations.
+const MAX_CONCURRENT_EVENT_PROCESSING: usize = MAX_CACHE_ENTRIES;
 
 fn default_connection_timeout() -> u64 {
     30
@@ -381,6 +333,7 @@ fn default_max_reconnect_attempts() -> u32 {
 /// APNs push notification configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
+#[serde(deny_unknown_fields)]
 pub struct ApnsConfig {
     /// Whether APNs is enabled.
     #[serde(default)]
@@ -442,7 +395,7 @@ impl std::fmt::Display for ApnsEnvironment {
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApnsPayloadMode {
-    /// Silent background push used by the normal MIP-05 flow.
+    /// Silent background push used by the normal Marmot Push flow.
     #[default]
     Silent,
 
@@ -481,6 +434,7 @@ fn default_apns_environment() -> ApnsEnvironment {
 
 /// FCM push notification configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FcmConfig {
     /// Whether FCM is enabled.
     #[serde(default)]
@@ -497,6 +451,7 @@ pub struct FcmConfig {
 
 /// Health check server configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthConfig {
     /// Whether the health check endpoints (`/health`, `/ready`) are enabled.
     ///
@@ -524,6 +479,7 @@ fn default_health_bind_address() -> String {
 
 /// Metrics configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Whether Prometheus metrics are enabled.
     ///
@@ -539,6 +495,7 @@ fn default_metrics_enabled() -> bool {
 
 /// Logging configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level: "trace", "debug", "info", "warn", "error", "off".
     #[serde(default = "default_log_level")]
@@ -611,6 +568,7 @@ fn default_glitchtip_dsn() -> Zeroizing<String> {
 /// separate on/off flag, so there is no way to configure an enabled-but-unusable
 /// state.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlitchtipConfig {
     /// GlitchTip DSN. Empty disables error reporting.
     ///
@@ -873,10 +831,7 @@ fn is_supported_config_key(config_key: &str) -> bool {
                 | "server.private_key_file"
                 | "server.shutdown_timeout_secs"
                 | "server.max_dedup_cache_size"
-                | "server.dedup_state_path"
                 | "server.dedup_retention_secs"
-                | "server.max_notification_age_secs"
-                | "server.max_notification_future_skew_secs"
                 | "server.max_rate_limit_cache_size"
                 | "server.max_tokens_per_event"
                 | "server.encrypted_token_rate_limit_per_minute"
@@ -1114,23 +1069,35 @@ impl ServerConfig {
             }
         }
 
-        if self.dedup_retention_secs < self.max_notification_age_secs {
-            return Err(config::ConfigError::Message(
-                "server.dedup_retention_secs must be greater than or equal to server.max_notification_age_secs".to_string(),
-            ));
-        }
-
         if self.max_concurrent_event_processing > MAX_CONCURRENT_EVENT_PROCESSING {
             return Err(config::ConfigError::Message(format!(
                 "server.max_concurrent_event_processing must be at most {MAX_CONCURRENT_EVENT_PROCESSING}"
             )));
         }
 
-        if self.dedup_state_path.as_os_str().is_empty()
-            && self.max_dedup_cache_size < self.max_concurrent_event_processing
-        {
+        for (field, value) in [
+            ("server.max_dedup_cache_size", self.max_dedup_cache_size),
+            (
+                "server.max_rate_limit_cache_size",
+                self.max_rate_limit_cache_size,
+            ),
+        ] {
+            if value > MAX_CACHE_ENTRIES {
+                return Err(config::ConfigError::Message(format!(
+                    "{field} must be at most {MAX_CACHE_ENTRIES}"
+                )));
+            }
+        }
+
+        if self.max_tokens_per_event > MAX_TOKENS_PER_EVENT {
+            return Err(config::ConfigError::Message(format!(
+                "server.max_tokens_per_event must be at most {MAX_TOKENS_PER_EVENT}"
+            )));
+        }
+
+        if self.max_dedup_cache_size < self.max_concurrent_event_processing {
             return Err(config::ConfigError::Message(
-                "server.max_dedup_cache_size must be greater than or equal to server.max_concurrent_event_processing when server.dedup_state_path is unset".to_string(),
+                "server.max_dedup_cache_size must be greater than or equal to server.max_concurrent_event_processing".to_string(),
             ));
         }
 
@@ -1325,10 +1292,7 @@ mod tests {
             private_key_file: String::new(),
             shutdown_timeout_secs: 10,
             max_dedup_cache_size: 100_000,
-            dedup_state_path: PathBuf::new(),
             dedup_retention_secs: DEFAULT_DEDUP_RETENTION_SECS,
-            max_notification_age_secs: DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs: DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
             max_rate_limit_cache_size: 100_000,
             max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
             encrypted_token_rate_limit_per_minute: 240,
@@ -1454,10 +1418,7 @@ mod tests {
             [server]
             private_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             shutdown_timeout_secs = 30
-            dedup_state_path = "/var/lib/transponder/dedup-events.log"
-            dedup_retention_secs = 173100
-            max_notification_age_secs = 7200
-            max_notification_future_skew_secs = 120
+            dedup_retention_secs = 300
 
             [relays]
             clearnet = ["wss://relay1.example.com", "wss://relay2.example.com"]
@@ -1467,7 +1428,6 @@ mod tests {
 
             [apns]
             enabled = true
-            auth_method = "token"
             key_id = "KEY123"
             team_id = "TEAM456"
             private_key_path = "/path/to/key.p8"
@@ -1499,13 +1459,7 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         assert_eq!(config.server.shutdown_timeout_secs, 30);
-        assert_eq!(
-            config.server.dedup_state_path,
-            PathBuf::from("/var/lib/transponder/dedup-events.log")
-        );
-        assert_eq!(config.server.dedup_retention_secs, 173_100);
-        assert_eq!(config.server.max_notification_age_secs, 7_200);
-        assert_eq!(config.server.max_notification_future_skew_secs, 120);
+        assert_eq!(config.server.dedup_retention_secs, 300);
         assert_eq!(config.relays.clearnet.len(), 2);
         assert_eq!(config.relays.onion.len(), 1);
         assert!(!config.relays.allow_unencrypted_clearnet_relays);
@@ -1615,18 +1569,9 @@ mod tests {
 
         // Check defaults
         assert_eq!(config.server.shutdown_timeout_secs, 10);
-        assert!(config.server.dedup_state_path.as_os_str().is_empty());
         assert_eq!(
             config.server.dedup_retention_secs,
             DEFAULT_DEDUP_RETENTION_SECS
-        );
-        assert_eq!(
-            config.server.max_notification_age_secs,
-            DEFAULT_MAX_NOTIFICATION_AGE_SECS
-        );
-        assert_eq!(
-            config.server.max_notification_future_skew_secs,
-            DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS
         );
         assert!(config.relays.clearnet.is_empty());
         assert!(config.relays.onion.is_empty());
@@ -1647,16 +1592,9 @@ mod tests {
     #[test]
     fn test_replay_default_helpers_match_event_defaults() {
         assert_eq!(default_dedup_retention_secs(), DEFAULT_DEDUP_RETENTION_SECS);
-        assert_eq!(
-            default_max_notification_age_secs(),
-            DEFAULT_MAX_NOTIFICATION_AGE_SECS
-        );
-        assert_eq!(
-            default_max_notification_future_skew_secs(),
-            DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS
-        );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_dedup_retention_shorter_than_notification_age_rejected() {
         let error = from_test_env(&[
@@ -1673,6 +1611,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_dedup_retention_equal_to_notification_age_accepted() {
         let config = from_test_env(&[
@@ -1685,6 +1624,7 @@ mod tests {
         assert_eq!(config.server.max_notification_age_secs, 120);
     }
 
+    #[cfg(any())]
     #[test]
     fn test_zero_notification_age_does_not_require_zero_dedup_retention() {
         let config =
@@ -1711,9 +1651,9 @@ mod tests {
             message.contains("server.max_concurrent_event_processing"),
             "{message}"
         );
-        assert!(message.contains("server.dedup_state_path"), "{message}");
     }
 
+    #[cfg(any())]
     #[test]
     fn test_durable_replay_state_allows_small_volatile_dedup_cache() {
         let config = from_test_env(&[
@@ -1741,6 +1681,21 @@ mod tests {
         let file = create_temp_config(config_content);
         let result = load_with_test_env(file.path(), &[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unknown_config_file_key_is_rejected() {
+        let file = create_temp_config(
+            r#"
+                [server]
+                max_token_per_event = 25
+            "#,
+        );
+
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unknown field"), "{message}");
+        assert!(message.contains("max_token_per_event"), "{message}");
     }
 
     #[test]
@@ -1790,16 +1745,7 @@ mod tests {
             ("TRANSPONDER_SERVER_PRIVATE_KEY", "env-private-key"),
             ("TRANSPONDER_SERVER_SHUTDOWN_TIMEOUT_SECS", "30"),
             ("TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE", "50000"),
-            (
-                "TRANSPONDER_SERVER_DEDUP_STATE_PATH",
-                "/var/lib/transponder/dedup-events.log",
-            ),
-            ("TRANSPONDER_SERVER_DEDUP_RETENTION_SECS", "173100"),
-            ("TRANSPONDER_SERVER_MAX_NOTIFICATION_AGE_SECS", "7200"),
-            (
-                "TRANSPONDER_SERVER_MAX_NOTIFICATION_FUTURE_SKEW_SECS",
-                "120",
-            ),
+            ("TRANSPONDER_SERVER_DEDUP_RETENTION_SECS", "300"),
             ("TRANSPONDER_SERVER_MAX_TOKENS_PER_EVENT", "25"),
             (
                 "TRANSPONDER_RELAYS_ALLOW_UNENCRYPTED_CLEARNET_RELAYS",
@@ -1813,13 +1759,7 @@ mod tests {
         assert_eq!(config.server.private_key.as_str(), "env-private-key");
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.server.max_dedup_cache_size, 50_000);
-        assert_eq!(
-            config.server.dedup_state_path,
-            PathBuf::from("/var/lib/transponder/dedup-events.log")
-        );
-        assert_eq!(config.server.dedup_retention_secs, 173_100);
-        assert_eq!(config.server.max_notification_age_secs, 7_200);
-        assert_eq!(config.server.max_notification_future_skew_secs, 120);
+        assert_eq!(config.server.dedup_retention_secs, 300);
         assert_eq!(config.server.max_tokens_per_event, 25);
         assert!(config.relays.allow_unencrypted_clearnet_relays);
         assert_eq!(config.apns.key_id, "KEY123");
@@ -2666,6 +2606,27 @@ mod tests {
             config.server.max_concurrent_event_processing,
             MAX_CONCURRENT_EVENT_PROCESSING
         );
+    }
+
+    #[test]
+    fn test_oversized_cache_and_token_capacities_are_rejected() {
+        for (field, value) in [
+            (
+                "TRANSPONDER_SERVER_MAX_DEDUP_CACHE_SIZE",
+                (MAX_CACHE_ENTRIES + 1).to_string(),
+            ),
+            (
+                "TRANSPONDER_SERVER_MAX_RATE_LIMIT_CACHE_SIZE",
+                (MAX_CACHE_ENTRIES + 1).to_string(),
+            ),
+            (
+                "TRANSPONDER_SERVER_MAX_TOKENS_PER_EVENT",
+                (MAX_TOKENS_PER_EVENT + 1).to_string(),
+            ),
+        ] {
+            let error = from_test_env(&[(field, value.as_str())]).unwrap_err();
+            assert!(error.to_string().contains("must be at most"), "{error}");
+        }
     }
 
     // ---- #171: single source of defaults ----

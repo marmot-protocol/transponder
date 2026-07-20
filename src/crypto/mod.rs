@@ -1,4 +1,4 @@
-//! Cryptographic operations for MIP-05 token decryption and NIP-59 handling.
+//! Cryptographic operations for Marmot Push v1 token decryption and NIP-59 handling.
 
 pub mod nip59;
 pub mod token;

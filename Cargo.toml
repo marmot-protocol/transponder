@@ -110,7 +110,7 @@ lru = "0.16"
 rand = "0.9"
 
 [dev-dependencies]
-# Reference HKDF implementation for the encryption side of the MIP-05 test
+# Reference HKDF implementation for the encryption side of Marmot Push test
 # vectors; cross-checks the manual extract/expand in crypto/token.rs.
 hkdf = "0.12.4"
 tokio-test = "0.4.5"

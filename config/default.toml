@@ -1,5 +1,5 @@
 # Transponder Configuration
-# MIP-05 Push Notification Server
+# Marmot Push v1 notification server
 
 [server]
 # Server's Nostr private key (hex format).
@@ -24,31 +24,15 @@ private_key = ""
 # Increase this for environments with slow networks or high in-flight notification counts
 shutdown_timeout_secs = 10
 
-# Maximum size for the volatile event deduplication cache.
-# Applies only when dedup_state_path is unset. Durable replay state retains all
-# terminal event IDs inside dedup_retention_secs so restart/reconnect replay
-# suppression covers the full NIP-59 subscription lookback window.
+# Maximum size for the volatile decoded-content hash deduplication cache.
 # Must be >= 1; a value of 0 is rejected at startup (it was previously swapped
 # for the default silently).
 # Default: 100000
 # max_dedup_cache_size = 100000
 
-# Optional durable replay state for processed gift-wrap event IDs.
-# Production deployments should set this to a writable path so restarts or
-# relay reconnects do not re-dispatch the full NIP-59 2-day subscription
-# backlog. Stores only public event IDs and timestamps; no tokens, keys,
-# payloads, sender/recipient identities, or relay URLs.
-# dedup_state_path = "/var/lib/transponder/dedup-events.log"
-
-# Replay-state retention. Default covers the NIP-59 2-day timestamp tweak
-# window plus tolerated future skew (172800 + 300 seconds).
-# dedup_retention_secs = 173100
-
-# Freshness bound for the unwrapped kind:446 notification rumor timestamp.
-# Outer gift-wrap created_at is randomized by NIP-59 and is not a freshness
-# signal. Set to 0 to disable this stateless bound.
-# max_notification_age_secs = 3600
-# max_notification_future_skew_secs = 300
+# Short-lived decoded-content hash retention, in seconds. Trigger material is
+# volatile and is never written to disk. Default: 5 minutes.
+# dedup_retention_secs = 300
 
 # Maximum tracked keys for each rate limit cache (encrypted_token and device_token).
 # This caps key count, not timestamp storage: worst-case timestamps per limiter

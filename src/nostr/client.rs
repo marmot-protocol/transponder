@@ -13,10 +13,7 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::config::RelayConfig;
-use crate::defaults::{
-    DEFAULT_MAX_NOTIFICATION_AGE_SECS, DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-    NIP59_TIMESTAMP_TWEAK_WINDOW_SECS,
-};
+use crate::defaults::{DEFAULT_DEDUP_RETENTION_SECS, NIP59_TIMESTAMP_TWEAK_WINDOW_SECS};
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 
@@ -34,15 +31,13 @@ const DEGRADED_RELAY_CLASS_WARNING_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
 struct SubscriptionLookbackConfig {
-    max_notification_age_secs: u64,
-    max_notification_future_skew_secs: u64,
+    trigger_retention_secs: u64,
 }
 
 impl SubscriptionLookbackConfig {
     fn from_server_config(server: &crate::config::ServerConfig) -> Self {
         Self {
-            max_notification_age_secs: server.max_notification_age_secs,
-            max_notification_future_skew_secs: server.max_notification_future_skew_secs,
+            trigger_retention_secs: server.dedup_retention_secs,
         }
     }
 }
@@ -50,8 +45,7 @@ impl SubscriptionLookbackConfig {
 impl Default for SubscriptionLookbackConfig {
     fn default() -> Self {
         Self {
-            max_notification_age_secs: DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs: DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+            trigger_retention_secs: DEFAULT_DEDUP_RETENTION_SECS,
         }
     }
 }
@@ -153,8 +147,11 @@ async fn resync_reconnect_attempts_from_client(client: &Client, limiter: &Reconn
     resync_reconnect_attempts(limiter, relays);
 }
 
-fn initial_subscription_since(now: u64) -> Timestamp {
-    Timestamp::from_secs(now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS))
+fn initial_subscription_since(now: u64, config: SubscriptionLookbackConfig) -> Timestamp {
+    Timestamp::from_secs(
+        now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+            .saturating_sub(config.trigger_retention_secs),
+    )
 }
 
 fn reconnect_subscription_since(
@@ -162,16 +159,11 @@ fn reconnect_subscription_since(
     now: u64,
     config: SubscriptionLookbackConfig,
 ) -> Timestamp {
-    let earliest_relevant_publish = if config.max_notification_age_secs == 0 {
-        disconnect_started_at
-    } else {
-        disconnect_started_at.max(now.saturating_sub(config.max_notification_age_secs))
-    };
+    let earliest_relevant_publish =
+        disconnect_started_at.max(now.saturating_sub(config.trigger_retention_secs));
 
     Timestamp::from_secs(
-        earliest_relevant_publish
-            .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-            .saturating_sub(config.max_notification_future_skew_secs),
+        earliest_relevant_publish.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS),
     )
 }
 
@@ -467,7 +459,10 @@ impl RelayClient {
         let total = config.clearnet.len() + config.onion.len();
 
         metrics.set_relay_counts(config.clearnet.len(), config.onion.len());
-        metrics.set_relay_subscription_lookback(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS);
+        metrics.set_relay_subscription_lookback(
+            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS
+                .saturating_add(subscription_lookback.trigger_retention_secs),
+        );
 
         Ok(Self {
             client,
@@ -587,12 +582,14 @@ impl RelayClient {
 
     /// Subscribe to gift-wrapped events for the server's public key.
     pub async fn subscribe(&self, server_pubkey: PublicKey) -> Result<()> {
-        let since = initial_subscription_since(Timestamp::now().as_secs());
+        let since =
+            initial_subscription_since(Timestamp::now().as_secs(), self.subscription_lookback);
         let subscription_id = SubscriptionId::generate();
 
         debug!(
             pubkey = %server_pubkey,
-            lookback_secs = NIP59_TIMESTAMP_TWEAK_WINDOW_SECS,
+            lookback_secs = NIP59_TIMESTAMP_TWEAK_WINDOW_SECS
+                .saturating_add(self.subscription_lookback.trigger_retention_secs),
             "Subscribing to gift wrap events"
         );
 
@@ -1649,10 +1646,18 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription_lookback_matches_nip59_tweak_window() {
+    fn test_initial_subscription_covers_tweak_and_trigger_retention() {
+        let now = 1_000_000;
+        let since = initial_subscription_since(
+            now,
+            SubscriptionLookbackConfig {
+                trigger_retention_secs: 300,
+            },
+        );
         assert_eq!(
-            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS, 172_800,
-            "lookback must cover NIP-59's 2-day timestamp tweak window"
+            since.as_secs(),
+            now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+                .saturating_sub(300)
         );
     }
 
@@ -1661,55 +1666,47 @@ mod tests {
         let now = 1_000_000;
         let disconnected_at = now - 60;
         let config = SubscriptionLookbackConfig {
-            max_notification_age_secs: 3_600,
-            max_notification_future_skew_secs: 30,
+            trigger_retention_secs: 300,
         };
 
         let since = reconnect_subscription_since(disconnected_at, now, config);
 
         assert_eq!(
             since.as_secs(),
-            disconnected_at
-                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-                .saturating_sub(30)
+            disconnected_at.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
         );
     }
 
     #[test]
-    fn test_reconnect_subscription_since_caps_long_outage_to_freshness_window() {
+    fn test_reconnect_subscription_since_caps_long_outage_to_retention_window() {
         let now = 1_000_000;
         let disconnected_at = now - 100_000;
         let config = SubscriptionLookbackConfig {
-            max_notification_age_secs: 3_600,
-            max_notification_future_skew_secs: 30,
+            trigger_retention_secs: 300,
         };
 
         let since = reconnect_subscription_since(disconnected_at, now, config);
 
         assert_eq!(
             since.as_secs(),
-            now.saturating_sub(3_600)
+            now.saturating_sub(300)
                 .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-                .saturating_sub(30)
         );
     }
 
     #[test]
-    fn test_reconnect_subscription_since_zero_age_uses_disconnect_start() {
+    fn test_reconnect_subscription_since_zero_retention_uses_current_time() {
         let now = 1_000_000;
         let disconnected_at = now - 100_000;
         let config = SubscriptionLookbackConfig {
-            max_notification_age_secs: 0,
-            max_notification_future_skew_secs: 30,
+            trigger_retention_secs: 0,
         };
 
         let since = reconnect_subscription_since(disconnected_at, now, config);
 
         assert_eq!(
             since.as_secs(),
-            disconnected_at
-                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-                .saturating_sub(30)
+            now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
         );
     }
 

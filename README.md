@@ -14,13 +14,13 @@ The adopted Marmot surface documents supersede the deprecated MIP-era documents.
 - [Nostr transport](https://github.com/marmot-protocol/marmot/blob/master/transports/nostr.md) — normative NIP-59 wrapping, account inbox relays, relay URL profile, and transport encoding rules
 - [MIP coverage](https://github.com/marmot-protocol/marmot/blob/master/mip-coverage.md) — historical mapping only; it is not a normative protocol surface
 
-The current Transponder implementation predates the adopted `marmot-push-v1` interop surface and is not yet fully `marmot-push-v1` compatible. In particular, it still uses the MIP-era HKDF labels and version tag, accepts the old optional `encoding` tag, and deduplicates on outer gift-wrap event IDs with optional durable retention. The adopted specification instead requires `marmot-push-token-v1` / `marmot-push-token-encryption`, a kind `446` rumor whose only tag is `["v", "marmot-push-v1"]`, and short-lived deduplication on `SHA-256` of the decoded trigger content rather than the rewrappable outer event ID. Operational sections below describe the current server behavior; they must not be read as claims of `marmot-push-v1` conformance until the implementation and test vectors are migrated.
+Transponder implements the adopted `marmot-push-v1` server interop surface: token keys use the normative HKDF domain separation, kind `446` rumors require the exact `["v", "marmot-push-v1"]` tag shape, content is standard padded base64, and duplicate suppression uses a short-lived `SHA-256` hash of decoded trigger content rather than the rewrappable outer event ID.
 
 The maintained MIP-05 implementation is preserved in the [`release/mip05-v1`](https://github.com/marmot-protocol/transponder/tree/release/mip05-v1) branch and the immutable [`transponder-mip05-v1.0.0`](https://github.com/marmot-protocol/transponder/releases/tag/transponder-mip05-v1.0.0) release. Existing MIP-05 services should build from that release line rather than from `master`; `master` is the forward-looking Marmot Push development line.
 
 ### Privacy Properties
 
-- **No persisted secrets or message/user content**: Device tokens, trigger plaintext, message content, group identifiers, and recipient linkage are not persisted; the current compatibility replay state retains only public gift-wrap event IDs and processing timestamps, while the adopted feature separately defines short-lived trigger-content-hash retention
+- **No persisted secrets or message/user content**: Device tokens, trigger plaintext, content hashes, message content, group identifiers, and recipient linkage are never persisted
 - **Cannot learn**: Message content, sender/recipient identities, or group membership
 - **Minimal metadata**: Only knows that a notification event occurred
 
@@ -77,20 +77,13 @@ private_key = ""
 # Graceful shutdown timeout in seconds (must be >= 1; 0 skips the drain)
 shutdown_timeout_secs = 10
 
-# Volatile event deduplication cache size when durable replay state is disabled
-# (default: 100000; must be >= 1). With dedup_state_path set, all terminal event
-# IDs inside dedup_retention_secs are retained for the full NIP-59 lookback.
+# Volatile decoded-content hash deduplication cache size
+# (default: 100000; must be >= 1).
 # max_dedup_cache_size = 100000
 
-# Optional durable replay state for processed gift-wrap event IDs.
-# Production deployments should set this to a writable path so restarts do not
-# re-dispatch the NIP-59 2-day subscription backlog.
-# Stores only public event IDs and timestamps; no tokens, keys, payloads,
-# identities, or relay URLs.
-# dedup_state_path = "/var/lib/transponder/dedup-events.log"
-# dedup_retention_secs = 173100
-# max_notification_age_secs = 3600
-# max_notification_future_skew_secs = 300
+# Short-lived volatile content-hash retention (default: 300 seconds).
+# Trigger/replay material is never persisted.
+# dedup_retention_secs = 300
 
 # Rate limiting to prevent spam and replay attacks. Size fields must be >= 1;
 # a value of 0 is rejected at startup (it previously either silently swapped in

@@ -1,14 +1,11 @@
 //! Shared test fixtures for constructing common configuration shapes.
 
-use std::path::PathBuf;
-
 use zeroize::Zeroizing;
 
 use crate::config::ServerConfig;
 use crate::defaults::{
     DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR,
-    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_DEDUP_CACHE_SIZE,
-    DEFAULT_MAX_NOTIFICATION_AGE_SECS, DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS, DEFAULT_MAX_SIZE,
+    DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_SIZE,
     DEFAULT_MAX_TOKENS_PER_EVENT, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
 };
 
@@ -20,10 +17,7 @@ pub fn default_server_config() -> ServerConfig {
         private_key_file: String::new(),
         shutdown_timeout_secs: 10,
         max_dedup_cache_size: DEFAULT_MAX_DEDUP_CACHE_SIZE,
-        dedup_state_path: PathBuf::new(),
         dedup_retention_secs: DEFAULT_DEDUP_RETENTION_SECS,
-        max_notification_age_secs: DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-        max_notification_future_skew_secs: DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
         max_rate_limit_cache_size: DEFAULT_MAX_SIZE,
         max_tokens_per_event: DEFAULT_MAX_TOKENS_PER_EVENT,
         encrypted_token_rate_limit_per_minute: DEFAULT_RATE_LIMIT_PER_MINUTE,
