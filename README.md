@@ -1,14 +1,26 @@
 # Transponder
 
-A privacy-preserving push notification server for [Marmot](https://github.com/marmot-protocol/marmot) group messaging, implementing the [MIP-05 specification](https://github.com/marmot-protocol/marmot/blob/master/05.md).
+A privacy-preserving push notification server for [Marmot](https://github.com/marmot-protocol/marmot) group messaging. Its canonical protocol target is the adopted [Marmot push-notifications feature](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md).
 
 ## Overview
 
-Transponder enables push notifications for Marmot-compatible messaging apps while preserving user privacy. It operates as a Nostr client, subscribing to relays for gift-wrapped notification requests and dispatching silent push notifications to APNs (Apple) and FCM (Google).
+Transponder enables push notifications for Marmot-compatible messaging apps while preserving user privacy. It operates as a Nostr client, subscribing to relays for gift-wrapped notification triggers and dispatching silent push notifications to APNs (Apple) and FCM (Google).
+
+### Protocol Status
+
+The adopted Marmot surface documents supersede the deprecated MIP-era documents. For Transponder work, use these sources:
+
+- [Push notifications](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md) — normative token encryption, token gossip, kind `446` trigger, replay, freshness, and retention behavior
+- [Nostr transport](https://github.com/marmot-protocol/marmot/blob/master/transports/nostr.md) — normative NIP-59 wrapping, account inbox relays, relay URL profile, and transport encoding rules
+- [MIP coverage](https://github.com/marmot-protocol/marmot/blob/master/mip-coverage.md) — historical mapping only; it is not a normative protocol surface
+
+The current Transponder implementation predates the adopted `marmot-push-v1` interop surface and is not yet fully `marmot-push-v1` compatible. In particular, it still uses the MIP-era HKDF labels and version tag, accepts the old optional `encoding` tag, and deduplicates on outer gift-wrap event IDs with optional durable retention. The adopted specification instead requires `marmot-push-token-v1` / `marmot-push-token-encryption`, a kind `446` rumor whose only tag is `["v", "marmot-push-v1"]`, and short-lived deduplication on `SHA-256` of the decoded trigger content rather than the rewrappable outer event ID. Operational sections below describe the current server behavior; they must not be read as claims of `marmot-push-v1` conformance until the implementation and test vectors are migrated.
+
+The maintained MIP-05 implementation is preserved in the [`release/mip05-v1`](https://github.com/marmot-protocol/transponder/tree/release/mip05-v1) branch and the immutable [`transponder-mip05-v1.0.0`](https://github.com/marmot-protocol/transponder/releases/tag/transponder-mip05-v1.0.0) release. Existing MIP-05 services should build from that release line rather than from `master`; `master` is the forward-looking Marmot Push development line.
 
 ### Privacy Properties
 
-- **No stored tokens or user data**: Durable replay state stores only public gift-wrap event IDs and processing timestamps
+- **No persisted secrets or message/user content**: Device tokens, trigger plaintext, message content, group identifiers, and recipient linkage are not persisted; the current compatibility replay state retains only public gift-wrap event IDs and processing timestamps, while the adopted feature separately defines short-lived trigger-content-hash retention
 - **Cannot learn**: Message content, sender/recipient identities, or group membership
 - **Minimal metadata**: Only knows that a notification event occurred
 
@@ -444,7 +456,7 @@ Transponder exposes Prometheus metrics at `/metrics` on the health server port (
 | `transponder_gift_wrap_unwrap_duration_seconds` | Histogram | `outcome` | Duration of NIP-59 gift-wrap unwraps |
 | `transponder_notification_parse_duration_seconds` | Histogram | `outcome` | Duration of notification tag validation, base64 decode, and token splitting |
 | `transponder_tokens_per_event` | Histogram | - | Number of encrypted tokens carried by each parsed event |
-| `transponder_notification_content_size_bytes` | Histogram | - | Size in bytes of the raw base64 token content received in kind 446 notification requests |
+| `transponder_notification_content_size_bytes` | Histogram | - | Size in bytes of the raw base64 token content received in kind 446 notification triggers |
 | `transponder_dedup_cache_size` | Gauge | - | Current deduplication cache size |
 | `transponder_dedup_cache_evictions_total` | Counter | - | Total dedup cache evictions |
 | `transponder_tokens_decrypted_total` | Counter | - | Total tokens successfully decrypted |
@@ -527,9 +539,9 @@ To preserve the server's privacy guarantees, only `ERROR`-level events emitted b
 
 1. **Subscribe**: Transponder connects to configured Nostr relays and subscribes to `kind:1059` (gift-wrapped) events addressed to its public key.
 
-2. **Unwrap**: When an event arrives, it unwraps the NIP-59 gift wrap to extract the inner `kind:446` notification request.
+2. **Unwrap**: When an event arrives, it unwraps the NIP-59 gift wrap to extract the inner `kind:446` notification trigger.
 
-3. **Decrypt**: Each encrypted token in the request is decrypted using ECDH + HKDF + ChaCha20-Poly1305 (per MIP-05).
+3. **Decrypt**: Each encrypted token in the request is decrypted using ECDH + HKDF + ChaCha20-Poly1305. The adopted domain-separation values are defined by the [Marmot push-notifications feature](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md); see [Protocol Status](#protocol-status) for the current compatibility gap.
 
 4. **Dispatch**: Tokens are routed to APNs or FCM based on platform identifier, sending silent push notifications.
 
@@ -648,6 +660,7 @@ cargo build --release
 
 ## Related
 
-- [Marmot Protocol](https://github.com/marmot-protocol/marmot) - Privacy-preserving group messaging
-- [MIP-05 Specification](https://github.com/marmot-protocol/marmot/blob/master/05.md) - Push notification protocol
+- [Marmot Protocol](https://github.com/marmot-protocol/marmot) - Adopted privacy-preserving group-messaging specification
+- [Marmot Push Notifications](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md) - Adopted push-notification feature and interop surface
+- [MIP Coverage](https://github.com/marmot-protocol/marmot/blob/master/mip-coverage.md) - Historical mapping from deprecated MIPs to adopted spec surfaces
 - [NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) - Gift wrap specification
