@@ -29,7 +29,8 @@ services:
       # Error reporting to GlitchTip. Unset by default, which leaves it disabled.
       TRANSPONDER_GLITCHTIP_DSN: ${TRANSPONDER_GLITCHTIP_DSN:-}
       TRANSPONDER_GLITCHTIP_ENVIRONMENT: ${TRANSPONDER_GLITCHTIP_ENVIRONMENT:-production}
-      RUST_LOG: ${RUST_LOG:-info,transponder=debug,nostr_relay_pool=info,nostr_sdk=info,nostr=info,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,tower=warn,rustls=warn,tungstenite=warn,tokio_tungstenite=warn}
+      # RUST_LOG overrides TRANSPONDER_LOGGING_LEVEL when set.
+      RUST_LOG: ${RUST_LOG:-info,transponder=info,nostr_relay_pool=info,nostr_sdk=info,nostr=info,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,tower=warn,rustls=warn,tungstenite=warn,tokio_tungstenite=warn}
     secrets:
       - transponder_private_key
     healthcheck:

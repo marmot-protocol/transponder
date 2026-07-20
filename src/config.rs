@@ -684,6 +684,12 @@ where
         }
 
         builder = if is_string_list_key(&config_key) {
+            // An empty deployment variable is normally an unset optional
+            // override. Preserve any file-configured relay list instead of
+            // silently replacing it with an empty list.
+            if value.trim().is_empty() {
+                continue;
+            }
             builder.set_override(&config_key, parse_string_list_env(&env_key, &value)?)?
         } else {
             builder.set_override(&config_key, value)?
@@ -768,7 +774,14 @@ fn line_col_for_byte_offset(input: &str, offset: usize) -> (usize, usize) {
         }
     }
 
-    let column = input[line_start..offset].chars().count() + 1;
+    // `offset` comes from a dependency error span and is not guaranteed by our
+    // type system to be a UTF-8 boundary. Count character starts instead of
+    // byte-slicing at that untrusted offset.
+    let column = input[line_start..]
+        .char_indices()
+        .take_while(|(relative, _)| line_start + relative < offset)
+        .count()
+        + 1;
     (line, column)
 }
 
@@ -1789,6 +1802,30 @@ mod tests {
 
         assert_eq!(config.server.private_key.as_str(), "env-private-key");
         assert_eq!(config.apns.private_key_path, "/env/key.p8");
+    }
+
+    #[test]
+    fn test_empty_relay_env_preserves_file_values() {
+        let file = create_temp_config(
+            r#"
+            [relays]
+            clearnet = ["wss://relay.example.com"]
+        "#,
+        );
+
+        let config =
+            load_with_test_env(file.path(), &[("TRANSPONDER_RELAYS_CLEARNET", "  \n\t ")]).unwrap();
+
+        assert_eq!(
+            config.relays.clearnet,
+            vec!["wss://relay.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn line_col_tolerates_offset_inside_multibyte_character() {
+        assert_eq!(line_col_for_byte_offset("aéz", 2), (1, 3));
+        assert_eq!(line_col_for_byte_offset("aé\nz", 4), (2, 1));
     }
 
     #[test]

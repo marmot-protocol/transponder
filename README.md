@@ -242,7 +242,8 @@ export TRANSPONDER_RELAYS_ONION="wss://exampleonionrelay.onion" # requires `--fe
 # Logging
 export TRANSPONDER_LOGGING_LEVEL="info"
 export TRANSPONDER_LOGGING_FORMAT="pretty"
-export RUST_LOG="info,transponder=debug,nostr_relay_pool=info,nostr_sdk=info,nostr=info,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,tower=warn,rustls=warn,tungstenite=warn,tokio_tungstenite=warn"
+# RUST_LOG overrides TRANSPONDER_LOGGING_LEVEL when set.
+export RUST_LOG="info,transponder=info,nostr_relay_pool=info,nostr_sdk=info,nostr=info,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,tower=warn,rustls=warn,tungstenite=warn,tokio_tungstenite=warn"
 ```
 
 ### Generating a Server Key Pair

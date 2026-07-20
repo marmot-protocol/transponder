@@ -908,6 +908,8 @@ fn degraded_relay_class(configured: usize, connected: usize) -> bool {
 
 fn validate_relay_config(config: &RelayConfig) -> Result<()> {
     for url in &config.clearnet {
+        validate_clearnet_relay_url(url)?;
+
         if clearnet_relay_uses_tls(url) {
             continue;
         }
@@ -943,6 +945,28 @@ fn validate_relay_config(config: &RelayConfig) -> Result<()> {
     // silently routing traffic over clearnet at connect time (only a `warn!`).
     for url in &config.onion {
         validate_onion_relay_url(url)?;
+    }
+
+    Ok(())
+}
+
+/// Reject malformed or onion-hosted entries in the clearnet relay list.
+///
+/// Provenance selects the transport, so accepting a `.onion` host here would
+/// deliberately dial it outside Tor and expose the hidden-service address to
+/// clearnet DNS. Parsing at startup also prevents a malformed `wss://` entry
+/// from being silently dropped later while the live relay set shrinks.
+fn validate_clearnet_relay_url(url: &str) -> Result<()> {
+    let parsed = RelayUrl::parse(url).map_err(|e| {
+        Error::Nostr(format!(
+            "ClearNet relay '{url}' is not a valid ws:// or wss:// URL: {e}"
+        ))
+    })?;
+
+    if parsed.is_onion() {
+        return Err(Error::Nostr(format!(
+            "ClearNet relay '{url}' must not have a .onion host; configure it under relays.onion"
+        )));
     }
 
     Ok(())
@@ -1524,7 +1548,35 @@ mod tests {
         let err = result
             .err()
             .expect("malformed clearnet relay should be rejected");
-        assert!(err.to_string().contains("must use wss://"));
+        assert!(err.to_string().contains("not a valid"));
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_rejects_empty_host_clearnet_url() {
+        let keys = Keys::generate();
+        let config = test_relay_config(vec!["wss://".to_string()]);
+
+        let error = RelayClient::new(keys, config)
+            .await
+            .err()
+            .expect("empty relay host must fail at startup");
+
+        assert!(error.to_string().contains("not a valid"));
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_rejects_onion_host_in_clearnet_list() {
+        let keys = Keys::generate();
+        let config = test_relay_config(vec![
+            "wss://abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion".to_string(),
+        ]);
+
+        let error = RelayClient::new(keys, config)
+            .await
+            .err()
+            .expect("onion relay must never use clearnet transport");
+
+        assert!(error.to_string().contains("relays.onion"));
     }
 
     #[tokio::test]

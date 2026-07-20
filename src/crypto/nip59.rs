@@ -53,7 +53,6 @@ fn max_encoded_token_blob_len(max_tokens: usize) -> usize {
 }
 
 /// Handler for NIP-59 gift wrap operations.
-#[derive(Clone)]
 pub struct Nip59Handler {
     keys: Keys,
 }
@@ -100,7 +99,12 @@ impl Nip59Handler {
             .keys
             .nip44_decrypt(&event.pubkey, &event.content)
             .await
-            .map_err(|e| Error::Crypto(format!("Failed to decrypt gift wrap: {e}")))?;
+            .map_err(|e| {
+                Error::Crypto(format!(
+                    "Failed to decrypt gift wrap: {}",
+                    sanitize_for_error(&e.to_string(), MAX_PARSE_ERROR_CHARS)
+                ))
+            })?;
         // Parse-error details can embed the (attacker-controlled) decrypted
         // plaintext, so they are bounded and escaped before formatting.
         let seal = Event::from_json(&seal_json).map_err(|e| {
@@ -113,8 +117,12 @@ impl Nip59Handler {
         // Step 3: verify the seal signature, then the seal kind. nostr-sdk's
         // `UnwrappedGift::from_gift_wrap` verifies the signature but not the
         // kind; both are enforced here.
-        seal.verify()
-            .map_err(|e| Error::Crypto(format!("Invalid seal: {e}")))?;
+        seal.verify().map_err(|e| {
+            Error::Crypto(format!(
+                "Invalid seal: {}",
+                sanitize_for_error(&e.to_string(), MAX_PARSE_ERROR_CHARS)
+            ))
+        })?;
         if seal.kind != Kind::Seal {
             return Err(Error::Crypto(format!(
                 "Expected seal (kind 13), got kind {}",
@@ -127,7 +135,12 @@ impl Nip59Handler {
             .keys
             .nip44_decrypt(&seal.pubkey, &seal.content)
             .await
-            .map_err(|e| Error::Crypto(format!("Failed to decrypt seal: {e}")))?;
+            .map_err(|e| {
+                Error::Crypto(format!(
+                    "Failed to decrypt seal: {}",
+                    sanitize_for_error(&e.to_string(), MAX_PARSE_ERROR_CHARS)
+                ))
+            })?;
         let rumor = UnsignedEvent::from_json(&rumor_json).map_err(|e| {
             Error::Crypto(format!(
                 "Failed to parse rumor: {}",
