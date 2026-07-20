@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lru::LruCache;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 pub use crate::defaults::{
@@ -34,7 +34,8 @@ const CLEANUP_BATCH_SIZE: usize = 1000;
 /// [`cleanup`]: RateLimiter::cleanup
 const ADMISSION_SCAN_LIMIT: usize = 32;
 
-/// Number of entries below which the limiter uses a single stripe.
+/// Target entries per stripe. Integer division means sharding begins at 512
+/// entries (`2 * MIN_ENTRIES_PER_SHARD`).
 ///
 /// Sharding a tiny cache would make per-stripe capacity zero or one, changing
 /// the LRU admission-eviction semantics that callers (and tests) rely on for
@@ -166,30 +167,35 @@ impl RateLimitResult {
 /// Entry tracking rate limit counters for a single key.
 #[derive(Debug, Clone)]
 struct RateLimitEntry {
-    minute_hits: VecDeque<(Instant, u64)>,
-    hour_hits: VecDeque<(Instant, u64)>,
+    hits: VecDeque<(Instant, u64)>,
 }
 
 impl RateLimitEntry {
     fn new() -> Self {
         Self {
-            minute_hits: VecDeque::new(),
-            hour_hits: VecDeque::new(),
+            hits: VecDeque::new(),
         }
     }
 
     fn prune(&mut self, now: Instant) {
-        prune_hits(&mut self.minute_hits, now, Duration::from_secs(60));
-        prune_hits(&mut self.hour_hits, now, Duration::from_secs(3600));
+        prune_hits(&mut self.hits, now, Duration::from_secs(3600));
     }
 
     fn is_empty(&self) -> bool {
-        self.minute_hits.is_empty() && self.hour_hits.is_empty()
+        self.hits.is_empty()
     }
 
     fn is_below_limits(&self, max_per_minute: u32, max_per_hour: u32) -> bool {
-        self.minute_hits.len() < max_per_minute as usize
-            && self.hour_hits.len() < max_per_hour as usize
+        self.minute_count(Instant::now()) < max_per_minute as usize
+            && self.hits.len() < max_per_hour as usize
+    }
+
+    fn minute_count(&self, now: Instant) -> usize {
+        self.hits
+            .iter()
+            .rev()
+            .take_while(|(hit, _)| now.duration_since(*hit) < Duration::from_secs(60))
+            .count()
     }
 }
 
@@ -229,9 +235,9 @@ pub struct RateLimitConfig {
     ///
     /// This caps the total number of tracked keys across all stripes, not the
     /// total number of stored timestamps. Each key may retain up to
-    /// `max_per_minute + max_per_hour` admitted-hit timestamps until its
-    /// windows expire, so worst-case timestamp storage per limiter is
-    /// `max_entries * (max_per_minute + max_per_hour)`. For caches large
+    /// `max_per_hour` admitted-hit records until its window expires; the minute
+    /// count is derived from the tail of the same deque. Each `(Instant, u64)`
+    /// record is 24 bytes before deque overhead. For caches large
     /// enough to shard, the aggregate budget is divided across stripes and
     /// admission is stripe-local: a key can be rejected when its routed stripe
     /// has no stale or below-limit victim, even if other stripes still have
@@ -263,12 +269,11 @@ impl Default for RateLimitConfig {
 /// across the minute and hour windows before older hits are pruned.
 ///
 /// The aggregate memory bound is the per-key bound multiplied by the configured
-/// cache size: `max_entries * (max_per_minute + max_per_hour)` hit records per
-/// limiter. With the default 100,000-key cache and 240/minute plus 5,000/hour
-/// limits, one fully saturated limiter can retain roughly 524,000,000 records
-/// before pruning. Production event processing owns separate encrypted-token and
-/// device-token limiters, so size `max_entries` and process memory for both
-/// caches.
+/// cache size: `max_entries * max_per_hour` hit records per limiter. With the
+/// default 100,000-key cache and 5,000/hour limit, one fully saturated limiter
+/// can retain roughly 500,000,000 `(Instant, u64)` records (about 12 GB at 24
+/// bytes per record, before deque/map overhead). Production owns two such
+/// limiters, so size `max_entries` and host memory for both caches.
 ///
 /// Uses a bounded, striped cache to limit tracked key cardinality. The
 /// configured `max_entries` is a hard aggregate budget divided across stripes,
@@ -285,20 +290,18 @@ impl Default for RateLimitConfig {
 /// weakens per-key precision but does not bypass limits because the global
 /// unwrap limiter still bounds total admission.
 pub struct RateLimiter<K: Hash + Eq + Clone + Send + Sync + 'static> {
-    /// Independent LRU stripes, each behind its own `RwLock`. A key is routed
+    /// Independent LRU stripes, each behind its own `Mutex`. A key is routed
     /// to `stripes[hash(key) % stripes.len()]`, so admission checks for keys in
     /// different stripes never contend on the same lock — localizing both the
     /// bounded admission scan and lock waits under a cardinality flood (#123).
-    stripes: Vec<RwLock<LruCache<K, RateLimitEntry>>>,
+    stripes: Vec<Mutex<LruCache<K, RateLimitEntry>>>,
     /// Stable per-limiter hasher so a key always routes to the same stripe.
     hasher: RandomState,
     max_per_minute: u32,
     max_per_hour: u32,
-    /// Process-wide monotonic reservation-id source. Shared across ALL stripes
-    /// so a [`RateLimitReservation`] is unique within the limiter regardless of
-    /// which stripe holds the key — preserving the #206 identity guarantee that
-    /// a delayed rollback cannot remove a newer hit for the same key.
-    next_hit_id: AtomicU64,
+    /// Per-stripe reservation-id sources. Keys are stripe-stable, so rollback
+    /// identity only needs to be unique within the owning stripe.
+    next_hit_ids: Vec<AtomicU64>,
     /// Counts stripe-mutating admissions to drive the sampled gauge (#125).
     gauge_sample_counter: AtomicU64,
     /// Exact aggregate entry count for lock-free gauge samples on the hot path.
@@ -324,7 +327,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
                 // the configured `max_entries` exactly.
                 let cap = base + usize::from(i < remainder);
                 let cap = NonZeroUsize::new(cap).expect("per-stripe capacity is non-zero");
-                RwLock::new(LruCache::new(cap))
+                Mutex::new(LruCache::new(cap))
             })
             .collect();
 
@@ -333,7 +336,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
             hasher: RandomState::new(),
             max_per_minute: config.max_per_minute,
             max_per_hour: config.max_per_hour,
-            next_hit_id: AtomicU64::new(0),
+            next_hit_ids: (0..shard_count).map(|_| AtomicU64::new(0)).collect(),
             gauge_sample_counter: AtomicU64::new(0),
             entry_count: AtomicUsize::new(0),
         }
@@ -348,7 +351,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     }
 
     /// Routes a key to its stripe by stable hash.
-    fn stripe_for(&self, key: &K) -> &RwLock<LruCache<K, RateLimitEntry>> {
+    fn stripe_for(&self, key: &K) -> &Mutex<LruCache<K, RateLimitEntry>> {
         &self.stripes[self.stripe_index(key)]
     }
 
@@ -407,7 +410,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     async fn total_len(&self) -> usize {
         let mut total = 0;
         for stripe in &self.stripes {
-            total += stripe.read().await.len();
+            total += stripe.lock().await.len();
         }
         total
     }
@@ -422,7 +425,8 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     ///   victim for the unknown key
     pub async fn check_and_increment(&self, key: &K) -> RateLimitCheck {
         let (result, admission_evicted) = {
-            let mut entries = self.stripe_for(key).write().await;
+            let stripe_index = self.stripe_index(key);
+            let mut entries = self.stripes[stripe_index].lock().await;
             // Timestamp after acquiring the stripe lock so hits for one key
             // are appended in monotonic lock-acquisition order.
             let now = Instant::now();
@@ -461,7 +465,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
             entry.prune(now);
 
             // Check minute limit first (more likely to be hit)
-            if entry.minute_hits.len() >= self.max_per_minute as usize {
+            if entry.minute_count(now) >= self.max_per_minute as usize {
                 return RateLimitCheck {
                     result: RateLimitResult::ExceededMinuteLimit,
                     admission_evicted,
@@ -470,7 +474,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
             }
 
             // Check hour limit
-            if entry.hour_hits.len() >= self.max_per_hour as usize {
+            if entry.hits.len() >= self.max_per_hour as usize {
                 return RateLimitCheck {
                     result: RateLimitResult::ExceededHourLimit,
                     admission_evicted,
@@ -479,9 +483,8 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
             }
 
             // Increment counters
-            let hit_id = self.next_hit_id.fetch_add(1, Ordering::Relaxed);
-            entry.minute_hits.push_back((now, hit_id));
-            entry.hour_hits.push_back((now, hit_id));
+            let hit_id = self.next_hit_ids[stripe_index].fetch_add(1, Ordering::Relaxed);
+            entry.hits.push_back((now, hit_id));
 
             (
                 RateLimitResult::Allowed(RateLimitReservation(hit_id)),
@@ -511,11 +514,10 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// failed admission leaves no window-start trace for the next real request.
     pub async fn rollback_increment(&self, key: &K, reservation: RateLimitReservation) {
         let hit_id = reservation.0;
-        let mut entries = self.stripe_for(key).write().await;
-        let should_remove = if let Some(entry) = entries.get_mut(key) {
-            remove_hit(&mut entry.minute_hits, hit_id);
-            remove_hit(&mut entry.hour_hits, hit_id);
-            entry.minute_hits.is_empty() && entry.hour_hits.is_empty()
+        let mut entries = self.stripe_for(key).lock().await;
+        let should_remove = if let Some(entry) = entries.peek_mut(key) {
+            remove_hit(&mut entry.hits, hit_id);
+            entry.hits.is_empty()
         } else {
             false
         };
@@ -537,7 +539,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
         let mut remaining = 0;
 
         for stripe in &self.stripes {
-            let mut entries = stripe.write().await;
+            let mut entries = stripe.lock().await;
             let before = entries.len();
 
             // Collect stale keys (hour window expired)
@@ -545,7 +547,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
                 .iter()
                 .rev()
                 .take(CLEANUP_BATCH_SIZE)
-                .filter(|(_, entry)| match entry.hour_hits.back() {
+                .filter(|(_, entry)| match entry.hits.back() {
                     Some((hit, _)) => now.duration_since(*hit) >= hour,
                     None => true,
                 })
@@ -582,10 +584,13 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> RateLimiter<K> {
     /// Checks the current count without incrementing.
     #[cfg(test)]
     pub async fn peek_counts(&self, key: &K) -> Option<(u32, u32)> {
-        let entries = self.stripe_for(key).read().await;
-        entries
-            .peek(key)
-            .map(|entry| (entry.minute_hits.len() as u32, entry.hour_hits.len() as u32))
+        let entries = self.stripe_for(key).lock().await;
+        entries.peek(key).map(|entry| {
+            (
+                entry.minute_count(Instant::now()) as u32,
+                entry.hits.len() as u32,
+            )
+        })
     }
 }
 
@@ -777,7 +782,7 @@ mod tests {
             max_entries: entries(100),
         }));
 
-        let blocked = limiter.stripe_for(&key).write().await;
+        let blocked = limiter.stripe_for(&key).lock().await;
         let task_limiter = Arc::clone(&limiter);
         let handle = tokio::spawn(async move { task_limiter.check_and_increment(&key).await });
 
@@ -1052,11 +1057,9 @@ mod tests {
             .checked_sub(Duration::from_secs(3601))
             .expect("test instant should support one-hour subtraction");
         let mut below_limit_entry = RateLimitEntry::new();
-        below_limit_entry.minute_hits.push_back((now, 0));
-        below_limit_entry.hour_hits.push_back((now, 0));
+        below_limit_entry.hits.push_back((now, 0));
         let mut stale_entry = RateLimitEntry::new();
-        stale_entry.minute_hits.push_back((stale_hit, 1));
-        stale_entry.hour_hits.push_back((stale_hit, 1));
+        stale_entry.hits.push_back((stale_hit, 1));
 
         let mut entries = LruCache::new(NonZeroUsize::new(3).expect("non-zero test capacity"));
         entries.put(1u64, below_limit_entry);
@@ -1111,7 +1114,7 @@ mod tests {
         assert_eq!(limiter.peek_counts(&0u64).await, None);
         assert_eq!(
             limiter.peek_counts(&(capacity as u64 - 1)).await,
-            Some((1, 1))
+            Some((0, 1))
         );
         assert_eq!(limiter.peek_counts(&new_key).await, Some((1, 1)));
     }
@@ -1245,7 +1248,7 @@ mod tests {
 
         let mut summed = 0usize;
         for stripe in &limiter.stripes {
-            summed += stripe.read().await.cap().get();
+            summed += stripe.lock().await.cap().get();
         }
         assert_eq!(summed, max);
     }
@@ -1266,7 +1269,7 @@ mod tests {
 
         let target_stripe = 0usize;
         let other_stripe = 1usize;
-        let target_capacity = limiter.stripes[target_stripe].read().await.cap().get();
+        let target_capacity = limiter.stripes[target_stripe].lock().await.cap().get();
         assert!(target_capacity < max, "test must leave aggregate headroom");
 
         let mut target_keys = Vec::with_capacity(target_capacity + 1);
@@ -1338,10 +1341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reservation_ids_unique_across_stripes() {
-        // The reservation-id source is shared process-wide, so a rollback with a
-        // reservation from one stripe never removes a hit in another stripe even
-        // when ids would collide under per-stripe counters (#206 identity).
+    async fn test_reservation_ids_need_only_be_unique_within_a_stripe() {
         let max = MIN_ENTRIES_PER_SHARD * 4;
         let limiter: RateLimiter<u64> = RateLimiter::new(RateLimitConfig {
             max_per_minute: 10,
@@ -1349,21 +1349,28 @@ mod tests {
             max_entries: entries(max),
         });
 
-        let mut reservations = Vec::new();
-        for key in 0..max as u64 {
-            let reservation = limiter
-                .check_and_increment(&key)
-                .await
-                .reservation()
-                .expect("admit");
-            reservations.push(reservation);
-        }
-        let unique: std::collections::HashSet<u64> = reservations.iter().map(|r| r.0).collect();
-        assert_eq!(
-            unique.len(),
-            reservations.len(),
-            "reservation ids must be globally unique across stripes"
-        );
+        let first_key = 0u64;
+        let first_stripe = limiter.stripe_index(&first_key);
+        let second_key = (1..max as u64)
+            .find(|key| limiter.stripe_index(key) != first_stripe)
+            .expect("sharded limiter routes some key elsewhere");
+        let first = limiter
+            .check_and_increment(&first_key)
+            .await
+            .reservation()
+            .expect("first admit");
+        let second = limiter
+            .check_and_increment(&second_key)
+            .await
+            .reservation()
+            .expect("second admit");
+
+        // Per-stripe counters may collide, but rollback always routes through
+        // the key's stable stripe and therefore cannot touch the other hit.
+        assert_eq!(first, second);
+        limiter.rollback_increment(&first_key, first).await;
+        assert_eq!(limiter.peek_counts(&first_key).await, None);
+        assert_eq!(limiter.peek_counts(&second_key).await, Some((1, 1)));
     }
 
     #[tokio::test]
@@ -1423,7 +1430,7 @@ mod tests {
             .find(|candidate| limiter.stripe_index(candidate) != blocked_stripe)
             .expect("test key for unblocked stripe");
 
-        let _blocked = limiter.stripes[blocked_stripe].write().await;
+        let _blocked = limiter.stripes[blocked_stripe].lock().await;
         let check = tokio::time::timeout(Duration::from_secs(1), limiter.check_and_increment(&key))
             .await
             .expect("sampled cache-size gauge must not wait on unrelated stripes");

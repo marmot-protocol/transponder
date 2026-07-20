@@ -87,10 +87,6 @@ fn parse_server_secret_key(server_private_key: &str) -> Result<SecretKey> {
 /// Bounds total in-flight gift-wrap unwrap (ECDH) work. Load-time config
 /// validation rejects zero, so this preserves the operator's configured cap.
 #[must_use]
-fn event_processing_permits(max_concurrent_event_processing: usize) -> usize {
-    max_concurrent_event_processing
-}
-
 /// Outcome of racing relay startup against a shutdown signal.
 #[derive(Debug)]
 enum StartupOutcome<T, S> {
@@ -422,6 +418,11 @@ async fn staged_teardown(
 /// `crate::telemetry::init`, `init_logging`) occur before the subscriber and client
 /// exist, so they surface only on stderr, not in GlitchTip.
 pub async fn run(mut config: AppConfig) -> Result<()> {
+    // Poll signal streams before any fallible or networked initialization so
+    // SIGTERM/SIGINT cannot take the default, ungraceful action during startup.
+    let shutdown = ShutdownHandler::new();
+    let _signal_handler = shutdown.install_signal_handlers();
+
     // Note: the `metrics.enabled && !health.enabled` case is no longer a
     // silent-loss footgun. The health server now binds its listener and serves
     // `/metrics` whenever a metrics collector exists — independent of
@@ -538,16 +539,11 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
             config.relays.clone(),
             metrics.clone(),
             &config.server,
+            shutdown.trigger_handle(),
         )
         .await
         .context("Failed to create relay client")?,
     );
-
-    // Initialize shutdown handler before connecting so a SIGTERM/SIGINT during
-    // startup exits promptly. Without this, signal handlers were installed only
-    // after `connect()` returned, so a signal received while waiting for relays
-    // (potentially up to the whole connection timeout) was ignored.
-    let shutdown = ShutdownHandler::new();
 
     // Bind the health server before any relay work so a bind failure — almost
     // always a permanent misconfiguration — fails startup fast instead of
@@ -591,12 +587,16 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
         }
         StartupOutcome::ShutdownRequested(reason) => {
             info!("Shutdown signal received during startup; stopping before relay connection");
-            if let Err(e) = relay_client.disconnect().await {
-                warn!(error = %e, "Error disconnecting from relays during startup shutdown");
-            }
-            // The shutdown watch is already set, so the health task exits on
-            // its own; join it to finish teardown cleanly.
-            let _ = health_handle.await;
+            crate::shutdown::graceful_shutdown(
+                || async {
+                    if let Err(e) = relay_client.disconnect().await {
+                        warn!(error = %e, "Error disconnecting from relays during startup shutdown");
+                    }
+                    let _ = health_handle.await;
+                },
+                config.server.shutdown_timeout_secs,
+            )
+            .await;
             info!("Transponder stopped");
             return shutdown_result(reason);
         }
@@ -623,8 +623,9 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
     // The loop runs under supervision: an unexpected exit (notification
     // channel closed) triggers global shutdown instead of leaving a zombie
     // process that reports healthy while processing nothing.
-    let event_permits = event_processing_permits(config.server.max_concurrent_event_processing);
-    let event_semaphore = Arc::new(Semaphore::new(event_permits));
+    let event_semaphore = Arc::new(Semaphore::new(
+        config.server.max_concurrent_event_processing,
+    ));
     let event_tasks = TaskTracker::new();
     let event_shutdown = shutdown.subscribe();
     let event_trigger = shutdown.trigger_handle();
@@ -662,7 +663,24 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
     .await
     {
         StartupOutcome::Connected(result) => {
-            result?;
+            if let Err(error) = result {
+                crate::shutdown::graceful_shutdown(
+                    || {
+                        staged_teardown(
+                            event_handle,
+                            event_tasks,
+                            push_dispatcher,
+                            relay_client,
+                            health_handle,
+                            tokio::spawn(async {}),
+                            tokio::spawn(async {}),
+                        )
+                    },
+                    config.server.shutdown_timeout_secs,
+                )
+                .await;
+                return Err(error);
+            }
         }
         StartupOutcome::ShutdownRequested(reason) => {
             info!("Shutdown signal received during relay startup; stopping before run loop");
@@ -963,17 +981,9 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
 
-    #[test]
-    fn event_processing_permits_preserves_configured_values() {
-        assert_eq!(event_processing_permits(0), 0);
-        assert_eq!(event_processing_permits(1), 1);
-        assert_eq!(event_processing_permits(64), 64);
-        assert_eq!(event_processing_permits(1000), 1000);
-    }
-
     #[tokio::test]
     async fn event_semaphore_caps_in_flight_permits() {
-        let permits = event_processing_permits(3);
+        let permits = 3;
         let semaphore = Arc::new(Semaphore::new(permits));
 
         // Acquire up to the cap; all succeed.

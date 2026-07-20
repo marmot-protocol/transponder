@@ -143,12 +143,11 @@ pub struct ServerConfig {
     /// device token).
     ///
     /// This caps key cardinality, not total timestamp storage. Each tracked key
-    /// can retain up to `per_minute + per_hour` admitted-hit timestamps, so
-    /// worst-case timestamp storage is `max_rate_limit_cache_size *
-    /// (per_minute + per_hour)` per limiter. With the defaults, that is roughly
-    /// 524,000,000 `Instant` values per limiter (about 8.4 GB at 16 bytes per
-    /// timestamp, before `VecDeque` overhead), and Transponder creates two such
-    /// limiters.
+    /// can retain up to `per_hour` admitted-hit records; the minute count is
+    /// derived from that same deque. With the defaults, worst-case storage is
+    /// roughly 500,000,000 `(Instant, u64)` records per limiter (about 12 GB at
+    /// 24 bytes per record before deque/map overhead), and Transponder creates
+    /// two such limiters.
     ///
     /// Unknown keys are rate limited at capacity until cleanup removes stale
     /// entries. Default: 100,000 entries per cache.
@@ -287,10 +286,10 @@ pub struct RelayConfig {
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval_secs: u64,
 
-    /// Maximum reconnect attempts after the initial connection attempt.
+    /// Failed reconnect-attempt threshold for emitting a degraded warning.
     ///
-    /// A value of `0` disables automatic retries after the first failed attempt.
-    /// The counter resets after a successful relay connection.
+    /// Relays continue retrying indefinitely so a recovered configured relay
+    /// can always rejoin. The counter resets after a successful connection.
     #[serde(default = "default_max_reconnect_attempts")]
     pub max_reconnect_attempts: u32,
 

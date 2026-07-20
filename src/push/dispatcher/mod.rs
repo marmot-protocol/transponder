@@ -707,13 +707,17 @@ impl PushDispatcher {
     pub async fn wait_for_completion(&self) {
         {
             let _admission_guard = self.admission_lock.lock().await;
-
-            // Mark as shutting down to prevent new dispatches.
             self.shutting_down.store(true, Ordering::SeqCst);
-
-            // Enqueue a shutdown signal after any already-queued notifications.
-            let _ = self.sender.send(PushMessage::Shutdown).await;
         }
+
+        // Wake/shed retries parked in backoff. Closing also prevents the queue
+        // loop from admitting fresh HTTP work during bounded teardown.
+        self.semaphore.close();
+
+        // Never hold the admission lock across a potentially blocking bounded
+        // channel send; concurrent dispatchers can now observe shutdown and
+        // fail fast.
+        let _ = self.sender.send(PushMessage::Shutdown).await;
 
         let dispatcher_handle = {
             let mut handle = self.dispatcher_handle.lock().await;
@@ -1821,18 +1825,11 @@ mod tests {
             shutdown_dispatcher.wait_for_completion().await;
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !shutdown_handle.is_finished(),
-            "the 101st send should wait for semaphore capacity before shutdown can drain"
-        );
-
-        drop(saturated_permits);
-
         tokio::time::timeout(Duration::from_secs(1), shutdown_handle)
             .await
-            .expect("shutdown should complete after a permit is released")
+            .expect("shutdown should close admission instead of waiting for capacity")
             .expect("shutdown task should not panic");
+        drop(saturated_permits);
         assert_eq!(
             dispatcher.semaphore.available_permits(),
             MAX_CONCURRENT_PUSHES
@@ -2032,7 +2029,7 @@ mod tests {
                 Metrics::disabled(),
             )
             .await;
-            assert!(matches!(result, Ok(PushSendOutcome::Sent)));
+            assert!(matches!(result, Ok(PushSendOutcome::RetriesExhausted)));
         });
 
         // Let the task reach its backoff sleep (first attempt + release of permit).
@@ -2060,8 +2057,8 @@ mod tests {
             "wait_for_completion must not complete while a retry task is sleeping in backoff"
         );
 
-        // Once the retry task finishes (re-acquires, succeeds, drops its guard),
-        // shutdown completes.
+        // Once the backoff ends, the closed semaphore aborts the retry instead
+        // of allowing another provider request during teardown.
         send_task.await.expect("send task should not panic");
 
         tokio::time::timeout(Duration::from_secs(2), shutdown)
@@ -2069,7 +2066,7 @@ mod tests {
             .expect("wait_for_completion should complete after the retry task finishes")
             .expect("shutdown task should not panic");
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
