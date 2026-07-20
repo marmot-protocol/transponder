@@ -35,7 +35,10 @@ If you need to run on a smaller VM, lower the cache sizes in `config/production.
 - Use a modern Linux host such as Ubuntu 24.04 LTS or Debian 12
 - Prefer rootless Docker if it fits your ops model
 - Keep SSH key-only and disable password auth
-- Use a host firewall; do not expose the health or metrics port publicly unless you explicitly need it
+- Use a host firewall; do not expose the health or metrics port publicly. If it
+  must be reachable beyond loopback, place it behind a proxy that enforces
+  concurrent-connection limits plus header-read and idle timeouts; the
+  application's request-level limits begin only after headers are parsed.
 - Keep Transponder bound to localhost unless an external health endpoint is genuinely required
 - Put APNs and FCM credential files in a directory readable only by your deploy user
 

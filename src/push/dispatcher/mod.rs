@@ -259,6 +259,18 @@ impl PushDispatcher {
                 );
                 metrics.record_push_failed(platform_str, "invalid_token");
             }
+            PushSendOutcome::LocallyRejected => {
+                // The provider was never contacted, so this says nothing about
+                // delivery health and must neither heal nor harm its signal.
+                trace!(service = service_name, "push token rejected locally");
+                metrics.record_push_failed(platform_str, "locally_rejected");
+            }
+            PushSendOutcome::Throttled => {
+                // Backpressure proves the provider is reachable and must not be
+                // promoted into a provider-outage readiness signal.
+                trace!(service = service_name, "push notification throttled");
+                metrics.record_push_failed(platform_str, "throttled");
+            }
             PushSendOutcome::RetriesExhausted => {
                 delivery_health.record_hard_failure(platform);
                 trace!(
@@ -845,7 +857,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            push_failed_metric_value(&metrics, "fcm", "invalid_token"),
+            push_failed_metric_value(&metrics, "fcm", "locally_rejected"),
             1
         );
     }
@@ -942,10 +954,11 @@ mod tests {
     }
 
     #[test]
-    fn delivery_health_flags_provider_after_sustained_hard_failure_streak() {
+    fn delivery_health_flags_provider_after_sustained_hard_failure_score() {
         let health = DeliveryHealth::default();
+        let failures_to_trip = DELIVERY_FAILURE_STREAK_THRESHOLD.div_ceil(2);
 
-        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD - 1 {
+        for _ in 0..failures_to_trip - 1 {
             health.record_hard_failure(Platform::Apns);
         }
         assert!(
@@ -968,16 +981,20 @@ mod tests {
     fn delivery_health_processed_request_ends_streak() {
         let health = DeliveryHealth::default();
 
-        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD.div_ceil(2) {
             health.record_hard_failure(Platform::Fcm);
         }
         assert!(!health.is_delivering(Platform::Fcm));
 
         health.record_processed(Platform::Fcm);
         assert!(
-            health.is_delivering(Platform::Fcm),
-            "any processed request must reset the consecutive-failure streak"
+            !health.is_delivering(Platform::Fcm),
+            "one processed request must not erase accumulated outage evidence"
         );
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+            health.record_processed(Platform::Fcm);
+        }
+        assert!(health.is_delivering(Platform::Fcm));
     }
 
     #[test]
@@ -999,8 +1016,8 @@ mod tests {
             "consecutive exhausted-retry outcomes must flag the provider"
         );
 
-        // An invalid-token verdict proves the provider processed the request,
-        // so it ends the streak just like a successful send.
+        // An invalid-token verdict proves the provider processed a request and
+        // decays the score, but one success cannot hide a sustained outage.
         PushDispatcher::record_send_outcome(
             "APNs",
             Platform::Apns,
@@ -1008,7 +1025,7 @@ mod tests {
             &metrics,
             &delivery_health,
         );
-        assert!(delivery_health.is_delivering(Platform::Apns));
+        assert!(!delivery_health.is_delivering(Platform::Apns));
     }
 
     #[tokio::test]

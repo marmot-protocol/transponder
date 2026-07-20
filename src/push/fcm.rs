@@ -395,14 +395,16 @@ impl AuthTokenGenerator for FcmTokenGenerator {
                     return Err(oauth_error_from_transport(error));
                 }
                 Err(crate::push::BoundedJsonBodyError::TooLarge) => {
-                    return Err(TokenAcquisitionError::permanent(Error::Fcm(
-                        "OAuth token response exceeded the size cap".to_string(),
-                    )));
+                    return Err(TokenAcquisitionError::Retriable {
+                        status_code: 200,
+                        retry_after: None,
+                    });
                 }
                 Err(crate::push::BoundedJsonBodyError::Parse) => {
-                    return Err(TokenAcquisitionError::permanent(Error::Fcm(
-                        "OAuth token response was malformed JSON".to_string(),
-                    )));
+                    return Err(TokenAcquisitionError::Retriable {
+                        status_code: 200,
+                        retry_after: None,
+                    });
                 }
             };
 
@@ -546,7 +548,7 @@ impl FcmClient {
                 token_len = device_token.len(),
                 "Invalid FCM device token format"
             );
-            return Ok(PushSendOutcome::InvalidToken);
+            return Ok(PushSendOutcome::LocallyRejected);
         }
 
         // Record one duration sample per logical push, across all retries, so
@@ -648,6 +650,13 @@ impl FcmClient {
         match classify_fcm_error(&error.error) {
             FcmClassification::TokenDead => {
                 debug!(status = %error.error.status, "FCM token unregistered");
+                SendAttemptResult::Success(false)
+            }
+            FcmClassification::Permanent if error.error.status == "INVALID_ARGUMENT" => {
+                // A 400 INVALID_ARGUMENT is scoped to this token/request. It
+                // must not become a provider-wide readiness failure that an
+                // anonymous sender can trigger.
+                debug!(status = %error.error.status, "FCM rejected invalid token/request");
                 SendAttemptResult::Success(false)
             }
             FcmClassification::Permanent => {
@@ -1592,14 +1601,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_response_400_invalid_argument_is_permanent_error() {
-        // INVALID_ARGUMENT is a malformed-payload/config error, not token death.
+    async fn test_handle_response_400_invalid_argument_is_token_scoped() {
         let result = fcm_error_result(400, "INVALID_ARGUMENT").await;
-        assert!(matches!(
-            result,
-            SendAttemptResult::Permanent(Error::Fcm(ref message))
-                if message.contains("INVALID_ARGUMENT")
-        ));
+        assert!(matches!(result, SendAttemptResult::Success(false)));
     }
 
     #[tokio::test]
@@ -1686,8 +1690,8 @@ mod tests {
         // A hostile/buggy endpoint returns a 400 whose body is far larger than
         // any legitimate FCM error payload but contains an UNREGISTERED detail.
         // The bounded read must refuse to buffer/parse the whole body and fall
-        // back to the default INVALID_ARGUMENT classification (a permanent
-        // error), never evicting the token based on attacker-controlled content.
+        // back to the default token-scoped INVALID_ARGUMENT classification,
+        // never trusting attacker-controlled detail content.
         let padding = "A".repeat(4 * 1024 * 1024);
         let huge_body = format!(
             r#"{{"error":{{"code":400,"message":"{padding}","status":"NOT_FOUND","details":[{{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}}]}}}}"#
@@ -1695,14 +1699,7 @@ mod tests {
 
         let result = fcm_error_result_with_string_body(400, huge_body).await;
 
-        let SendAttemptResult::Permanent(Error::Fcm(message)) = result else {
-            panic!("expected a permanent FCM error, got {result:?}");
-        };
-        assert!(message.contains("INVALID_ARGUMENT"));
-        // The oversized provider body must not leak into the error message,
-        // which stays bounded regardless of the (huge) upstream body.
-        assert!(!message.contains(&padding));
-        assert!(message.len() < 128);
+        assert!(matches!(result, SendAttemptResult::Success(false)));
     }
 
     #[tokio::test]
@@ -2634,7 +2631,7 @@ mod tests {
     async fn test_send_rejects_invalid_token_without_oauth() {
         // A client with no service account / encoding key would error on the
         // OAuth round-trip if it ever reached it. Invalid tokens must instead
-        // short-circuit to InvalidToken before any auth lookup or request build.
+        // short-circuit to LocallyRejected before any auth lookup or request build.
         let config = FcmConfig {
             enabled: true,
             service_account_path: String::new(),
@@ -2644,7 +2641,7 @@ mod tests {
 
         assert_eq!(
             client.send(zeroizing_token(""), None).await.unwrap(),
-            PushSendOutcome::InvalidToken,
+            PushSendOutcome::LocallyRejected,
             "empty token"
         );
         assert_eq!(
@@ -2652,7 +2649,7 @@ mod tests {
                 .send(zeroizing_token("token with space"), None)
                 .await
                 .unwrap(),
-            PushSendOutcome::InvalidToken,
+            PushSendOutcome::LocallyRejected,
             "whitespace token"
         );
         assert_eq!(
@@ -2660,7 +2657,7 @@ mod tests {
                 .send(zeroizing_token("tokén-with-unicode"), None)
                 .await
                 .unwrap(),
-            PushSendOutcome::InvalidToken,
+            PushSendOutcome::LocallyRejected,
             "unicode token"
         );
         assert_eq!(
@@ -2668,7 +2665,7 @@ mod tests {
                 .send(Zeroizing::new("a".repeat(MAX_FCM_TOKEN_LEN + 1)), None)
                 .await
                 .unwrap(),
-            PushSendOutcome::InvalidToken,
+            PushSendOutcome::LocallyRejected,
             "overlong token"
         );
     }
@@ -2976,11 +2973,13 @@ LTP/MQIxLydQxT4+jx2NBu0=
 
         let generator = generator_with_token_uri(&mock_server.uri());
         let result = generator.mint().await;
-        let Err(TokenAcquisitionError::Permanent(Error::Fcm(message))) = result else {
-            panic!("expected a permanent OAuth error for the oversized body");
-        };
-        assert!(message.contains("exceeded the size cap"));
-        assert!(!message.contains(&padding));
+        assert!(matches!(
+            result,
+            Err(TokenAcquisitionError::Retriable {
+                status_code: 200,
+                retry_after: None
+            })
+        ));
     }
 
     #[tokio::test]

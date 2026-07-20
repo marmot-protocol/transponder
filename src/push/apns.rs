@@ -471,6 +471,7 @@ impl ApnsClient {
                 }
             }
             403 => {
+                let retry_after = retry::retry_after_from_headers(response.headers());
                 // Parse the reason BEFORE deciding whether to evict. Only a
                 // genuine provider-token reason (ExpiredProviderToken /
                 // InvalidProviderToken) means the JWT is the problem; every
@@ -484,7 +485,18 @@ impl ApnsClient {
                         reason: "Unknown".to_string(),
                     });
                 let apns_error = Error::Apns(format!("Authentication error: {}", error.reason));
-                if is_apns_jwt_reason(&error.reason) {
+                if error.reason == "TooManyProviderTokenUpdates" {
+                    // This is provider backpressure, not a bad key. Reuse the
+                    // cached JWT and retry with bounded backoff.
+                    debug!(
+                        payload_mode = %self.config.payload_mode,
+                        "APNs throttled provider-token updates"
+                    );
+                    SendAttemptResult::Retriable {
+                        status_code: 403,
+                        retry_after,
+                    }
+                } else if is_apns_jwt_reason(&error.reason) {
                     // The cached JWT is stale/invalid: evict it (gated on it
                     // still being the failing token) and ask the retry engine
                     // to retry once with a freshly minted JWT (issue #85).
@@ -1498,6 +1510,41 @@ mod tests {
                 if message.contains("BadCertificateEnvironment")
         ));
         // The valid JWT must NOT be evicted by a non-token 403.
+        assert_eq!(
+            client.cached_token_value().await.as_deref(),
+            Some("valid-jwt")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_too_many_provider_token_updates_retries_without_eviction() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("retry-after", "2")
+                    .set_body_json(serde_json::json!({
+                        "reason": "TooManyProviderTokenUpdates"
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = ApnsClient::mock(test_config(), false);
+        client
+            .seed_token("valid-jwt", SystemTime::now() + TOKEN_LIFETIME)
+            .await;
+        let response = Client::new().post(mock_server.uri()).send().await.unwrap();
+
+        let result = client.handle_response(response, "valid-jwt").await;
+
+        assert!(matches!(
+            result,
+            SendAttemptResult::Retriable {
+                status_code: 403,
+                retry_after: Some(delay)
+            } if delay == Duration::from_secs(2)
+        ));
         assert_eq!(
             client.cached_token_value().await.as_deref(),
             Some("valid-jwt")

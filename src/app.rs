@@ -268,12 +268,26 @@ async fn run_event_loop(
                         };
 
                         let processor = processor.clone();
+                        let task_metrics = metrics.clone();
                         event_tasks.spawn(async move {
-                            // Hold the permit for the lifetime of the task; it
-                            // is released when `permit` is dropped on return.
-                            let _permit = permit;
-                            if let Err(e) = processor.process(&event).await {
-                                debug!(error = %e, "Event processing error");
+                            // Observe panics through the JoinError while keeping
+                            // one malformed event isolated from the receive loop.
+                            let result = tokio::spawn(async move {
+                                // Hold the permit for the lifetime of processing.
+                                let _permit = permit;
+                                processor.process(&event).await
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => debug!(error = %e, "Event processing error"),
+                                Err(error) if error.is_panic() => {
+                                    task_metrics.record_event_processing_panic();
+                                    error!("Event processing task panicked");
+                                }
+                                Err(error) => {
+                                    debug!(error = %error, "Event processing task cancelled");
+                                }
                             }
                         });
                     }
@@ -455,46 +469,32 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
 
     // Initialize push clients
     let apns_client = if config.apns.enabled {
-        match ApnsClient::with_metrics(config.apns.clone(), metrics.clone()).await {
-            Ok(client) => {
-                if client.is_configured() {
-                    info!(
-                        environment = %config.apns.environment,
-                        payload_mode = %config.apns.payload_mode,
-                        "APNs push service configured"
-                    );
-                    Some(client)
-                } else {
-                    warn!("APNs enabled but not fully configured");
-                    None
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to initialize APNs client");
-                None
-            }
+        let client = ApnsClient::with_metrics(config.apns.clone(), metrics.clone())
+            .await
+            .context("Failed to initialize enabled APNs client")?;
+        if !client.is_configured() {
+            anyhow::bail!("enabled APNs client did not initialize as configured");
         }
+        info!(
+            environment = %config.apns.environment,
+            payload_mode = %config.apns.payload_mode,
+            "APNs push service configured"
+        );
+        Some(client)
     } else {
         info!("APNs push service disabled");
         None
     };
 
     let fcm_client = if config.fcm.enabled {
-        match FcmClient::with_metrics(config.fcm.clone(), metrics.clone()).await {
-            Ok(client) => {
-                if client.is_configured() {
-                    info!("FCM push service configured");
-                    Some(client)
-                } else {
-                    warn!("FCM enabled but not fully configured");
-                    None
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to initialize FCM client");
-                None
-            }
+        let client = FcmClient::with_metrics(config.fcm.clone(), metrics.clone())
+            .await
+            .context("Failed to initialize enabled FCM client")?;
+        if !client.is_configured() {
+            anyhow::bail!("enabled FCM client did not initialize as configured");
         }
+        info!("FCM push service configured");
+        Some(client)
     } else {
         info!("FCM push service disabled");
         None

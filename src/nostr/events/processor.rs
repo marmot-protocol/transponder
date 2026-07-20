@@ -2776,7 +2776,8 @@ mod tests {
         // threshold (a genuine prior outage), so we can prove a pre-filtered APNs
         // drop neither resets FCM's streak nor touches APNs's.
         use crate::push::dispatcher::DELIVERY_FAILURE_STREAK_THRESHOLD;
-        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD - 1 {
+        let failures_to_trip = DELIVERY_FAILURE_STREAK_THRESHOLD.div_ceil(2);
+        for _ in 0..failures_to_trip - 1 {
             dispatcher_handle
                 .delivery_health()
                 .record_hard_failure(Platform::Fcm);
