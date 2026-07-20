@@ -1,4 +1,4 @@
-//! MIP-05 token decryption implementation.
+//! Marmot Push v1 token decryption implementation.
 //!
 //! Handles encrypted token parsing and decryption using:
 //! - ECDH key agreement with secp256k1
@@ -28,11 +28,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{Error, Result};
 
-/// MIP-05 HKDF salt for key derivation.
-const HKDF_SALT: &[u8] = b"mip05-v1";
+/// Marmot Push v1 HKDF salt for key derivation.
+const HKDF_SALT: &[u8] = b"marmot-push-token-v1";
 
-/// MIP-05 HKDF info string for token encryption key.
-const HKDF_INFO: &[u8] = b"mip05-token-encryption";
+/// Marmot Push v1 HKDF info string for token encryption key.
+const HKDF_INFO: &[u8] = b"marmot-push-token-encryption";
 
 /// Expected size of the encrypted token (1084 bytes total).
 /// - 32 bytes: x-only ephemeral public key
@@ -284,12 +284,31 @@ impl Drop for ZeroizingSecretKey {
 /// buffer so the only surviving copy is the caller's (which the caller wraps in
 /// `Zeroizing`). The consumed `Hmac` value itself is dropped without erasure —
 /// hmac 0.12 has no zeroize support — see `docs/zeroization-plan.md`.
-fn finalize_hmac(mac: Hmac<Sha256>) -> [u8; 32] {
+fn finalize_hmac(mac: Hmac<Sha256>) -> Zeroizing<[u8; 32]> {
     let mut tag = mac.finalize().into_bytes();
     let mut output = [0u8; 32];
     output.copy_from_slice(&tag);
     tag.as_mut_slice().zeroize();
-    output
+    Zeroizing::new(output)
+}
+
+/// Derive the Marmot Push v1 AEAD key from the raw ECDH X coordinate.
+fn derive_encryption_key(shared_x: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    // Extract: PRK = HMAC-SHA256(salt, IKM).
+    let prk = {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(HKDF_SALT)
+            .expect("HMAC-SHA256 accepts keys of any length");
+        mac.update(shared_x);
+        finalize_hmac(mac)
+    };
+
+    // Expand: the derived key is exactly one hash block long, so
+    // OKM = T(1) = HMAC-SHA256(PRK, info || 0x01).
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(prk.as_ref())
+        .expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(HKDF_INFO);
+    mac.update(&[0x01]);
+    finalize_hmac(mac)
 }
 
 impl TokenDecryptor {
@@ -348,22 +367,7 @@ impl TokenDecryptor {
         // Extract: PRK = HMAC-SHA256(salt, IKM).
         // (`<_ as Mac>` disambiguates from the `chacha20poly1305::KeyInit`
         // import, which also provides a `new_from_slice`.)
-        let prk: Zeroizing<[u8; 32]> = {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(HKDF_SALT)
-                .expect("HMAC-SHA256 accepts keys of any length");
-            mac.update(shared_x.as_ref());
-            Zeroizing::new(finalize_hmac(mac))
-        };
-
-        // Expand: the derived key is exactly one hash block long, so
-        // OKM = T(1) = HMAC-SHA256(PRK, info || 0x01).
-        let encryption_key: Zeroizing<[u8; 32]> = {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(prk.as_ref())
-                .expect("HMAC-SHA256 accepts keys of any length");
-            mac.update(HKDF_INFO);
-            mac.update(&[0x01]);
-            Zeroizing::new(finalize_hmac(mac))
-        };
+        let encryption_key = derive_encryption_key(&shared_x);
 
         // Decrypt using ChaCha20-Poly1305
         let cipher = ChaCha20Poly1305::new_from_slice(encryption_key.as_ref())
@@ -409,6 +413,17 @@ impl TokenDecryptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marmot_push_v1_hkdf_conformance_vector() {
+        let shared_x = std::array::from_fn(|index| index as u8);
+        let derived = derive_encryption_key(&shared_x);
+
+        assert_eq!(
+            hex::encode(derived.as_ref()),
+            "954b9d7be996c0e74517fe49e41e1278f44395d2855a52f50b5e322976dd168d"
+        );
+    }
 
     fn build_plaintext(platform: u8, token_length: u16, token_bytes: &[u8]) -> Vec<u8> {
         let mut plaintext = vec![0u8; TOKEN_PLAINTEXT_SIZE];
