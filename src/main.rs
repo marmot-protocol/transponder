@@ -10,7 +10,7 @@ use transponder::app::{generate_keys, init_logging, run, run_healthcheck};
 use transponder::config::AppConfig;
 use transponder::telemetry;
 
-/// Transponder - MIP-05 Push Notification Server
+/// Transponder - Marmot Push v1 notification server.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {

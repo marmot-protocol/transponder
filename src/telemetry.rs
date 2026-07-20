@@ -241,28 +241,32 @@ fn scrub_envelope(envelope: Envelope) -> Envelope {
     let headers = envelope.headers().clone();
     let mut scrubbed = Envelope::new().with_headers(headers);
     for item in envelope.into_items() {
-        scrubbed.add_item(scrub_envelope_item(item));
+        if let Some(item) = scrub_envelope_item(item) {
+            scrubbed.add_item(item);
+        }
     }
     scrubbed
 }
 
-fn scrub_envelope_item(item: EnvelopeItem) -> EnvelopeItem {
+fn scrub_envelope_item(item: EnvelopeItem) -> Option<EnvelopeItem> {
     match item {
-        EnvelopeItem::Event(mut event) => {
-            scrub_event_fields(&mut event);
-            EnvelopeItem::Event(event)
-        }
+        // Events already passed through `before_send`; scrubbing them again
+        // would duplicate the entire regex walk and allocation pipeline.
+        EnvelopeItem::Event(event) => Some(EnvelopeItem::Event(event)),
         EnvelopeItem::Transaction(mut transaction) => {
             scrub_transaction(&mut transaction);
-            EnvelopeItem::Transaction(transaction)
+            Some(EnvelopeItem::Transaction(transaction))
         }
         EnvelopeItem::ItemContainer(ItemContainer::Logs(mut logs)) => {
             for log in &mut logs {
                 scrub_log(log);
             }
-            EnvelopeItem::ItemContainer(ItemContainer::Logs(logs))
+            Some(EnvelopeItem::ItemContainer(ItemContainer::Logs(logs)))
         }
-        other => other,
+        // No other envelope category is enabled by this service. Drop any that
+        // nevertheless appears instead of letting a future Sentry integration
+        // create a new, unredacted secret-egress path.
+        _ => None,
     }
 }
 
@@ -318,6 +322,17 @@ fn scrub_log(log: &mut Log) {
 }
 
 fn scrub_request(request: &mut Request) {
+    if let Some(url) = request.url.as_mut()
+        && let std::borrow::Cow::Owned(redacted) = redaction::redact(url.as_str())
+    {
+        // Redaction replacements are URL-safe in the request shapes we handle.
+        // If that invariant changes, dropping the URL is safer than forwarding
+        // the original secret-bearing value.
+        request.url = redacted.parse().ok();
+    }
+    if let Some(method) = request.method.as_mut() {
+        redaction::redact_in_place(method);
+    }
     if let Some(data) = request.data.as_mut() {
         redaction::redact_in_place(data);
     }
@@ -495,6 +510,47 @@ mod tests {
     }
 
     #[test]
+    fn scrub_event_redacts_request_url_and_method() {
+        let token = "0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        let event = sentry::protocol::Event {
+            request: Some(sentry::protocol::Request {
+                url: Some(
+                    format!("https://api.push.apple.com/3/device/{token}")
+                        .parse()
+                        .expect("test URL is valid"),
+                ),
+                method: Some(format!("Bearer ya29.{token}")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let scrubbed = scrub_event(event).expect("the scrubber keeps the event");
+        let request = scrubbed.request.expect("the request is kept");
+
+        assert!(
+            !request
+                .url
+                .expect("the URL remains valid")
+                .as_str()
+                .contains(token)
+        );
+        assert_eq!(request.method.as_deref(), Some("Bearer [REDACTED]"));
+    }
+
+    #[test]
+    fn scrub_envelope_drops_unsupported_item_categories() {
+        let attachment = sentry::protocol::Attachment {
+            buffer: b"secret attachment".to_vec(),
+            filename: "panic.txt".to_string(),
+            ..Default::default()
+        };
+        let scrubbed = scrub_envelope(EnvelopeItem::Attachment(attachment).into());
+
+        assert!(scrubbed.into_items().next().is_none());
+    }
+
+    #[test]
     fn scrub_event_redacts_exception_values_and_log_entries() {
         let hex_token = "ab".repeat(32); // 64 hex chars
         let event = sentry::protocol::Event {
@@ -543,7 +599,7 @@ mod tests {
         let logentry = scrubbed.logentry.expect("the log entry is kept");
         assert!(!logentry.message.contains("relay.example.com"));
         assert!(!logentry.message.contains(&hex_token));
-        assert!(logentry.message.contains("wss://[REDACTED]"));
+        assert!(logentry.message.contains("[REDACTED-RELAY-URL]"));
         assert_eq!(
             logentry.params[0],
             sentry::protocol::Value::String("key [REDACTED-NSEC]".into())
@@ -557,7 +613,7 @@ mod tests {
                 fields.insert(
                     "relays".to_string(),
                     sentry::protocol::Value::Array(vec![sentry::protocol::Value::String(
-                        "wss://[REDACTED]".into(),
+                        "[REDACTED-RELAY-URL]".into(),
                     )]),
                 );
                 fields
@@ -574,7 +630,7 @@ mod tests {
         let breadcrumb = &scrubbed.breadcrumbs.values[0];
         assert_eq!(
             breadcrumb.message.as_deref(),
-            Some("sent via wss://[REDACTED]")
+            Some("sent via [REDACTED-RELAY-URL]")
         );
         assert_eq!(
             breadcrumb.data.get("key"),
@@ -625,7 +681,7 @@ mod tests {
         let scrubbed = scrub_event(event).expect("the scrubber keeps the event");
 
         let tag = scrubbed.tags.get("relay").expect("the tag is kept");
-        assert_eq!(tag, "wss://[REDACTED]");
+        assert_eq!(tag, "[REDACTED-RELAY-URL]");
 
         let sentry::protocol::Context::Other(fields) = scrubbed
             .contexts
@@ -636,7 +692,9 @@ mod tests {
         };
         assert_eq!(
             fields.get("relay"),
-            Some(&sentry::protocol::Value::String("wss://[REDACTED]".into()))
+            Some(&sentry::protocol::Value::String(
+                "[REDACTED-RELAY-URL]".into()
+            ))
         );
         let nested = fields
             .get("nested")
@@ -718,11 +776,11 @@ mod tests {
         assert!(transaction.server_name.is_none());
         assert_eq!(
             transaction.name.as_deref(),
-            Some("publish wss://[REDACTED]")
+            Some("publish [REDACTED-RELAY-URL]")
         );
         assert_eq!(
             transaction.tags.get("relay"),
-            Some(&"wss://[REDACTED]".to_string())
+            Some(&"[REDACTED-RELAY-URL]".to_string())
         );
         assert_eq!(
             transaction.extra.get("request"),
@@ -740,15 +798,20 @@ mod tests {
         };
         assert_eq!(
             fields.get("relay"),
-            Some(&sentry::protocol::Value::String("wss://[REDACTED]".into()))
+            Some(&sentry::protocol::Value::String(
+                "[REDACTED-RELAY-URL]".into()
+            ))
         );
 
         let span = &transaction.spans[0];
-        assert_eq!(span.op.as_deref(), Some("connect wss://[REDACTED]"));
-        assert_eq!(span.description.as_deref(), Some("relay wss://[REDACTED]"));
+        assert_eq!(span.op.as_deref(), Some("connect [REDACTED-RELAY-URL]"));
+        assert_eq!(
+            span.description.as_deref(),
+            Some("relay [REDACTED-RELAY-URL]")
+        );
         assert_eq!(
             span.tags.get("relay"),
-            Some(&"wss://[REDACTED]".to_string())
+            Some(&"[REDACTED-RELAY-URL]".to_string())
         );
         assert_eq!(
             span.data.get("nested"),

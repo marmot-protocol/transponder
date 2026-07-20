@@ -1,9 +1,9 @@
 [package]
 name = "transponder"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 rust-version = "1.90"
-description = "Privacy-preserving push notification server implementing the MIP-05 specification"
+description = "Privacy-preserving push notification server implementing Marmot Push v1"
 license = "MIT"
 
 [features]
@@ -110,7 +110,7 @@ lru = "0.16"
 rand = "0.9"
 
 [dev-dependencies]
-# Reference HKDF implementation for the encryption side of the MIP-05 test
+# Reference HKDF implementation for the encryption side of Marmot Push test
 # vectors; cross-checks the manual extract/expand in crypto/token.rs.
 hkdf = "0.12.4"
 tokio-test = "0.4.5"

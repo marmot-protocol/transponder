@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::crypto::Platform;
 
-/// Number of consecutive hard delivery failures after which a provider is
+/// Accumulated hard-failure score after which a provider is
 /// reported as not delivering (see [`DeliveryHealth`]).
 ///
 /// "Hard" failures are outcomes indicating the provider itself is refusing or
@@ -15,15 +15,15 @@ use crate::crypto::Platform;
 /// processed the request. The threshold trades detection speed against
 /// flapping: five hard failures in a row with no intervening success is a
 /// sustained outage signal, not an isolated transient blip.
-pub const DELIVERY_FAILURE_STREAK_THRESHOLD: u32 = 5;
+pub const DELIVERY_FAILURE_STREAK_THRESHOLD: u32 = 9;
 
 /// Passive per-provider delivery-health signal derived from real send
 /// outcomes.
 ///
-/// Tracks, for each push provider, the current streak of *consecutive* hard
-/// send failures. The streak grows on permanent errors and exhausted retries,
-/// and resets to zero whenever the provider demonstrably processes a request
-/// (successful send or a definitive invalid-token verdict). The readiness
+/// Tracks a bounded leaky failure score per provider. A hard failure adds two
+/// points while a demonstrably processed request removes one. This retains a
+/// fast signal for total outages while also detecting sustained brownouts;
+/// interleaved successes can no longer reset all accumulated evidence. The readiness
 /// endpoint uses [`DeliveryHealth::is_delivering`] to gate `/ready` on live
 /// delivery capability instead of static configuration alone.
 ///
@@ -45,9 +45,13 @@ impl DeliveryHealth {
     }
 
     /// Record that the provider processed a request (successful send, or a
-    /// definitive invalid-token verdict), ending any hard-failure streak.
+    /// definitive invalid-token verdict), decaying the failure score.
     pub(crate) fn record_processed(&self, platform: Platform) {
-        self.streak(platform).store(0, Ordering::SeqCst);
+        let _ = self
+            .streak(platform)
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |score| {
+                Some(score.saturating_sub(1))
+            });
     }
 
     /// Record a hard send failure (permanent error or exhausted retries).
@@ -58,7 +62,7 @@ impl DeliveryHealth {
         let _ = self
             .streak(platform)
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |streak| {
-                Some(streak.saturating_add(1))
+                Some(streak.saturating_add(2))
             });
     }
 

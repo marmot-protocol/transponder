@@ -14,20 +14,10 @@ shutdown_timeout_secs = 20
 
 # These defaults are reasonable for small to medium deployments.
 # Reduce them if you are running on a very small VM.
-# Only applies if dedup_state_path is unset; durable replay state below retains
-# all terminal IDs inside dedup_retention_secs.
 # max_dedup_cache_size = 100000
-# Durable replay state for processed gift-wrap event IDs. The systemd example
-# and compose.prod.yml make /var/lib/transponder writable. This stores only
-# public event IDs and processing timestamps; no push tokens, keys, payloads,
-# identities, or relay URLs.
-dedup_state_path = "/var/lib/transponder/dedup-events.log"
-# Retain IDs across the full NIP-59 2-day subscription lookback plus skew.
-# dedup_retention_secs = 173100
-# Reject stale unwrapped notification rumors; outer gift-wrap timestamps are
-# intentionally randomized and are not freshness signals.
-# max_notification_age_secs = 3600
-# max_notification_future_skew_secs = 300
+# Short-lived volatile SHA-256 deduplication of decoded trigger content.
+# Marmot Push v1 never persists trigger or replay material.
+dedup_retention_secs = 300
 # Rate-limit cache size caps tracked keys, not stored timestamps. Worst-case
 # timestamps per limiter are max_rate_limit_cache_size * (per_minute + per_hour),
 # or ~524M Instant values with the defaults (~8.4 GB at 16 B/timestamp before
@@ -60,7 +50,7 @@ allow_unencrypted_clearnet_relays = false
 onion = []
 
 # Base retry interval and retry cap for relay reconnection.
-# max_reconnect_attempts caps retries after the initial failed attempt; 0 disables retries.
+# max_reconnect_attempts is a warning threshold; retries continue indefinitely.
 reconnect_interval_secs = 5
 max_reconnect_attempts = 10
 connection_timeout_secs = 30

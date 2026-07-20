@@ -108,6 +108,11 @@ no zeroize integration:
   has absorbed the ECDH shared secret). `finalize()` consumes them, but their
   memory is released without being wiped.
 - The same applies to transient SHA-256 compression state on the stack.
+- The server's Nostr identity key is also held by `nostr-sdk`'s `Keys` type for
+  NIP-59 unwraps and relay signing. `Keys` has no zeroize-on-drop support, so
+  that long-lived copy cannot currently be erased by Transponder. The local
+  `Nip59Handler` is deliberately non-`Clone`, but a complete fix requires
+  upstream zeroization support in `nostr-sdk`.
 
 These temporaries are scoped to a single `decrypt` call, but their remnants
 after drop are not zeroed — the memory-dump/swap/core-dump protection this

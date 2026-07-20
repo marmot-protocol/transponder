@@ -38,6 +38,9 @@ pub struct Metrics {
     /// Total number of events that failed processing.
     pub events_failed_total: IntCounter,
 
+    /// Total number of per-event processing tasks that panicked.
+    pub event_processing_panicked_total: IntCounter,
+
     /// Total number of events shed by global admission control before the
     /// gift-wrap unwrap (ECDH) was attempted.
     pub events_shed_total: IntCounter,
@@ -278,6 +281,12 @@ impl Metrics {
         ))?;
         registry.register(Box::new(events_failed_total.clone()))?;
 
+        let event_processing_panicked_total = IntCounter::with_opts(Opts::new(
+            "transponder_event_processing_panicked_total",
+            "Total number of per-event processing tasks that panicked",
+        ))?;
+        registry.register(Box::new(event_processing_panicked_total.clone()))?;
+
         let events_shed_total = IntCounter::with_opts(Opts::new(
             "transponder_events_shed_total",
             "Total number of events shed by global admission control before the gift-wrap unwrap (ECDH) was attempted",
@@ -509,7 +518,7 @@ impl Metrics {
                 "transponder_push_retries_total",
                 "Total number of push notification retry attempts",
             ),
-            &["platform"],
+            &["platform", "kind"],
         )?;
         registry.register(Box::new(push_retries_total.clone()))?;
 
@@ -608,6 +617,7 @@ impl Metrics {
             events_processed_total,
             events_deduplicated_total,
             events_failed_total,
+            event_processing_panicked_total,
             events_shed_total,
             events_rate_limited_total,
             events_in_flight,
@@ -728,6 +738,14 @@ impl Metrics {
             return;
         }
         self.events_failed_total.inc();
+    }
+
+    /// Record a panic in a per-event processing task.
+    pub fn record_event_processing_panic(&self) {
+        if !self.enabled {
+            return;
+        }
+        self.event_processing_panicked_total.inc();
     }
 
     /// Record an event shed by global admission control before unwrap.
@@ -1021,11 +1039,13 @@ impl Metrics {
     }
 
     /// Record a push retry attempt.
-    pub fn record_push_retry(&self, platform: &str) {
+    pub fn record_push_retry(&self, platform: &str, kind: &str) {
         if !self.enabled {
             return;
         }
-        self.push_retries_total.with_label_values(&[platform]).inc();
+        self.push_retries_total
+            .with_label_values(&[platform, kind])
+            .inc();
     }
 
     /// Observe push request duration.
@@ -1351,7 +1371,7 @@ mod tests {
 
         metrics.observe_push_duration("apns", 0.125);
         metrics.record_push_response_status("apns", 200);
-        metrics.record_push_retry("fcm");
+        metrics.record_push_retry("fcm", "provider");
         metrics.record_auth_token_refresh("apns_jwt");
 
         assert_eq!(
@@ -1374,7 +1394,7 @@ mod tests {
             counter_value(
                 &metrics,
                 "transponder_push_retries_total",
-                &[("platform", "fcm")]
+                &[("platform", "fcm"), ("kind", "provider")]
             ),
             1.0
         );

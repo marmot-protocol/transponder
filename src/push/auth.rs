@@ -20,6 +20,7 @@
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::Instant;
 use tracing::debug;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -108,6 +109,18 @@ pub(crate) struct TokenCache<G> {
     /// concurrent cache misses queue here and coalesce onto the refreshed
     /// value via the double-check instead of minting redundantly.
     refresh: Mutex<()>,
+    /// Briefly coalesces transient mint failures so queued waiters do not each
+    /// perform another full-timeout OAuth request.
+    recent_failure: Mutex<Option<RecentMintFailure>>,
+}
+
+const PROACTIVE_REFRESH_WINDOW: Duration = Duration::from_secs(60);
+const MINT_FAILURE_COOLDOWN: Duration = Duration::from_millis(100);
+
+struct RecentMintFailure {
+    retry_at: Instant,
+    status_code: u16,
+    retry_after: Option<Duration>,
 }
 
 impl<G> TokenCache<G> {
@@ -117,6 +130,7 @@ impl<G> TokenCache<G> {
             generator,
             cached: RwLock::new(None),
             refresh: Mutex::new(()),
+            recent_failure: Mutex::new(None),
         }
     }
 
@@ -132,6 +146,61 @@ impl<G> TokenCache<G> {
             .as_ref()
             .filter(|token| token.expires_at > SystemTime::now())
             .map(|token| token.token.clone())
+    }
+
+    async fn read_fresh(&self) -> Option<Zeroizing<String>> {
+        let refresh_deadline = SystemTime::now()
+            .checked_add(PROACTIVE_REFRESH_WINDOW)
+            .unwrap_or(SystemTime::now());
+        let cached = self.cached.read().await;
+        cached
+            .as_ref()
+            .filter(|token| token.expires_at > refresh_deadline)
+            .map(|token| token.token.clone())
+    }
+
+    async fn recent_failure(&self) -> Option<TokenAcquisitionError> {
+        let mut failure = self.recent_failure.lock().await;
+        let current = failure.as_ref()?;
+        if current.retry_at <= Instant::now() {
+            *failure = None;
+            return None;
+        }
+        Some(TokenAcquisitionError::Retriable {
+            status_code: current.status_code,
+            retry_after: current.retry_after,
+        })
+    }
+
+    async fn mint_and_store(&self) -> Result<Zeroizing<String>, TokenAcquisitionError>
+    where
+        G: AuthTokenGenerator,
+    {
+        let minted = match self.generator.mint().await {
+            Ok(minted) => minted,
+            Err(error) => {
+                if let TokenAcquisitionError::Retriable {
+                    status_code,
+                    retry_after,
+                } = &error
+                {
+                    *self.recent_failure.lock().await = Some(RecentMintFailure {
+                        retry_at: Instant::now() + MINT_FAILURE_COOLDOWN,
+                        status_code: *status_code,
+                        retry_after: *retry_after,
+                    });
+                }
+                return Err(error);
+            }
+        };
+        *self.recent_failure.lock().await = None;
+        let outbound = minted.token.clone();
+        let mut cached = self.cached.write().await;
+        *cached = Some(CachedToken {
+            token: minted.token,
+            expires_at: minted.expires_at,
+        });
+        Ok(outbound)
     }
 
     /// Invalidate the cached credential only if it still matches the one the
@@ -162,9 +231,24 @@ impl<G: AuthTokenGenerator> TokenCache<G> {
     /// The caller receives a short-lived zeroizing clone for request
     /// construction while the cache owns the reusable copy.
     pub(crate) async fn get(&self) -> Result<Zeroizing<String>, TokenAcquisitionError> {
-        // Fast path: serve the cached credential under the read lock.
-        if let Some(token) = self.read_valid().await {
+        // Fast path: serve credentials outside the proactive refresh window.
+        if let Some(token) = self.read_fresh().await {
             return Ok(token);
+        }
+
+        // Within the refresh window, one caller refreshes while concurrent
+        // readers continue using the still-valid credential.
+        if let Some(still_valid) = self.read_valid().await {
+            let Ok(_refresh_guard) = self.refresh.try_lock() else {
+                return Ok(still_valid);
+            };
+            if let Some(token) = self.read_fresh().await {
+                return Ok(token);
+            }
+            if self.recent_failure().await.is_some() {
+                return Ok(still_valid);
+            }
+            return self.mint_and_store().await;
         }
 
         // Slow path: single-flight refresh. Concurrent misses queue on the
@@ -177,15 +261,10 @@ impl<G: AuthTokenGenerator> TokenCache<G> {
         if let Some(token) = self.read_valid().await {
             return Ok(token);
         }
-
-        let minted = self.generator.mint().await?;
-        let outbound = minted.token.clone();
-        let mut cached = self.cached.write().await;
-        *cached = Some(CachedToken {
-            token: minted.token,
-            expires_at: minted.expires_at,
-        });
-        Ok(outbound)
+        if let Some(error) = self.recent_failure().await {
+            return Err(error);
+        }
+        self.mint_and_store().await
     }
 }
 

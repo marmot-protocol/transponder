@@ -23,8 +23,8 @@ Why these numbers make sense today:
 - the dispatcher allows up to 100 concurrent outbound push requests
 - the push queue is bounded at 10,000 pending notifications
 - the event deduplication and rate-limit caches default to 100,000 entries each
-- production deployments persist a small replay-suppression log containing only public gift-wrap event IDs and processing timestamps
-- rate-limit cache entries retain admitted-hit timestamps for sliding-window precision; worst-case timestamp storage is `max_rate_limit_cache_size × (per_minute + per_hour)` per limiter (about 8.4 GB at 16 bytes per timestamp with the defaults, before `VecDeque` overhead), and Transponder runs separate encrypted-token and device-token limiters
+- replay suppression retains only decoded-content hashes in memory for the configured short window; it intentionally resets on restart
+- rate-limit cache entries retain one deque of admitted-hit timestamps for sliding-window precision; worst-case timestamp storage is `max_rate_limit_cache_size × per_hour` per limiter (about 12 GB at 24 bytes per record with the defaults, before `VecDeque` overhead), and Transponder runs separate encrypted-token and device-token limiters
 - under cache pressure, new rate-limit keys evict stale or below-limit entries from their routed shard when possible; if no safe same-shard victim exists they are rate limited even when other shards have room, so size these caches with headroom and monitor `transponder_rate_limit_admission_evictions_total` plus `transponder_tokens_rate_limited_total{reason="capacity"}`
 - Tor adds noticeable memory and connection-management overhead, which is why the default build leaves it disabled
 
@@ -35,7 +35,10 @@ If you need to run on a smaller VM, lower the cache sizes in `config/production.
 - Use a modern Linux host such as Ubuntu 24.04 LTS or Debian 12
 - Prefer rootless Docker if it fits your ops model
 - Keep SSH key-only and disable password auth
-- Use a host firewall; do not expose the health or metrics port publicly unless you explicitly need it
+- Use a host firewall; do not expose the health or metrics port publicly. If it
+  must be reachable beyond loopback, place it behind a proxy that enforces
+  concurrent-connection limits plus header-read and idle timeouts; the
+  application's request-level limits begin only after headers are parsed.
 - Keep Transponder bound to localhost unless an external health endpoint is genuinely required
 - Put APNs and FCM credential files in a directory readable only by your deploy user
 
@@ -79,7 +82,6 @@ cp config/production.toml.example config/production.toml
 cp deploy/production.env.example deploy/production.env
 mkdir -p credentials secrets
 chmod 700 credentials secrets
-sudo install -d -m 0700 -o 65532 -g 65532 state
 ```
 
 2. Create the server private key secret file:
@@ -126,7 +128,7 @@ docker login dhi.io
 docker build --build-arg CARGO_FEATURES='--features tor' -t transponder:tor .
 ```
 
-The Dockerfile pins the DHI base images by digest, and `compose.prod.yml` runs only the Transponder container. The runtime image runs as UID/GID `65532`, so any bind-mounted `TRANSPONDER_STATE_DIR` must be writable by that UID/GID.
+The Dockerfile pins the DHI base images by digest, and `compose.prod.yml` runs only the Transponder container. Marmot Push v1 does not require a writable persistent data mount.
 
 Start the service:
 
@@ -140,7 +142,7 @@ The Compose stack publishes Transponder on `127.0.0.1:${TRANSPONDER_PUBLISHED_PO
 
 ## Native systemd Deployment
 
-For operators who do not want Docker at all, a native `systemd` deployment is a good fit. Transponder is a single binary with a config file, a small set of credential files, and a writable state directory for replay suppression.
+For operators who do not want Docker at all, a native `systemd` deployment is a good fit. Transponder is a single binary with a config file and a small set of credential files.
 
 Example host layout:
 
@@ -149,7 +151,6 @@ Example host layout:
 - `/etc/transponder/secrets/server_private_key`
 - `/etc/transponder/credentials/AuthKey_XXXXXXXXXX.p8`
 - `/etc/transponder/credentials/service-account.json`
-- `/var/lib/transponder/dedup-events.log`
 
 Build and install the binary:
 

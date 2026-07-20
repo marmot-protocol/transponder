@@ -8,13 +8,11 @@ use nostr_sdk::prelude::*;
 use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
 use crate::error::{Error, Result};
 
-/// Kind for MIP-05 notification requests (rumor inside seal).
+/// Kind for Marmot Push v1 notification requests (rumor inside seal).
 pub const KIND_NOTIFICATION_REQUEST: u16 = 446;
 
 const TAG_VERSION: &str = "v";
-const TAG_ENCODING: &str = "encoding";
-const VERSION_MIP05_V1: &str = "mip05-v1";
-const ENCODING_BASE64: &str = "base64";
+const VERSION_MARMOT_PUSH_V1: &str = "marmot-push-v1";
 
 pub use crate::defaults::DEFAULT_MAX_TOKENS_PER_EVENT;
 
@@ -55,7 +53,6 @@ fn max_encoded_token_blob_len(max_tokens: usize) -> usize {
 }
 
 /// Handler for NIP-59 gift wrap operations.
-#[derive(Clone)]
 pub struct Nip59Handler {
     keys: Keys,
 }
@@ -102,7 +99,12 @@ impl Nip59Handler {
             .keys
             .nip44_decrypt(&event.pubkey, &event.content)
             .await
-            .map_err(|e| Error::Crypto(format!("Failed to decrypt gift wrap: {e}")))?;
+            .map_err(|e| {
+                Error::Crypto(format!(
+                    "Failed to decrypt gift wrap: {}",
+                    sanitize_for_error(&e.to_string(), MAX_PARSE_ERROR_CHARS)
+                ))
+            })?;
         // Parse-error details can embed the (attacker-controlled) decrypted
         // plaintext, so they are bounded and escaped before formatting.
         let seal = Event::from_json(&seal_json).map_err(|e| {
@@ -115,8 +117,12 @@ impl Nip59Handler {
         // Step 3: verify the seal signature, then the seal kind. nostr-sdk's
         // `UnwrappedGift::from_gift_wrap` verifies the signature but not the
         // kind; both are enforced here.
-        seal.verify()
-            .map_err(|e| Error::Crypto(format!("Invalid seal: {e}")))?;
+        seal.verify().map_err(|e| {
+            Error::Crypto(format!(
+                "Invalid seal: {}",
+                sanitize_for_error(&e.to_string(), MAX_PARSE_ERROR_CHARS)
+            ))
+        })?;
         if seal.kind != Kind::Seal {
             return Err(Error::Crypto(format!(
                 "Expected seal (kind 13), got kind {}",
@@ -129,7 +135,12 @@ impl Nip59Handler {
             .keys
             .nip44_decrypt(&seal.pubkey, &seal.content)
             .await
-            .map_err(|e| Error::Crypto(format!("Failed to decrypt seal: {e}")))?;
+            .map_err(|e| {
+                Error::Crypto(format!(
+                    "Failed to decrypt seal: {}",
+                    sanitize_for_error(&e.to_string(), MAX_PARSE_ERROR_CHARS)
+                ))
+            })?;
         let rumor = UnsignedEvent::from_json(&rumor_json).map_err(|e| {
             Error::Crypto(format!(
                 "Failed to parse rumor: {}",
@@ -168,71 +179,41 @@ impl Nip59Handler {
 pub struct UnwrappedNotification {
     /// Content containing encrypted tokens as a single base64 blob.
     pub content: String,
-    /// Rumor tags used for versioning and optional content encoding validation.
+    /// Rumor tags used for exact version validation.
     pub tags: Tags,
     /// When the rumor was created.
     pub created_at: Timestamp,
 }
 
-/// Whether a validated tag must be present on the rumor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TagPresence {
-    /// At least one tag with the given name must exist.
-    Required,
-    /// Zero tags with the given name is accepted.
-    Optional,
-}
-
 impl UnwrappedNotification {
-    /// Validate every tag named `tag_name` against `expected_value`.
+    /// Require the exact Marmot Push v1 trigger tag set.
     ///
-    /// Each present tag must carry exactly `expected_value`. When `presence`
-    /// is [`TagPresence::Required`], at least one such tag must exist; when
-    /// [`TagPresence::Optional`], the tag may be absent entirely.
-    ///
-    /// Tag values are attacker-controlled decrypted content, so they are
-    /// truncated and escaped before being embedded in error messages.
-    fn validate_tag(
-        &self,
-        tag_name: &str,
-        expected_value: &str,
-        presence: TagPresence,
-    ) -> Result<()> {
-        let mut found_tag = false;
+    /// The adopted interop surface permits one tag only:
+    /// `["v", "marmot-push-v1"]`. Rejecting extra and duplicate tags keeps
+    /// the server from accepting pre-standard or ambiguous trigger shapes.
+    fn validate_tags(&self) -> Result<()> {
+        let [tag] = self.tags.as_slice() else {
+            return Err(Error::InvalidToken(
+                "Notification rumor must contain exactly one version tag".to_string(),
+            ));
+        };
 
-        for tag in self
-            .tags
-            .iter()
-            .filter(|tag| tag.kind() == TagKind::custom(tag_name))
-        {
-            found_tag = true;
-
-            match tag.content() {
-                Some(value) if value == expected_value => continue,
-                Some(value) => {
-                    return Err(Error::InvalidToken(format!(
-                        "Unsupported {tag_name} tag value: {}",
-                        sanitize_for_error(value, MAX_TAG_VALUE_ERROR_CHARS)
-                    )));
-                }
-                None => {
-                    return Err(Error::InvalidToken(match presence {
-                        TagPresence::Required => {
-                            format!("Missing value for required {tag_name} tag")
-                        }
-                        TagPresence::Optional => format!("Missing value for {tag_name} tag"),
-                    }));
-                }
-            }
+        if tag.kind() != TagKind::custom(TAG_VERSION) {
+            return Err(Error::InvalidToken(
+                "Notification rumor contains an unsupported tag".to_string(),
+            ));
         }
 
-        if presence == TagPresence::Required && !found_tag {
-            return Err(Error::InvalidToken(format!(
-                "Missing required {tag_name} tag"
-            )));
+        match tag.content() {
+            Some(VERSION_MARMOT_PUSH_V1) if tag.as_slice().len() == 2 => Ok(()),
+            Some(value) => Err(Error::InvalidToken(format!(
+                "Unsupported version tag value: {}",
+                sanitize_for_error(value, MAX_TAG_VALUE_ERROR_CHARS)
+            ))),
+            None => Err(Error::InvalidToken(
+                "Missing value for required version tag".to_string(),
+            )),
         }
-
-        Ok(())
     }
 
     /// Parse the encrypted tokens from the content.
@@ -253,10 +234,7 @@ impl UnwrappedNotification {
     pub fn parse_tokens_with_limit(&self, max_tokens: usize) -> Result<Vec<Vec<u8>>> {
         use base64::prelude::*;
 
-        self.validate_tag(TAG_VERSION, VERSION_MIP05_V1, TagPresence::Required)?;
-        // Zero `encoding` tags defaults to base64 (current Darkmatter / Marmot
-        // spec). If present, every `encoding` tag must carry the value `base64`.
-        self.validate_tag(TAG_ENCODING, ENCODING_BASE64, TagPresence::Optional)?;
+        self.validate_tags()?;
 
         let max_encoded_len = max_encoded_token_blob_len(max_tokens);
         if self.content.len() > max_encoded_len {
@@ -299,29 +277,13 @@ mod tests {
     }
 
     fn version_only_tags() -> Tags {
-        Tags::parse([[TAG_VERSION, VERSION_MIP05_V1]]).unwrap()
-    }
-
-    fn valid_tags_with_encoding() -> Tags {
-        Tags::parse([
-            [TAG_VERSION, VERSION_MIP05_V1],
-            [TAG_ENCODING, ENCODING_BASE64],
-        ])
-        .unwrap()
+        Tags::parse([[TAG_VERSION, VERSION_MARMOT_PUSH_V1]]).unwrap()
     }
 
     fn notification(content: String) -> UnwrappedNotification {
         UnwrappedNotification {
             content,
             tags: version_only_tags(),
-            created_at: Timestamp::now(),
-        }
-    }
-
-    fn notification_with_encoding(content: String) -> UnwrappedNotification {
-        UnwrappedNotification {
-            content,
-            tags: valid_tags_with_encoding(),
             created_at: Timestamp::now(),
         }
     }
@@ -614,31 +576,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rejects_missing_version_tag() {
+    fn test_parse_rejects_non_version_tag() {
         let notification = UnwrappedNotification {
             content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
-            tags: Tags::parse([[TAG_ENCODING, ENCODING_BASE64]]).unwrap(),
+            tags: Tags::parse([["encoding", "base64"]]).unwrap(),
             created_at: Timestamp::now(),
         };
 
         let result = notification.parse_tokens();
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Missing required v tag")
-        );
+        assert!(result.unwrap_err().to_string().contains("unsupported tag"));
     }
 
     #[test]
     fn test_parse_rejects_missing_version_tag_value() {
         let notification = UnwrappedNotification {
             content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
-            tags: Tags::from_list(vec![
-                Tag::parse([TAG_VERSION]).unwrap(),
-                Tag::parse([TAG_ENCODING, ENCODING_BASE64]).unwrap(),
-            ]),
+            tags: Tags::from_list(vec![Tag::parse([TAG_VERSION]).unwrap()]),
             created_at: Timestamp::now(),
         };
 
@@ -648,7 +602,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Missing value for required v tag")
+                .contains("Missing value for required version tag")
         );
     }
 
@@ -755,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_succeeds_without_encoding_tag() {
+    fn test_parse_accepts_exact_version_tag() {
         let token = vec![0x01; ENCRYPTED_TOKEN_SIZE];
         let notification = notification(BASE64_STANDARD.encode(&token));
 
@@ -765,63 +719,51 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_succeeds_with_encoding_tag() {
+    fn test_parse_rejects_encoding_tag() {
         let token = vec![0x01; ENCRYPTED_TOKEN_SIZE];
-        let notification = notification_with_encoding(BASE64_STANDARD.encode(&token));
+        let notification = UnwrappedNotification {
+            content: BASE64_STANDARD.encode(&token),
+            tags: Tags::parse([
+                [TAG_VERSION, VERSION_MARMOT_PUSH_V1],
+                ["encoding", "base64"],
+            ])
+            .unwrap(),
+            created_at: Timestamp::now(),
+        };
 
-        let tokens = notification.parse_tokens().unwrap();
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0], token);
+        assert!(notification.parse_tokens().is_err());
     }
 
     #[test]
-    fn test_parse_rejects_malformed_encoding_tag_missing_value() {
+    fn test_parse_rejects_missing_version_tag() {
+        let notification = UnwrappedNotification {
+            content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
+            tags: Tags::new(),
+            created_at: Timestamp::now(),
+        };
+
+        assert!(notification.parse_tokens().is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_duplicate_version_tags() {
         let notification = UnwrappedNotification {
             content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
             tags: Tags::from_list(vec![
-                Tag::parse([TAG_VERSION, VERSION_MIP05_V1]).unwrap(),
-                Tag::parse([TAG_ENCODING]).unwrap(),
+                Tag::parse([TAG_VERSION, VERSION_MARMOT_PUSH_V1]).unwrap(),
+                Tag::parse([TAG_VERSION, VERSION_MARMOT_PUSH_V1]).unwrap(),
             ]),
             created_at: Timestamp::now(),
         };
 
-        let result = notification.parse_tokens();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Missing value for encoding tag")
-        );
+        assert!(notification.parse_tokens().is_err());
     }
 
     #[test]
-    fn test_parse_rejects_duplicate_conflicting_encoding_tags() {
-        let notification = UnwrappedNotification {
-            content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
-            tags: Tags::from_list(vec![
-                Tag::parse([TAG_VERSION, VERSION_MIP05_V1]).unwrap(),
-                Tag::parse([TAG_ENCODING, ENCODING_BASE64]).unwrap(),
-                Tag::parse([TAG_ENCODING, "hex"]).unwrap(),
-            ]),
-            created_at: Timestamp::now(),
-        };
-
-        let result = notification.parse_tokens();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Unsupported encoding tag value")
-        );
-    }
-
-    #[test]
-    fn test_parse_rejects_invalid_encoding_tag() {
+    fn test_parse_rejects_legacy_version() {
         let notification = UnwrappedNotification {
             content: BASE64_STANDARD.encode(vec![0x11; ENCRYPTED_TOKEN_SIZE]),
-            tags: Tags::parse([[TAG_VERSION, VERSION_MIP05_V1], [TAG_ENCODING, "hex"]]).unwrap(),
+            tags: Tags::parse([[TAG_VERSION, "mip05-v1"]]).unwrap(),
             created_at: Timestamp::now(),
         };
 
@@ -831,14 +773,14 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Unsupported encoding tag value: hex")
+                .contains("Unsupported version tag value: mip05-v1")
         );
     }
 
     #[test]
     fn test_tag_value_error_escapes_and_truncates_attacker_content() {
         let long_tail = "B".repeat(512);
-        let injected = format!("mip05-v1\n2026-07-03 ERROR forged line {long_tail}");
+        let injected = format!("marmot-push-v1\n2026-07-03 ERROR forged line {long_tail}");
         let notification = UnwrappedNotification {
             content: BASE64_STANDARD.encode(vec![0x01; ENCRYPTED_TOKEN_SIZE]),
             tags: Tags::parse([[TAG_VERSION, injected.as_str()]]).unwrap(),
@@ -847,7 +789,7 @@ mod tests {
 
         let message = notification.parse_tokens().unwrap_err().to_string();
 
-        assert!(message.contains("Unsupported v tag value"));
+        assert!(message.contains("Unsupported version tag value"));
         // The raw value must never appear: no control characters, no
         // unbounded content.
         assert!(!message.contains(&injected));

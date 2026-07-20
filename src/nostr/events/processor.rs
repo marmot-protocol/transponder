@@ -1,11 +1,10 @@
 //! Gift-wrapped notification event processing.
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lru::LruCache;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -16,46 +15,27 @@ use super::admission::{
     AdmissionGuard, AdmittedCharges, InFlightEventGuard, ProcessOutcome, StageTimer,
     platform_metric_label,
 };
-use super::dedup::{
-    CLEANUP_BATCH_SIZE, DEDUP_WINDOW, PersistentDedupState, SeenEvent, SeenEventStore,
-};
+use super::dedup::{DEDUP_WINDOW, Reservation, SeenEventStore};
 use crate::crypto::{Nip59Handler, TokenDecryptor, TokenPayload};
+use crate::defaults::DEFAULT_MAX_DEDUP_CACHE_SIZE;
 use crate::defaults::{
     DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_HOUR, DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_SIZE,
     DEFAULT_MAX_TOKENS_PER_EVENT, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
-};
-use crate::defaults::{
-    DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-    DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
 };
 use crate::error::{Error, Result};
 use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
 use crate::push::PushDispatcher;
 use crate::rate_limiter::{RateLimitConfig, RateLimiter};
 
-const FUTURE_NOTIFICATION_ERROR: &str = "Notification request timestamp is too far in the future";
-const STALE_NOTIFICATION_ERROR: &str = "Notification request timestamp is stale";
-
 /// Event processor for handling incoming gift-wrapped notifications.
 pub struct EventProcessor {
     nip59_handler: Nip59Handler,
     token_decryptor: TokenDecryptor,
     push_dispatcher: Arc<PushDispatcher>,
-    /// Event ID replay-protection state.
+    /// Short-lived SHA-256 deduplication state for decoded trigger content.
     seen_events: Arc<RwLock<SeenEventStore>>,
-    /// Volatile per-token terminal replay state keyed by event ID plus the
-    /// encrypted-token hash. This lets a mixed event stay retryable for tokens
-    /// that were transiently shed while skipping siblings that already reached
-    /// terminal local processing.
-    terminal_tokens: Arc<RwLock<LruCache<[u8; 32], Instant>>>,
-    /// Optional durable event-ID replay state.
-    dedup_persistence: Option<Arc<PersistentDedupState>>,
-    /// How long event IDs remain in replay state.
+    /// How long decoded trigger-content hashes remain in replay state.
     dedup_retention: Duration,
-    /// Maximum accepted age for the unwrapped notification rumor.
-    max_notification_age: Duration,
-    /// Tolerated sender/server clock skew for future-dated notification rumors.
-    max_notification_future_skew: Duration,
     /// Global pre-unwrap admission limiter.
     ///
     /// Checked BEFORE the gift-wrap unwrap (ECDH + seal decryption) using a
@@ -74,7 +54,6 @@ pub struct EventProcessor {
 
 struct AdmittedToken {
     charges: AdmittedCharges,
-    replay_key: [u8; 32],
 }
 
 /// Configuration for token rate limiting.
@@ -142,35 +121,17 @@ impl TokenRateLimitConfig {
     }
 }
 
-/// Replay-protection configuration for event IDs and notification freshness.
+/// Short-lived replay-protection configuration for trigger-content hashes.
 #[derive(Debug, Clone)]
 pub struct ReplayProtectionConfig {
-    /// Maximum in-memory event IDs retained for duplicate suppression when
-    /// durable replay state is disabled.
-    ///
-    /// When `dedup_state_path` is set, all terminal event IDs inside
-    /// `dedup_retention` are kept so durable replay state covers the full relay
-    /// lookback window instead of being capped by this LRU size.
-    ///
+    /// Maximum in-memory content hashes retained for duplicate suppression.
     /// `NonZeroUsize` so a zero capacity is unrepresentable here: production
     /// config rejects `server.max_dedup_cache_size = 0` at load time with a
     /// named-field error instead of the constructor silently substituting the
     /// default.
     pub max_dedup_cache_size: NonZeroUsize,
-    /// Optional durable replay-state path.
-    ///
-    /// The file stores only public Nostr gift-wrap event IDs and the time they
-    /// reached a terminal state. It does not store tokens, payloads, sender
-    /// identities, device identifiers, or relay URLs.
-    pub dedup_state_path: Option<PathBuf>,
-    /// How long event IDs remain eligible for duplicate suppression.
+    /// How long content hashes remain eligible for duplicate suppression.
     pub dedup_retention: Duration,
-    /// Maximum accepted age for the unwrapped kind:446 notification rumor.
-    ///
-    /// Set to zero to disable the freshness bound.
-    pub max_notification_age: Duration,
-    /// Tolerated future clock skew for the unwrapped notification rumor.
-    pub max_notification_future_skew: Duration,
 }
 
 impl Default for ReplayProtectionConfig {
@@ -178,12 +139,7 @@ impl Default for ReplayProtectionConfig {
         Self {
             max_dedup_cache_size: NonZeroUsize::new(DEFAULT_MAX_DEDUP_CACHE_SIZE)
                 .expect("DEFAULT_MAX_DEDUP_CACHE_SIZE is non-zero"),
-            dedup_state_path: None,
             dedup_retention: DEDUP_WINDOW,
-            max_notification_age: Duration::from_secs(DEFAULT_MAX_NOTIFICATION_AGE_SECS),
-            max_notification_future_skew: Duration::from_secs(
-                DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-            ),
         }
     }
 }
@@ -192,21 +148,10 @@ impl ReplayProtectionConfig {
     /// Build from a validated [`crate::config::ServerConfig`].
     #[must_use]
     pub fn from_server_config(server: &crate::config::ServerConfig) -> Self {
-        let dedup_state_path = if server.dedup_state_path.as_os_str().is_empty() {
-            None
-        } else {
-            Some(server.dedup_state_path.clone())
-        };
-
         Self {
             max_dedup_cache_size: NonZeroUsize::new(server.max_dedup_cache_size)
                 .expect("server.max_dedup_cache_size validated non-zero"),
-            dedup_state_path,
             dedup_retention: Duration::from_secs(server.dedup_retention_secs),
-            max_notification_age: Duration::from_secs(server.max_notification_age_secs),
-            max_notification_future_skew: Duration::from_secs(
-                server.max_notification_future_skew_secs,
-            ),
         }
     }
 }
@@ -224,38 +169,14 @@ impl EventProcessor {
         // `max_dedup_cache_size` is `NonZeroUsize`, so the previous silent
         // zero-to-default substitution is unrepresentable.
         let cache_size = replay_config.max_dedup_cache_size;
-        let terminal_token_cache_size = NonZeroUsize::new(
-            cache_size
-                .get()
-                .saturating_mul(rate_limit_config.max_tokens_per_event.get())
-                .max(1),
-        )
-        .expect("token replay cache size is non-zero");
-
-        let (seen_events, dedup_persistence) = if let Some(path) = replay_config.dedup_state_path {
-            let seen =
-                PersistentDedupState::load_seen_events(&path, replay_config.dedup_retention)?;
-            (
-                Arc::new(RwLock::new(seen)),
-                Some(Arc::new(PersistentDedupState::new(path)?)),
-            )
-        } else {
-            (
-                Arc::new(RwLock::new(SeenEventStore::bounded(cache_size))),
-                None,
-            )
-        };
+        let seen_events = Arc::new(RwLock::new(SeenEventStore::bounded(cache_size)));
 
         Ok(Self {
             nip59_handler,
             token_decryptor,
             push_dispatcher,
             seen_events,
-            terminal_tokens: Arc::new(RwLock::new(LruCache::new(terminal_token_cache_size))),
-            dedup_persistence,
             dedup_retention: replay_config.dedup_retention,
-            max_notification_age: replay_config.max_notification_age,
-            max_notification_future_skew: replay_config.max_notification_future_skew,
             // A single fixed `()` key, so capacity of 1 entry is sufficient.
             global_unwrap_limiter: RateLimiter::new(RateLimitConfig {
                 max_per_minute: rate_limit_config.global_unwrap_per_minute,
@@ -287,39 +208,18 @@ impl EventProcessor {
     pub async fn process(&self, event: &Event) -> Result<bool> {
         let _in_flight = InFlightEventGuard::new(&self.metrics);
         let started_at = StageTimer::start();
-
-        // Record event received
         self.metrics.record_event_received();
-
-        // Logged at trace, not info: the kind:1059 event ID is a stable,
-        // public correlation handle. Emitting it per-event at info would
-        // persist delivery-timing metadata in logs (and downstream log
-        // shipping) — exactly what this privacy-preserving server avoids.
-        trace!(event_id = %event.id, "Received Nostr notification event");
-
-        // Cheap duplicate fast path before the global admission gate. This
-        // preserves duplicate-vs-shed metric fidelity without making a unique
-        // flood take the event-dedup write lock before the cheap global
-        // throttle.
-        if self.contains_seen(&event.id).await {
-            trace!("Skipping duplicate event");
-            self.metrics.record_event_deduplicated();
-            self.metrics.observe_event_processing_duration(
-                EventOutcome::Duplicate,
-                started_at.elapsed_secs(),
-            );
-
-            return Ok(false);
-        }
+        trace!("Received Nostr notification event");
 
         // Global pre-unwrap admission control.
         //
         // Checked BEFORE the expensive NIP-59 gift-wrap unwrap (ECDH + seal
-        // decryption) and before the event-ID write reservation. The server
+        // decryption). The content-hash dedup key is intentionally unavailable
+        // until after a successful unwrap and exact trigger validation. The server
         // pubkey is public and gift wraps are sender-anonymous, so a cheap
         // GLOBAL throttle is the correct first write-free admission control for
         // unique-ID floods. When the budget is exceeded we shed the event
-        // without unwrapping and without touching dedup state.
+        // without unwrapping and without touching the content-hash cache.
         let admission = self.global_unwrap_limiter.check_and_increment(&()).await;
         if !admission.is_allowed() {
             trace!(
@@ -333,36 +233,44 @@ impl EventProcessor {
             return Ok(false);
         }
 
-        // Atomically reserve the event ID after admission.
-        //
-        // The reservation (check-and-mark) happens under a single write-lock
-        // critical section so concurrent deliveries of the same event ID — now
-        // possible because the event loop in `main.rs` processes events in
-        // bounded-concurrency spawned tasks — cannot both pass the dedup gate
-        // and dispatch duplicate notifications. A concurrent duplicate can
-        // still race past the read-only fast path above; this reserve remains
-        // the authoritative check. The reservation is rolled back
-        // (`release_reservation`) on transient failures so those events remain
-        // eligible for retry, preserving the prior "not marked seen on
-        // transient failure" semantics.
-        if !self.try_reserve(event.id).await {
-            trace!("Skipping duplicate event");
-            self.metrics.record_event_deduplicated();
-            self.metrics.observe_event_processing_duration(
-                EventOutcome::Duplicate,
-                started_at.elapsed_secs(),
-            );
+        let (content_hash, token_bytes) = match self.parse_trigger(event).await {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                warn!(error = %error, "Failed to process event");
+                self.metrics.record_event_failed();
+                self.metrics.observe_event_processing_duration(
+                    EventOutcome::Failed,
+                    started_at.elapsed_secs(),
+                );
+                return Ok(false);
+            }
+        };
 
-            return Ok(false);
+        // Reserve the stable decoded-content hash, not the rewrappable outer
+        // gift-wrap ID. A racing duplicate waits for the owner to finish. If
+        // the owner releases a transient result, the waiter retries the
+        // reservation itself instead of silently losing the only redelivery.
+        loop {
+            match self.try_reserve(content_hash).await {
+                Reservation::Acquired => break,
+                Reservation::Duplicate => {
+                    trace!("Skipping duplicate trigger content");
+                    self.metrics.record_event_deduplicated();
+                    self.metrics.observe_event_processing_duration(
+                        EventOutcome::Duplicate,
+                        started_at.elapsed_secs(),
+                    );
+                    return Ok(false);
+                }
+                Reservation::Wait(mut completed) => {
+                    let _ = completed.changed().await;
+                }
+            }
         }
 
-        // Process the event
-        match self.process_inner(event).await {
+        match self.process_inner(token_bytes).await {
             Ok(ProcessOutcome::Admitted) => {
-                // Refresh the seen timestamp now that processing succeeded, so
-                // the dedup window is measured from completion. The reservation
-                // taken above already keeps the event marked seen.
-                self.mark_seen(event.id).await;
+                self.mark_seen(content_hash).await;
 
                 // Logged at trace, not info: emitting a per-event success line
                 // at the default level persists delivery-timing metadata in
@@ -385,7 +293,7 @@ impl EventProcessor {
                 // not a permanent result. Release the reservation so a relay
                 // redelivery after the rate window resets is not dropped as a
                 // duplicate, and do NOT count it as processed.
-                self.release_reservation(&event.id).await;
+                self.release_reservation(&content_hash).await;
                 trace!("Shed event (all tokens per-token rate limited)");
                 self.metrics.record_event_rate_limited();
                 self.metrics.observe_event_processing_duration(
@@ -399,11 +307,11 @@ impl EventProcessor {
                 if Self::is_permanent_error(&e) {
                     // Permanent failures stay marked seen (via the reservation)
                     // so replays short-circuit as duplicates.
-                    self.mark_seen(event.id).await;
+                    self.mark_seen(content_hash).await;
                 } else {
                     // Transient failures release the reservation so the event
                     // can be retried on a later delivery.
-                    self.release_reservation(&event.id).await;
+                    self.release_reservation(&content_hash).await;
                 }
 
                 // Log but don't propagate - we want to continue processing other events
@@ -423,7 +331,7 @@ impl EventProcessor {
     fn is_permanent_error(error: &Error) -> bool {
         match error {
             Error::Crypto(_) => true,
-            Error::InvalidToken(message) => message != FUTURE_NOTIFICATION_ERROR,
+            Error::InvalidToken(_) => true,
             Error::Config(_)
             | Error::Nostr(_)
             | Error::Apns(_)
@@ -438,24 +346,8 @@ impl EventProcessor {
         }
     }
 
-    fn validate_notification_freshness(&self, created_at: Timestamp) -> Result<()> {
-        let now = Timestamp::now().as_secs();
-        let created_at = created_at.as_secs();
-        if created_at > now.saturating_add(self.max_notification_future_skew.as_secs()) {
-            return Err(Error::InvalidToken(FUTURE_NOTIFICATION_ERROR.to_string()));
-        }
-
-        if !self.max_notification_age.is_zero()
-            && now.saturating_sub(created_at) > self.max_notification_age.as_secs()
-        {
-            return Err(Error::InvalidToken(STALE_NOTIFICATION_ERROR.to_string()));
-        }
-
-        Ok(())
-    }
-
-    /// Inner processing logic for an event.
-    async fn process_inner(&self, event: &Event) -> Result<ProcessOutcome> {
+    /// Unwrap, validate, and parse a trigger before it can enter the content-hash cache.
+    async fn parse_trigger(&self, event: &Event) -> Result<(EventId, Vec<Vec<u8>>)> {
         // Unwrap the gift wrap to get the notification request
         let unwrap_started_at = StageTimer::start();
         let notification = match self.nip59_handler.unwrap(event).await {
@@ -476,8 +368,6 @@ impl EventProcessor {
                 return Err(e);
             }
         };
-
-        self.validate_notification_freshness(notification.created_at)?;
 
         debug!("Unwrapped notification request");
 
@@ -505,6 +395,17 @@ impl EventProcessor {
             }
         };
 
+        let mut hasher = Sha256::new();
+        for token in &token_bytes {
+            hasher.update(token);
+        }
+        let content_hash = EventId::from_byte_array(hasher.finalize().into());
+
+        Ok((content_hash, token_bytes))
+    }
+
+    /// Decrypt, admit, and dispatch the already validated token chunks.
+    async fn process_inner(&self, token_bytes: Vec<Vec<u8>>) -> Result<ProcessOutcome> {
         // `parse_tokens_with_limit` rejects empty blobs with `InvalidToken`, so
         // `token_bytes` is non-empty on the `Ok` path; the "nothing admitted"
         // case is handled after the per-token loop.
@@ -516,16 +417,12 @@ impl EventProcessor {
         // Prevents wasting CPU on tokens we'll immediately rate-limit anyway.
         let mut payloads = Vec::with_capacity(token_bytes.len());
         let mut admitted_tokens: Vec<AdmittedToken> = Vec::with_capacity(token_bytes.len());
-        // Track whether any token remains retryable due to transient per-token
-        // rate limiting. Terminal sibling tokens are recorded in
-        // `terminal_tokens` and skipped on redelivery, so they no longer force
-        // the whole event into terminal event-ID dedup state.
+        let mut unique_tokens = HashSet::with_capacity(token_bytes.len());
         let mut rate_limited_any = false;
         for bytes in token_bytes {
             let encrypted_key = Self::hash_bytes(&bytes);
-            let token_replay_key = Self::token_replay_key(&event.id, &encrypted_key);
-            if self.token_is_terminal(&token_replay_key).await {
-                trace!("Skipping token already terminal for this event");
+            if !unique_tokens.insert(encrypted_key) {
+                trace!("Skipping repeated encrypted token within trigger");
                 continue;
             }
 
@@ -598,13 +495,12 @@ impl EventProcessor {
                     p
                 }
                 Err(e) => {
-                    // Silently ignore invalid tokens per MIP-05 spec.
+                    // Silently ignore invalid tokens as advisory push hygiene.
                     // Keep the encrypted-token rate-limit increment: invalid
                     // encrypted blobs should still spend replay/spam budget.
                     // A decrypt failure is permanent for this token, but not
                     // for transiently-shed siblings in the same event.
                     guard.keep_charge();
-                    self.mark_token_terminal(token_replay_key).await;
                     trace!(error = %e, "Failed to decrypt token (ignoring)");
                     self.metrics.record_token_decryption_failed();
                     self.metrics.observe_token_decrypt_duration(
@@ -625,7 +521,6 @@ impl EventProcessor {
             // it silently after both limiters were charged.
             if !self.push_dispatcher.accepts(payload.platform) {
                 guard.refund().await;
-                self.mark_token_terminal(token_replay_key).await;
                 let platform = platform_metric_label(payload.platform);
                 trace!(platform, "Dropping token: platform not configured");
                 self.metrics.record_push_failed(platform, "unconfigured");
@@ -634,7 +529,6 @@ impl EventProcessor {
             }
             if !PushDispatcher::token_is_encodable(&payload) {
                 guard.refund().await;
-                self.mark_token_terminal(token_replay_key).await;
                 let platform = platform_metric_label(payload.platform);
                 trace!(platform, "Dropping token: device token not encodable");
                 self.metrics
@@ -681,7 +575,6 @@ impl EventProcessor {
             // rolls back exactly the rate-limit increments for admitted work.
             admitted_tokens.push(AdmittedToken {
                 charges: guard.commit(),
-                replay_key: token_replay_key,
             });
         }
 
@@ -707,15 +600,11 @@ impl EventProcessor {
                 );
                 self.metrics.observe_notifications_admitted_per_event(count);
 
-                for admitted in &admitted_tokens {
-                    self.mark_token_terminal(admitted.replay_key).await;
-                }
-
-                if rate_limited_any {
-                    Ok(ProcessOutcome::RateLimitedShed)
-                } else {
-                    Ok(ProcessOutcome::Admitted)
-                }
+                // Once any notification has been handed to the dispatcher the
+                // whole trigger is terminal locally. Re-driving a transiently
+                // shed sibling would also redispatch successful siblings after
+                // a restart or cache eviction.
+                Ok(ProcessOutcome::Admitted)
             }
             Err(e) => {
                 for admitted in &admitted_tokens {
@@ -760,24 +649,6 @@ impl EventProcessor {
         hasher.finalize().into()
     }
 
-    /// Hash `(event_id, encrypted_token_hash)` into a bounded-cache key.
-    fn token_replay_key(event_id: &EventId, encrypted_key: &[u8; 32]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(event_id.to_hex().as_bytes());
-        hasher.update(encrypted_key);
-        hasher.finalize().into()
-    }
-
-    async fn token_is_terminal(&self, replay_key: &[u8; 32]) -> bool {
-        let terminal_tokens = self.terminal_tokens.read().await;
-        terminal_tokens.contains(replay_key)
-    }
-
-    async fn mark_token_terminal(&self, replay_key: [u8; 32]) {
-        let mut terminal_tokens = self.terminal_tokens.write().await;
-        terminal_tokens.put(replay_key, Instant::now());
-    }
-
     /// Hash device token key (platform || device_token) for rate limiting.
     fn hash_device_token_key(payload: &TokenPayload) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -786,10 +657,11 @@ impl EventProcessor {
         hasher.finalize().into()
     }
 
-    /// Read-only check for event replay state.
-    async fn contains_seen(&self, event_id: &EventId) -> bool {
+    /// Read-only check for terminal trigger-content state.
+    #[cfg(test)]
+    async fn contains_seen(&self, content_hash: &EventId) -> bool {
         let seen = self.seen_events.read().await;
-        seen.contains(event_id)
+        seen.contains_terminal(content_hash)
     }
 
     /// Test-facing duplicate check.
@@ -798,46 +670,27 @@ impl EventProcessor {
         self.contains_seen(event_id).await
     }
 
-    /// Atomically reserve an event ID for processing.
-    ///
-    /// Returns `true` if the reservation succeeded (the event was previously
-    /// unseen and is now marked seen), or `false` if the event was already
-    /// seen/reserved — i.e. a duplicate.
-    ///
-    /// The check-and-insert happens under a single write-lock critical section
-    /// so that concurrent deliveries of the same Nostr event ID (common when
-    /// the same event arrives from multiple relays) cannot both observe the
-    /// event as unseen. Without this, the bounded-concurrency event loop in
-    /// `main.rs` — which spawns a task per event — would let duplicates race
-    /// past a non-atomic check-then-mark sequence and dispatch duplicate push
-    /// notifications.
-    ///
-    /// On transient (retryable) processing failure or admission shedding, the
-    /// reservation must be released with [`Self::release_reservation`] so the
-    /// event can be retried later.
-    async fn try_reserve(&self, event_id: EventId) -> bool {
+    /// Atomically reserve a decoded trigger-content hash for processing.
+    async fn try_reserve(&self, content_hash: EventId) -> Reservation {
         let mut seen = self.seen_events.write().await;
-        if seen.contains(&event_id) {
-            return false;
+        let previous_len = seen.len();
+        let reservation = seen.reserve(content_hash, Instant::now());
+        if seen.len() != previous_len {
+            self.metrics.set_dedup_cache_size(seen.len());
         }
-        seen.put(event_id, SeenEvent::reservation(Instant::now()));
-
-        // Update cache size metric
-        self.metrics.set_dedup_cache_size(seen.len());
-
-        true
+        reservation
     }
 
-    /// Release a previously reserved event ID.
+    /// Release a previously reserved trigger-content hash.
     ///
     /// Used to roll back a [`Self::try_reserve`] when processing did not reach
     /// a terminal state (transient failure or pre-unwrap admission shedding),
     /// so the event remains eligible for retry. This is the inverse of the
     /// reservation and preserves the prior "not marked seen on transient
     /// failure" semantics.
-    async fn release_reservation(&self, event_id: &EventId) {
+    async fn release_reservation(&self, content_hash: &EventId) {
         let mut seen = self.seen_events.write().await;
-        seen.pop(event_id);
+        seen.release(content_hash);
 
         // Update cache size metric
         self.metrics.set_dedup_cache_size(seen.len());
@@ -850,7 +703,7 @@ impl EventProcessor {
     /// [`Self::try_reserve`]; this updates its timestamp so the dedup window is
     /// measured from completion. Kept distinct from `try_reserve` for clarity
     /// at the call sites.
-    async fn mark_seen(&self, event_id: EventId) {
+    async fn mark_seen(&self, content_hash: EventId) {
         let now = Instant::now();
         {
             let mut seen = self.seen_events.write().await;
@@ -860,22 +713,9 @@ impl EventProcessor {
             // old double-lock path carried is skipped (#197). The gauge is only
             // touched on the rare path where the entry was evicted between
             // reservation and completion and had to be re-inserted.
-            let size_changed = seen.mark_terminal(event_id, now);
+            let size_changed = seen.mark_terminal(content_hash, now);
             if size_changed {
                 self.metrics.set_dedup_cache_size(seen.len());
-            }
-        }
-
-        if let Some(ref state) = self.dedup_persistence {
-            let _guard = state.write_lock.lock().await;
-            if let Err(e) = state
-                .append_seen_locked(event_id, Timestamp::now().as_secs())
-                .await
-            {
-                warn!(
-                    error = %e,
-                    "Failed to persist event deduplication state"
-                );
             }
         }
     }
@@ -883,22 +723,11 @@ impl EventProcessor {
     /// Clean up all caches by removing expired entries.
     ///
     /// Uses incremental cleanup for volatile LRU state to avoid holding write
-    /// locks for extended periods. Durable replay state scans all retained IDs
-    /// so the persisted set stays bounded by retention rather than cache size.
-    /// Call periodically for full cleanup of all expired entries.
+    /// locks for extended periods.
     pub async fn cleanup(&self) {
-        // Clean event deduplication cache
-        let persistence = self.dedup_persistence.clone();
-        let _persistence_guard = if let Some(ref state) = persistence {
-            Some(state.write_lock.lock().await)
-        } else {
-            None
-        };
-
-        let (evicted, remaining, retained_entries) = {
+        let (evicted, remaining) = {
             let mut seen = self.seen_events.write().await;
             let now = Instant::now();
-            let now_wall = Timestamp::now().as_secs();
 
             let expired_keys = seen.expired_keys(now, self.dedup_retention);
 
@@ -906,27 +735,8 @@ impl EventProcessor {
                 seen.pop(key);
             }
 
-            let retained_entries = if persistence.is_some() {
-                seen.terminal_entries(now_wall, now)
-            } else {
-                Vec::new()
-            };
-
-            (expired_keys.len(), seen.len(), retained_entries)
+            (expired_keys.len(), seen.len())
         };
-
-        if evicted > 0 {
-            let rewrite_result = match persistence.as_ref() {
-                Some(state) => state.rewrite_locked(&retained_entries).await,
-                None => Ok(()),
-            };
-            if let Err(e) = rewrite_result {
-                warn!(
-                    error = %e,
-                    "Failed to compact event deduplication state"
-                );
-            }
-        }
 
         self.metrics.set_dedup_cache_size(remaining);
         if evicted > 0 {
@@ -938,21 +748,6 @@ impl EventProcessor {
                 remaining = remaining,
                 "Cleaned up event deduplication cache"
             );
-        }
-
-        {
-            let mut terminal_tokens = self.terminal_tokens.write().await;
-            let now = Instant::now();
-            let expired_keys: Vec<_> = terminal_tokens
-                .iter()
-                .rev()
-                .take(CLEANUP_BATCH_SIZE)
-                .filter(|(_, seen_at)| now.duration_since(**seen_at) >= self.dedup_retention)
-                .map(|(key, _)| *key)
-                .collect();
-            for key in &expired_keys {
-                terminal_tokens.pop(key);
-            }
         }
 
         // Clean global pre-unwrap admission limiter cache.
@@ -1044,6 +839,7 @@ impl EventProcessorBuilder {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn replay_config(mut self, config: ReplayProtectionConfig) -> Self {
         self.replay_config = config;
         self
@@ -1073,12 +869,11 @@ mod tests {
     use crate::config::ApnsConfig;
     use crate::crypto::Platform;
     use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
-    use crate::defaults::{
-        DEFAULT_MAX_NOTIFICATION_AGE_SECS, DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-        DEFAULT_MAX_TOKENS_PER_EVENT,
-    };
+    use crate::defaults::DEFAULT_MAX_TOKENS_PER_EVENT;
     use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
-    use crate::nostr::events::dedup::{CLEANUP_BATCH_SIZE, DEDUP_WINDOW, instant_to_unix_secs};
+    use crate::nostr::events::dedup::{
+        CLEANUP_BATCH_SIZE, DEDUP_WINDOW, SeenEvent, instant_to_unix_secs,
+    };
     use crate::push::{ApnsClient, PushDispatcher};
     use crate::test_metrics::{
         counter_value, gauge_value as metric_gauge_value,
@@ -1115,39 +910,21 @@ mod tests {
 
     #[test]
     fn replay_protection_config_from_server_config_matches_settings() {
-        let state_path = PathBuf::from("/var/lib/transponder/dedup-events.log");
         let server = server_config_with(default_server_config(), |server| {
             server.max_dedup_cache_size = 77;
-            server.dedup_state_path = state_path.clone();
             server.dedup_retention_secs = 88;
-            server.max_notification_age_secs = 99;
-            server.max_notification_future_skew_secs = 11;
         });
 
         let replay_config = ReplayProtectionConfig::from_server_config(&server);
 
         assert_eq!(replay_config.max_dedup_cache_size.get(), 77);
-        assert_eq!(replay_config.dedup_state_path, Some(state_path));
         assert_eq!(replay_config.dedup_retention, Duration::from_secs(88));
-        assert_eq!(replay_config.max_notification_age, Duration::from_secs(99));
-        assert_eq!(
-            replay_config.max_notification_future_skew,
-            Duration::from_secs(11)
-        );
     }
 
     #[test]
-    fn replay_protection_config_from_server_config_disables_empty_state_path() {
-        let server = server_config_with(default_server_config(), |server| {
-            server.max_dedup_cache_size = 77;
-            server.dedup_retention_secs = 88;
-            server.max_notification_age_secs = 99;
-            server.max_notification_future_skew_secs = 11;
-        });
-
-        let replay_config = ReplayProtectionConfig::from_server_config(&server);
-
-        assert_eq!(replay_config.dedup_state_path, None);
+    fn replay_protection_defaults_are_short_lived_and_volatile() {
+        let replay_config = ReplayProtectionConfig::default();
+        assert_eq!(replay_config.dedup_retention, Duration::from_secs(300));
     }
 
     fn gauge_value(metrics: &Metrics, name: &str) -> f64 {
@@ -1184,6 +961,7 @@ mod tests {
             .build()
     }
 
+    #[allow(dead_code)]
     fn create_processor_with_replay_config(
         server_keys: &Keys,
         replay_config: ReplayProtectionConfig,
@@ -1410,6 +1188,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rewrapped_trigger_content_is_deduplicated() {
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let encrypted = encryptor.encrypt_base64(&TestToken::apns(
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        ));
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(encrypted)
+            .build();
+        let builder = GiftWrapBuilder::new(server_keys.clone(), sender_keys);
+        let first_wrap = builder.build(&content).await;
+        let second_wrap = builder.build(&content).await;
+        assert_ne!(first_wrap.id, second_wrap.id);
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+        assert!(processor.process(&first_wrap).await.unwrap());
+        assert!(!processor.process(&second_wrap).await.unwrap());
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_dispatched_total",
+                &[("platform", "apns")],
+            ),
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_encrypted_token_in_one_trigger_dispatches_once() {
+        use crate::test_vectors::{
+            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
+        };
+
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let encryptor = TokenEncryptor::from_keys(&server_keys);
+        let encrypted = encryptor.encrypt_base64(&TestToken::apns(
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        ));
+        let content = NotificationContentBuilder::new(&server_keys)
+            .with_raw_token(encrypted.clone())
+            .with_raw_token(encrypted)
+            .build();
+        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
+            .build(&content)
+            .await;
+
+        let (processor, metrics) = create_processor_with_metrics(&server_keys);
+        assert!(processor.process(&event).await.unwrap());
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_push_dispatched_total",
+                &[("platform", "apns")],
+            ),
+            1.0
+        );
+    }
+
+    #[tokio::test]
     async fn test_process_duplicate_event_records_metrics() {
         let server_keys = Keys::generate();
         let sender_keys = Keys::generate();
@@ -1442,315 +1285,6 @@ mod tests {
                 &[("outcome", EventOutcome::Duplicate.as_str())],
             ),
             1
-        );
-    }
-
-    #[tokio::test]
-    async fn test_process_rejects_stale_notification_rumor() {
-        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
-
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-        let content = NotificationContentBuilder::new(&server_keys)
-            .with_apns_token("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678")
-            .build();
-        let stale_created_at = Timestamp::from_secs(
-            Timestamp::now()
-                .as_secs()
-                .saturating_sub(DEFAULT_MAX_NOTIFICATION_AGE_SECS + 1),
-        );
-        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
-            .build_with_created_at(&content, stale_created_at)
-            .await;
-
-        let (processor, metrics) = create_processor_with_metrics(&server_keys);
-        let result = processor.process(&event).await;
-
-        assert!(result.is_ok());
-        assert!(!result.unwrap(), "stale notification must not dispatch");
-        assert_eq!(
-            counter_value(&metrics, "transponder_events_processed_total", &[]),
-            0.0
-        );
-        assert_eq!(
-            counter_value(&metrics, "transponder_events_failed_total", &[]),
-            1.0
-        );
-        assert_eq!(processor.cache_len(), 1, "stale replays are terminal");
-    }
-
-    #[tokio::test]
-    async fn test_process_rejects_future_notification_rumor() {
-        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
-
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-        let content = NotificationContentBuilder::new(&server_keys)
-            .with_apns_token("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678")
-            .build();
-        // One hour beyond the skew tolerance, not +1s: `process()` re-reads
-        // `Timestamp::now()` (1-second granularity) when it validates freshness,
-        // so a whole-second wall-clock tick between here and that read would
-        // collapse a +1s margin onto the exact threshold (`>` becomes `==`) and
-        // spuriously accept the event under load. A large margin exercises the
-        // same "created_at exceeds now + skew" rejection path, drift-proof.
-        let future_created_at = Timestamp::from_secs(
-            Timestamp::now()
-                .as_secs()
-                .saturating_add(DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS + 3600),
-        );
-        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
-            .build_with_created_at(&content, future_created_at)
-            .await;
-
-        let (processor, metrics) = create_processor_with_metrics(&server_keys);
-        let result = processor.process(&event).await;
-
-        assert!(result.is_ok());
-        assert!(
-            !result.unwrap(),
-            "future-dated notification must not dispatch"
-        );
-        assert_eq!(
-            counter_value(&metrics, "transponder_events_processed_total", &[]),
-            0.0
-        );
-        assert_eq!(
-            counter_value(&metrics, "transponder_events_failed_total", &[]),
-            1.0
-        );
-        assert_eq!(
-            processor.cache_len(),
-            0,
-            "future-dated replays must stay retryable"
-        );
-
-        let replay = processor.process(&event).await;
-        assert!(replay.is_ok());
-        assert!(!replay.unwrap());
-        assert_eq!(
-            counter_value(&metrics, "transponder_events_failed_total", &[]),
-            2.0
-        );
-        assert_eq!(
-            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
-            0.0,
-            "future-dated retry must not short-circuit as a duplicate"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_dedup_state_persists_processed_event_across_processors() {
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-        let event = scenarios::single_apns_notification(
-            &server_keys,
-            &sender_keys,
-            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
-        )
-        .await;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state_path = dir.path().join("dedup-state.tsv");
-
-        let processor = create_processor_with_replay_config(
-            &server_keys,
-            ReplayProtectionConfig {
-                dedup_state_path: Some(state_path.clone()),
-                ..ReplayProtectionConfig::default()
-            },
-        );
-        assert!(processor.process(&event).await.unwrap());
-
-        let state = std::fs::read_to_string(&state_path).expect("dedup state written");
-        assert!(
-            state.contains(&event.id.to_hex()),
-            "state file must record processed event IDs"
-        );
-
-        let restarted = create_processor_with_replay_config(
-            &server_keys,
-            ReplayProtectionConfig {
-                dedup_state_path: Some(state_path),
-                ..ReplayProtectionConfig::default()
-            },
-        );
-
-        assert!(
-            !restarted.process(&event).await.unwrap(),
-            "a restarted processor must not re-dispatch an event already in durable dedup state"
-        );
-        assert!(restarted.is_duplicate(&event.id).await);
-    }
-
-    #[tokio::test]
-    async fn test_durable_dedup_state_is_not_capped_by_lru_size() {
-        let server_keys = Keys::generate();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state_path = dir.path().join("dedup-state.tsv");
-        let replay_config = ReplayProtectionConfig {
-            max_dedup_cache_size: NonZeroUsize::new(2).unwrap(),
-            dedup_state_path: Some(state_path.clone()),
-            ..ReplayProtectionConfig::default()
-        };
-        let processor = create_processor_with_replay_config(&server_keys, replay_config.clone());
-        let event_ids: Vec<_> = (0..5)
-            .map(|i| {
-                let mut bytes = [0u8; 32];
-                bytes[0] = i;
-                EventId::from_byte_array(bytes)
-            })
-            .collect();
-
-        for event_id in &event_ids {
-            processor.mark_seen(*event_id).await;
-        }
-
-        assert_eq!(processor.cache_len(), event_ids.len());
-        assert!(processor.is_duplicate(&event_ids[0]).await);
-
-        let restarted = create_processor_with_replay_config(&server_keys, replay_config);
-        assert_eq!(restarted.cache_len(), event_ids.len());
-        for event_id in event_ids {
-            assert!(
-                restarted.is_duplicate(&event_id).await,
-                "durable replay state must retain every ID inside retention, even past max_dedup_cache_size"
-            );
-        }
-    }
-
-    #[test]
-    fn test_dedup_state_loader_ignores_malformed_and_expired_rows() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state_path = dir.path().join("nested").join("dedup-state.tsv");
-        let now = Timestamp::now().as_secs();
-        let retained_id = EventId::from_byte_array([1u8; 32]);
-        let expired_id = EventId::from_byte_array([2u8; 32]);
-        let state = format!(
-            "malformed\nnot-an-event-id {}\n{} not-a-timestamp\n{} {}\n{} {} extra\n{} {}\n",
-            now,
-            retained_id.to_hex(),
-            expired_id.to_hex(),
-            now.saturating_sub(61),
-            EventId::from_byte_array([3u8; 32]).to_hex(),
-            now,
-            retained_id.to_hex(),
-            now
-        );
-        std::fs::create_dir_all(state_path.parent().expect("state parent")).expect("mkdir");
-        std::fs::write(&state_path, state).expect("write state");
-
-        let seen = PersistentDedupState::load_seen_events(&state_path, Duration::from_secs(60))
-            .expect("load state");
-
-        assert!(seen.contains(&retained_id));
-        assert!(!seen.contains(&expired_id));
-        assert_eq!(seen.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_dedup_state_cleanup_compacts_terminal_entries_only() {
-        let server_keys = Keys::generate();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state_path = dir.path().join("dedup-state.tsv");
-        let processor = create_processor_with_replay_config(
-            &server_keys,
-            ReplayProtectionConfig {
-                dedup_state_path: Some(state_path.clone()),
-                dedup_retention: Duration::from_secs(1),
-                ..ReplayProtectionConfig::default()
-            },
-        );
-        let expired_id = EventId::from_byte_array([4u8; 32]);
-        let retained_id = EventId::from_byte_array([5u8; 32]);
-        let reserved_id = EventId::from_byte_array([6u8; 32]);
-
-        {
-            let mut seen = processor.seen_events.write().await;
-            seen.put(
-                expired_id,
-                SeenEvent::terminal(Instant::now() - Duration::from_secs(2)),
-            );
-            seen.put(retained_id, SeenEvent::terminal(Instant::now()));
-            seen.put(reserved_id, SeenEvent::reservation(Instant::now()));
-        }
-
-        processor.cleanup().await;
-
-        let state = std::fs::read_to_string(&state_path).expect("compacted state");
-        assert!(state.contains(&retained_id.to_hex()));
-        assert!(!state.contains(&expired_id.to_hex()));
-        assert!(!state.contains(&reserved_id.to_hex()));
-        assert!(processor.is_duplicate(&retained_id).await);
-        assert!(!processor.is_duplicate(&expired_id).await);
-        assert!(processor.is_duplicate(&reserved_id).await);
-    }
-
-    #[tokio::test]
-    async fn test_notification_freshness_can_be_disabled() {
-        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
-
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-        let content = NotificationContentBuilder::new(&server_keys)
-            .with_apns_token("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678")
-            .build();
-        let stale_created_at = Timestamp::from_secs(
-            Timestamp::now()
-                .as_secs()
-                .saturating_sub(DEFAULT_MAX_NOTIFICATION_AGE_SECS + 1),
-        );
-        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
-            .build_with_created_at(&content, stale_created_at)
-            .await;
-        let processor = create_processor_with_replay_config(
-            &server_keys,
-            ReplayProtectionConfig {
-                max_notification_age: Duration::ZERO,
-                ..ReplayProtectionConfig::default()
-            },
-        );
-
-        assert!(processor.process(&event).await.unwrap());
-    }
-
-    #[test]
-    fn future_freshness_error_is_retryable_but_stale_is_permanent() {
-        assert!(!EventProcessor::is_permanent_error(&Error::InvalidToken(
-            FUTURE_NOTIFICATION_ERROR.to_string()
-        )));
-        assert!(EventProcessor::is_permanent_error(&Error::InvalidToken(
-            STALE_NOTIFICATION_ERROR.to_string()
-        )));
-    }
-
-    #[tokio::test]
-    async fn test_disabled_notification_age_still_rejects_future_rumor() {
-        use crate::test_vectors::{GiftWrapBuilder, NotificationContentBuilder};
-
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-        let content = NotificationContentBuilder::new(&server_keys)
-            .with_apns_token("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678")
-            .build();
-        let future_created_at = Timestamp::from_secs(
-            Timestamp::now()
-                .as_secs()
-                .saturating_add(DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS + 3600),
-        );
-        let event = GiftWrapBuilder::new(server_keys.clone(), sender_keys)
-            .build_with_created_at(&content, future_created_at)
-            .await;
-        let processor = create_processor_with_replay_config(
-            &server_keys,
-            ReplayProtectionConfig {
-                max_notification_age: Duration::ZERO,
-                ..ReplayProtectionConfig::default()
-            },
-        );
-
-        assert!(
-            !processor.process(&event).await.unwrap(),
-            "future skew validation must stay active when stale-age validation is disabled"
         );
     }
 
@@ -1902,13 +1436,13 @@ mod tests {
 
         assert_eq!(
             counter_value(&metrics, "transponder_events_failed_total", &[]),
-            1.0
+            2.0
         );
         assert_eq!(
             counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
-            1.0
+            0.0
         );
-        assert_eq!(processor.cache_len(), 1);
+        assert_eq!(processor.cache_len(), 0);
     }
 
     #[tokio::test]
@@ -2193,37 +1727,6 @@ mod tests {
             ),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn test_process_invalid_token_failure_is_deduplicated_on_replay() {
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-
-        let event = scenarios::empty_notification(&server_keys, &sender_keys).await;
-
-        let (processor, metrics) = create_processor_with_metrics(&server_keys);
-
-        assert!(!processor.process(&event).await.unwrap());
-        assert!(!processor.process(&event).await.unwrap());
-
-        assert_eq!(
-            counter_value(&metrics, "transponder_events_failed_total", &[]),
-            1.0
-        );
-        assert_eq!(
-            counter_value(&metrics, "transponder_events_deduplicated_total", &[]),
-            1.0
-        );
-        assert_eq!(
-            histogram_count(
-                &metrics,
-                "transponder_notification_parse_duration_seconds",
-                &[("outcome", OperationOutcome::Failed.as_str())],
-            ),
-            1
-        );
-        assert_eq!(processor.cache_len(), 1);
     }
 
     #[tokio::test]
@@ -2662,86 +2165,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_encrypted_token_rate_limiting() {
-        use crate::test_vectors::{
-            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
-        };
-
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-
-        // Create processor with very low encrypted token rate limit
-        let processor = create_processor_with_rate_limits(
-            &server_keys,
-            TokenRateLimitConfig {
-                max_cache_size: NonZeroUsize::new(100).unwrap(),
-                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
-                encrypted_token_per_minute: 2, // Only allow 2 per minute per encrypted token
-                encrypted_token_per_hour: 100,
-                device_token_per_minute: 100, // High limit for device tokens
-                device_token_per_hour: 1000,
-                global_unwrap_per_minute: 1000,
-                global_unwrap_per_hour: 10000,
-            },
-        );
-
-        // Encrypt a token once and reuse the same encrypted blob
-        let encryptor = TokenEncryptor::from_keys(&server_keys);
-        let test_token =
-            TestToken::apns("deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678");
-        let encrypted_b64 = encryptor.encrypt_base64(&test_token);
-
-        // Create events with the exact same encrypted token
-        let content = NotificationContentBuilder::new(&server_keys)
-            .with_raw_token(encrypted_b64.clone())
-            .build();
-
-        let event1 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build(&content)
-            .await;
-        let result1 = processor.process(&event1).await;
-        assert!(result1.is_ok());
-        assert!(
-            result1.unwrap(),
-            "First use of encrypted token should succeed"
-        );
-
-        let event2 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build(&content)
-            .await;
-        let result2 = processor.process(&event2).await;
-        assert!(result2.is_ok());
-        assert!(
-            result2.unwrap(),
-            "Second use of encrypted token should succeed"
-        );
-
-        // Third use of the same encrypted blob should be rate limited. The only
-        // token is shed by the encrypted-token limiter, admitting zero
-        // notifications. A pure per-token rate shed is transient back-pressure,
-        // so the event returns false and stays retryable (not marked seen).
-        let event3 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build(&content)
-            .await;
-        let result3 = processor.process(&event3).await;
-        assert!(result3.is_ok());
-        assert!(!result3.unwrap());
-
-        // A different encrypted token (same device) should work since we rate limit
-        // encrypted tokens first
-        let encrypted_b64_2 = encryptor.encrypt_base64(&test_token);
-        let content2 = NotificationContentBuilder::new(&server_keys)
-            .with_raw_token(encrypted_b64_2)
-            .build();
-        let event4 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build(&content2)
-            .await;
-        let result4 = processor.process(&event4).await;
-        assert!(result4.is_ok());
-        assert!(result4.unwrap(), "Different encrypted token should work");
-    }
-
-    #[tokio::test]
     async fn test_device_reject_refunds_encrypted_charge() {
         // #170: when the device-token limiter rejects a token, the encrypted
         // charge already spent for that same token must be rolled back, so a
@@ -2922,7 +2345,8 @@ mod tests {
         // threshold (a genuine prior outage), so we can prove a pre-filtered APNs
         // drop neither resets FCM's streak nor touches APNs's.
         use crate::push::dispatcher::DELIVERY_FAILURE_STREAK_THRESHOLD;
-        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD - 1 {
+        let failures_to_trip = DELIVERY_FAILURE_STREAK_THRESHOLD.div_ceil(2);
+        for _ in 0..failures_to_trip - 1 {
             dispatcher_handle
                 .delivery_health()
                 .record_hard_failure(Platform::Fcm);
@@ -3254,70 +2678,8 @@ mod tests {
             1.0,
             "dedup gauge reflects the single retained terminal entry"
         );
-        assert!(processor.is_duplicate(&event.id).await);
         // The completion refresh kept the entry terminal (a replay dedups).
         assert!(!processor.process(&event).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_rate_limit_window_reset() {
-        use crate::test_vectors::{
-            GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
-        };
-
-        tokio::time::pause();
-
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-
-        let processor = create_processor_with_rate_limits(
-            &server_keys,
-            TokenRateLimitConfig {
-                max_cache_size: NonZeroUsize::new(100).unwrap(),
-                max_tokens_per_event: NonZeroUsize::new(DEFAULT_MAX_TOKENS_PER_EVENT).unwrap(),
-                encrypted_token_per_minute: 1,
-                encrypted_token_per_hour: 100,
-                device_token_per_minute: 100,
-                device_token_per_hour: 1000,
-                global_unwrap_per_minute: 1000,
-                global_unwrap_per_hour: 10000,
-            },
-        );
-
-        let encryptor = TokenEncryptor::from_keys(&server_keys);
-        let test_token =
-            TestToken::apns("aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344");
-        let encrypted_b64 = encryptor.encrypt_base64(&test_token);
-        let content = NotificationContentBuilder::new(&server_keys)
-            .with_raw_token(encrypted_b64)
-            .build();
-
-        // First request succeeds
-        let event1 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build(&content)
-            .await;
-        assert!(processor.process(&event1).await.unwrap());
-
-        // Second request is rate limited (same encrypted token)
-        let event2 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build(&content)
-            .await;
-        processor.process(&event2).await.unwrap();
-        // Can't easily assert the token was skipped without metrics, but we can test window reset
-
-        // Advance time past the minute window
-        tokio::time::advance(Duration::from_secs(61)).await;
-
-        // Now the same token should be allowed again
-        let event3 = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build(&content)
-            .await;
-        let result3 = processor.process(&event3).await;
-        assert!(result3.is_ok());
-        assert!(
-            result3.unwrap(),
-            "Token should be allowed after window reset"
-        );
     }
 
     // === Per-Token Rate-Limit Shed Tests (issue #195) ===
@@ -3421,7 +2783,6 @@ mod tests {
         // Zero admission, but the cause is a permanently invalid token, so the
         // event is terminal (processed with zero notifications), not a rate shed.
         assert!(processor.process(&event).await.unwrap());
-        assert!(processor.is_duplicate(&event.id).await);
         assert_eq!(processor.cache_len(), 1);
         assert_eq!(
             counter_value(&metrics, "transponder_events_processed_total", &[]),
@@ -3510,8 +2871,9 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(61)).await;
 
-        // The replay skips the invalid sibling already marked terminal and
-        // admits the formerly rate-limited token.
+        // With no prior dispatch the whole trigger remains retryable. V2 no
+        // longer keeps a second token-terminal cache, so the invalid sibling is
+        // safely revalidated while the formerly rate-limited token is admitted.
         assert!(processor.process(&event).await.unwrap());
         assert_eq!(
             counter_value(&metrics, "transponder_events_processed_total", &[]),
@@ -3519,8 +2881,7 @@ mod tests {
         );
         assert_eq!(
             counter_value(&metrics, "transponder_tokens_decryption_failed_total", &[]),
-            1.0,
-            "terminal invalid sibling must not be decrypted again on replay"
+            2.0
         );
     }
 
@@ -3568,13 +2929,12 @@ mod tests {
             .build(&content)
             .await;
 
-        // One sibling is admitted, but the event remains retryable for the
-        // transiently shed token.
-        assert!(!processor.process(&event).await.unwrap());
-        assert!(!processor.is_duplicate(&event.id).await);
+        // Once one sibling is dispatched the content hash is terminal. This
+        // avoids redispatching that sibling after restart/cache eviction.
+        assert!(processor.process(&event).await.unwrap());
         assert_eq!(
             counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
-            1.0
+            0.0
         );
         assert_eq!(
             counter_value(
@@ -3587,20 +2947,18 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(61)).await;
 
-        // The admitted sibling is terminal and skipped; only the formerly shed
-        // token is admitted on replay.
-        assert!(processor.process(&event).await.unwrap());
+        assert!(!processor.process(&event).await.unwrap());
         assert_eq!(
             counter_value(
                 &metrics,
                 "transponder_push_dispatched_total",
                 &[("platform", "apns")],
             ),
-            3.0
+            2.0
         );
         assert_eq!(
             counter_value(&metrics, "transponder_events_processed_total", &[]),
-            2.0 // warmup + replay
+            2.0 // warmup + initial mixed trigger
         );
     }
 
@@ -3654,10 +3012,9 @@ mod tests {
             .await;
 
         assert!(
-            !processor.process(&event).await.unwrap(),
-            "event remains retryable for the token shed by the global decrypt budget"
+            processor.process(&event).await.unwrap(),
+            "dispatching any sibling makes the V2 trigger terminal"
         );
-        assert!(!processor.is_duplicate(&event.id).await);
         assert_eq!(
             counter_value(
                 &metrics,
@@ -3668,7 +3025,7 @@ mod tests {
         );
         assert_eq!(
             counter_value(&metrics, "transponder_events_rate_limited_total", &[]),
-            1.0
+            0.0
         );
         assert_eq!(
             counter_value(
@@ -3682,8 +3039,8 @@ mod tests {
         tokio::time::advance(Duration::from_secs(61)).await;
 
         assert!(
-            processor.process(&event).await.unwrap(),
-            "redelivery should skip the first terminal token and admit the previously shed token"
+            !processor.process(&event).await.unwrap(),
+            "redelivery must deduplicate a trigger after any sibling was dispatched"
         );
         assert_eq!(
             counter_value(
@@ -3691,7 +3048,7 @@ mod tests {
                 "transponder_push_dispatched_total",
                 &[("platform", "apns")],
             ),
-            2.0
+            1.0
         );
     }
 

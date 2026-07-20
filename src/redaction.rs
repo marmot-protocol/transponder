@@ -12,7 +12,8 @@
 //!
 //! - APNs device-token URL paths (`/3/device/<hex>`)
 //! - FCM registration tokens (`<app-instance>:<opaque-token>`)
-//! - Provider auth JWTs / bearer credentials (`eyJ…`.`…`.`…`)
+//! - Provider auth JWTs and opaque bearer credentials
+//! - PEM-encoded private keys
 //! - Nostr bech32 secret keys (`nsec1…`)
 //! - `ws://` / `wss://` relay URLs (the host can identify a private relay)
 //! - `.onion` hostnames
@@ -29,19 +30,31 @@ use regex::Regex;
 /// pattern so device tokens shorter than 64 hex chars are still caught when
 /// they appear in a request URL, and `ws(s)://` runs before `.onion` so an onion
 /// relay URL is redacted as a whole.
-static REDACTIONS: LazyLock<[(Regex, &'static str); 6]> = LazyLock::new(|| {
+static REDACTIONS: LazyLock<[(Regex, &'static str); 8]> = LazyLock::new(|| {
     [
         (
             Regex::new(r"(?i)/3/device/[0-9a-f]+").expect("static redaction regex is valid"),
             "/3/device/[REDACTED]",
         ),
         (
-            Regex::new(r"(?i)nsec1[0-9a-z]+").expect("static redaction regex is valid"),
-            "[REDACTED-NSEC]",
+            Regex::new(
+                r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            )
+            .expect("static redaction regex is valid"),
+            "[REDACTED-PRIVATE-KEY]",
+        ),
+        (
+            Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{20,}")
+                .expect("static redaction regex is valid"),
+            "Bearer [REDACTED]",
         ),
         (
             Regex::new(r#"(?i)(wss?)://[^\s"']+"#).expect("static redaction regex is valid"),
-            "$1://[REDACTED]",
+            "[REDACTED-RELAY-URL]",
+        ),
+        (
+            Regex::new(r"(?i)nsec1[0-9a-z]+").expect("static redaction regex is valid"),
+            "[REDACTED-NSEC]",
         ),
         (
             Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
@@ -83,11 +96,16 @@ pub(crate) fn redact(input: &str) -> Cow<'_, str> {
     }
 
     let mut output = input.to_owned();
+    for (pattern, replacement) in REDACTIONS.iter() {
+        if let Cow::Owned(redacted) = pattern.replace_all(&output, *replacement) {
+            output = redacted;
+        }
+    }
+    // Run the broad FCM-token candidate last. In particular, redact relay URLs
+    // first so a token immediately followed by `wss://` cannot consume the URL
+    // scheme and expose its host.
     if has_fcm_token {
         output = redact_fcm_registration_tokens(&output);
-    }
-    for (pattern, replacement) in REDACTIONS.iter() {
-        output = pattern.replace_all(&output, *replacement).into_owned();
     }
     Cow::Owned(output)
 }
@@ -193,7 +211,29 @@ mod tests {
         let output = redact(&input);
 
         assert!(!output.contains(jwt));
-        assert_eq!(output, "authorization: bearer [REDACTED-JWT]");
+        assert_eq!(output, "authorization: Bearer [REDACTED]");
+    }
+
+    #[test]
+    fn opaque_oauth_bearer_tokens_are_redacted() {
+        let token = "ya29.a0AfH6SMB-opaque_fcm_access_token_123456789";
+        let input = format!("authorization: Bearer {token}");
+
+        let output = redact(&input);
+
+        assert!(!output.contains(token));
+        assert_eq!(output, "authorization: Bearer [REDACTED]");
+    }
+
+    #[test]
+    fn pem_private_keys_are_redacted_across_lines() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg\nsecret+/base64material==\n-----END PRIVATE KEY-----";
+        let input = format!("signing failed with key {pem}");
+
+        let output = redact(&input);
+
+        assert!(!output.contains("secret+/base64material"));
+        assert_eq!(output, "signing failed with key [REDACTED-PRIVATE-KEY]");
     }
 
     #[test]
@@ -236,7 +276,7 @@ mod tests {
         let output = redact(input);
 
         assert!(!output.contains("relay.example.com"));
-        assert_eq!(output, "connect to wss://[REDACTED] timed out");
+        assert_eq!(output, "connect to [REDACTED-RELAY-URL] timed out");
     }
 
     #[test]
@@ -246,7 +286,7 @@ mod tests {
         let output = redact(input);
 
         assert!(!output.contains("relay.internal.example.com"));
-        assert_eq!(output, "connect to ws://[REDACTED] failed");
+        assert_eq!(output, "connect to [REDACTED-RELAY-URL] failed");
     }
 
     #[test]
@@ -270,6 +310,16 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_secret_does_not_hide_relay_url() {
+        let input = "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwss://relay.secret.example/path";
+
+        let output = redact(input);
+
+        assert!(!output.contains("relay.secret.example"));
+        assert_eq!(output, "[REDACTED-NSEC][REDACTED-RELAY-URL]");
+    }
+
+    #[test]
     fn multiple_patterns_in_one_message_are_all_redacted() {
         let token = "ab".repeat(32); // 64 hex chars
         let input =
@@ -281,7 +331,7 @@ mod tests {
         assert!(!output.contains(&token));
         assert_eq!(
             output,
-            "panicked: wss://[REDACTED] failed; retry token [REDACTED-HEX]"
+            "panicked: [REDACTED-RELAY-URL] failed; retry token [REDACTED-HEX]"
         );
     }
 

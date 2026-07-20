@@ -7,8 +7,10 @@
 //! `health.enabled`: disabling the health endpoints does not silence the
 //! metrics endpoint (both share the `health.bind_address` listener). The
 //! listener is hardened with a per-request timeout, a request-body cap, and a
-//! global concurrency limit; it should nevertheless stay loopback-bound or
-//! behind an access-controlled proxy, as all routes are unauthenticated.
+//! metrics-route concurrency limit. It must stay loopback-bound or behind an
+//! access-controlled proxy that enforces connection and header-read timeouts:
+//! all routes are unauthenticated, and tower request layers do not cover idle
+//! connections that have not completed their headers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,11 +44,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// beyond a trivial allowance is rejected with `413 Payload Too Large`.
 const MAX_REQUEST_BODY_BYTES: usize = 1024;
 
-/// Maximum concurrently processed requests across all routes.
+/// Maximum concurrently processed metrics requests.
 ///
-/// Health probes and metric scrapes are low-rate; excess concurrent requests
-/// queue behind this cap instead of consuming unbounded task slots and file
-/// descriptors.
+/// Scrapes are isolated from health probes so registry-rendering load cannot
+/// starve liveness/readiness and cause self-inflicted restarts.
 const MAX_CONCURRENT_REQUESTS: usize = 32;
 
 /// Health check response.
@@ -176,7 +177,11 @@ impl HealthServer {
                 .route("/ready", get(ready_handler));
         }
         if self.metrics.is_enabled() {
-            router = router.route("/metrics", get(metrics_handler));
+            router = router.route(
+                "/metrics",
+                get(metrics_handler)
+                    .layer(GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS)),
+            );
         }
 
         // Hardening layers: bound how long any request may run, reject
@@ -185,7 +190,6 @@ impl HealthServer {
         // the last-added layer outermost, so requests flow
         // timeout -> body limit -> concurrency cap -> route.
         let app = router
-            .layer(GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
             .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
             .layer(TimeoutLayer::with_status_code(
                 StatusCode::REQUEST_TIMEOUT,
@@ -234,9 +238,9 @@ async fn health_handler() -> impl IntoResponse {
 ///    no gauges.
 /// 2. **Push configured** — at least one push provider (APNs/FCM) is
 ///    configured.
-/// 3. **Providers delivering** — no *configured* provider is in a sustained
-///    streak of consecutive hard send failures (provider auth rejections and
-///    other permanent errors, or exhausted retry budgets). This signal is
+/// 3. **Providers delivering** — at least one configured provider has a healthy
+///    delivery score. A single-provider outage does not depool a dual-provider
+///    instance that can still deliver the other platform. This signal is
 ///    passive: it is derived from real send outcomes and never probes the
 ///    providers, so a revoked APNs key or expired FCM service account flips
 ///    readiness once the failure streak is observed on live traffic.
@@ -248,14 +252,11 @@ async fn ready_handler(State(state): State<Arc<HealthState>>) -> impl IntoRespon
     let relays_connected = state.relay_client.is_connected().await;
     let apns_configured = state.push_dispatcher.has_apns();
     let fcm_configured = state.push_dispatcher.has_fcm();
-    let apns_delivering = state.push_dispatcher.is_apns_delivering();
-    let fcm_delivering = state.push_dispatcher.is_fcm_delivering();
+    let apns_delivering = apns_configured && state.push_dispatcher.is_apns_delivering();
+    let fcm_delivering = fcm_configured && state.push_dispatcher.is_fcm_delivering();
 
     let push_configured = apns_configured || fcm_configured;
-    // Only configured providers gate readiness; an unconfigured provider's
-    // delivery state is irrelevant.
-    let providers_delivering =
-        (!apns_configured || apns_delivering) && (!fcm_configured || fcm_delivering);
+    let providers_delivering = apns_delivering || fcm_delivering;
 
     let is_ready = relays_connected && push_configured && providers_delivering;
 
@@ -552,9 +553,8 @@ mod tests {
         assert!(!body.relays_connected);
         assert!(!body.apns_configured);
         assert!(!body.fcm_configured);
-        // No failures observed yet, so the passive delivery signal is healthy.
-        assert!(body.apns_delivering);
-        assert!(body.fcm_delivering);
+        assert!(!body.apns_delivering);
+        assert!(!body.fcm_delivering);
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
@@ -809,18 +809,18 @@ mod tests {
         assert!(body.apns_configured);
         assert!(!body.fcm_configured);
         assert!(body.apns_delivering);
-        assert!(body.fcm_delivering);
+        assert!(!body.fcm_delivering);
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
     }
 
     #[tokio::test]
-    async fn test_ready_not_ready_when_configured_provider_stops_delivering() {
-        use crate::config::ApnsConfig;
+    async fn test_ready_stays_ready_when_one_of_two_providers_stops_delivering() {
+        use crate::config::{ApnsConfig, FcmConfig};
         use crate::crypto::Platform;
-        use crate::push::ApnsClient;
         use crate::push::dispatcher::DELIVERY_FAILURE_STREAK_THRESHOLD;
+        use crate::push::{ApnsClient, FcmClient};
         use nostr_relay_builder::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
@@ -849,7 +849,15 @@ mod tests {
             payload_mode: Default::default(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
-        let push_dispatcher = Arc::new(PushDispatcher::new(Some(apns_client), None));
+        let fcm_client = FcmClient::mock(
+            FcmConfig {
+                enabled: true,
+                service_account_path: String::new(),
+                project_id: "test-project".to_string(),
+            },
+            true,
+        );
+        let push_dispatcher = Arc::new(PushDispatcher::new(Some(apns_client), Some(fcm_client)));
 
         // Simulate a sustained hard-failure streak (e.g. a revoked APNs key
         // rejecting every send) as the dispatcher would record it.
@@ -876,14 +884,14 @@ mod tests {
         let client = reqwest::Client::new();
         let response = wait_for_server_response(&client, format!("http://{}/ready", addr)).await;
 
-        // Relays are connected and APNs is configured, but delivery is in a
-        // sustained failure streak: readiness must reflect delivery capability.
-        assert_eq!(response.status(), 503);
+        // APNs is down, but the same instance can still deliver FCM traffic.
+        assert_eq!(response.status(), 200);
         let body: ReadyResponse = response.json().await.unwrap();
-        assert_eq!(body.status, "not_ready");
+        assert_eq!(body.status, "ready");
         assert!(body.relays_connected);
         assert!(body.apns_configured);
         assert!(!body.apns_delivering);
+        assert!(body.fcm_configured);
         assert!(body.fcm_delivering);
 
         shutdown_tx.send(true).unwrap();

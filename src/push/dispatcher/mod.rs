@@ -259,6 +259,18 @@ impl PushDispatcher {
                 );
                 metrics.record_push_failed(platform_str, "invalid_token");
             }
+            PushSendOutcome::LocallyRejected => {
+                // The provider was never contacted, so this says nothing about
+                // delivery health and must neither heal nor harm its signal.
+                trace!(service = service_name, "push token rejected locally");
+                metrics.record_push_failed(platform_str, "locally_rejected");
+            }
+            PushSendOutcome::Throttled => {
+                // Backpressure proves the provider is reachable and must not be
+                // promoted into a provider-outage readiness signal.
+                trace!(service = service_name, "push notification throttled");
+                metrics.record_push_failed(platform_str, "throttled");
+            }
             PushSendOutcome::RetriesExhausted => {
                 delivery_health.record_hard_failure(platform);
                 trace!(
@@ -488,7 +500,7 @@ impl PushDispatcher {
     /// This queues notifications for processing by the dispatcher task. The batch is
     /// only accepted if enough queue capacity exists for all notifications, so
     /// callers can safely treat a successful return as "all notifications were
-    /// admitted locally". Invalid tokens are silently ignored per MIP-05 spec.
+    /// admitted locally". Invalid tokens are silently ignored as advisory push hygiene.
     pub async fn dispatch(&self, payloads: Vec<TokenPayload>) -> Result<usize> {
         let _admission_guard = self.admission_lock.lock().await;
         let requested_count = payloads.len();
@@ -695,13 +707,17 @@ impl PushDispatcher {
     pub async fn wait_for_completion(&self) {
         {
             let _admission_guard = self.admission_lock.lock().await;
-
-            // Mark as shutting down to prevent new dispatches.
             self.shutting_down.store(true, Ordering::SeqCst);
-
-            // Enqueue a shutdown signal after any already-queued notifications.
-            let _ = self.sender.send(PushMessage::Shutdown).await;
         }
+
+        // Wake/shed retries parked in backoff. Closing also prevents the queue
+        // loop from admitting fresh HTTP work during bounded teardown.
+        self.semaphore.close();
+
+        // Never hold the admission lock across a potentially blocking bounded
+        // channel send; concurrent dispatchers can now observe shutdown and
+        // fail fast.
+        let _ = self.sender.send(PushMessage::Shutdown).await;
 
         let dispatcher_handle = {
             let mut handle = self.dispatcher_handle.lock().await;
@@ -845,7 +861,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            push_failed_metric_value(&metrics, "fcm", "invalid_token"),
+            push_failed_metric_value(&metrics, "fcm", "locally_rejected"),
             1
         );
     }
@@ -942,10 +958,11 @@ mod tests {
     }
 
     #[test]
-    fn delivery_health_flags_provider_after_sustained_hard_failure_streak() {
+    fn delivery_health_flags_provider_after_sustained_hard_failure_score() {
         let health = DeliveryHealth::default();
+        let failures_to_trip = DELIVERY_FAILURE_STREAK_THRESHOLD.div_ceil(2);
 
-        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD - 1 {
+        for _ in 0..failures_to_trip - 1 {
             health.record_hard_failure(Platform::Apns);
         }
         assert!(
@@ -968,16 +985,20 @@ mod tests {
     fn delivery_health_processed_request_ends_streak() {
         let health = DeliveryHealth::default();
 
-        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD.div_ceil(2) {
             health.record_hard_failure(Platform::Fcm);
         }
         assert!(!health.is_delivering(Platform::Fcm));
 
         health.record_processed(Platform::Fcm);
         assert!(
-            health.is_delivering(Platform::Fcm),
-            "any processed request must reset the consecutive-failure streak"
+            !health.is_delivering(Platform::Fcm),
+            "one processed request must not erase accumulated outage evidence"
         );
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+            health.record_processed(Platform::Fcm);
+        }
+        assert!(health.is_delivering(Platform::Fcm));
     }
 
     #[test]
@@ -999,8 +1020,8 @@ mod tests {
             "consecutive exhausted-retry outcomes must flag the provider"
         );
 
-        // An invalid-token verdict proves the provider processed the request,
-        // so it ends the streak just like a successful send.
+        // An invalid-token verdict proves the provider processed a request and
+        // decays the score, but one success cannot hide a sustained outage.
         PushDispatcher::record_send_outcome(
             "APNs",
             Platform::Apns,
@@ -1008,7 +1029,7 @@ mod tests {
             &metrics,
             &delivery_health,
         );
-        assert!(delivery_health.is_delivering(Platform::Apns));
+        assert!(!delivery_health.is_delivering(Platform::Apns));
     }
 
     #[tokio::test]
@@ -1804,18 +1825,11 @@ mod tests {
             shutdown_dispatcher.wait_for_completion().await;
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !shutdown_handle.is_finished(),
-            "the 101st send should wait for semaphore capacity before shutdown can drain"
-        );
-
-        drop(saturated_permits);
-
         tokio::time::timeout(Duration::from_secs(1), shutdown_handle)
             .await
-            .expect("shutdown should complete after a permit is released")
+            .expect("shutdown should close admission instead of waiting for capacity")
             .expect("shutdown task should not panic");
+        drop(saturated_permits);
         assert_eq!(
             dispatcher.semaphore.available_permits(),
             MAX_CONCURRENT_PUSHES
@@ -2015,7 +2029,7 @@ mod tests {
                 Metrics::disabled(),
             )
             .await;
-            assert!(matches!(result, Ok(PushSendOutcome::Sent)));
+            assert!(matches!(result, Ok(PushSendOutcome::RetriesExhausted)));
         });
 
         // Let the task reach its backoff sleep (first attempt + release of permit).
@@ -2043,8 +2057,8 @@ mod tests {
             "wait_for_completion must not complete while a retry task is sleeping in backoff"
         );
 
-        // Once the retry task finishes (re-acquires, succeeds, drops its guard),
-        // shutdown completes.
+        // Once the backoff ends, the closed semaphore aborts the retry instead
+        // of allowing another provider request during teardown.
         send_task.await.expect("send task should not panic");
 
         tokio::time::timeout(Duration::from_secs(2), shutdown)
@@ -2052,7 +2066,7 @@ mod tests {
             .expect("wait_for_completion should complete after the retry task finishes")
             .expect("shutdown task should not panic");
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

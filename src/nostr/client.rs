@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -13,17 +14,13 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::config::RelayConfig;
-use crate::defaults::{
-    DEFAULT_MAX_NOTIFICATION_AGE_SECS, DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-    NIP59_TIMESTAMP_TWEAK_WINDOW_SECS,
-};
+use crate::defaults::{DEFAULT_DEDUP_RETENTION_SECS, NIP59_TIMESTAMP_TWEAK_WINDOW_SECS};
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
+use crate::shutdown::ShutdownTrigger;
 
 // Type alias to avoid confusion with our RelayStatus
 use nostr_sdk::RelayStatus as NostrRelayStatus;
-
-const INBOX_RELAY_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(feature = "tor")]
 const TOR_FEATURE_ENABLED: bool = true;
@@ -34,15 +31,13 @@ const DEGRADED_RELAY_CLASS_WARNING_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
 struct SubscriptionLookbackConfig {
-    max_notification_age_secs: u64,
-    max_notification_future_skew_secs: u64,
+    trigger_retention_secs: u64,
 }
 
 impl SubscriptionLookbackConfig {
     fn from_server_config(server: &crate::config::ServerConfig) -> Self {
         Self {
-            max_notification_age_secs: server.max_notification_age_secs,
-            max_notification_future_skew_secs: server.max_notification_future_skew_secs,
+            trigger_retention_secs: server.dedup_retention_secs,
         }
     }
 }
@@ -50,8 +45,7 @@ impl SubscriptionLookbackConfig {
 impl Default for SubscriptionLookbackConfig {
     fn default() -> Self {
         Self {
-            max_notification_age_secs: DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-            max_notification_future_skew_secs: DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
+            trigger_retention_secs: DEFAULT_DEDUP_RETENTION_SECS,
         }
     }
 }
@@ -82,11 +76,11 @@ impl ReconnectAttemptLimiter {
             .entry(relay_url.clone())
             .or_default();
 
-        if *attempts > self.max_reconnect_attempts {
-            return AdmitStatus::rejected(format!(
-                "relays.max_reconnect_attempts ({}) exceeded",
-                self.max_reconnect_attempts
-            ));
+        if *attempts == self.max_reconnect_attempts.saturating_add(1) {
+            warn!(
+                attempts = *attempts,
+                "Relay remains unavailable after the configured reconnect-attempt threshold; retrying indefinitely"
+            );
         }
 
         *attempts = attempts.saturating_add(1);
@@ -116,13 +110,19 @@ fn spawn_reconnect_attempt_monitor(
     monitor: Monitor,
     limiter: ReconnectAttemptLimiter,
     client: Client,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_trigger: Option<ShutdownTrigger>,
 ) {
     let notifications = monitor.subscribe();
-    std::mem::drop(tokio::spawn(run_reconnect_attempt_monitor(
-        notifications,
-        limiter,
-        client,
-    )));
+    std::mem::drop(tokio::spawn(async move {
+        run_reconnect_attempt_monitor(notifications, limiter, client).await;
+        if !shutting_down.load(Ordering::SeqCst) {
+            error!("Relay reconnect-attempt monitor exited unexpectedly");
+            if let Some(trigger) = shutdown_trigger {
+                trigger.trigger();
+            }
+        }
+    }));
 }
 
 fn resync_reconnect_attempts<I>(limiter: &ReconnectAttemptLimiter, relays: I)
@@ -153,8 +153,11 @@ async fn resync_reconnect_attempts_from_client(client: &Client, limiter: &Reconn
     resync_reconnect_attempts(limiter, relays);
 }
 
-fn initial_subscription_since(now: u64) -> Timestamp {
-    Timestamp::from_secs(now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS))
+fn initial_subscription_since(now: u64, config: SubscriptionLookbackConfig) -> Timestamp {
+    Timestamp::from_secs(
+        now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+            .saturating_sub(config.trigger_retention_secs),
+    )
 }
 
 fn reconnect_subscription_since(
@@ -162,16 +165,11 @@ fn reconnect_subscription_since(
     now: u64,
     config: SubscriptionLookbackConfig,
 ) -> Timestamp {
-    let earliest_relevant_publish = if config.max_notification_age_secs == 0 {
-        disconnect_started_at
-    } else {
-        disconnect_started_at.max(now.saturating_sub(config.max_notification_age_secs))
-    };
+    let earliest_relevant_publish =
+        disconnect_started_at.max(now.saturating_sub(config.trigger_retention_secs));
 
     Timestamp::from_secs(
-        earliest_relevant_publish
-            .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-            .saturating_sub(config.max_notification_future_skew_secs),
+        earliest_relevant_publish.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS),
     )
 }
 
@@ -225,10 +223,21 @@ async fn run_subscription_refresh_monitor(
                 let now = Timestamp::now().as_secs();
                 match status {
                     NostrRelayStatus::Connected => {
-                        if let Some(disconnected_at) = disconnected_since.remove(&relay_url) {
-                            let since =
-                                reconnect_subscription_since(disconnected_at, now, lookback_config);
-                            if let Err(e) = refresh_gift_wrap_subscription(
+                        if disconnected_since.contains_key(&relay_url) {
+                            // A REQ refresh replaces the subscription on every
+                            // relay, so retain the oldest outstanding gap until
+                            // each catch-up refresh succeeds.
+                            let oldest_disconnect = disconnected_since
+                                .values()
+                                .copied()
+                                .min()
+                                .expect("connected relay has a disconnect record");
+                            let since = reconnect_subscription_since(
+                                oldest_disconnect,
+                                now,
+                                lookback_config,
+                            );
+                            match refresh_gift_wrap_subscription(
                                 &client,
                                 &metrics,
                                 &subscription_id,
@@ -237,7 +246,12 @@ async fn run_subscription_refresh_monitor(
                             )
                             .await
                             {
-                                warn!(error = %e, "Failed to refresh gift-wrap subscription after relay reconnect");
+                                Ok(()) => {
+                                    disconnected_since.remove(&relay_url);
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to refresh gift-wrap subscription after relay reconnect");
+                                }
                             }
                         }
                     }
@@ -261,15 +275,12 @@ async fn run_subscription_refresh_monitor(
                 );
 
                 let current_relays = client.relays().await;
-                let mut refresh_from: Option<u64> = None;
+                let mut connected_to_clear = Vec::new();
                 for (relay_url, relay) in &current_relays {
                     match relay.status() {
                         NostrRelayStatus::Connected => {
-                            if let Some(disconnected_at) = disconnected_since.remove(relay_url) {
-                                refresh_from =
-                                    Some(refresh_from.map_or(disconnected_at, |oldest| {
-                                        oldest.min(disconnected_at)
-                                    }));
+                            if disconnected_since.contains_key(relay_url) {
+                                connected_to_clear.push(relay_url.clone());
                             }
                         }
                         NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
@@ -287,23 +298,30 @@ async fn run_subscription_refresh_monitor(
                     }
                 }
 
-                let oldest_disconnect = refresh_from
-                    .into_iter()
+                // Lost monitor messages can hide a complete disconnect/reconnect
+                // flap. Always refresh conservatively; retention caps the
+                // effective lookback even for a long-lived process.
+                let oldest_disconnect = std::iter::once(process_started_at)
                     .chain(disconnected_since.values().copied())
-                    .min();
+                    .min()
+                    .expect("process start provides a lag recovery bound");
 
-                if let Some(oldest_disconnect) = oldest_disconnect {
-                    let since =
-                        reconnect_subscription_since(oldest_disconnect, now, lookback_config);
-                    if let Err(e) = refresh_gift_wrap_subscription(
-                        &client,
-                        &metrics,
-                        &subscription_id,
-                        server_pubkey,
-                        since,
-                    )
-                    .await
-                    {
+                let since = reconnect_subscription_since(oldest_disconnect, now, lookback_config);
+                match refresh_gift_wrap_subscription(
+                    &client,
+                    &metrics,
+                    &subscription_id,
+                    server_pubkey,
+                    since,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        for relay_url in connected_to_clear {
+                            disconnected_since.remove(&relay_url);
+                        }
+                    }
+                    Err(e) => {
                         warn!(error = %e, "Failed to refresh gift-wrap subscription after relay monitor lag");
                     }
                 }
@@ -407,6 +425,8 @@ pub struct RelayClient {
     origins: Mutex<BTreeMap<RelayUrl, RelayKind>>,
     subscription_lookback: SubscriptionLookbackConfig,
     metrics: Metrics,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_trigger: Option<ShutdownTrigger>,
 }
 
 impl RelayClient {
@@ -423,6 +443,7 @@ impl RelayClient {
             config,
             metrics,
             SubscriptionLookbackConfig::default(),
+            None,
         )
         .await
     }
@@ -432,12 +453,14 @@ impl RelayClient {
         config: RelayConfig,
         metrics: Metrics,
         server: &crate::config::ServerConfig,
+        shutdown_trigger: ShutdownTrigger,
     ) -> Result<Self> {
         Self::with_metrics_and_subscription_lookback(
             keys,
             config,
             metrics,
             SubscriptionLookbackConfig::from_server_config(server),
+            Some(shutdown_trigger),
         )
         .await
     }
@@ -447,11 +470,13 @@ impl RelayClient {
         config: RelayConfig,
         metrics: Metrics,
         subscription_lookback: SubscriptionLookbackConfig,
+        shutdown_trigger: Option<ShutdownTrigger>,
     ) -> Result<Self> {
         validate_relay_config(&config)?;
 
         let reconnect_attempt_limiter = ReconnectAttemptLimiter::new(config.max_reconnect_attempts);
         let relay_monitor = Monitor::new(RELAY_MONITOR_CHANNEL_SIZE);
+        let shutting_down = Arc::new(AtomicBool::new(false));
 
         let client = Client::builder()
             .signer(keys)
@@ -462,12 +487,17 @@ impl RelayClient {
             relay_monitor.clone(),
             reconnect_attempt_limiter.clone(),
             client.clone(),
+            shutting_down.clone(),
+            shutdown_trigger.clone(),
         );
 
         let total = config.clearnet.len() + config.onion.len();
 
         metrics.set_relay_counts(config.clearnet.len(), config.onion.len());
-        metrics.set_relay_subscription_lookback(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS);
+        metrics.set_relay_subscription_lookback(
+            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS
+                .saturating_add(subscription_lookback.trigger_retention_secs),
+        );
 
         Ok(Self {
             client,
@@ -481,6 +511,8 @@ impl RelayClient {
             origins: Mutex::new(BTreeMap::new()),
             subscription_lookback,
             metrics,
+            shutting_down,
+            shutdown_trigger,
         })
     }
 
@@ -587,12 +619,14 @@ impl RelayClient {
 
     /// Subscribe to gift-wrapped events for the server's public key.
     pub async fn subscribe(&self, server_pubkey: PublicKey) -> Result<()> {
-        let since = initial_subscription_since(Timestamp::now().as_secs());
+        let since =
+            initial_subscription_since(Timestamp::now().as_secs(), self.subscription_lookback);
         let subscription_id = SubscriptionId::generate();
 
         debug!(
             pubkey = %server_pubkey,
-            lookback_secs = NIP59_TIMESTAMP_TWEAK_WINDOW_SECS,
+            lookback_secs = NIP59_TIMESTAMP_TWEAK_WINDOW_SECS
+                .saturating_add(self.subscription_lookback.trigger_retention_secs),
             "Subscribing to gift wrap events"
         );
 
@@ -605,14 +639,29 @@ impl RelayClient {
         )
         .await?;
 
-        std::mem::drop(tokio::spawn(run_subscription_refresh_monitor(
-            self.monitor.subscribe(),
-            self.client.clone(),
-            self.metrics.clone(),
-            subscription_id,
-            server_pubkey,
-            self.subscription_lookback,
-        )));
+        let notifications = self.monitor.subscribe();
+        let client = self.client.clone();
+        let metrics = self.metrics.clone();
+        let lookback = self.subscription_lookback;
+        let shutting_down = self.shutting_down.clone();
+        let shutdown_trigger = self.shutdown_trigger.clone();
+        std::mem::drop(tokio::spawn(async move {
+            run_subscription_refresh_monitor(
+                notifications,
+                client,
+                metrics,
+                subscription_id,
+                server_pubkey,
+                lookback,
+            )
+            .await;
+            if !shutting_down.load(Ordering::SeqCst) {
+                error!("Relay subscription-refresh monitor exited unexpectedly");
+                if let Some(trigger) = shutdown_trigger {
+                    trigger.trigger();
+                }
+            }
+        }));
 
         info!("Subscribed to gift wrap events");
         Ok(())
@@ -679,6 +728,7 @@ impl RelayClient {
 
     /// Disconnect from all relays.
     pub async fn disconnect(&self) -> Result<()> {
+        self.shutting_down.store(true, Ordering::SeqCst);
         info!("Disconnecting from all relays");
         self.client.disconnect().await;
         Ok(())
@@ -793,7 +843,13 @@ impl RelayClient {
             .limit(1);
         let events = self
             .client
-            .fetch_events(filter, INBOX_RELAY_FETCH_TIMEOUT)
+            // Use the operator's relay timeout rather than a fixed two-second
+            // window that routinely looks empty on Tor/high-latency relays and
+            // causes a needless replaceable-event republish.
+            .fetch_events(
+                filter,
+                Duration::from_secs(self.config.connection_timeout_secs),
+            )
             .await
             .map_err(|e| Error::Nostr(format!("Failed to fetch existing kind 10050 event: {e}")))?;
 
@@ -911,6 +967,8 @@ fn degraded_relay_class(configured: usize, connected: usize) -> bool {
 
 fn validate_relay_config(config: &RelayConfig) -> Result<()> {
     for url in &config.clearnet {
+        validate_clearnet_relay_url(url)?;
+
         if clearnet_relay_uses_tls(url) {
             continue;
         }
@@ -946,6 +1004,28 @@ fn validate_relay_config(config: &RelayConfig) -> Result<()> {
     // silently routing traffic over clearnet at connect time (only a `warn!`).
     for url in &config.onion {
         validate_onion_relay_url(url)?;
+    }
+
+    Ok(())
+}
+
+/// Reject malformed or onion-hosted entries in the clearnet relay list.
+///
+/// Provenance selects the transport, so accepting a `.onion` host here would
+/// deliberately dial it outside Tor and expose the hidden-service address to
+/// clearnet DNS. Parsing at startup also prevents a malformed `wss://` entry
+/// from being silently dropped later while the live relay set shrinks.
+fn validate_clearnet_relay_url(url: &str) -> Result<()> {
+    let parsed = RelayUrl::parse(url).map_err(|e| {
+        Error::Nostr(format!(
+            "ClearNet relay '{url}' is not a valid ws:// or wss:// URL: {e}"
+        ))
+    })?;
+
+    if parsed.is_onion() {
+        return Err(Error::Nostr(format!(
+            "ClearNet relay '{url}' must not have a .onion host; configure it under relays.onion"
+        )));
     }
 
     Ok(())
@@ -1280,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reconnect_attempt_limiter_allows_initial_attempt_plus_configured_retries() {
+    fn test_reconnect_attempt_limiter_never_permanently_rejects_recovery() {
         let limiter = ReconnectAttemptLimiter::new(1);
         let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
 
@@ -1292,10 +1372,14 @@ mod tests {
             limiter.admit_relay_connection(&relay_url),
             AdmitStatus::Success
         );
-        assert!(matches!(
+        assert_eq!(
             limiter.admit_relay_connection(&relay_url),
-            AdmitStatus::Rejected { .. }
-        ));
+            AdmitStatus::Success
+        );
+        assert_eq!(
+            limiter.attempts_since_connection().get(&relay_url),
+            Some(&3)
+        );
 
         limiter.reset(&relay_url);
         assert_eq!(
@@ -1306,7 +1390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_admit_policy_rejects_after_exhausting_attempts() {
+    async fn test_admit_policy_keeps_retrying_after_threshold() {
         let limiter = ReconnectAttemptLimiter::new(0);
         let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
 
@@ -1319,10 +1403,7 @@ mod tests {
         let second = AdmitPolicy::admit_connection(&limiter, &relay_url)
             .await
             .unwrap();
-        assert!(
-            matches!(second, AdmitStatus::Rejected { .. }),
-            "attempt beyond the initial connection must be rejected at max_reconnect_attempts = 0"
-        );
+        assert_eq!(second, AdmitStatus::Success);
     }
 
     #[test]
@@ -1334,10 +1415,10 @@ mod tests {
             limiter.admit_relay_connection(&relay_url),
             AdmitStatus::Success
         );
-        assert!(matches!(
+        assert_eq!(
             limiter.admit_relay_connection(&relay_url),
-            AdmitStatus::Rejected { .. }
-        ));
+            AdmitStatus::Success
+        );
 
         limiter.remove(&relay_url);
         assert!(
@@ -1360,10 +1441,7 @@ mod tests {
         // Exhaust both relays' budgets so the monitor's effect is observable.
         for url in [&connected_url, &terminated_url] {
             assert_eq!(limiter.admit_relay_connection(url), AdmitStatus::Success);
-            assert!(matches!(
-                limiter.admit_relay_connection(url),
-                AdmitStatus::Rejected { .. }
-            ));
+            assert_eq!(limiter.admit_relay_connection(url), AdmitStatus::Success);
         }
 
         let (sender, receiver) = broadcast::channel(8);
@@ -1430,10 +1508,7 @@ mod tests {
 
         for url in [&connected_url, &terminated_url, &disconnected_url] {
             assert_eq!(limiter.admit_relay_connection(url), AdmitStatus::Success);
-            assert!(matches!(
-                limiter.admit_relay_connection(url),
-                AdmitStatus::Rejected { .. }
-            ));
+            assert_eq!(limiter.admit_relay_connection(url), AdmitStatus::Success);
         }
 
         resync_reconnect_attempts(
@@ -1456,11 +1531,13 @@ mod tests {
                 .contains_key(&terminated_url),
             "lag resync must remove terminal relay state"
         );
-        assert!(
-            matches!(
-                limiter.admit_relay_connection(&disconnected_url),
-                AdmitStatus::Rejected { .. }
-            ),
+        assert_eq!(
+            limiter.admit_relay_connection(&disconnected_url),
+            AdmitStatus::Success
+        );
+        assert_eq!(
+            limiter.attempts_since_connection().get(&disconnected_url),
+            Some(&3),
             "lag resync must not erase counters for still-disconnected relays"
         );
     }
@@ -1527,7 +1604,35 @@ mod tests {
         let err = result
             .err()
             .expect("malformed clearnet relay should be rejected");
-        assert!(err.to_string().contains("must use wss://"));
+        assert!(err.to_string().contains("not a valid"));
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_rejects_empty_host_clearnet_url() {
+        let keys = Keys::generate();
+        let config = test_relay_config(vec!["wss://".to_string()]);
+
+        let error = RelayClient::new(keys, config)
+            .await
+            .err()
+            .expect("empty relay host must fail at startup");
+
+        assert!(error.to_string().contains("not a valid"));
+    }
+
+    #[tokio::test]
+    async fn test_relay_client_rejects_onion_host_in_clearnet_list() {
+        let keys = Keys::generate();
+        let config = test_relay_config(vec![
+            "wss://abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion".to_string(),
+        ]);
+
+        let error = RelayClient::new(keys, config)
+            .await
+            .err()
+            .expect("onion relay must never use clearnet transport");
+
+        assert!(error.to_string().contains("relays.onion"));
     }
 
     #[tokio::test]
@@ -1649,10 +1754,18 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription_lookback_matches_nip59_tweak_window() {
+    fn test_initial_subscription_covers_tweak_and_trigger_retention() {
+        let now = 1_000_000;
+        let since = initial_subscription_since(
+            now,
+            SubscriptionLookbackConfig {
+                trigger_retention_secs: 300,
+            },
+        );
         assert_eq!(
-            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS, 172_800,
-            "lookback must cover NIP-59's 2-day timestamp tweak window"
+            since.as_secs(),
+            now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+                .saturating_sub(300)
         );
     }
 
@@ -1661,55 +1774,47 @@ mod tests {
         let now = 1_000_000;
         let disconnected_at = now - 60;
         let config = SubscriptionLookbackConfig {
-            max_notification_age_secs: 3_600,
-            max_notification_future_skew_secs: 30,
+            trigger_retention_secs: 300,
         };
 
         let since = reconnect_subscription_since(disconnected_at, now, config);
 
         assert_eq!(
             since.as_secs(),
-            disconnected_at
-                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-                .saturating_sub(30)
+            disconnected_at.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
         );
     }
 
     #[test]
-    fn test_reconnect_subscription_since_caps_long_outage_to_freshness_window() {
+    fn test_reconnect_subscription_since_caps_long_outage_to_retention_window() {
         let now = 1_000_000;
         let disconnected_at = now - 100_000;
         let config = SubscriptionLookbackConfig {
-            max_notification_age_secs: 3_600,
-            max_notification_future_skew_secs: 30,
+            trigger_retention_secs: 300,
         };
 
         let since = reconnect_subscription_since(disconnected_at, now, config);
 
         assert_eq!(
             since.as_secs(),
-            now.saturating_sub(3_600)
+            now.saturating_sub(300)
                 .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-                .saturating_sub(30)
         );
     }
 
     #[test]
-    fn test_reconnect_subscription_since_zero_age_uses_disconnect_start() {
+    fn test_reconnect_subscription_since_zero_retention_uses_current_time() {
         let now = 1_000_000;
         let disconnected_at = now - 100_000;
         let config = SubscriptionLookbackConfig {
-            max_notification_age_secs: 0,
-            max_notification_future_skew_secs: 30,
+            trigger_retention_secs: 0,
         };
 
         let since = reconnect_subscription_since(disconnected_at, now, config);
 
         assert_eq!(
             since.as_secs(),
-            disconnected_at
-                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-                .saturating_sub(30)
+            now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
         );
     }
 
@@ -1767,6 +1872,92 @@ mod tests {
         assert_eq!(filters[0].since, Some(second_since));
 
         client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn subscription_refresh_monitor_reconciles_disconnect_and_terminal_transitions() {
+        let client = Client::default();
+        let metrics = Metrics::disabled();
+        let server_pubkey = Keys::generate().public_key();
+        let subscription_id = SubscriptionId::generate();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let (sender, receiver) = broadcast::channel(8);
+
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: relay_url.clone(),
+                status: NostrRelayStatus::Disconnected,
+            })
+            .unwrap();
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: relay_url.clone(),
+                status: NostrRelayStatus::Connected,
+            })
+            .unwrap();
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url,
+                status: NostrRelayStatus::Terminated,
+            })
+            .unwrap();
+        drop(sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_subscription_refresh_monitor(
+                receiver,
+                client,
+                metrics,
+                subscription_id,
+                server_pubkey,
+                SubscriptionLookbackConfig {
+                    trigger_retention_secs: 300,
+                },
+            ),
+        )
+        .await
+        .expect("closed notification channel must stop the monitor");
+    }
+
+    #[tokio::test]
+    async fn subscription_refresh_monitor_recovers_conservatively_after_lag() {
+        let client = Client::default();
+        let metrics = Metrics::disabled();
+        let server_pubkey = Keys::generate().public_key();
+        let subscription_id = SubscriptionId::generate();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let (sender, receiver) = broadcast::channel(1);
+
+        for status in [
+            NostrRelayStatus::Disconnected,
+            NostrRelayStatus::Connecting,
+            NostrRelayStatus::Connected,
+        ] {
+            sender
+                .send(MonitorNotification::StatusChanged {
+                    relay_url: relay_url.clone(),
+                    status,
+                })
+                .unwrap();
+        }
+        drop(sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_subscription_refresh_monitor(
+                receiver,
+                client,
+                metrics,
+                subscription_id,
+                server_pubkey,
+                SubscriptionLookbackConfig {
+                    trigger_retention_secs: 300,
+                },
+            ),
+        )
+        .await
+        .expect("lag recovery must finish after the channel closes");
     }
 
     #[tokio::test]

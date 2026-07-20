@@ -132,6 +132,10 @@ pub enum PushSendOutcome {
     Sent,
     /// The provider or local validation identified a dead/invalid device token.
     InvalidToken,
+    /// The token was rejected locally and the provider was never contacted.
+    LocallyRejected,
+    /// Provider backpressure or request timeout exhausted the retry budget.
+    Throttled,
     /// A transient provider failure consumed the bounded retry budget.
     RetriesExhausted,
 }
@@ -204,7 +208,7 @@ where
             SendAttemptResult::AuthRejected(error) if !auth_retry_used => {
                 auth_retry_used = true;
 
-                metrics.record_push_retry(service_name.to_lowercase().as_str());
+                metrics.record_push_retry(retry_metric_platform(service_name), "provider");
 
                 // Retry immediately: the rejection is not backpressure, and
                 // the client already evicted the rejected credential, so the
@@ -228,7 +232,7 @@ where
             } if retries < config.max_retries => {
                 retries += 1;
 
-                metrics.record_push_retry(service_name.to_lowercase().as_str());
+                metrics.record_push_retry(retry_metric_platform(service_name), "provider");
 
                 // Honor provider-supplied Retry-After values, but floor zero
                 // or tiny values, cap at MAX_RETRY_AFTER (untrusted input),
@@ -280,7 +284,11 @@ where
                     retries = retries,
                     "Max retries exceeded for push notification"
                 );
-                return Ok(PushSendOutcome::RetriesExhausted);
+                return Ok(if matches!(status_code, 408 | 429) {
+                    PushSendOutcome::Throttled
+                } else {
+                    PushSendOutcome::RetriesExhausted
+                });
             }
             SendAttemptResult::Permanent(e) => return Err(e),
         }
@@ -406,7 +414,7 @@ where
             {
                 retries += 1;
 
-                metrics.record_push_retry(service_name.to_lowercase().as_str());
+                metrics.record_push_retry(retry_metric_platform(service_name), "transport");
 
                 // A reqwest error can embed the request URL, and the APNs URL
                 // contains the raw device token; strip it before the error can
@@ -445,6 +453,14 @@ where
             // (issue #172).
             Err(error) => return Err(error.redact_transport_url()),
         }
+    }
+}
+
+fn retry_metric_platform(service_name: &str) -> &'static str {
+    if service_name.eq_ignore_ascii_case("APNs") {
+        "apns"
+    } else {
+        "fcm"
     }
 }
 

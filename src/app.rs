@@ -87,10 +87,6 @@ fn parse_server_secret_key(server_private_key: &str) -> Result<SecretKey> {
 /// Bounds total in-flight gift-wrap unwrap (ECDH) work. Load-time config
 /// validation rejects zero, so this preserves the operator's configured cap.
 #[must_use]
-fn event_processing_permits(max_concurrent_event_processing: usize) -> usize {
-    max_concurrent_event_processing
-}
-
 /// Outcome of racing relay startup against a shutdown signal.
 #[derive(Debug)]
 enum StartupOutcome<T, S> {
@@ -268,12 +264,26 @@ async fn run_event_loop(
                         };
 
                         let processor = processor.clone();
+                        let task_metrics = metrics.clone();
                         event_tasks.spawn(async move {
-                            // Hold the permit for the lifetime of the task; it
-                            // is released when `permit` is dropped on return.
-                            let _permit = permit;
-                            if let Err(e) = processor.process(&event).await {
-                                debug!(error = %e, "Event processing error");
+                            // Observe panics through the JoinError while keeping
+                            // one malformed event isolated from the receive loop.
+                            let result = tokio::spawn(async move {
+                                // Hold the permit for the lifetime of processing.
+                                let _permit = permit;
+                                processor.process(&event).await
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => debug!(error = %e, "Event processing error"),
+                                Err(error) if error.is_panic() => {
+                                    task_metrics.record_event_processing_panic();
+                                    error!("Event processing task panicked");
+                                }
+                                Err(error) => {
+                                    debug!(error = %error, "Event processing task cancelled");
+                                }
                             }
                         });
                     }
@@ -300,7 +310,9 @@ async fn run_periodic_cleanup(
     mut shutdown: watch::Receiver<bool>,
     event_processor: Arc<EventProcessor>,
 ) -> std::result::Result<(), &'static str> {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let period = std::time::Duration::from_secs(60);
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -406,6 +418,11 @@ async fn staged_teardown(
 /// `crate::telemetry::init`, `init_logging`) occur before the subscriber and client
 /// exist, so they surface only on stderr, not in GlitchTip.
 pub async fn run(mut config: AppConfig) -> Result<()> {
+    // Poll signal streams before any fallible or networked initialization so
+    // SIGTERM/SIGINT cannot take the default, ungraceful action during startup.
+    let shutdown = ShutdownHandler::new();
+    let _signal_handler = shutdown.install_signal_handlers();
+
     // Note: the `metrics.enabled && !health.enabled` case is no longer a
     // silent-loss footgun. The health server now binds its listener and serves
     // `/metrics` whenever a metrics collector exists — independent of
@@ -453,46 +470,32 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
 
     // Initialize push clients
     let apns_client = if config.apns.enabled {
-        match ApnsClient::with_metrics(config.apns.clone(), metrics.clone()).await {
-            Ok(client) => {
-                if client.is_configured() {
-                    info!(
-                        environment = %config.apns.environment,
-                        payload_mode = %config.apns.payload_mode,
-                        "APNs push service configured"
-                    );
-                    Some(client)
-                } else {
-                    warn!("APNs enabled but not fully configured");
-                    None
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to initialize APNs client");
-                None
-            }
+        let client = ApnsClient::with_metrics(config.apns.clone(), metrics.clone())
+            .await
+            .context("Failed to initialize enabled APNs client")?;
+        if !client.is_configured() {
+            anyhow::bail!("enabled APNs client did not initialize as configured");
         }
+        info!(
+            environment = %config.apns.environment,
+            payload_mode = %config.apns.payload_mode,
+            "APNs push service configured"
+        );
+        Some(client)
     } else {
         info!("APNs push service disabled");
         None
     };
 
     let fcm_client = if config.fcm.enabled {
-        match FcmClient::with_metrics(config.fcm.clone(), metrics.clone()).await {
-            Ok(client) => {
-                if client.is_configured() {
-                    info!("FCM push service configured");
-                    Some(client)
-                } else {
-                    warn!("FCM enabled but not fully configured");
-                    None
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to initialize FCM client");
-                None
-            }
+        let client = FcmClient::with_metrics(config.fcm.clone(), metrics.clone())
+            .await
+            .context("Failed to initialize enabled FCM client")?;
+        if !client.is_configured() {
+            anyhow::bail!("enabled FCM client did not initialize as configured");
         }
+        info!("FCM push service configured");
+        Some(client)
     } else {
         info!("FCM push service disabled");
         None
@@ -536,16 +539,11 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
             config.relays.clone(),
             metrics.clone(),
             &config.server,
+            shutdown.trigger_handle(),
         )
         .await
         .context("Failed to create relay client")?,
     );
-
-    // Initialize shutdown handler before connecting so a SIGTERM/SIGINT during
-    // startup exits promptly. Without this, signal handlers were installed only
-    // after `connect()` returned, so a signal received while waiting for relays
-    // (potentially up to the whole connection timeout) was ignored.
-    let shutdown = ShutdownHandler::new();
 
     // Bind the health server before any relay work so a bind failure — almost
     // always a permanent misconfiguration — fails startup fast instead of
@@ -589,12 +587,16 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
         }
         StartupOutcome::ShutdownRequested(reason) => {
             info!("Shutdown signal received during startup; stopping before relay connection");
-            if let Err(e) = relay_client.disconnect().await {
-                warn!(error = %e, "Error disconnecting from relays during startup shutdown");
-            }
-            // The shutdown watch is already set, so the health task exits on
-            // its own; join it to finish teardown cleanly.
-            let _ = health_handle.await;
+            crate::shutdown::graceful_shutdown(
+                || async {
+                    if let Err(e) = relay_client.disconnect().await {
+                        warn!(error = %e, "Error disconnecting from relays during startup shutdown");
+                    }
+                    let _ = health_handle.await;
+                },
+                config.server.shutdown_timeout_secs,
+            )
+            .await;
             info!("Transponder stopped");
             return shutdown_result(reason);
         }
@@ -621,8 +623,9 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
     // The loop runs under supervision: an unexpected exit (notification
     // channel closed) triggers global shutdown instead of leaving a zombie
     // process that reports healthy while processing nothing.
-    let event_permits = event_processing_permits(config.server.max_concurrent_event_processing);
-    let event_semaphore = Arc::new(Semaphore::new(event_permits));
+    let event_semaphore = Arc::new(Semaphore::new(
+        config.server.max_concurrent_event_processing,
+    ));
     let event_tasks = TaskTracker::new();
     let event_shutdown = shutdown.subscribe();
     let event_trigger = shutdown.trigger_handle();
@@ -660,7 +663,24 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
     .await
     {
         StartupOutcome::Connected(result) => {
-            result?;
+            if let Err(error) = result {
+                crate::shutdown::graceful_shutdown(
+                    || {
+                        staged_teardown(
+                            event_handle,
+                            event_tasks,
+                            push_dispatcher,
+                            relay_client,
+                            health_handle,
+                            tokio::spawn(async {}),
+                            tokio::spawn(async {}),
+                        )
+                    },
+                    config.server.shutdown_timeout_secs,
+                )
+                .await;
+                return Err(error);
+            }
         }
         StartupOutcome::ShutdownRequested(reason) => {
             info!("Shutdown signal received during relay startup; stopping before run loop");
@@ -961,17 +981,85 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
 
-    #[test]
-    fn event_processing_permits_preserves_configured_values() {
-        assert_eq!(event_processing_permits(0), 0);
-        assert_eq!(event_processing_permits(1), 1);
-        assert_eq!(event_processing_permits(64), 64);
-        assert_eq!(event_processing_permits(1000), 1000);
+    fn startup_test_config(private_key: &str, health_bind_address: &str) -> AppConfig {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+            [server]
+            private_key = "{private_key}"
+
+            [relays]
+            clearnet = ["ws://127.0.0.1:9"]
+            allow_unencrypted_clearnet_relays = true
+            connection_timeout_secs = 1
+
+            [health]
+            enabled = true
+            bind_address = "{health_bind_address}"
+
+            [metrics]
+            enabled = false
+            "#
+        )
+        .unwrap();
+
+        AppConfig::load(file.path()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_rejects_invalid_secret_after_early_signal_installation() {
+        let config = startup_test_config("not-a-secret-key", "127.0.0.1:9");
+
+        let error = run(config)
+            .await
+            .expect_err("invalid secret must fail startup");
+
+        assert!(error.to_string().contains("Invalid server private key"));
+    }
+
+    #[tokio::test]
+    async fn run_reaches_health_bind_with_valid_disabled_providers() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = startup_test_config(
+            &"11".repeat(32),
+            &occupied.local_addr().unwrap().to_string(),
+        );
+
+        let error = run(config)
+            .await
+            .expect_err("occupied health bind address must fail startup");
+
+        assert!(error.to_string().contains("Failed to start health server"));
+    }
+
+    #[tokio::test]
+    async fn run_fails_fast_when_enabled_apns_cannot_initialize() {
+        let mut config = startup_test_config(&"11".repeat(32), "127.0.0.1:9");
+        config.apns.enabled = true;
+
+        let error = run(config)
+            .await
+            .expect_err("incomplete enabled APNs config must fail startup");
+
+        assert!(error.to_string().contains("APNs"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn run_fails_fast_when_enabled_fcm_cannot_initialize() {
+        let mut config = startup_test_config(&"11".repeat(32), "127.0.0.1:9");
+        config.fcm.enabled = true;
+
+        let error = run(config)
+            .await
+            .expect_err("incomplete enabled FCM config must fail startup");
+
+        assert!(error.to_string().contains("FCM"), "{error:#}");
     }
 
     #[tokio::test]
     async fn event_semaphore_caps_in_flight_permits() {
-        let permits = event_processing_permits(3);
+        let permits = 3;
         let semaphore = Arc::new(Semaphore::new(permits));
 
         // Acquire up to the cap; all succeed.
@@ -1208,6 +1296,10 @@ mod tests {
     }
 
     fn test_event_processor() -> Arc<EventProcessor> {
+        test_event_processor_with_keys().0
+    }
+
+    fn test_event_processor_with_keys() -> (Arc<EventProcessor>, Keys) {
         let keys = Keys::generate();
         let nip59_handler = Nip59Handler::new(keys.clone());
         let mut secp_secret_key =
@@ -1215,15 +1307,22 @@ mod tests {
                 .expect("valid secret key");
         let token_decryptor = TokenDecryptor::new(&mut secp_secret_key);
         let push_dispatcher = Arc::new(PushDispatcher::new(None, None));
-        Arc::new(
-            EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher).build(),
+        (
+            Arc::new(
+                EventProcessorBuilder::new(nip59_handler, token_decryptor, push_dispatcher).build(),
+            ),
+            keys,
         )
     }
 
-    fn test_event_notification() -> RelayPoolNotification {
-        let event = EventBuilder::text_note("task lifecycle test")
-            .sign_with_keys(&Keys::generate())
-            .expect("signable test event");
+    async fn test_event_notification(server_keys: &Keys) -> RelayPoolNotification {
+        let sender_keys = Keys::generate();
+        let event = crate::test_vectors::scenarios::single_apns_notification(
+            server_keys,
+            &sender_keys,
+            "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
+        )
+        .await;
         RelayPoolNotification::Event {
             relay_url: RelayUrl::parse("ws://127.0.0.1:7777").unwrap(),
             subscription_id: SubscriptionId::new("test-sub"),
@@ -1353,7 +1452,7 @@ mod tests {
         let (notification_tx, notifications) = broadcast::channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let semaphore = Arc::new(Semaphore::new(2));
-        let processor = test_event_processor();
+        let (processor, server_keys) = test_event_processor_with_keys();
         let event_tasks = TaskTracker::new();
 
         let loop_handle = tokio::spawn(run_event_loop(
@@ -1365,7 +1464,9 @@ mod tests {
             Metrics::disabled(),
         ));
 
-        notification_tx.send(test_event_notification()).unwrap();
+        notification_tx
+            .send(test_event_notification(&server_keys).await)
+            .unwrap();
 
         assert!(
             wait_for_cache_len(&processor, 1).await,
@@ -1431,11 +1532,15 @@ mod tests {
         let (notification_tx, notifications) = broadcast::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let metrics = Metrics::new().unwrap();
-        let processor = test_event_processor();
+        let (processor, server_keys) = test_event_processor_with_keys();
         let event_tasks = TaskTracker::new();
 
-        notification_tx.send(test_event_notification()).unwrap();
-        notification_tx.send(test_event_notification()).unwrap();
+        notification_tx
+            .send(test_event_notification(&server_keys).await)
+            .unwrap();
+        notification_tx
+            .send(test_event_notification(&server_keys).await)
+            .unwrap();
 
         let loop_handle = tokio::spawn(run_event_loop(
             notifications,

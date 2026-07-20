@@ -13,10 +13,7 @@ pub use processor::{EventProcessor, ReplayProtectionConfig, TokenRateLimitConfig
 pub(crate) use processor::EventProcessorBuilder;
 
 #[allow(unused_imports)]
-pub use crate::defaults::{
-    DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_NOTIFICATION_AGE_SECS,
-    DEFAULT_MAX_NOTIFICATION_FUTURE_SKEW_SECS,
-};
+pub use crate::defaults::{DEFAULT_DEDUP_RETENTION_SECS, DEFAULT_MAX_DEDUP_CACHE_SIZE};
 
 #[allow(unused_imports)]
 pub(crate) use dedup::DEDUP_WINDOW;

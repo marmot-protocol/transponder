@@ -4,12 +4,12 @@
 
 Transponder is a privacy-preserving push notification server targeting the adopted [Marmot push-notifications feature](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md) and [Nostr transport binding](https://github.com/marmot-protocol/marmot/blob/master/transports/nostr.md). It listens for gift-wrapped Nostr events (kind 1059) on configured relays, decrypts notification triggers, and dispatches silent push notifications to APNs and FCM.
 
-The Marmot repository's adopted surface documents are normative. The MIP-era documents are deprecated; use [mip-coverage.md](https://github.com/marmot-protocol/marmot/blob/master/mip-coverage.md) only as a historical map. The current source is not yet fully `marmot-push-v1` interoperable: it still carries MIP-era HKDF labels and version/encoding-tag behavior, and its replay store keys outer event IDs instead of the decoded trigger-content hash. Treat those as migration gaps and do not describe the current server as `marmot-push-v1` conformant until the implementation and vectors match the adopted feature document.
+The Marmot repository's adopted surface documents are normative. The MIP-era documents are deprecated; use [mip-coverage.md](https://github.com/marmot-protocol/marmot/blob/master/mip-coverage.md) only as a historical map. The current source implements the `marmot-push-v1` server surface and must retain exact wire compatibility with those adopted documents.
 
-The maintained MIP-05 line is [`release/mip05-v1`](https://github.com/marmot-protocol/transponder/tree/release/mip05-v1), anchored by [`transponder-mip05-v1.0.0`](https://github.com/marmot-protocol/transponder/releases/tag/transponder-mip05-v1.0.0). Target MIP-05-only fixes to that branch. Treat `master` as the forward-looking Marmot Push line and do not merge protocol-changing work until production deployment automation is pinned away from `master`.
+The maintained MIP-05 line is [`release/mip05-v1`](https://github.com/marmot-protocol/transponder/tree/release/mip05-v1), anchored by [`transponder-mip05-v1.0.0`](https://github.com/marmot-protocol/transponder/releases/tag/transponder-mip05-v1.0.0). Target MIP-05-only fixes to that branch; `master` is the Marmot Push v1 line.
 
 Key properties:
-- **No persisted secrets or message/user content**: Device tokens, trigger plaintext, message content, group identifiers, and recipient linkage are not persisted. The current optional replay log retains only public gift-wrap event IDs and processing timestamps; the adopted feature separately defines short-lived trigger-content-hash retention.
+- **No persisted secrets or message/user content**: Device tokens, trigger plaintext, content hashes, message content, group identifiers, and recipient linkage are never persisted.
 - **Privacy-preserving**: Cannot learn message content, sender/recipient identities, or group membership
 - **Nostr-native**: Subscribes to relays for incoming events (not an HTTP server for notifications)
 - **Multi-network**: Supports both ClearNet and Tor (.onion) relays
@@ -105,14 +105,14 @@ src/
 
 ### Marmot Push Token Decryption (crypto/token.rs)
 - Uses ECDH with secp256k1 for key agreement
-- **Current compatibility gap**: `src/crypto/token.rs` uses the deprecated salt `mip05-v1` and info `mip05-token-encryption`; the adopted feature requires salt `marmot-push-token-v1` and info `marmot-push-token-encryption`
+- HKDF-SHA256 uses salt `marmot-push-token-v1` and info `marmot-push-token-encryption`
 - ChaCha20-Poly1305 for authenticated encryption
 - Length-prefixed plaintext: platform byte, u16 big-endian token length, device token, ignored random padding
 - Platform byte: 0x01 = APNs, 0x02 = FCM
 
 ### Event Processing (nostr/events.rs)
-- **Current compatibility gap**: replay protection uses outer gift-wrap event IDs (and may persist them); the adopted feature uses `SHA-256` of the decoded kind `446` content with retention measured in minutes and explicitly forbids relying on the rewrappable outer event ID
-- **Current compatibility gap**: the parser requires `mip05-v1` and permits an optional `encoding` tag; the adopted kind `446` rumor requires `["v", "marmot-push-v1"]` as its only tag and standard padded base64 content
+- Replay protection retains `SHA-256` hashes of decoded kind `446` content in memory for minutes; it never keys on outer gift-wrap IDs or persists trigger state
+- The parser requires `["v", "marmot-push-v1"]` as the rumor's only tag and standard padded base64 content
 - Silently ignores invalid, stale, or replayed notification triggers as local push hygiene under the adopted feature
 - Concurrent push dispatch (doesn't wait for completion)
 
@@ -144,7 +144,7 @@ src/
 
 - **Never log device tokens or private keys** - these are sensitive
 - **`ERROR` logs and panics are forwarded to GlitchTip.** Transponder-target `error!` events, plus any panic, are sent to the error reporter (see `src/telemetry.rs`; panics go through Sentry's global hook and are *not* target-scoped, so they can originate anywhere). Never interpolate a device token, encrypted blob, private key, recipient identity, or a raw `reqwest::Error` (whose APNs URL contains the device token) into an `error!`, `panic!`, `expect`, or `unwrap` message - fail or log with a redacted id or status instead. The same rule already governs `warn!`/`debug!`, but for anything reportable it is a hard privacy boundary, not just hygiene. As a mechanical backstop, `scrub_event` (`src/telemetry.rs` + `src/redaction.rs`) redacts secret-shaped substrings (64+ char hex runs, `/3/device/<hex>` paths, `wss://` URLs, `.onion` hosts, `nsec1` keys) from every outgoing event — this catches dependency panics, which are not target-scoped. The backstop does not relax the no-secrets rule.
-- **Never persist device tokens, trigger plaintext, group identifiers, or recipient linkage.** The adopted feature permits only short-lived trigger/content-hash retention needed to dispatch and suppress immediate replay. The current optional public-event-ID replay log is a compatibility gap, not the `marmot-push-v1` protocol model.
+- **Never persist device tokens, trigger plaintext, trigger/content hashes, group identifiers, or recipient linkage.** The adopted feature permits only short-lived in-memory trigger/content-hash retention needed to dispatch and suppress immediate replay.
 - **Silently ignore invalid, stale, and replayed notification triggers** under the adopted push-notification feature
 - Use `tracing` at debug level for push results, never include user-identifying info
 - All credentials should come from environment variables or config files, never hardcoded

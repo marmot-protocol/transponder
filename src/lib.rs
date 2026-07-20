@@ -1,7 +1,7 @@
-//! Transponder - MIP-05 Push Notification Server
+//! Transponder - Marmot Push v1 notification server.
 //!
-//! A privacy-preserving push notification server implementing the Marmot MIP-05
-//! specification.
+//! A privacy-preserving push notification server implementing the adopted
+//! Marmot Push v1 feature.
 
 pub mod app;
 pub mod config;

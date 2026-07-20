@@ -2,6 +2,8 @@
 //!
 //! Listens for SIGTERM and SIGINT signals and coordinates shutdown.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{future, io, time::Duration};
 
 use tokio::signal;
@@ -10,9 +12,12 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 /// Shutdown coordinator.
+#[derive(Clone)]
 pub struct ShutdownHandler {
     sender: watch::Sender<bool>,
     receiver: watch::Receiver<bool>,
+    internal_triggered: Arc<AtomicBool>,
+    signal_received: Arc<AtomicBool>,
 }
 
 /// Cloneable handle that lets supervised tasks request a process-wide shutdown.
@@ -23,11 +28,13 @@ pub struct ShutdownHandler {
 #[derive(Clone)]
 pub struct ShutdownTrigger {
     sender: watch::Sender<bool>,
+    internal_triggered: Arc<AtomicBool>,
 }
 
 impl ShutdownTrigger {
     /// Request a process-wide shutdown.
     pub fn trigger(&self) {
+        self.internal_triggered.store(true, Ordering::SeqCst);
         let _ = self.sender.send(true);
     }
 }
@@ -46,7 +53,12 @@ impl ShutdownHandler {
     /// Create a new shutdown handler.
     pub fn new() -> Self {
         let (sender, receiver) = watch::channel(false);
-        Self { sender, receiver }
+        Self {
+            sender,
+            receiver,
+            internal_triggered: Arc::new(AtomicBool::new(false)),
+            signal_received: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Get a receiver for shutdown signals.
@@ -58,12 +70,21 @@ impl ShutdownHandler {
     pub fn trigger_handle(&self) -> ShutdownTrigger {
         ShutdownTrigger {
             sender: self.sender.clone(),
+            internal_triggered: self.internal_triggered.clone(),
         }
     }
 
     /// Trigger a shutdown.
     pub fn trigger(&self) {
+        self.internal_triggered.store(true, Ordering::SeqCst);
         let _ = self.sender.send(true);
+    }
+
+    /// Install and poll the OS signal listeners immediately.
+    #[must_use]
+    pub fn install_signal_handlers(&self) -> tokio::task::JoinHandle<()> {
+        let handler = self.clone();
+        tokio::spawn(async move { handler.wait_for_signal().await })
     }
 
     /// Wait for a shutdown signal (SIGTERM or SIGINT).
@@ -85,16 +106,16 @@ impl ShutdownHandler {
     /// call, so an early supervised failure is never missed.
     pub async fn wait_for_signal_or_trigger(&self) -> ShutdownReason {
         let mut receiver = self.subscribe();
-        tokio::select! {
-            () = self.wait_for_signal() => ShutdownReason::Signal,
-            _ = receiver.wait_for(|&triggered| triggered) => {
-                info!("Internal shutdown trigger received, initiating shutdown");
-                // Keep signal semantics consistent with the OS-signal path: a
-                // signal arriving after an internal trigger forces the process
-                // out instead of being ignored during teardown.
-                spawn_force_quit_on_second_signal();
-                ShutdownReason::InternalTrigger
-            }
+        let _ = receiver.wait_for(|&triggered| triggered).await;
+        // Internal failure wins classification even if an OS signal became
+        // ready in the same scheduler turn, preserving the non-zero exit code.
+        if self.internal_triggered.load(Ordering::SeqCst) {
+            info!("Internal shutdown trigger received, initiating shutdown");
+            spawn_force_quit_on_second_signal();
+            ShutdownReason::InternalTrigger
+        } else {
+            debug_assert!(self.signal_received.load(Ordering::SeqCst));
+            ShutdownReason::Signal
         }
     }
 
@@ -111,7 +132,8 @@ impl ShutdownHandler {
             signal = signal.name(),
             "Received shutdown signal, initiating shutdown"
         );
-        self.trigger();
+        self.signal_received.store(true, Ordering::SeqCst);
+        let _ = self.sender.send(true);
         spawn_second_signal_listener();
     }
 }

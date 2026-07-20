@@ -1,4 +1,4 @@
-//! Test vectors and utilities for testing the MIP-05 notification flow.
+//! Test vectors and utilities for testing the Marmot Push v1 notification flow.
 //!
 //! This module provides:
 //! - Token encryption (the inverse of what the server does for decryption)
@@ -22,19 +22,17 @@ use crate::crypto::token::{
     ENCRYPTED_TOKEN_SIZE, MAX_DEVICE_TOKEN_SIZE, PLATFORM_APNS, PLATFORM_FCM, TOKEN_PLAINTEXT_SIZE,
 };
 
-/// MIP-05 HKDF salt for key derivation (same as in token.rs).
-const HKDF_SALT: &[u8] = b"mip05-v1";
+/// Marmot Push v1 HKDF salt for key derivation (same as in token.rs).
+const HKDF_SALT: &[u8] = b"marmot-push-token-v1";
 
-/// MIP-05 HKDF info string for token encryption key.
-const HKDF_INFO: &[u8] = b"mip05-token-encryption";
+/// Marmot Push v1 HKDF info string for token encryption key.
+const HKDF_INFO: &[u8] = b"marmot-push-token-encryption";
 
-/// Kind for MIP-05 notification requests.
+/// Kind for Marmot Push v1 notification requests.
 pub const KIND_NOTIFICATION_REQUEST: u16 = 446;
 
 const TAG_VERSION: &str = "v";
-const TAG_ENCODING: &str = "encoding";
-const VERSION_MIP05_V1: &str = "mip05-v1";
-const ENCODING_BASE64: &str = "base64";
+const VERSION_MARMOT_PUSH_V1: &str = "marmot-push-v1";
 
 /// A test token that can be encrypted for the server.
 #[derive(Debug, Clone)]
@@ -88,7 +86,7 @@ impl TestToken {
         }
     }
 
-    /// Get the fixed-size token plaintext used by MIP-05.
+    /// Get the fixed-size token plaintext used by Marmot Push v1.
     ///
     /// Format: platform || token_length || device_token || random_padding
     fn to_plaintext(&self) -> Vec<u8> {
@@ -290,47 +288,29 @@ impl GiftWrapBuilder {
         }
     }
 
-    /// Build a gift-wrapped notification request event (MIP-05 spec shape).
+    /// Build a gift-wrapped Marmot Push v1 notification request event.
     ///
     /// # Arguments
     /// * `content` - The base64 content (concatenated encrypted tokens)
     #[must_use = "event must be used or creation effort is wasted"]
     pub async fn build(&self, content: &str) -> Event {
-        self.build_with_tags(content, true).await
-    }
-
-    /// Build a gift-wrapped notification request without the `encoding` tag.
-    ///
-    /// Matches the Darkmatter / Marmot compatibility shape.
-    #[must_use = "event must be used or creation effort is wasted"]
-    pub async fn build_without_encoding_tag(&self, content: &str) -> Event {
-        self.build_with_tags_and_created_at(content, false, None)
-            .await
+        self.build_with_created_at_option(content, None).await
     }
 
     /// Build a gift-wrapped notification request with a custom rumor timestamp.
     #[must_use = "event must be used or creation effort is wasted"]
     pub async fn build_with_created_at(&self, content: &str, created_at: Timestamp) -> Event {
-        self.build_with_tags_and_created_at(content, true, Some(created_at))
+        self.build_with_created_at_option(content, Some(created_at))
             .await
     }
 
-    async fn build_with_tags(&self, content: &str, include_encoding_tag: bool) -> Event {
-        self.build_with_tags_and_created_at(content, include_encoding_tag, None)
-            .await
-    }
-
-    async fn build_with_tags_and_created_at(
+    async fn build_with_created_at_option(
         &self,
         content: &str,
-        include_encoding_tag: bool,
         created_at: Option<Timestamp>,
     ) -> Event {
-        let mut tags =
-            vec![Tag::parse([TAG_VERSION, VERSION_MIP05_V1]).expect("valid version tag")];
-        if include_encoding_tag {
-            tags.push(Tag::parse([TAG_ENCODING, ENCODING_BASE64]).expect("valid encoding tag"));
-        }
+        let tags =
+            vec![Tag::parse([TAG_VERSION, VERSION_MARMOT_PUSH_V1]).expect("valid version tag")];
 
         // Create the kind 446 rumor (unsigned event)
         let mut rumor_builder =
@@ -507,29 +487,6 @@ mod tests {
         // Verify it's addressed to the server
         let p_tag = event.tags.iter().find(|t| t.kind() == TagKind::p());
         assert!(p_tag.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_gift_wrap_unwrap_roundtrip_without_encoding_tag() {
-        use crate::crypto::Nip59Handler;
-
-        let server_keys = Keys::generate();
-        let sender_keys = Keys::generate();
-
-        let content = NotificationContentBuilder::new(&server_keys)
-            .with_apns_token("deadbeef1234567890abcdefdeadbeef1234567890abcdefdeadbeef12345678")
-            .build();
-
-        let gift_wrap = GiftWrapBuilder::new(server_keys.clone(), sender_keys.clone())
-            .build_without_encoding_tag(&content)
-            .await;
-
-        let handler = Nip59Handler::new(server_keys.clone());
-        let unwrapped = handler.unwrap(&gift_wrap).await.unwrap();
-
-        let tokens = unwrapped.parse_tokens().unwrap();
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].len(), ENCRYPTED_TOKEN_SIZE);
     }
 
     #[tokio::test]
