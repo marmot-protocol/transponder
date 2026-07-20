@@ -1875,6 +1875,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_refresh_monitor_reconciles_disconnect_and_terminal_transitions() {
+        let client = Client::default();
+        let metrics = Metrics::disabled();
+        let server_pubkey = Keys::generate().public_key();
+        let subscription_id = SubscriptionId::generate();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let (sender, receiver) = broadcast::channel(8);
+
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: relay_url.clone(),
+                status: NostrRelayStatus::Disconnected,
+            })
+            .unwrap();
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: relay_url.clone(),
+                status: NostrRelayStatus::Connected,
+            })
+            .unwrap();
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url,
+                status: NostrRelayStatus::Terminated,
+            })
+            .unwrap();
+        drop(sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_subscription_refresh_monitor(
+                receiver,
+                client,
+                metrics,
+                subscription_id,
+                server_pubkey,
+                SubscriptionLookbackConfig {
+                    trigger_retention_secs: 300,
+                },
+            ),
+        )
+        .await
+        .expect("closed notification channel must stop the monitor");
+    }
+
+    #[tokio::test]
+    async fn subscription_refresh_monitor_recovers_conservatively_after_lag() {
+        let client = Client::default();
+        let metrics = Metrics::disabled();
+        let server_pubkey = Keys::generate().public_key();
+        let subscription_id = SubscriptionId::generate();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let (sender, receiver) = broadcast::channel(1);
+
+        for status in [
+            NostrRelayStatus::Disconnected,
+            NostrRelayStatus::Connecting,
+            NostrRelayStatus::Connected,
+        ] {
+            sender
+                .send(MonitorNotification::StatusChanged {
+                    relay_url: relay_url.clone(),
+                    status,
+                })
+                .unwrap();
+        }
+        drop(sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_subscription_refresh_monitor(
+                receiver,
+                client,
+                metrics,
+                subscription_id,
+                server_pubkey,
+                SubscriptionLookbackConfig {
+                    trigger_retention_secs: 300,
+                },
+            ),
+        )
+        .await
+        .expect("lag recovery must finish after the channel closes");
+    }
+
+    #[tokio::test]
     async fn test_relay_client_fails_with_no_relays() {
         let keys = Keys::generate();
         let config = RelayConfig {

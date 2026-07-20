@@ -981,6 +981,82 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
 
+    fn startup_test_config(private_key: &str, health_bind_address: &str) -> AppConfig {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+            [server]
+            private_key = "{private_key}"
+
+            [relays]
+            clearnet = ["ws://127.0.0.1:9"]
+            allow_unencrypted_clearnet_relays = true
+            connection_timeout_secs = 1
+
+            [health]
+            enabled = true
+            bind_address = "{health_bind_address}"
+
+            [metrics]
+            enabled = false
+            "#
+        )
+        .unwrap();
+
+        AppConfig::load(file.path()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_rejects_invalid_secret_after_early_signal_installation() {
+        let config = startup_test_config("not-a-secret-key", "127.0.0.1:9");
+
+        let error = run(config)
+            .await
+            .expect_err("invalid secret must fail startup");
+
+        assert!(error.to_string().contains("Invalid server private key"));
+    }
+
+    #[tokio::test]
+    async fn run_reaches_health_bind_with_valid_disabled_providers() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = startup_test_config(
+            &"11".repeat(32),
+            &occupied.local_addr().unwrap().to_string(),
+        );
+
+        let error = run(config)
+            .await
+            .expect_err("occupied health bind address must fail startup");
+
+        assert!(error.to_string().contains("Failed to start health server"));
+    }
+
+    #[tokio::test]
+    async fn run_fails_fast_when_enabled_apns_cannot_initialize() {
+        let mut config = startup_test_config(&"11".repeat(32), "127.0.0.1:9");
+        config.apns.enabled = true;
+
+        let error = run(config)
+            .await
+            .expect_err("incomplete enabled APNs config must fail startup");
+
+        assert!(error.to_string().contains("APNs"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn run_fails_fast_when_enabled_fcm_cannot_initialize() {
+        let mut config = startup_test_config(&"11".repeat(32), "127.0.0.1:9");
+        config.fcm.enabled = true;
+
+        let error = run(config)
+            .await
+            .expect_err("incomplete enabled FCM config must fail startup");
+
+        assert!(error.to_string().contains("FCM"), "{error:#}");
+    }
+
     #[tokio::test]
     async fn event_semaphore_caps_in_flight_permits() {
         let permits = 3;
