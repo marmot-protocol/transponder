@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added opt-in, product-neutral APNs `generic_alert` and `mutable_alert` payload modes with configurable title/body copy and optional `apns-collapse-id` coalescing. `mutable_alert` sets Apple's `mutable-content` flag so an iOS Notification Service Extension can replace the fallback alert. Configuration rejects empty alerts, oversized serialized payloads, overlong collapse identifiers, and invalid header values at startup.
+- Added opt-in, product-neutral APNs `generic_alert` and `mutable_alert` payload modes with configurable title/body copy and optional `apns-collapse-id` coalescing. `mutable_alert` sets Apple's `mutable-content` flag so an iOS Notification Service Extension configured by the app can replace the fallback alert. For enabled APNs configurations, startup validation rejects empty alerts, oversized serialized payloads, overlong collapse identifiers, and invalid header values.
 - Optional error and panic reporting to a GlitchTip (Sentry-compatible) instance, enabled by setting `glitchtip.dsn` (or `TRANSPONDER_GLITCHTIP_DSN`). Only Transponder's own `ERROR` events and panics are sent, over a self-contained TLS transport (bundled roots, no system CA store dependency); dependency-crate errors and lower log levels are dropped, and Transponder never logs or panics with secret material.
 
 ### Fixed
