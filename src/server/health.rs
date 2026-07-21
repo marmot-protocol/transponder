@@ -777,6 +777,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let push_dispatcher = Arc::new(PushDispatcher::new(Some(apns_client), None));
@@ -847,6 +850,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let fcm_client = FcmClient::mock(

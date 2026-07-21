@@ -417,9 +417,9 @@ impl PushDispatcher {
                         {
                             Ok(p) => p,
                             Err(_) => {
-                                // The dispatcher never closes this semaphore today; if a
-                                // future change does, the dequeued token is zeroed as this
-                                // loop scope unwinds.
+                                // Normal shutdown closes this semaphore only after the
+                                // queue loop exits. If another path closes it earlier, the
+                                // dequeued token is zeroed as this loop scope unwinds.
                                 drop(live_task_permit);
                                 Self::update_live_task_available_metric(
                                     &metrics,
@@ -710,27 +710,29 @@ impl PushDispatcher {
             self.shutting_down.store(true, Ordering::SeqCst);
         }
 
-        // Wake/shed retries parked in backoff. Closing also prevents the queue
-        // loop from admitting fresh HTTP work during bounded teardown.
-        self.semaphore.close();
+        // Serialize shutdown coordination by retaining the handle lock until the
+        // queue loop has stopped. A concurrent caller must not close the
+        // semaphore while the first caller is still draining queued sends.
+        let mut dispatcher_handle = self.dispatcher_handle.lock().await;
+        if let Some(handle) = dispatcher_handle.take() {
+            // Never hold the admission lock across a potentially blocking
+            // bounded-channel send; concurrent dispatchers can now observe
+            // shutdown and fail fast. The marker is placed behind every
+            // previously admitted notification, so the queue loop spawns all of
+            // them before it exits.
+            let _ = self.sender.send(PushMessage::Shutdown).await;
 
-        // Never hold the admission lock across a potentially blocking bounded
-        // channel send; concurrent dispatchers can now observe shutdown and
-        // fail fast.
-        let _ = self.sender.send(PushMessage::Shutdown).await;
-
-        let dispatcher_handle = {
-            let mut handle = self.dispatcher_handle.lock().await;
-            handle.take()
-        };
-
-        if let Some(handle) = dispatcher_handle {
             match handle.await {
                 Ok(()) => {}
                 Err(error) => {
                     warn!(error = %error, "Push dispatcher exited unexpectedly during shutdown");
                 }
             }
+
+            // Every queued send has now become an in-flight task. Close the
+            // active-HTTP semaphore only at this point, waking retries parked in
+            // backoff without causing the queue loop to shed admitted work.
+            self.semaphore.close();
         }
 
         // Wait for all spawned send tasks to finish. We track task lifetimes
@@ -1084,6 +1086,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_only = PushDispatcher::new(Some(ApnsClient::mock(apns_config, true)), None);
         assert!(apns_only.accepts(Platform::Apns));
@@ -1152,6 +1157,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let apns_client = ApnsClient::mock(config, true);
@@ -1219,6 +1227,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let dispatcher = PushDispatcher::new(Some(apns_client), None);
@@ -1270,6 +1281,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
 
@@ -1341,6 +1355,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let metrics = Metrics::new().unwrap();
@@ -1385,6 +1402,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
 
@@ -1416,6 +1436,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: String::new(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, false);
         let dispatcher = PushDispatcher::new(Some(apns_client), None);
@@ -1466,6 +1489,9 @@ mod tests {
                     environment: crate::config::ApnsEnvironment::Sandbox,
                     bundle_id: "com.example.app".to_string(),
                     payload_mode: Default::default(),
+                    alert_title: String::new(),
+                    alert_body: String::new(),
+                    collapse_id: String::new(),
                 },
                 true,
             )),
@@ -1625,6 +1651,9 @@ mod tests {
                     environment: crate::config::ApnsEnvironment::Sandbox,
                     bundle_id: "com.example.app".to_string(),
                     payload_mode: Default::default(),
+                    alert_title: String::new(),
+                    alert_body: String::new(),
+                    collapse_id: String::new(),
                 },
                 true,
             )),
@@ -1664,6 +1693,9 @@ mod tests {
                     environment: crate::config::ApnsEnvironment::Sandbox,
                     bundle_id: "com.example.app".to_string(),
                     payload_mode: Default::default(),
+                    alert_title: String::new(),
+                    alert_body: String::new(),
+                    collapse_id: String::new(),
                 },
                 true,
             )),
@@ -1721,6 +1753,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let dispatcher = PushDispatcher::new(Some(apns_client), None);
@@ -1733,6 +1768,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_completion_drains_backlog_before_returning() {
         use crate::config::ApnsConfig;
+        use crate::metrics::Metrics;
         use crate::push::ApnsClient;
 
         let apns_config = ApnsConfig {
@@ -1743,10 +1779,15 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
-        let dispatcher = Arc::new(PushDispatcher::new(
+        let metrics = Metrics::new().unwrap();
+        let dispatcher = Arc::new(PushDispatcher::with_metrics(
             Some(ApnsClient::mock(apns_config, true)),
             None,
+            metrics.clone(),
         ));
 
         let permits = dispatcher
@@ -1775,6 +1816,11 @@ mod tests {
             .expect("shutdown task should not panic");
 
         assert_eq!(dispatcher.queue_capacity(), MAX_PENDING_QUEUE_SIZE);
+        assert_eq!(
+            push_failed_metric_value(&metrics, "apns", "error"),
+            (MAX_CONCURRENT_PUSHES + 2) as u64,
+            "every admitted notification must reach the mock send path before shutdown returns"
+        );
     }
 
     #[tokio::test]
@@ -1790,6 +1836,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let dispatcher = Arc::new(PushDispatcher::new(
             Some(ApnsClient::mock(apns_config, true)),
@@ -1825,11 +1874,17 @@ mod tests {
             shutdown_dispatcher.wait_for_completion().await;
         });
 
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !shutdown_handle.is_finished(),
+            "shutdown must wait rather than shed an admitted notification"
+        );
+        drop(saturated_permits);
+
         tokio::time::timeout(Duration::from_secs(1), shutdown_handle)
             .await
-            .expect("shutdown should close admission instead of waiting for capacity")
+            .expect("shutdown should complete after capacity is restored")
             .expect("shutdown task should not panic");
-        drop(saturated_permits);
         assert_eq!(
             dispatcher.semaphore.available_permits(),
             MAX_CONCURRENT_PUSHES
@@ -1850,6 +1905,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let apns_client = ApnsClient::mock(apns_config, true);
         let metrics = Metrics::new().unwrap();
@@ -1906,6 +1964,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
 
         let metrics = Metrics::new().unwrap();
@@ -2108,6 +2169,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let mut client = ApnsClient::mock(apns_config, true);
         client.test_base_url = Some(mock_server.uri());

@@ -63,6 +63,10 @@ private_key_path = "/credentials/AuthKey_XXXXXXXXXX.p8"
 environment = "production"
 bundle_id = ""
 payload_mode = "silent"
+alert_title = "New activity"
+alert_body = "You have a new notification"
+# Optional, maximum 64 header-safe bytes. Empty disables APNs coalescing.
+collapse_id = ""
 
 [fcm]
 enabled = false

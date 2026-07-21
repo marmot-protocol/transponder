@@ -4,10 +4,13 @@
 
 ### Added
 
+- Added an opt-in, product-neutral APNs `generic_alert` payload mode with configurable title/body copy and optional `apns-collapse-id` coalescing. Configuration now rejects empty alerts, oversized serialized payloads, overlong collapse identifiers, and invalid header values at startup.
 - Optional error and panic reporting to a GlitchTip (Sentry-compatible) instance, enabled by setting `glitchtip.dsn` (or `TRANSPONDER_GLITCHTIP_DSN`). Only Transponder's own `ERROR` events and panics are sent, over a self-contained TLS transport (bundled roots, no system CA store dependency); dependency-crate errors and lower log levels are dropped, and Transponder never logs or panics with secret material.
 
 ### Fixed
 
+- Drain every admitted push notification before closing the outbound concurrency semaphore during graceful shutdown, preventing a backlogged queue from being silently shed.
+- Protect in-flight Marmot Push deduplication reservations from LRU eviction so a waiting relay redelivery cannot re-acquire and dispatch the same trigger concurrently.
 - Reject invalid APNs `environment` configuration values at startup instead of silently routing pushes to the sandbox gateway; only `production` and `sandbox` are accepted ([#143](https://github.com/marmot-protocol/transponder/pull/143)).
 - Limit each notification event to at most 100 encrypted tokens before base64 decoding, preventing oversized events from forcing unbounded token blob allocation and rate-limit work ([#38](https://github.com/marmot-protocol/transponder/pull/38)).
 - Validate configuration at load time so misconfiguration fails loudly at startup with a named-field error instead of silently coercing or detonating later: `server.max_dedup_cache_size`, `server.max_rate_limit_cache_size`, and `server.max_tokens_per_event` now reject `0`; `health.bind_address` must parse as a socket address; `logging.format` accepts only `json`/`pretty` (unknown values, including `off`, are rejected — silence console logs with `logging.level = "off"`); and `relays.onion` entries must be `ws://`/`wss://` URLs with a `.onion` host. Change-detection for the kind-10050 inbox relay list now normalizes URLs through `RelayUrl` and selects the newest event by `created_at`, avoiding spurious republishes.

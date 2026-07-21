@@ -137,9 +137,20 @@ environment = "production"
 # iOS app bundle identifier
 bundle_id = ""
 
-# APNs payload mode: "silent" or "nse_prototype_alert"
-# Keep production silent. Use nse_prototype_alert only for staging NSE prototype testing.
+# APNs payload mode: "silent" or "generic_alert".
+# Silent remains the privacy-preserving default. generic_alert sends only the
+# product-neutral copy configured below; it never contains message or sender data.
 payload_mode = "silent"
+
+# Visible copy used only when payload_mode = "generic_alert". An empty title or
+# body omits that field, but at least one must be non-empty. The serialized JSON
+# payload is checked against APNs' 4096-byte limit at startup.
+alert_title = "New activity"
+alert_body = "You have a new notification"
+
+# Optional APNs collapse identifier (maximum 64 header-safe bytes). The same
+# identifier lets APNs coalesce undelivered notifications. Empty disables it.
+collapse_id = ""
 
 [fcm]
 # Whether FCM (Android) push notifications are enabled
