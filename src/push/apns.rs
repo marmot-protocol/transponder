@@ -39,7 +39,7 @@ struct ApnsClaims {
 #[serde(untagged)]
 enum ApnsPayload {
     Silent(ApnsSilentPayload),
-    GenericAlert(ApnsGenericAlertPayload),
+    GenericAlert(serde_json::Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -67,39 +67,9 @@ impl ApnsPayload {
     fn for_config(config: &ApnsConfig) -> Self {
         match config.payload_mode {
             ApnsPayloadMode::Silent => Self::default(),
-            ApnsPayloadMode::GenericAlert => Self::GenericAlert(ApnsGenericAlertPayload {
-                aps: ApnsGenericAlertAps {
-                    alert: ApnsGenericAlert {
-                        title: config.alert_title.clone(),
-                        body: config.alert_body.clone(),
-                    },
-                    sound: "default",
-                },
-            }),
+            ApnsPayloadMode::GenericAlert => Self::GenericAlert(config.generic_alert_payload()),
         }
     }
-}
-
-/// Product-neutral alert carrying no message or sender content.
-#[derive(Debug, Serialize)]
-struct ApnsGenericAlertPayload {
-    aps: ApnsGenericAlertAps,
-}
-
-#[derive(Debug, Serialize)]
-struct ApnsGenericAlertAps {
-    alert: ApnsGenericAlert,
-    sound: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ApnsGenericAlert {
-    /// Omitted when configured empty, allowing a body-only alert.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    title: String,
-    /// Omitted when configured empty, allowing a title-only alert.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    body: String,
 }
 
 fn redacted_device_token_id(_device_token: &str) -> &'static str {
@@ -264,6 +234,7 @@ impl AuthTokenGenerator for ApnsTokenGenerator {
 pub struct ApnsClient {
     pub(crate) http_client: Client,
     pub(crate) config: ApnsConfig,
+    request_parts: ApnsRequestParts,
     pub(crate) token_cache: TokenCache<ApnsTokenGenerator>,
     pub(crate) metrics: Metrics,
     /// Test-only override for the APNs base URL (scheme + host + port).
@@ -289,6 +260,7 @@ impl ApnsClient {
 
     /// Create a new APNs client with metrics.
     pub async fn with_metrics(config: ApnsConfig, metrics: Metrics) -> Result<Self> {
+        let request_parts = ApnsRequestParts::for_config(&config)?;
         let http_client = Client::builder()
             .http2_prior_knowledge()
             .timeout(Duration::from_secs(30))
@@ -328,6 +300,7 @@ impl ApnsClient {
         Ok(Self {
             http_client,
             config,
+            request_parts,
             token_cache,
             metrics,
             #[cfg(test)]
@@ -365,12 +338,10 @@ impl ApnsClient {
             "device token must be even-length hex; TokenPayload is the single source of truth"
         );
 
-        // Build the request template once, outside the retry closures, so a
-        // retry does not re-allocate the payload/headers (issue #198). The
+        // The immutable request template is built once with the client. The
         // device-token URL is a zeroizing buffer (issue #126); reqwest still
-        // materializes the serialized body/headers into non-zeroized buffers
-        // it owns, which is the accepted #126 posture (see build_request).
-        let request_parts = ApnsRequestParts::for_config(&self.config)?;
+        // materializes the serialized body/headers into non-zeroized buffers it
+        // owns, which is the accepted #126 posture (see build_request).
         let url = device_token_url(self.base_url(), device_token.as_str());
 
         debug!(
@@ -391,7 +362,7 @@ impl ApnsClient {
         let result = retry::with_retry(
             &retry_config,
             "APNs",
-            || self.send_once(url.as_str(), &request_parts),
+            || self.send_once(url.as_str(), &self.request_parts),
             backoff_permit,
             self.metrics.clone(),
         )
@@ -657,6 +628,8 @@ impl ApnsClient {
 impl ApnsClient {
     /// Create a mock APNs client for testing.
     pub(crate) fn mock(config: ApnsConfig, with_encoding_key: bool) -> Self {
+        let request_parts =
+            ApnsRequestParts::for_config(&config).expect("mock APNs config must be valid");
         let encoding_key = with_encoding_key.then(|| EncodingKey::from_secret(b"fake-key"));
         let token_cache = TokenCache::new(ApnsTokenGenerator {
             encoding_key,
@@ -667,6 +640,7 @@ impl ApnsClient {
         Self {
             http_client: Client::new(),
             config,
+            request_parts,
             token_cache,
             metrics: Metrics::disabled(),
             test_base_url: None,

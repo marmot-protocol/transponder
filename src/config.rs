@@ -1233,6 +1233,31 @@ impl GlitchtipConfig {
 }
 
 impl ApnsConfig {
+    /// Build the canonical content-free generic-alert payload used for both
+    /// startup size validation and outbound APNs requests.
+    pub(crate) fn generic_alert_payload(&self) -> serde_json::Value {
+        let mut alert = serde_json::Map::new();
+        if !self.alert_title.is_empty() {
+            alert.insert(
+                "title".to_string(),
+                serde_json::Value::String(self.alert_title.clone()),
+            );
+        }
+        if !self.alert_body.is_empty() {
+            alert.insert(
+                "body".to_string(),
+                serde_json::Value::String(self.alert_body.clone()),
+            );
+        }
+
+        serde_json::json!({
+            "aps": {
+                "alert": alert,
+                "sound": "default"
+            }
+        })
+    }
+
     /// Rejects enabled APNs configuration that cannot produce valid requests.
     fn validate(&self) -> std::result::Result<(), config::ConfigError> {
         if !self.enabled {
@@ -1264,26 +1289,7 @@ impl ApnsConfig {
         }
 
         if self.payload_mode == ApnsPayloadMode::GenericAlert {
-            let mut alert = serde_json::Map::new();
-            if !self.alert_title.is_empty() {
-                alert.insert(
-                    "title".to_string(),
-                    serde_json::Value::String(self.alert_title.clone()),
-                );
-            }
-            if !self.alert_body.is_empty() {
-                alert.insert(
-                    "body".to_string(),
-                    serde_json::Value::String(self.alert_body.clone()),
-                );
-            }
-            let payload = serde_json::json!({
-                "aps": {
-                    "alert": alert,
-                    "sound": "default"
-                }
-            });
-            let payload_size = serde_json::to_vec(&payload)
+            let payload_size = serde_json::to_vec(&self.generic_alert_payload())
                 .map_err(|error| {
                     config::ConfigError::Message(format!(
                         "failed to serialize the configured APNs generic alert: {error}"
