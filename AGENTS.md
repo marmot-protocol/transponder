@@ -182,8 +182,20 @@ Example environment overrides:
 TRANSPONDER_SERVER_PRIVATE_KEY=abc123...
 TRANSPONDER_APNS_ENABLED=true
 TRANSPONDER_APNS_KEY_ID=ABCD123456
-TRANSPONDER_RELAYS_CLEARNET='["wss://relay.example.com"]'
+TRANSPONDER_APNS_PAYLOAD_MODE=mutable_alert
+TRANSPONDER_APNS_ALERT_TITLE="New activity"
+TRANSPONDER_APNS_ALERT_BODY="You have a new notification"
+TRANSPONDER_APNS_COLLAPSE_ID=message-sync
+TRANSPONDER_RELAYS_CLEARNET=wss://relay.example.com
 ```
+
+APNs supports three payload modes:
+
+- `silent` (default) sends a background push with no visible alert.
+- `generic_alert` sends the operator-configured, product-neutral fallback title and body.
+- `mutable_alert` sends the same fallback with Apple's `mutable-content` flag, allowing a Notification Service Extension already provided and configured by the iOS app to process and replace it. Transponder does not provide or configure the extension.
+
+`apns.alert_title` and `apns.alert_body` (or `TRANSPONDER_APNS_ALERT_TITLE` and `TRANSPONDER_APNS_ALERT_BODY`) configure the fallback copy for both alert modes. When APNs is enabled in an alert mode, at least one must be non-empty and the serialized payload must fit APNs' 4096-byte limit. `apns.collapse_id` / `TRANSPONDER_APNS_COLLAPSE_ID` is optional and must be at most 64 header-safe bytes.
 
 ## PR Guidelines
 

@@ -150,7 +150,8 @@ bundle_id = ""
 
 # APNs payload mode: "silent", "generic_alert", or "mutable_alert".
 # Both alert modes use only the product-neutral fallback copy configured below;
-# mutable_alert also invokes an iOS Notification Service Extension.
+# mutable_alert allows a configured iOS Notification Service Extension to
+# process and replace that fallback. The app must provide and configure it.
 payload_mode = "silent"
 alert_title = "New activity"
 alert_body = "You have a new notification"
@@ -240,7 +241,7 @@ export TRANSPONDER_APNS_BUNDLE_ID="com.example.app"
 export TRANSPONDER_APNS_PAYLOAD_MODE="silent"
 # Optional visible, product-neutral APNs modes:
 # export TRANSPONDER_APNS_PAYLOAD_MODE="generic_alert"
-# Or let an iOS Notification Service Extension replace the fallback alert:
+# Or allow the app's configured Notification Service Extension to replace it:
 # export TRANSPONDER_APNS_PAYLOAD_MODE="mutable_alert"
 # export TRANSPONDER_APNS_ALERT_TITLE="New activity"
 # export TRANSPONDER_APNS_ALERT_BODY="You have a new notification"
