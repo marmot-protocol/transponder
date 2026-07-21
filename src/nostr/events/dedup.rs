@@ -23,6 +23,13 @@ pub(crate) enum Reservation {
     /// receiver to change and then retrying avoids losing the trigger if that
     /// owner later releases a transient reservation.
     Wait(watch::Receiver<bool>),
+    /// Every cache slot is occupied by an in-flight reservation.
+    ///
+    /// The validated relationship between event-processing concurrency and
+    /// dedup capacity makes this unreachable in normal operation. Keeping an
+    /// explicit fail-closed result prevents a future caller from evicting a
+    /// live reservation and admitting a duplicate notification.
+    AtCapacity,
 }
 
 enum EntryState {
@@ -69,6 +76,10 @@ impl SeenEventStore {
             };
         }
 
+        if !self.make_room_without_evicting_in_flight() {
+            return Reservation::AtCapacity;
+        }
+
         let (completed, _receiver) = watch::channel(false);
         self.entries.put(
             content_hash,
@@ -78,6 +89,29 @@ impl SeenEventStore {
             },
         );
         Reservation::Acquired
+    }
+
+    /// Ensure one slot is available, evicting only terminal state.
+    ///
+    /// `LruCache::put` evicts the LRU entry without considering its state. A
+    /// still-active reservation must remain resident so concurrent duplicates
+    /// keep waiting on the same owner instead of re-acquiring after its watch
+    /// channel is dropped.
+    fn make_room_without_evicting_in_flight(&mut self) -> bool {
+        if self.entries.len() < self.entries.cap().get() {
+            return true;
+        }
+
+        let terminal_victim = self.entries.iter().rev().find_map(|(content_hash, entry)| {
+            matches!(entry.state, EntryState::Terminal).then_some(*content_hash)
+        });
+
+        if let Some(content_hash) = terminal_victim {
+            self.entries.pop(&content_hash);
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn release(&mut self, content_hash: &EventId) {
@@ -90,7 +124,8 @@ impl SeenEventStore {
 
     /// Complete a reservation and wake every concurrent duplicate waiter.
     ///
-    /// Returns `true` when the entry was absent and had to be inserted.
+    /// Returns `true` when the entry was absent and could be inserted. Returns
+    /// `false` when the entry already existed or every slot is still in flight.
     pub(crate) fn mark_terminal(&mut self, content_hash: EventId, now: Instant) -> bool {
         if let Some(entry) = self.entries.peek_mut(&content_hash) {
             let prior = std::mem::replace(&mut entry.state, EntryState::Terminal);
@@ -101,6 +136,9 @@ impl SeenEventStore {
             }
             false
         } else {
+            if !self.make_room_without_evicting_in_flight() {
+                return false;
+            }
             self.entries.put(
                 content_hash,
                 SeenTrigger {
@@ -224,6 +262,82 @@ mod tests {
         waiter.changed().await.unwrap();
         assert!(matches!(
             store.reserve(key, Instant::now()),
+            Reservation::Duplicate
+        ));
+    }
+
+    #[tokio::test]
+    async fn capacity_pressure_evicts_terminal_state_not_in_flight_reservation() {
+        let mut store = SeenEventStore::bounded(NonZeroUsize::new(2).unwrap());
+        let in_flight = hash(1);
+        let terminal = hash(2);
+        let newcomer = hash(3);
+
+        assert!(matches!(
+            store.reserve(in_flight, Instant::now()),
+            Reservation::Acquired
+        ));
+        let Reservation::Wait(mut waiter) = store.reserve(in_flight, Instant::now()) else {
+            panic!("concurrent reservation must wait");
+        };
+        assert!(store.mark_terminal(terminal, Instant::now()));
+
+        assert!(matches!(
+            store.reserve(newcomer, Instant::now()),
+            Reservation::Acquired
+        ));
+        assert!(
+            waiter.has_changed().is_ok(),
+            "the in-flight owner's completion channel must remain open"
+        );
+
+        store.mark_terminal(in_flight, Instant::now());
+        waiter.changed().await.unwrap();
+        assert!(matches!(
+            store.reserve(in_flight, Instant::now()),
+            Reservation::Duplicate
+        ));
+    }
+
+    #[test]
+    fn all_in_flight_capacity_fails_closed_without_evicting_an_owner() {
+        let mut store = SeenEventStore::bounded(NonZeroUsize::new(2).unwrap());
+        let first = hash(1);
+        let second = hash(2);
+
+        assert!(matches!(
+            store.reserve(first, Instant::now()),
+            Reservation::Acquired
+        ));
+        assert!(matches!(
+            store.reserve(second, Instant::now()),
+            Reservation::Acquired
+        ));
+        assert!(matches!(
+            store.reserve(hash(3), Instant::now()),
+            Reservation::AtCapacity
+        ));
+        assert!(
+            !store.mark_terminal(hash(4), Instant::now()),
+            "terminal fallback must not evict an in-flight owner"
+        );
+        assert!(matches!(
+            store.reserve(first, Instant::now()),
+            Reservation::Wait(_)
+        ));
+    }
+
+    #[test]
+    fn test_only_seen_event_helpers_cover_reservation_and_terminal_state() {
+        let now = Instant::now();
+        let mut store = SeenEventStore::bounded(NonZeroUsize::new(2).unwrap());
+
+        store.put(hash(1), SeenEvent::reservation(now));
+        store.put(hash(2), SeenEvent::terminal(now));
+
+        assert!(matches!(store.reserve(hash(1), now), Reservation::Wait(_)));
+        assert!(matches!(
+            store.reserve(hash(2), now),
             Reservation::Duplicate
         ));
     }

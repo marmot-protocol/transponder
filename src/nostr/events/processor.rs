@@ -265,6 +265,17 @@ impl EventProcessor {
                 Reservation::Wait(mut completed) => {
                     let _ = completed.changed().await;
                 }
+                Reservation::AtCapacity => {
+                    warn!(
+                        "Deduplication cache is fully occupied by in-flight reservations; dropping trigger"
+                    );
+                    self.metrics.record_event_failed();
+                    self.metrics.observe_event_processing_duration(
+                        EventOutcome::Failed,
+                        started_at.elapsed_secs(),
+                    );
+                    return Ok(false);
+                }
             }
         }
 
@@ -1002,6 +1013,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let metrics = Metrics::new().expect("metrics");
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
@@ -1045,6 +1059,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let metrics = Metrics::new().expect("metrics");
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
@@ -2029,6 +2046,9 @@ mod tests {
             environment: crate::config::ApnsEnvironment::Sandbox,
             bundle_id: "com.example.app".to_string(),
             payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
         };
         let push_dispatcher = Arc::new(PushDispatcher::with_metrics(
             Some(ApnsClient::mock(apns_config, true)),

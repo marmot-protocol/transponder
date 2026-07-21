@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Transponder is a privacy-preserving push notification server targeting the adopted [Marmot push-notifications feature](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md) and [Nostr transport binding](https://github.com/marmot-protocol/marmot/blob/master/transports/nostr.md). It listens for gift-wrapped Nostr events (kind 1059) on configured relays, decrypts notification triggers, and dispatches silent push notifications to APNs and FCM.
+Transponder is a privacy-preserving push notification server targeting the adopted [Marmot push-notifications feature](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md) and [Nostr transport binding](https://github.com/marmot-protocol/marmot/blob/master/transports/nostr.md). It listens for gift-wrapped Nostr events (kind 1059) on configured relays, decrypts notification triggers, and dispatches content-free push notifications to APNs and FCM. APNs delivery is silent by default and may use the opt-in, product-neutral `generic_alert` mode.
 
 The Marmot repository's adopted surface documents are normative. The MIP-era documents are deprecated; use [mip-coverage.md](https://github.com/marmot-protocol/marmot/blob/master/mip-coverage.md) only as a historical map. The current source implements the `marmot-push-v1` server surface and must retain exact wire compatibility with those adopted documents.
 
