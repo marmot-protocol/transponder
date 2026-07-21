@@ -2086,6 +2086,18 @@ mod tests {
         config
             .validate()
             .expect("valid generic alert configuration");
+        assert_eq!(
+            config.generic_alert_payload(),
+            serde_json::json!({
+                "aps": {
+                    "alert": {
+                        "title": "Activity",
+                        "body": "Open the app to check for updates"
+                    },
+                    "sound": "default"
+                }
+            })
+        );
 
         config.alert_title.clear();
         config
