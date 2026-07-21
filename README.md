@@ -148,8 +148,9 @@ environment = "production"
 # Your iOS app's bundle identifier (e.g., "com.example.myapp")
 bundle_id = ""
 
-# APNs payload mode: "silent" or "generic_alert".
-# generic_alert uses only the product-neutral copy configured below.
+# APNs payload mode: "silent", "generic_alert", or "mutable_alert".
+# Both alert modes use only the product-neutral fallback copy configured below;
+# mutable_alert also invokes an iOS Notification Service Extension.
 payload_mode = "silent"
 alert_title = "New activity"
 alert_body = "You have a new notification"
@@ -237,8 +238,10 @@ export TRANSPONDER_APNS_TEAM_ID="TEAM123456"
 export TRANSPONDER_APNS_PRIVATE_KEY_PATH="/path/to/AuthKey.p8"
 export TRANSPONDER_APNS_BUNDLE_ID="com.example.app"
 export TRANSPONDER_APNS_PAYLOAD_MODE="silent"
-# Optional visible, product-neutral APNs mode:
+# Optional visible, product-neutral APNs modes:
 # export TRANSPONDER_APNS_PAYLOAD_MODE="generic_alert"
+# Or let an iOS Notification Service Extension replace the fallback alert:
+# export TRANSPONDER_APNS_PAYLOAD_MODE="mutable_alert"
 # export TRANSPONDER_APNS_ALERT_TITLE="New activity"
 # export TRANSPONDER_APNS_ALERT_BODY="You have a new notification"
 # export TRANSPONDER_APNS_COLLAPSE_ID="message-sync"
@@ -539,7 +542,7 @@ To preserve the server's privacy guarantees, only `ERROR`-level events emitted b
 
 3. **Decrypt**: Each encrypted token in the request is decrypted using ECDH + HKDF + ChaCha20-Poly1305. The adopted domain-separation values are defined by the [Marmot push-notifications feature](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md); see [Protocol Status](#protocol-status) for the exact implemented surface.
 
-4. **Dispatch**: Tokens are routed to APNs or FCM based on platform identifier, sending content-free push notifications. APNs uses the configured `silent` or `generic_alert` payload mode.
+4. **Dispatch**: Tokens are routed to APNs or FCM based on platform identifier, sending content-free push notifications. APNs uses the configured `silent`, `generic_alert`, or `mutable_alert` payload mode. `mutable_alert` includes Apple's `mutable-content` flag so an iOS Notification Service Extension can fetch and replace the product-neutral fallback alert.
 
 5. **Wake**: Client apps wake up, fetch messages from relays, and display notifications locally.
 
