@@ -39,7 +39,7 @@ struct ApnsClaims {
 #[serde(untagged)]
 enum ApnsPayload {
     Silent(ApnsSilentPayload),
-    GenericAlert(serde_json::Value),
+    Alert(serde_json::Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -67,7 +67,9 @@ impl ApnsPayload {
     fn for_config(config: &ApnsConfig) -> Self {
         match config.payload_mode {
             ApnsPayloadMode::Silent => Self::default(),
-            ApnsPayloadMode::GenericAlert => Self::GenericAlert(config.generic_alert_payload()),
+            ApnsPayloadMode::GenericAlert | ApnsPayloadMode::MutableAlert => {
+                Self::Alert(config.alert_payload())
+            }
         }
     }
 }
@@ -813,6 +815,42 @@ mod tests {
                         "title": "New activity",
                         "body": "You have a new notification"
                     },
+                    "sound": "default"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_mutable_alert_mode_builds_service_extension_payload() {
+        let mut config = test_config();
+        config.payload_mode = ApnsPayloadMode::MutableAlert;
+        config.alert_title = "New activity".to_string();
+        config.alert_body = "You have a new notification".to_string();
+        let client = ApnsClient::mock(config, false);
+        let request_parts = ApnsRequestParts::for_config(&client.config).unwrap();
+
+        let request = client
+            .build_request(
+                "https://api.push.apple.com/3/device/aabbccdd11223344",
+                "test-token",
+                &request_parts,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(header_value(&request, "apns-push-type"), "alert");
+        assert_eq!(header_value(&request, "apns-priority"), "10");
+        assert_eq!(header_value(&request, "apns-topic"), "com.example.app");
+        assert_eq!(
+            request_json(&request),
+            serde_json::json!({
+                "aps": {
+                    "alert": {
+                        "title": "New activity",
+                        "body": "You have a new notification"
+                    },
+                    "mutable-content": 1,
                     "sound": "default"
                 }
             })

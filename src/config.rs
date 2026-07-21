@@ -368,11 +368,11 @@ pub struct ApnsConfig {
     #[serde(default)]
     pub payload_mode: ApnsPayloadMode,
 
-    /// Product-neutral title for the `generic_alert` payload mode.
+    /// Product-neutral title for the visible alert payload modes.
     #[serde(default = "default_apns_alert_title")]
     pub alert_title: String,
 
-    /// Product-neutral body for the `generic_alert` payload mode.
+    /// Product-neutral body for the visible alert payload modes.
     #[serde(default = "default_apns_alert_body")]
     pub alert_body: String,
 
@@ -418,21 +418,32 @@ pub enum ApnsPayloadMode {
 
     /// Visible, content-free alert with operator-configured title and body.
     GenericAlert,
+
+    /// Visible, content-free alert that an iOS Notification Service Extension may replace.
+    MutableAlert,
 }
 
 impl ApnsPayloadMode {
     pub(crate) fn push_type(self) -> &'static str {
         match self {
             Self::Silent => "background",
-            Self::GenericAlert => "alert",
+            Self::GenericAlert | Self::MutableAlert => "alert",
         }
     }
 
     pub(crate) fn priority(self) -> &'static str {
         match self {
             Self::Silent => "5",
-            Self::GenericAlert => "10",
+            Self::GenericAlert | Self::MutableAlert => "10",
         }
+    }
+
+    fn is_alert(self) -> bool {
+        matches!(self, Self::GenericAlert | Self::MutableAlert)
+    }
+
+    fn uses_mutable_content(self) -> bool {
+        matches!(self, Self::MutableAlert)
     }
 }
 
@@ -441,6 +452,7 @@ impl std::fmt::Display for ApnsPayloadMode {
         match self {
             Self::Silent => f.write_str("silent"),
             Self::GenericAlert => f.write_str("generic_alert"),
+            Self::MutableAlert => f.write_str("mutable_alert"),
         }
     }
 }
@@ -1233,9 +1245,9 @@ impl GlitchtipConfig {
 }
 
 impl ApnsConfig {
-    /// Build the canonical content-free generic-alert payload used for both
-    /// startup size validation and outbound APNs requests.
-    pub(crate) fn generic_alert_payload(&self) -> serde_json::Value {
+    /// Build the canonical content-free alert payload used for both startup
+    /// size validation and outbound APNs requests.
+    pub(crate) fn alert_payload(&self) -> serde_json::Value {
         let mut alert = serde_json::Map::new();
         if !self.alert_title.is_empty() {
             alert.insert(
@@ -1250,12 +1262,17 @@ impl ApnsConfig {
             );
         }
 
-        serde_json::json!({
-            "aps": {
-                "alert": alert,
-                "sound": "default"
-            }
-        })
+        let mut aps = serde_json::Map::new();
+        aps.insert("alert".to_string(), serde_json::Value::Object(alert));
+        if self.payload_mode.uses_mutable_content() {
+            aps.insert("mutable-content".to_string(), serde_json::Value::from(1));
+        }
+        aps.insert(
+            "sound".to_string(),
+            serde_json::Value::String("default".to_string()),
+        );
+
+        serde_json::json!({ "aps": aps })
     }
 
     /// Rejects enabled APNs configuration that cannot produce valid requests.
@@ -1279,26 +1296,27 @@ impl ApnsConfig {
             }
         }
 
-        if self.payload_mode == ApnsPayloadMode::GenericAlert
+        if self.payload_mode.is_alert()
             && self.alert_title.trim().is_empty()
             && self.alert_body.trim().is_empty()
         {
-            return Err(config::ConfigError::Message(
-                "apns.alert_title or apns.alert_body must be set when apns.payload_mode = \"generic_alert\"".to_string(),
-            ));
+            return Err(config::ConfigError::Message(format!(
+                "apns.alert_title or apns.alert_body must be set when apns.payload_mode = \"{}\"",
+                self.payload_mode
+            )));
         }
 
-        if self.payload_mode == ApnsPayloadMode::GenericAlert {
-            let payload_size = serde_json::to_vec(&self.generic_alert_payload())
+        if self.payload_mode.is_alert() {
+            let payload_size = serde_json::to_vec(&self.alert_payload())
                 .map_err(|error| {
                     config::ConfigError::Message(format!(
-                        "failed to serialize the configured APNs generic alert: {error}"
+                        "failed to serialize the configured APNs alert: {error}"
                     ))
                 })?
                 .len();
             if payload_size > APNS_MAX_PAYLOAD_BYTES {
                 return Err(config::ConfigError::Message(format!(
-                    "configured APNs generic alert serializes to {payload_size} bytes; APNs permits at most {APNS_MAX_PAYLOAD_BYTES} bytes"
+                    "configured APNs alert serializes to {payload_size} bytes; APNs permits at most {APNS_MAX_PAYLOAD_BYTES} bytes"
                 )));
             }
         }
@@ -2006,6 +2024,7 @@ mod tests {
     fn test_apns_payload_mode_display_is_stable() {
         assert_eq!(ApnsPayloadMode::Silent.to_string(), "silent");
         assert_eq!(ApnsPayloadMode::GenericAlert.to_string(), "generic_alert");
+        assert_eq!(ApnsPayloadMode::MutableAlert.to_string(), "mutable_alert");
     }
 
     #[test]
@@ -2048,31 +2067,55 @@ mod tests {
     }
 
     #[test]
-    fn test_enabled_generic_alert_requires_title_or_body() {
-        let mut config = enabled_apns_config();
-        config.payload_mode = ApnsPayloadMode::GenericAlert;
-        config.alert_title = "  ".to_string();
-        config.alert_body = String::new();
+    fn test_apns_mutable_alert_parses_from_environment_with_custom_copy() {
+        let config = from_test_env(&[
+            ("TRANSPONDER_APNS_PAYLOAD_MODE", "mutable_alert"),
+            ("TRANSPONDER_APNS_ALERT_TITLE", "Messages"),
+            (
+                "TRANSPONDER_APNS_ALERT_BODY",
+                "Open the app to check for updates",
+            ),
+            ("TRANSPONDER_APNS_COLLAPSE_ID", "message-sync"),
+        ])
+        .unwrap();
 
-        let error = config.validate().unwrap_err();
-        assert!(error.to_string().contains("apns.alert_title"), "{error}");
-        assert!(error.to_string().contains("apns.alert_body"), "{error}");
+        assert_eq!(config.apns.payload_mode, ApnsPayloadMode::MutableAlert);
+        assert_eq!(config.apns.alert_title, "Messages");
+        assert_eq!(config.apns.alert_body, "Open the app to check for updates");
+        assert_eq!(config.apns.collapse_id, "message-sync");
     }
 
     #[test]
-    fn test_enabled_generic_alert_rejects_payload_over_apns_limit() {
-        let mut config = enabled_apns_config();
-        config.payload_mode = ApnsPayloadMode::GenericAlert;
-        config.alert_body = "\"".repeat(APNS_MAX_PAYLOAD_BYTES);
+    fn test_enabled_alert_modes_require_title_or_body() {
+        for mode in [ApnsPayloadMode::GenericAlert, ApnsPayloadMode::MutableAlert] {
+            let mut config = enabled_apns_config();
+            config.payload_mode = mode;
+            config.alert_title = "  ".to_string();
+            config.alert_body = String::new();
 
-        let error = config.validate().unwrap_err();
-        assert!(error.to_string().contains("serializes to"), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains(&APNS_MAX_PAYLOAD_BYTES.to_string()),
-            "{error}"
-        );
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("apns.alert_title"), "{error}");
+            assert!(error.to_string().contains("apns.alert_body"), "{error}");
+            assert!(error.to_string().contains(&mode.to_string()), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_enabled_alert_modes_reject_payload_over_apns_limit() {
+        for mode in [ApnsPayloadMode::GenericAlert, ApnsPayloadMode::MutableAlert] {
+            let mut config = enabled_apns_config();
+            config.payload_mode = mode;
+            config.alert_body = "\"".repeat(APNS_MAX_PAYLOAD_BYTES);
+
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("serializes to"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&APNS_MAX_PAYLOAD_BYTES.to_string()),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -2087,7 +2130,7 @@ mod tests {
             .validate()
             .expect("valid generic alert configuration");
         assert_eq!(
-            config.generic_alert_payload(),
+            config.alert_payload(),
             serde_json::json!({
                 "aps": {
                     "alert": {

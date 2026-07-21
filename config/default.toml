@@ -137,14 +137,15 @@ environment = "production"
 # iOS app bundle identifier
 bundle_id = ""
 
-# APNs payload mode: "silent" or "generic_alert".
-# Silent remains the privacy-preserving default. generic_alert sends only the
-# product-neutral copy configured below; it never contains message or sender data.
+# APNs payload mode: "silent", "generic_alert", or "mutable_alert".
+# Silent remains the privacy-preserving default. Both alert modes send only the
+# product-neutral fallback copy configured below; mutable_alert additionally sets
+# Apple's mutable-content flag for an iOS Notification Service Extension.
 payload_mode = "silent"
 
-# Visible copy used only when payload_mode = "generic_alert". An empty title or
-# body omits that field, but at least one must be non-empty. The serialized JSON
-# payload is checked against APNs' 4096-byte limit at startup.
+# Visible fallback copy used by generic_alert and mutable_alert. An empty title
+# or body omits that field, but at least one must be non-empty. The serialized
+# JSON payload is checked against APNs' 4096-byte limit at startup.
 alert_title = "New activity"
 alert_body = "You have a new notification"
 
