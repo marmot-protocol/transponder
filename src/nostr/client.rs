@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::config::RelayConfig;
-use crate::defaults::{DEFAULT_DEDUP_RETENTION_SECS, NIP59_TIMESTAMP_TWEAK_WINDOW_SECS};
+use crate::defaults::NIP59_TIMESTAMP_TWEAK_WINDOW_SECS;
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 use crate::shutdown::ShutdownTrigger;
@@ -29,24 +29,148 @@ const TOR_FEATURE_ENABLED: bool = false;
 const RELAY_MONITOR_CHANNEL_SIZE: usize = 64;
 const DEGRADED_RELAY_CLASS_WARNING_GRACE: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy)]
-struct SubscriptionLookbackConfig {
-    trigger_retention_secs: u64,
+#[derive(Debug, Clone)]
+struct LiveGiftWrapSubscription {
+    id: SubscriptionId,
+    state: LiveGiftWrapSubscriptionState,
 }
 
-impl SubscriptionLookbackConfig {
-    fn from_server_config(server: &crate::config::ServerConfig) -> Self {
-        Self {
-            trigger_retention_secs: server.dedup_retention_secs,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveGiftWrapSubscriptionState {
+    Pending,
+    Live,
+    Invalidated,
+}
+
+enum LiveGiftWrapInstall {
+    Current,
+    Replace {
+        subscription_id: SubscriptionId,
+        previous: Option<LiveGiftWrapSubscription>,
+    },
+}
+
+/// Relay-scoped state for live-only gift-wrap subscriptions.
+///
+/// A relay/subscription pair is not eligible for event processing until its
+/// matching EOSE has arrived. Replacing or removing an entry immediately makes
+/// notifications from the old subscription stale.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LiveGiftWrapSubscriptions {
+    subscriptions: Arc<RwLock<BTreeMap<RelayUrl, LiveGiftWrapSubscription>>>,
+    rebuild: Arc<Notify>,
+}
+
+impl LiveGiftWrapSubscriptions {
+    #[cfg(test)]
+    pub(crate) async fn replace_pending(&self, relay_url: RelayUrl, id: SubscriptionId) {
+        self.subscriptions.write().await.insert(
+            relay_url,
+            LiveGiftWrapSubscription {
+                id,
+                state: LiveGiftWrapSubscriptionState::Pending,
+            },
+        );
+    }
+
+    async fn prepare_install(
+        &self,
+        relay_url: RelayUrl,
+        subscription_id: SubscriptionId,
+    ) -> LiveGiftWrapInstall {
+        let mut subscriptions = self.subscriptions.write().await;
+        if subscriptions.get(&relay_url).is_some_and(|subscription| {
+            subscription.state != LiveGiftWrapSubscriptionState::Invalidated
+        }) {
+            return LiveGiftWrapInstall::Current;
+        }
+
+        let previous = subscriptions.insert(
+            relay_url,
+            LiveGiftWrapSubscription {
+                id: subscription_id.clone(),
+                state: LiveGiftWrapSubscriptionState::Pending,
+            },
+        );
+        LiveGiftWrapInstall::Replace {
+            subscription_id,
+            previous,
         }
     }
-}
 
-impl Default for SubscriptionLookbackConfig {
-    fn default() -> Self {
-        Self {
-            trigger_retention_secs: DEFAULT_DEDUP_RETENTION_SECS,
+    async fn invalidate(&self, relay_url: &RelayUrl) {
+        self.subscriptions.write().await.remove(relay_url);
+    }
+
+    async fn restore_if_current(
+        &self,
+        relay_url: &RelayUrl,
+        id: &SubscriptionId,
+        previous: Option<LiveGiftWrapSubscription>,
+    ) {
+        let mut subscriptions = self.subscriptions.write().await;
+        if subscriptions
+            .get(relay_url)
+            .is_some_and(|subscription| subscription.id == *id)
+        {
+            if let Some(previous) = previous {
+                subscriptions.insert(relay_url.clone(), previous);
+            } else {
+                subscriptions.remove(relay_url);
+            }
         }
+    }
+
+    async fn invalidate_all_for_rebuild(&self) {
+        for subscription in self.subscriptions.write().await.values_mut() {
+            subscription.state = LiveGiftWrapSubscriptionState::Invalidated;
+        }
+    }
+
+    /// Fail closed after relay-pool notification loss and request fresh
+    /// subscriptions for every relay that is still connected.
+    pub(crate) async fn recover_after_notification_lag(&self) {
+        self.invalidate_all_for_rebuild().await;
+        self.rebuild.notify_one();
+    }
+
+    /// Wait until the event loop requests a rebuild after losing relay-pool
+    /// notifications.
+    pub(crate) async fn wait_for_rebuild_request(&self) {
+        self.rebuild.notified().await;
+    }
+
+    /// Mark a relay/subscription pair live after receiving its matching EOSE.
+    ///
+    /// Returns `true` only when the pair is the relay's current subscription.
+    pub(crate) async fn mark_eose(&self, relay_url: &RelayUrl, id: &SubscriptionId) -> bool {
+        let mut subscriptions = self.subscriptions.write().await;
+        let Some(subscription) = subscriptions.get_mut(relay_url) else {
+            return false;
+        };
+        if subscription.id != *id {
+            return false;
+        }
+        match subscription.state {
+            LiveGiftWrapSubscriptionState::Pending => {
+                subscription.state = LiveGiftWrapSubscriptionState::Live;
+                true
+            }
+            LiveGiftWrapSubscriptionState::Live => true,
+            LiveGiftWrapSubscriptionState::Invalidated => false,
+        }
+    }
+
+    /// Return whether this is the current relay/subscription pair and its EOSE
+    /// boundary has been observed.
+    pub(crate) async fn is_live(&self, relay_url: &RelayUrl, id: &SubscriptionId) -> bool {
+        self.subscriptions
+            .read()
+            .await
+            .get(relay_url)
+            .is_some_and(|subscription| {
+                subscription.id == *id && subscription.state == LiveGiftWrapSubscriptionState::Live
+            })
     }
 }
 
@@ -153,180 +277,155 @@ async fn resync_reconnect_attempts_from_client(client: &Client, limiter: &Reconn
     resync_reconnect_attempts(limiter, relays);
 }
 
-fn initial_subscription_since(now: u64, config: SubscriptionLookbackConfig) -> Timestamp {
-    Timestamp::from_secs(
-        now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-            .saturating_sub(config.trigger_retention_secs),
-    )
-}
-
-fn reconnect_subscription_since(
-    disconnect_started_at: u64,
-    now: u64,
-    config: SubscriptionLookbackConfig,
-) -> Timestamp {
-    let earliest_relevant_publish =
-        disconnect_started_at.max(now.saturating_sub(config.trigger_retention_secs));
-
-    Timestamp::from_secs(
-        earliest_relevant_publish.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS),
-    )
-}
-
-fn gift_wrap_subscription_filter(server_pubkey: PublicKey, since: Timestamp) -> Filter {
+fn live_gift_wrap_subscription_filter(server_pubkey: PublicKey, now: u64) -> Filter {
     Filter::new()
         .kind(Kind::GiftWrap)
         .pubkey(server_pubkey)
-        .since(since)
+        .since(Timestamp::from_secs(
+            now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS),
+        ))
+        // NIP-01 applies `limit` only to the stored query. The relay keeps the
+        // subscription open after EOSE and ignores this limit for live events.
+        .limit(0)
 }
 
-async fn refresh_gift_wrap_subscription(
+async fn install_live_gift_wrap_subscription(
     client: &Client,
-    metrics: &Metrics,
-    subscription_id: &SubscriptionId,
-    server_pubkey: PublicKey,
-    since: Timestamp,
-) -> Result<()> {
-    let filter = gift_wrap_subscription_filter(server_pubkey, since);
-    client
-        .subscribe_with_id(subscription_id.clone(), filter, None)
-        .await
-        .map_err(|e| Error::Nostr(format!("Failed to subscribe: {e}")))?;
-
-    let now = Timestamp::now().as_secs();
-    metrics.set_relay_subscription_lookback(now.saturating_sub(since.as_secs()));
-    Ok(())
-}
-
-fn mark_disconnected_if_needed(
-    disconnected_since: &mut BTreeMap<RelayUrl, u64>,
+    subscriptions: &LiveGiftWrapSubscriptions,
     relay_url: RelayUrl,
-    now: u64,
-) {
-    disconnected_since.entry(relay_url).or_insert(now);
+    server_pubkey: PublicKey,
+) -> Result<()> {
+    let LiveGiftWrapInstall::Replace {
+        subscription_id,
+        previous,
+    } = subscriptions
+        .prepare_install(relay_url.clone(), SubscriptionId::generate())
+        .await
+    else {
+        return Ok(());
+    };
+
+    let filter = live_gift_wrap_subscription_filter(server_pubkey, Timestamp::now().as_secs());
+    let mut messages = Vec::with_capacity(usize::from(previous.is_some()) + 1);
+    if let Some(previous) = previous.as_ref() {
+        messages.push(ClientMessage::close(previous.id.clone()));
+    }
+    messages.push(ClientMessage::req(subscription_id.clone(), filter));
+
+    let output = match client.batch_msg_to([relay_url.clone()], messages).await {
+        Ok(output) => output,
+        Err(error) => {
+            subscriptions
+                .restore_if_current(&relay_url, &subscription_id, previous)
+                .await;
+            return Err(Error::Nostr(format!(
+                "Failed to send live subscription: {error}"
+            )));
+        }
+    };
+
+    if output.success.contains(&relay_url) {
+        return Ok(());
+    }
+
+    subscriptions
+        .restore_if_current(&relay_url, &subscription_id, previous)
+        .await;
+    let reason = output
+        .failed
+        .get(&relay_url)
+        .map(String::as_str)
+        .unwrap_or("relay did not accept the request");
+    Err(Error::Nostr(format!(
+        "Failed to send live subscription: {reason}"
+    )))
 }
 
-async fn run_subscription_refresh_monitor(
+async fn install_for_connected_relays(
+    client: &Client,
+    subscriptions: &LiveGiftWrapSubscriptions,
+    server_pubkey: PublicKey,
+) -> usize {
+    let relays = client.relays().await;
+    let mut installed = 0;
+    for (relay_url, relay) in relays {
+        if relay.status() != NostrRelayStatus::Connected {
+            subscriptions.invalidate(&relay_url).await;
+            continue;
+        }
+
+        match install_live_gift_wrap_subscription(client, subscriptions, relay_url, server_pubkey)
+            .await
+        {
+            Ok(()) => installed += 1,
+            Err(error) => {
+                warn!(error = %error, "Failed to install live gift-wrap subscription");
+            }
+        }
+    }
+    installed
+}
+
+async fn run_live_subscription_monitor(
     mut notifications: broadcast::Receiver<MonitorNotification>,
     client: Client,
-    metrics: Metrics,
-    subscription_id: SubscriptionId,
+    subscriptions: LiveGiftWrapSubscriptions,
     server_pubkey: PublicKey,
-    lookback_config: SubscriptionLookbackConfig,
 ) {
-    let process_started_at = Timestamp::now().as_secs();
-    let mut disconnected_since = BTreeMap::new();
+    let rebuild_request = subscriptions.wait_for_rebuild_request();
+    tokio::pin!(rebuild_request);
 
     loop {
-        match notifications.recv().await {
-            Ok(MonitorNotification::StatusChanged { relay_url, status }) => {
-                let now = Timestamp::now().as_secs();
-                match status {
+        tokio::select! {
+            _ = &mut rebuild_request => {
+                warn!("Relay notifications were lost; rebuilding live gift-wrap subscriptions");
+                // The event loop invalidates current IDs before signaling.
+                // Installation is idempotent, so a queued Connected status that
+                // already replaced them is retained.
+                install_for_connected_relays(&client, &subscriptions, server_pubkey).await;
+                rebuild_request.set(subscriptions.wait_for_rebuild_request());
+            }
+            result = notifications.recv() => match result {
+                Ok(MonitorNotification::StatusChanged { relay_url, status }) => match status {
                     NostrRelayStatus::Connected => {
-                        if disconnected_since.contains_key(&relay_url) {
-                            // A REQ refresh replaces the subscription on every
-                            // relay, so retain the oldest outstanding gap until
-                            // each catch-up refresh succeeds.
-                            let oldest_disconnect = disconnected_since
-                                .values()
-                                .copied()
-                                .min()
-                                .expect("connected relay has a disconnect record");
-                            let since = reconnect_subscription_since(
-                                oldest_disconnect,
-                                now,
-                                lookback_config,
+                        if let Err(error) = install_live_gift_wrap_subscription(
+                            &client,
+                            &subscriptions,
+                            relay_url,
+                            server_pubkey,
+                        )
+                        .await
+                        {
+                            warn!(
+                                error = %error,
+                                "Failed to install live gift-wrap subscription after relay connection"
                             );
-                            match refresh_gift_wrap_subscription(
-                                &client,
-                                &metrics,
-                                &subscription_id,
-                                server_pubkey,
-                                since,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    disconnected_since.remove(&relay_url);
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to refresh gift-wrap subscription after relay reconnect");
-                                }
-                            }
                         }
-                    }
-                    NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
-                        disconnected_since.remove(&relay_url);
                     }
                     NostrRelayStatus::Initialized
                     | NostrRelayStatus::Pending
                     | NostrRelayStatus::Connecting
                     | NostrRelayStatus::Disconnected
-                    | NostrRelayStatus::Sleeping => {
-                        mark_disconnected_if_needed(&mut disconnected_since, relay_url, now);
+                    | NostrRelayStatus::Sleeping
+                    | NostrRelayStatus::Terminated
+                    | NostrRelayStatus::Banned => {
+                        subscriptions.invalidate(&relay_url).await;
                     }
+                },
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        skipped,
+                        "Relay live-subscription monitor lagged; rebuilding current relay subscriptions"
+                    );
+
+                    // A lost status transition may hide a complete connection
+                    // flap. Fail closed by invalidating every old ID, then install
+                    // fresh raw subscriptions only on relays connected now.
+                    subscriptions.invalidate_all_for_rebuild().await;
+                    install_for_connected_relays(&client, &subscriptions, server_pubkey).await;
                 }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                let now = Timestamp::now().as_secs();
-                warn!(
-                    skipped,
-                    "Relay subscription refresh monitor lagged; conservatively refreshing gift-wrap subscription"
-                );
-
-                let current_relays = client.relays().await;
-                let mut connected_to_clear = Vec::new();
-                for (relay_url, relay) in &current_relays {
-                    match relay.status() {
-                        NostrRelayStatus::Connected => {
-                            if disconnected_since.contains_key(relay_url) {
-                                connected_to_clear.push(relay_url.clone());
-                            }
-                        }
-                        NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
-                            disconnected_since.remove(relay_url);
-                        }
-                        NostrRelayStatus::Initialized
-                        | NostrRelayStatus::Pending
-                        | NostrRelayStatus::Connecting
-                        | NostrRelayStatus::Disconnected
-                        | NostrRelayStatus::Sleeping => {
-                            disconnected_since
-                                .entry(relay_url.clone())
-                                .or_insert(process_started_at);
-                        }
-                    }
-                }
-
-                // Lost monitor messages can hide a complete disconnect/reconnect
-                // flap. Always refresh conservatively; retention caps the
-                // effective lookback even for a long-lived process.
-                let oldest_disconnect = std::iter::once(process_started_at)
-                    .chain(disconnected_since.values().copied())
-                    .min()
-                    .expect("process start provides a lag recovery bound");
-
-                let since = reconnect_subscription_since(oldest_disconnect, now, lookback_config);
-                match refresh_gift_wrap_subscription(
-                    &client,
-                    &metrics,
-                    &subscription_id,
-                    server_pubkey,
-                    since,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        for relay_url in connected_to_clear {
-                            disconnected_since.remove(&relay_url);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to refresh gift-wrap subscription after relay monitor lag");
-                    }
-                }
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
@@ -423,7 +522,7 @@ pub struct RelayClient {
     /// in [`RelayClient::connect`]. Used by [`RelayClient::refresh_status`] to
     /// classify connected relays by origin list instead of URL shape.
     origins: Mutex<BTreeMap<RelayUrl, RelayKind>>,
-    subscription_lookback: SubscriptionLookbackConfig,
+    gift_wrap_subscriptions: LiveGiftWrapSubscriptions,
     metrics: Metrics,
     shutting_down: Arc<AtomicBool>,
     shutdown_trigger: Option<ShutdownTrigger>,
@@ -438,38 +537,23 @@ impl RelayClient {
 
     /// Create a new relay client with metrics.
     pub async fn with_metrics(keys: Keys, config: RelayConfig, metrics: Metrics) -> Result<Self> {
-        Self::with_metrics_and_subscription_lookback(
-            keys,
-            config,
-            metrics,
-            SubscriptionLookbackConfig::default(),
-            None,
-        )
-        .await
+        Self::with_optional_shutdown_trigger(keys, config, metrics, None).await
     }
 
-    pub async fn with_metrics_and_server_config(
+    /// Create a relay client with metrics and critical-task shutdown signaling.
+    pub async fn with_metrics_and_shutdown_trigger(
         keys: Keys,
         config: RelayConfig,
         metrics: Metrics,
-        server: &crate::config::ServerConfig,
         shutdown_trigger: ShutdownTrigger,
     ) -> Result<Self> {
-        Self::with_metrics_and_subscription_lookback(
-            keys,
-            config,
-            metrics,
-            SubscriptionLookbackConfig::from_server_config(server),
-            Some(shutdown_trigger),
-        )
-        .await
+        Self::with_optional_shutdown_trigger(keys, config, metrics, Some(shutdown_trigger)).await
     }
 
-    async fn with_metrics_and_subscription_lookback(
+    async fn with_optional_shutdown_trigger(
         keys: Keys,
         config: RelayConfig,
         metrics: Metrics,
-        subscription_lookback: SubscriptionLookbackConfig,
         shutdown_trigger: Option<ShutdownTrigger>,
     ) -> Result<Self> {
         validate_relay_config(&config)?;
@@ -494,10 +578,7 @@ impl RelayClient {
         let total = config.clearnet.len() + config.onion.len();
 
         metrics.set_relay_counts(config.clearnet.len(), config.onion.len());
-        metrics.set_relay_subscription_lookback(
-            NIP59_TIMESTAMP_TWEAK_WINDOW_SECS
-                .saturating_add(subscription_lookback.trigger_retention_secs),
-        );
+        metrics.set_relay_subscription_lookback(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS);
 
         Ok(Self {
             client,
@@ -509,7 +590,7 @@ impl RelayClient {
                 total_configured: total,
             })),
             origins: Mutex::new(BTreeMap::new()),
-            subscription_lookback,
+            gift_wrap_subscriptions: LiveGiftWrapSubscriptions::default(),
             metrics,
             shutting_down,
             shutdown_trigger,
@@ -617,54 +698,52 @@ impl RelayClient {
         }
     }
 
-    /// Subscribe to gift-wrapped events for the server's public key.
+    /// Subscribe to newly published gift-wrapped events for the server's public
+    /// key without replaying relay history.
     pub async fn subscribe(&self, server_pubkey: PublicKey) -> Result<()> {
-        let since =
-            initial_subscription_since(Timestamp::now().as_secs(), self.subscription_lookback);
-        let subscription_id = SubscriptionId::generate();
-
         debug!(
             pubkey = %server_pubkey,
-            lookback_secs = NIP59_TIMESTAMP_TWEAK_WINDOW_SECS
-                .saturating_add(self.subscription_lookback.trigger_retention_secs),
-            "Subscribing to gift wrap events"
+            timestamp_filter_lookback_secs = NIP59_TIMESTAMP_TWEAK_WINDOW_SECS,
+            "Subscribing to live gift wrap events"
         );
 
-        refresh_gift_wrap_subscription(
-            &self.client,
-            &self.metrics,
-            &subscription_id,
-            server_pubkey,
-            since,
-        )
-        .await?;
-
+        // Subscribe to monitor notifications before the initial relay snapshot
+        // so a concurrent connection transition is queued for reconciliation.
         let notifications = self.monitor.subscribe();
+        let installed = install_for_connected_relays(
+            &self.client,
+            &self.gift_wrap_subscriptions,
+            server_pubkey,
+        )
+        .await;
+        if installed == 0 {
+            return Err(Error::Nostr(
+                "Failed to install a live gift-wrap subscription on any connected relay".into(),
+            ));
+        }
+
         let client = self.client.clone();
-        let metrics = self.metrics.clone();
-        let lookback = self.subscription_lookback;
+        let subscriptions = self.gift_wrap_subscriptions.clone();
         let shutting_down = self.shutting_down.clone();
         let shutdown_trigger = self.shutdown_trigger.clone();
         std::mem::drop(tokio::spawn(async move {
-            run_subscription_refresh_monitor(
-                notifications,
-                client,
-                metrics,
-                subscription_id,
-                server_pubkey,
-                lookback,
-            )
-            .await;
+            run_live_subscription_monitor(notifications, client, subscriptions, server_pubkey)
+                .await;
             if !shutting_down.load(Ordering::SeqCst) {
-                error!("Relay subscription-refresh monitor exited unexpectedly");
+                error!("Relay live-subscription monitor exited unexpectedly");
                 if let Some(trigger) = shutdown_trigger {
                     trigger.trigger();
                 }
             }
         }));
 
-        info!("Subscribed to gift wrap events");
+        info!("Subscribed to live gift wrap events");
         Ok(())
+    }
+
+    /// Get relay-scoped gift-wrap subscription state for EOSE admission.
+    pub(crate) fn gift_wrap_subscriptions(&self) -> LiveGiftWrapSubscriptions {
+        self.gift_wrap_subscriptions.clone()
     }
 
     /// Get the event stream for handling incoming events.
@@ -1075,13 +1154,51 @@ mod tests {
         notifications: &mut broadcast::Receiver<RelayPoolNotification>,
         timeout: std::time::Duration,
     ) -> Option<Box<Event>> {
+        receive_gift_wrap_notification(notifications, timeout)
+            .await
+            .map(|(_, event)| event)
+    }
+
+    async fn receive_gift_wrap_notification(
+        notifications: &mut broadcast::Receiver<RelayPoolNotification>,
+        timeout: std::time::Duration,
+    ) -> Option<(SubscriptionId, Box<Event>)> {
         tokio::time::timeout(timeout, async {
             loop {
                 match notifications.recv().await {
-                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                    Ok(RelayPoolNotification::Event {
+                        subscription_id,
+                        event,
+                        ..
+                    }) => {
                         if event.kind == Kind::GiftWrap {
-                            return Some(event);
+                            return Some((subscription_id, event));
                         }
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn receive_eose(
+        notifications: &mut broadcast::Receiver<RelayPoolNotification>,
+        relay_url: &RelayUrl,
+        timeout: std::time::Duration,
+    ) -> Option<SubscriptionId> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                match notifications.recv().await {
+                    Ok(RelayPoolNotification::Message {
+                        relay_url: received_url,
+                        message: RelayMessage::EndOfStoredEvents(subscription_id),
+                    }) if received_url == *relay_url => {
+                        return Some(subscription_id.into_owned());
                     }
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1720,14 +1837,36 @@ mod tests {
         receiver.client.connect().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        receiver.subscribe(server_pubkey).await.unwrap();
-        let mut notifications = receiver.notifications();
-
         let sender_keys = Keys::generate();
         let sender = Client::builder().signer(sender_keys.clone()).build();
         sender.add_relay(&relay_url).await.unwrap();
         sender.connect().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stored = EventBuilder::new(Kind::GiftWrap, "stored")
+            .tags([Tag::public_key(server_pubkey)])
+            .sign_with_keys(&sender_keys)
+            .unwrap();
+        sender.send_event(&stored).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut notifications = receiver.notifications();
+        receiver.subscribe(server_pubkey).await.unwrap();
+        let first_subscription =
+            receive_eose(&mut notifications, &relay_url, Duration::from_secs(2))
+                .await
+                .expect("live-only subscription must receive EOSE");
+
+        assert!(
+            receive_gift_wrap(&mut notifications, Duration::from_millis(100))
+                .await
+                .is_none(),
+            "limit zero must suppress stored gift wraps"
+        );
+        assert!(
+            receiver.client.subscriptions().await.is_empty(),
+            "raw live-only subscriptions must not be retained by nostr-sdk"
+        );
 
         let backdated = Timestamp::from_secs(
             Timestamp::now()
@@ -1749,77 +1888,247 @@ mod tests {
             "subscription must receive kind 1059 events backdated within the NIP-59 tweak window"
         );
 
+        install_live_gift_wrap_subscription(
+            &receiver.client,
+            &receiver.gift_wrap_subscriptions,
+            relay_url.clone(),
+            server_pubkey,
+        )
+        .await
+        .unwrap();
+        assert!(
+            receive_eose(&mut notifications, &relay_url, Duration::from_millis(100))
+                .await
+                .is_none(),
+            "installing an existing live subscription must be idempotent"
+        );
+
+        assert!(
+            receiver
+                .gift_wrap_subscriptions
+                .mark_eose(&relay_url, &first_subscription)
+                .await
+        );
+        receiver
+            .gift_wrap_subscriptions
+            .invalidate_all_for_rebuild()
+            .await;
+        install_live_gift_wrap_subscription(
+            &receiver.client,
+            &receiver.gift_wrap_subscriptions,
+            relay_url.clone(),
+            server_pubkey,
+        )
+        .await
+        .unwrap();
+        let replacement_subscription =
+            receive_eose(&mut notifications, &relay_url, Duration::from_secs(2))
+                .await
+                .expect("replacement subscription must receive EOSE");
+        assert_ne!(first_subscription, replacement_subscription);
+        assert!(
+            receive_gift_wrap(&mut notifications, Duration::from_millis(100))
+                .await
+                .is_none(),
+            "rotating the raw subscription must not redispatch stored wraps"
+        );
+
+        let after_rotation = EventBuilder::new(Kind::GiftWrap, "after-rotation")
+            .tags([Tag::public_key(server_pubkey)])
+            .sign_with_keys(&sender_keys)
+            .unwrap();
+        sender.send_event(&after_rotation).await.unwrap();
+
+        let (delivery_subscription, delivery) =
+            receive_gift_wrap_notification(&mut notifications, Duration::from_secs(2))
+                .await
+                .expect("replacement subscription must receive new gift wraps");
+        assert_eq!(delivery.id, after_rotation.id);
+        assert_eq!(delivery_subscription, replacement_subscription);
+        assert!(
+            receive_gift_wrap_notification(&mut notifications, Duration::from_millis(100))
+                .await
+                .is_none(),
+            "rotation must close the old relay-side subscription"
+        );
+
         receiver.disconnect().await.unwrap();
         sender.disconnect().await;
     }
 
     #[test]
-    fn test_initial_subscription_covers_tweak_and_trigger_retention() {
-        let now = 1_000_000;
-        let since = initial_subscription_since(
-            now,
-            SubscriptionLookbackConfig {
-                trigger_retention_secs: 300,
-            },
-        );
-        assert_eq!(
-            since.as_secs(),
-            now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-                .saturating_sub(300)
-        );
-    }
-
-    #[test]
-    fn test_reconnect_subscription_since_uses_disconnect_for_short_outage() {
-        let now = 1_000_000;
-        let disconnected_at = now - 60;
-        let config = SubscriptionLookbackConfig {
-            trigger_retention_secs: 300,
-        };
-
-        let since = reconnect_subscription_since(disconnected_at, now, config);
+    fn live_subscription_filter_uses_tweak_window_and_zero_limit() {
+        let now: u64 = 1_000_000;
+        let server_pubkey = Keys::generate().public_key();
+        let filter = live_gift_wrap_subscription_filter(server_pubkey, now);
 
         assert_eq!(
-            since.as_secs(),
-            disconnected_at.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+            filter.since,
+            Some(Timestamp::from_secs(
+                now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+            ))
         );
-    }
-
-    #[test]
-    fn test_reconnect_subscription_since_caps_long_outage_to_retention_window() {
-        let now = 1_000_000;
-        let disconnected_at = now - 100_000;
-        let config = SubscriptionLookbackConfig {
-            trigger_retention_secs: 300,
-        };
-
-        let since = reconnect_subscription_since(disconnected_at, now, config);
-
-        assert_eq!(
-            since.as_secs(),
-            now.saturating_sub(300)
-                .saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
+        assert_eq!(filter.limit, Some(0));
+        assert!(
+            filter
+                .kinds
+                .as_ref()
+                .is_some_and(|kinds| kinds.contains(&Kind::GiftWrap))
         );
-    }
-
-    #[test]
-    fn test_reconnect_subscription_since_zero_retention_uses_current_time() {
-        let now = 1_000_000;
-        let disconnected_at = now - 100_000;
-        let config = SubscriptionLookbackConfig {
-            trigger_retention_secs: 0,
-        };
-
-        let since = reconnect_subscription_since(disconnected_at, now, config);
-
-        assert_eq!(
-            since.as_secs(),
-            now.saturating_sub(NIP59_TIMESTAMP_TWEAK_WINDOW_SECS)
-        );
+        let matching_event = EventBuilder::new(Kind::GiftWrap, "ignored")
+            .tags([Tag::public_key(server_pubkey)])
+            .custom_created_at(Timestamp::from_secs(now))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert!(filter.match_event(&matching_event, MatchEventOptions::default()));
     }
 
     #[tokio::test]
-    async fn test_refresh_gift_wrap_subscription_reuses_subscription_id() {
+    async fn live_subscription_state_requires_current_id_and_matching_eose() {
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let old_id = SubscriptionId::new("old");
+        let new_id = SubscriptionId::new("new");
+
+        assert!(!subscriptions.mark_eose(&relay_url, &old_id).await);
+        subscriptions
+            .replace_pending(relay_url.clone(), old_id.clone())
+            .await;
+        assert!(!subscriptions.is_live(&relay_url, &old_id).await);
+        assert!(subscriptions.mark_eose(&relay_url, &old_id).await);
+        assert!(subscriptions.is_live(&relay_url, &old_id).await);
+
+        subscriptions
+            .replace_pending(relay_url.clone(), new_id.clone())
+            .await;
+        assert!(!subscriptions.mark_eose(&relay_url, &old_id).await);
+        assert!(!subscriptions.is_live(&relay_url, &old_id).await);
+        assert!(!subscriptions.is_live(&relay_url, &new_id).await);
+        assert!(subscriptions.mark_eose(&relay_url, &new_id).await);
+        assert!(subscriptions.is_live(&relay_url, &new_id).await);
+
+        subscriptions.invalidate_all_for_rebuild().await;
+        assert!(!subscriptions.mark_eose(&relay_url, &new_id).await);
+        assert!(!subscriptions.is_live(&relay_url, &new_id).await);
+    }
+
+    #[tokio::test]
+    async fn live_subscription_monitor_invalidates_on_disconnect() {
+        let client = Client::default();
+        let server_pubkey = Keys::generate().public_key();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let subscription_id = SubscriptionId::new("active");
+        subscriptions
+            .replace_pending(relay_url.clone(), subscription_id.clone())
+            .await;
+        assert!(subscriptions.mark_eose(&relay_url, &subscription_id).await);
+        let (sender, receiver) = broadcast::channel(8);
+
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: relay_url.clone(),
+                status: NostrRelayStatus::Connected,
+            })
+            .unwrap();
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: relay_url.clone(),
+                status: NostrRelayStatus::Disconnected,
+            })
+            .unwrap();
+        drop(sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_live_subscription_monitor(
+                receiver,
+                client.clone(),
+                subscriptions.clone(),
+                server_pubkey,
+            ),
+        )
+        .await
+        .expect("closed notification channel must stop the monitor");
+        assert!(!subscriptions.is_live(&relay_url, &subscription_id).await);
+    }
+
+    #[tokio::test]
+    async fn connected_rebuild_skips_disconnected_relays_and_invalidates_state() {
+        let client = Client::default();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        client.add_relay(&relay_url).await.unwrap();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let subscription_id = SubscriptionId::new("stale");
+        subscriptions
+            .replace_pending(relay_url.clone(), subscription_id.clone())
+            .await;
+        assert!(subscriptions.mark_eose(&relay_url, &subscription_id).await);
+
+        assert_eq!(
+            install_for_connected_relays(&client, &subscriptions, Keys::generate().public_key(),)
+                .await,
+            0
+        );
+        assert!(!subscriptions.is_live(&relay_url, &subscription_id).await);
+    }
+
+    #[tokio::test]
+    async fn failed_live_subscription_send_invalidates_pending_state() {
+        let client = Client::default();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        client.add_relay(&relay_url).await.unwrap();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+
+        let error = install_live_gift_wrap_subscription(
+            &client,
+            &subscriptions,
+            relay_url,
+            Keys::generate().public_key(),
+        )
+        .await
+        .expect_err("an unconnected relay must reject the raw subscription");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to send live subscription")
+        );
+        assert!(subscriptions.subscriptions.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_live_subscription_replacement_preserves_invalidated_id_for_retry() {
+        let client = Client::default();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        client.add_relay(&relay_url).await.unwrap();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let previous_id = SubscriptionId::new("previous");
+        subscriptions
+            .replace_pending(relay_url.clone(), previous_id.clone())
+            .await;
+        assert!(subscriptions.mark_eose(&relay_url, &previous_id).await);
+        subscriptions.invalidate_all_for_rebuild().await;
+
+        install_live_gift_wrap_subscription(
+            &client,
+            &subscriptions,
+            relay_url.clone(),
+            Keys::generate().public_key(),
+        )
+        .await
+        .expect_err("an unconnected relay must reject the replacement");
+
+        let stored = subscriptions.subscriptions.read().await;
+        let restored = stored
+            .get(&relay_url)
+            .expect("failed replacement must retain the previous ID for retry");
+        assert_eq!(restored.id, previous_id);
+        assert_eq!(restored.state, LiveGiftWrapSubscriptionState::Invalidated);
+    }
+
+    #[tokio::test]
+    async fn live_subscription_monitor_rebuilds_after_lag() {
         use nostr_relay_builder::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
@@ -1829,105 +2138,15 @@ mod tests {
         client.connect().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let metrics = Metrics::disabled();
-        let subscription_id = SubscriptionId::generate();
         let server_pubkey = Keys::generate().public_key();
-        let first_since = Timestamp::from_secs(1_000);
-        let second_since = Timestamp::from_secs(2_000);
-
-        refresh_gift_wrap_subscription(
-            &client,
-            &metrics,
-            &subscription_id,
-            server_pubkey,
-            first_since,
-        )
-        .await
-        .unwrap();
-        refresh_gift_wrap_subscription(
-            &client,
-            &metrics,
-            &subscription_id,
-            server_pubkey,
-            second_since,
-        )
-        .await
-        .unwrap();
-
-        let subscriptions = client.subscriptions().await;
-        let filters_by_relay = subscriptions
-            .get(&subscription_id)
-            .expect("subscription id should be reused");
-        assert_eq!(
-            subscriptions.len(),
-            1,
-            "refreshing must not accumulate extra subscription IDs"
-        );
-
-        let filters = filters_by_relay
-            .values()
-            .next()
-            .expect("mock relay should have the subscription");
-        assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].since, Some(second_since));
-
-        client.disconnect().await;
-    }
-
-    #[tokio::test]
-    async fn subscription_refresh_monitor_reconciles_disconnect_and_terminal_transitions() {
-        let client = Client::default();
-        let metrics = Metrics::disabled();
-        let server_pubkey = Keys::generate().public_key();
-        let subscription_id = SubscriptionId::generate();
-        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
-        let (sender, receiver) = broadcast::channel(8);
-
-        sender
-            .send(MonitorNotification::StatusChanged {
-                relay_url: relay_url.clone(),
-                status: NostrRelayStatus::Disconnected,
-            })
-            .unwrap();
-        sender
-            .send(MonitorNotification::StatusChanged {
-                relay_url: relay_url.clone(),
-                status: NostrRelayStatus::Connected,
-            })
-            .unwrap();
-        sender
-            .send(MonitorNotification::StatusChanged {
-                relay_url,
-                status: NostrRelayStatus::Terminated,
-            })
-            .unwrap();
-        drop(sender);
-
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            run_subscription_refresh_monitor(
-                receiver,
-                client,
-                metrics,
-                subscription_id,
-                server_pubkey,
-                SubscriptionLookbackConfig {
-                    trigger_retention_secs: 300,
-                },
-            ),
-        )
-        .await
-        .expect("closed notification channel must stop the monitor");
-    }
-
-    #[tokio::test]
-    async fn subscription_refresh_monitor_recovers_conservatively_after_lag() {
-        let client = Client::default();
-        let metrics = Metrics::disabled();
-        let server_pubkey = Keys::generate().public_key();
-        let subscription_id = SubscriptionId::generate();
-        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let subscription_id = SubscriptionId::new("stale");
+        subscriptions
+            .replace_pending(relay_url.clone(), subscription_id.clone())
+            .await;
+        assert!(subscriptions.mark_eose(&relay_url, &subscription_id).await);
         let (sender, receiver) = broadcast::channel(1);
+        let mut relay_notifications = client.notifications();
 
         for status in [
             NostrRelayStatus::Disconnected,
@@ -1945,19 +2164,100 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            run_subscription_refresh_monitor(
+            run_live_subscription_monitor(
                 receiver,
-                client,
-                metrics,
-                subscription_id,
+                client.clone(),
+                subscriptions.clone(),
                 server_pubkey,
-                SubscriptionLookbackConfig {
-                    trigger_retention_secs: 300,
-                },
             ),
         )
         .await
         .expect("lag recovery must finish after the channel closes");
+        assert!(
+            !subscriptions.is_live(&relay_url, &subscription_id).await,
+            "monitor lag recovery must invalidate stale subscription IDs"
+        );
+
+        let mut replacement_subscription = None;
+        for _ in 0..3 {
+            let id = receive_eose(&mut relay_notifications, &relay_url, Duration::from_secs(2))
+                .await
+                .expect("lag recovery must install a fresh subscription");
+            if subscriptions.mark_eose(&relay_url, &id).await {
+                replacement_subscription = Some(id);
+                break;
+            }
+        }
+        let replacement_subscription =
+            replacement_subscription.expect("a fresh subscription must remain current");
+        assert_ne!(replacement_subscription, subscription_id);
+        assert!(
+            subscriptions
+                .is_live(&relay_url, &replacement_subscription)
+                .await
+        );
+
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn live_subscription_monitor_rebuilds_after_event_notification_lag() {
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+        let client = Client::default();
+        client.add_relay(&relay_url).await.unwrap();
+        client.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let server_pubkey = Keys::generate().public_key();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let stale_id = SubscriptionId::new("stale");
+        subscriptions
+            .replace_pending(relay_url.clone(), stale_id.clone())
+            .await;
+        assert!(subscriptions.mark_eose(&relay_url, &stale_id).await);
+
+        let (monitor_sender, monitor_notifications) = broadcast::channel(8);
+        let mut relay_notifications = client.notifications();
+        let monitor_handle = tokio::spawn(run_live_subscription_monitor(
+            monitor_notifications,
+            client.clone(),
+            subscriptions.clone(),
+            server_pubkey,
+        ));
+
+        subscriptions.recover_after_notification_lag().await;
+        assert!(!subscriptions.is_live(&relay_url, &stale_id).await);
+        monitor_sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: relay_url.clone(),
+                status: NostrRelayStatus::Connected,
+            })
+            .unwrap();
+
+        let replacement_id =
+            receive_eose(&mut relay_notifications, &relay_url, Duration::from_secs(2))
+                .await
+                .expect("event-notification lag must install a fresh subscription");
+        assert_ne!(replacement_id, stale_id);
+        assert!(subscriptions.mark_eose(&relay_url, &replacement_id).await);
+        assert!(subscriptions.is_live(&relay_url, &replacement_id).await);
+        assert!(
+            receive_eose(
+                &mut relay_notifications,
+                &relay_url,
+                Duration::from_millis(100)
+            )
+            .await
+            .is_none(),
+            "overlapping rebuild and Connected signals must install only once"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        client.disconnect().await;
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 use crate::config::AppConfig;
 use crate::crypto::{Nip59Handler, TokenDecryptor};
 use crate::metrics::Metrics;
-use crate::nostr::client::RelayClient;
+use crate::nostr::client::{LiveGiftWrapSubscriptions, RelayClient};
 use crate::nostr::events::EventProcessor;
 use crate::push::{ApnsClient, FcmClient, PushDispatcher};
 use crate::server::HealthServer;
@@ -235,6 +235,7 @@ async fn run_event_loop(
     event_semaphore: Arc<Semaphore>,
     processor: Arc<EventProcessor>,
     event_tasks: TaskTracker,
+    gift_wrap_subscriptions: LiveGiftWrapSubscriptions,
     metrics: Metrics,
 ) -> EventLoopExit {
     loop {
@@ -246,8 +247,31 @@ async fn run_event_loop(
             result = notifications.recv() => {
                 match result {
                     Ok(notification) => {
-                        let RelayPoolNotification::Event { event, .. } = notification else {
-                            continue;
+                        let event = match notification {
+                            RelayPoolNotification::Message {
+                                relay_url,
+                                message: RelayMessage::EndOfStoredEvents(subscription_id),
+                            } => {
+                                gift_wrap_subscriptions
+                                    .mark_eose(&relay_url, subscription_id.as_ref())
+                                    .await;
+                                continue;
+                            }
+                            RelayPoolNotification::Event {
+                                relay_url,
+                                subscription_id,
+                                event,
+                            } => {
+                                if !gift_wrap_subscriptions
+                                    .is_live(&relay_url, &subscription_id)
+                                    .await
+                                {
+                                    metrics.record_relay_backlog_event_ignored();
+                                    continue;
+                                }
+                                event
+                            }
+                            _ => continue,
                         };
 
                         // Acquire a permit before spawning so total in-flight
@@ -292,7 +316,17 @@ async fn run_event_loop(
 
                         match classify_notification_receive_error(&e) {
                             NotificationReceiveAction::Continue => {
-                                warn!(error = %e, "Lagged relay notifications, continuing");
+                                // The dropped range may contain an EOSE. Clear
+                                // every current ID immediately and ask the
+                                // relay monitor to install fresh subscriptions
+                                // on relays that are still connected.
+                                gift_wrap_subscriptions
+                                    .recover_after_notification_lag()
+                                    .await;
+                                warn!(
+                                    error = %e,
+                                    "Lagged relay notifications; rebuilding live subscriptions"
+                                );
                             }
                             NotificationReceiveAction::Shutdown => {
                                 error!(error = %e, "Notification channel closed");
@@ -534,11 +568,10 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
 
     // Initialize relay client
     let relay_client = Arc::new(
-        RelayClient::with_metrics_and_server_config(
+        RelayClient::with_metrics_and_shutdown_trigger(
             keys.clone(),
             config.relays.clone(),
             metrics.clone(),
-            &config.server,
             shutdown.trigger_handle(),
         )
         .await
@@ -604,21 +637,16 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
 
     // Obtain the broadcast receiver BEFORE issuing the subscription REQ.
     //
-    // `notifications()` returns a fresh `tokio::sync::broadcast::Receiver`, which
-    // only observes messages broadcast after it is created. The subscription uses a
-    // 2-day lookback, so relays immediately stream the stored backlog of gift wraps.
-    // If the receiver were created after `subscribe()` (e.g. inside the spawned event
-    // task), any backlog delivered before the task is first polled would be broadcast
-    // to zero receivers and silently dropped — broadcast channels do not replay
-    // history. Creating the receiver first closes that startup window entirely.
+    // `notifications()` returns a fresh `tokio::sync::broadcast::Receiver`,
+    // which only observes messages broadcast after it is created. The live-only
+    // subscription remains pending until this receiver observes the matching
+    // EOSE, so it must exist before the raw REQ is issued.
     let notifications = relay_client.notifications();
+    let gift_wrap_subscriptions = relay_client.gift_wrap_subscriptions();
 
-    // Spawn the event consumer BEFORE `subscribe()` streams the backlog and
-    // before the `publish_inbox_relays()` network round-trip below. The early
-    // receiver above only prevents the "zero receivers" drop; a consumer must
-    // also be POLLING before any startup await that can block for a meaningful
-    // duration, or the backlog can overflow the bounded broadcast buffer while
-    // nothing drains it and the oldest gift wraps are silently lost.
+    // Spawn the event consumer before `subscribe()` so it can establish the
+    // per-relay EOSE boundary. Stored events (including any sent by a relay
+    // despite `limit = 0`) and events from stale subscription IDs are ignored.
     //
     // The loop runs under supervision: an unexpected exit (notification
     // channel closed) triggers global shutdown instead of leaving a zombie
@@ -640,6 +668,7 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
                 event_semaphore,
                 processor,
                 event_tasks,
+                gift_wrap_subscriptions,
                 event_metrics,
             )
             .await;
@@ -1316,6 +1345,13 @@ mod tests {
     }
 
     async fn test_event_notification(server_keys: &Keys) -> RelayPoolNotification {
+        test_event_notification_with_subscription(server_keys, test_subscription_id()).await
+    }
+
+    async fn test_event_notification_with_subscription(
+        server_keys: &Keys,
+        subscription_id: SubscriptionId,
+    ) -> RelayPoolNotification {
         let sender_keys = Keys::generate();
         let event = crate::test_vectors::scenarios::single_apns_notification(
             server_keys,
@@ -1324,10 +1360,29 @@ mod tests {
         )
         .await;
         RelayPoolNotification::Event {
-            relay_url: RelayUrl::parse("ws://127.0.0.1:7777").unwrap(),
-            subscription_id: SubscriptionId::new("test-sub"),
+            relay_url: test_relay_url(),
+            subscription_id,
             event: Box::new(event),
         }
+    }
+
+    fn test_relay_url() -> RelayUrl {
+        RelayUrl::parse("ws://127.0.0.1:7777").unwrap()
+    }
+
+    fn test_subscription_id() -> SubscriptionId {
+        SubscriptionId::new("test-sub")
+    }
+
+    async fn test_live_subscriptions() -> LiveGiftWrapSubscriptions {
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let relay_url = test_relay_url();
+        let subscription_id = test_subscription_id();
+        subscriptions
+            .replace_pending(relay_url.clone(), subscription_id.clone())
+            .await;
+        assert!(subscriptions.mark_eose(&relay_url, &subscription_id).await);
+        subscriptions
     }
 
     fn test_relay_client_config() -> crate::config::RelayConfig {
@@ -1415,6 +1470,7 @@ mod tests {
                 Arc::new(Semaphore::new(1)),
                 test_event_processor(),
                 TaskTracker::new(),
+                LiveGiftWrapSubscriptions::default(),
                 Metrics::disabled(),
             ),
         )
@@ -1438,6 +1494,7 @@ mod tests {
                 Arc::new(Semaphore::new(1)),
                 test_event_processor(),
                 TaskTracker::new(),
+                LiveGiftWrapSubscriptions::default(),
                 Metrics::disabled(),
             ),
         )
@@ -1454,6 +1511,7 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(2));
         let (processor, server_keys) = test_event_processor_with_keys();
         let event_tasks = TaskTracker::new();
+        let subscriptions = test_live_subscriptions().await;
 
         let loop_handle = tokio::spawn(run_event_loop(
             notifications,
@@ -1461,6 +1519,7 @@ mod tests {
             Arc::clone(&semaphore),
             Arc::clone(&processor),
             event_tasks.clone(),
+            subscriptions,
             Metrics::disabled(),
         ));
 
@@ -1490,6 +1549,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_event_loop_ignores_events_until_matching_eose() {
+        let (notification_tx, notifications) = broadcast::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let metrics = Metrics::new().unwrap();
+        let (processor, server_keys) = test_event_processor_with_keys();
+        let event_tasks = TaskTracker::new();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        subscriptions
+            .replace_pending(test_relay_url(), test_subscription_id())
+            .await;
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            notifications,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+            Arc::clone(&processor),
+            event_tasks.clone(),
+            subscriptions,
+            metrics.clone(),
+        ));
+
+        notification_tx
+            .send(test_event_notification(&server_keys).await)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(processor.cache_len(), 0);
+        assert_eq!(metrics.relay_backlog_events_ignored_total.get(), 1);
+
+        notification_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: test_relay_url(),
+                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                    test_subscription_id(),
+                )),
+            })
+            .unwrap();
+        notification_tx
+            .send(test_event_notification(&server_keys).await)
+            .unwrap();
+        assert!(
+            wait_for_cache_len(&processor, 1).await,
+            "the matching EOSE must activate live event processing"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), loop_handle)
+                .await
+                .expect("loop must exit on shutdown")
+                .expect("loop task must not panic"),
+            EventLoopExit::ShutdownRequested
+        );
+        event_tasks.close();
+        event_tasks.wait().await;
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_ignores_superseded_subscription_ids() {
+        let (notification_tx, notifications) = broadcast::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let metrics = Metrics::new().unwrap();
+        let (processor, server_keys) = test_event_processor_with_keys();
+        let subscriptions = test_live_subscriptions().await;
+        subscriptions
+            .replace_pending(test_relay_url(), SubscriptionId::new("replacement"))
+            .await;
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            notifications,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+            Arc::clone(&processor),
+            TaskTracker::new(),
+            subscriptions,
+            metrics.clone(),
+        ));
+
+        notification_tx
+            .send(test_event_notification(&server_keys).await)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(processor.cache_len(), 0);
+        assert_eq!(metrics.relay_backlog_events_ignored_total.get(), 1);
+
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), loop_handle)
+                .await
+                .expect("loop must exit on shutdown")
+                .expect("loop task must not panic"),
+            EventLoopExit::ShutdownRequested
+        );
+    }
+
+    #[tokio::test]
     async fn run_event_loop_skips_non_event_notifications() {
         let (notification_tx, notifications) = broadcast::channel(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1502,6 +1656,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             Arc::clone(&processor),
             event_tasks.clone(),
+            LiveGiftWrapSubscriptions::default(),
             Metrics::disabled(),
         ));
 
@@ -1526,20 +1681,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_event_loop_continues_after_lagged_notifications() {
-        // Capacity 1: the second pre-loop send overwrites the first, so the
-        // loop's first recv yields `Lagged` and must keep consuming.
+    async fn run_event_loop_rebuilds_after_lagged_eose() {
+        // Capacity 1: the filler overwrites EOSE before the loop starts, so the
+        // first recv reports `Lagged`. Recovery must invalidate the pending ID
+        // and request a fresh subscription instead of blackholing it forever.
         let (notification_tx, notifications) = broadcast::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let metrics = Metrics::new().unwrap();
         let (processor, server_keys) = test_event_processor_with_keys();
         let event_tasks = TaskTracker::new();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        subscriptions
+            .replace_pending(test_relay_url(), test_subscription_id())
+            .await;
 
         notification_tx
-            .send(test_event_notification(&server_keys).await)
+            .send(RelayPoolNotification::Message {
+                relay_url: test_relay_url(),
+                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                    test_subscription_id(),
+                )),
+            })
             .unwrap();
         notification_tx
-            .send(test_event_notification(&server_keys).await)
+            .send(RelayPoolNotification::Shutdown)
             .unwrap();
 
         let loop_handle = tokio::spawn(run_event_loop(
@@ -1548,16 +1713,59 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             Arc::clone(&processor),
             event_tasks.clone(),
+            subscriptions.clone(),
             metrics.clone(),
         ));
 
-        // The surviving (newest) event is still processed after the lag.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            subscriptions.wait_for_rebuild_request(),
+        )
+        .await
+        .expect("losing EOSE must request a live-subscription rebuild");
         assert!(
-            wait_for_cache_len(&processor, 1).await,
-            "the loop must keep processing after a lag"
+            !subscriptions
+                .is_live(&test_relay_url(), &test_subscription_id())
+                .await
         );
         assert_eq!(metrics.relay_notifications_lagged_total.get(), 1);
         assert_eq!(metrics.relay_notifications_dropped_total.get(), 1);
+
+        let replacement_id = SubscriptionId::new("replacement");
+        subscriptions
+            .replace_pending(test_relay_url(), replacement_id.clone())
+            .await;
+        notification_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: test_relay_url(),
+                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                    replacement_id.clone(),
+                )),
+            })
+            .unwrap();
+        for _ in 0..100 {
+            if subscriptions
+                .is_live(&test_relay_url(), &replacement_id)
+                .await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            subscriptions
+                .is_live(&test_relay_url(), &replacement_id)
+                .await,
+            "replacement EOSE must establish a new live boundary"
+        );
+
+        notification_tx
+            .send(test_event_notification_with_subscription(&server_keys, replacement_id).await)
+            .unwrap();
+        assert!(
+            wait_for_cache_len(&processor, 1).await,
+            "events must resume after the replacement subscription reaches EOSE"
+        );
 
         shutdown_tx.send(true).unwrap();
         let exit = tokio::time::timeout(Duration::from_secs(1), loop_handle)
