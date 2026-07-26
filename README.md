@@ -417,7 +417,7 @@ When enabled, Transponder exposes HTTP endpoints for monitoring:
 | Endpoint | Description | Success |
 |----------|-------------|---------|
 | `GET /health` | Liveness check - is the server running? | Always 200 OK |
-| `GET /ready` | Readiness check - can the server currently deliver notifications? | 200 if relays connected, at least one push service configured, and no configured push service is in a sustained delivery-failure streak |
+| `GET /ready` | Readiness check - can the server currently deliver notifications? | 200 if relays connected, at least one push service configured, and no configured push service has crossed the delivery-failure score threshold |
 | `GET /metrics` | Prometheus metrics (when metrics enabled - served even if the health endpoints are disabled) | 200 with metrics in Prometheus text format |
 
 The default bind address is `127.0.0.1:8080` so these unauthenticated endpoints stay local. If external health checks are required, bind to a specific internal interface or put the endpoints behind a reverse proxy, VPN, or load balancer with access controls. The listener additionally enforces a per-request timeout, a small request-body limit, and a global concurrency cap.
@@ -435,7 +435,7 @@ The default bind address is `127.0.0.1:8080` so these unauthenticated endpoints 
 }
 ```
 
-Readiness probes are side-effect-free: they read a cached relay-status snapshot maintained by a background refresher instead of enumerating the relay pool per request. The `*_delivering` fields expose a passive per-provider signal derived from real send outcomes - a provider is reported as not delivering (and `/ready` returns 503) once it accumulates a sustained streak of consecutive hard send failures (authentication rejections, permanent errors, or exhausted retries) with no intervening success. The signal never probes the providers, so with zero push traffic it retains its last observed state.
+Readiness probes are side-effect-free: they read a cached relay-status snapshot maintained by a background refresher instead of enumerating the relay pool per request. The `*_delivering` fields expose a passive per-provider signal derived from real send outcomes - a provider is reported as not delivering (and `/ready` returns 503) once its bounded failure score crosses the threshold. Authentication rejections, permanent errors, and exhausted retries increase the score; successful sends and definitive invalid-token responses decay it. Bounding the score keeps recovery time independent of outage duration. The signal never probes the providers, so with zero push traffic it retains its last observed state.
 
 ## Metrics
 

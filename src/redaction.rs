@@ -38,7 +38,7 @@ static REDACTIONS: LazyLock<[(Regex, &'static str); 8]> = LazyLock::new(|| {
         ),
         (
             Regex::new(
-                r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+                r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)",
             )
             .expect("static redaction regex is valid"),
             "[REDACTED-PRIVATE-KEY]",
@@ -228,12 +228,29 @@ mod tests {
     #[test]
     fn pem_private_keys_are_redacted_across_lines() {
         let pem = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg\nsecret+/base64material==\n-----END PRIVATE KEY-----";
-        let input = format!("signing failed with key {pem}");
+        let input = format!("signing failed with key {pem} while loading provider");
 
         let output = redact(&input);
 
         assert!(!output.contains("secret+/base64material"));
-        assert_eq!(output, "signing failed with key [REDACTED-PRIVATE-KEY]");
+        assert_eq!(
+            output,
+            "signing failed with key [REDACTED-PRIVATE-KEY] while loading provider"
+        );
+    }
+
+    #[test]
+    fn truncated_pem_private_keys_are_redacted_to_end_of_input() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEH\nsecret+/base64material==";
+        let input = format!("dependency panic included truncated key {pem}");
+
+        let output = redact(&input);
+
+        assert!(!output.contains("secret+/base64material"));
+        assert_eq!(
+            output,
+            "dependency panic included truncated key [REDACTED-PRIVATE-KEY]"
+        );
     }
 
     #[test]

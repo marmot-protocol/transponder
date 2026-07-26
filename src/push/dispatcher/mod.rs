@@ -250,8 +250,8 @@ impl PushDispatcher {
             }
             PushSendOutcome::InvalidToken => {
                 // A definitive invalid-token verdict proves the provider
-                // authenticated and processed the request, so it ends any
-                // hard-failure streak.
+                // authenticated and processed the request, so it decays the
+                // hard-failure score.
                 delivery_health.record_processed(platform);
                 trace!(
                     service = service_name,
@@ -323,7 +323,7 @@ impl PushDispatcher {
                         Err(e) => {
                             // Permanent send errors include provider auth
                             // rejections (revoked key, expired credentials),
-                            // so they count toward the hard-failure streak.
+                            // so they increase the hard-failure score.
                             delivery_health.record_hard_failure(platform);
                             // Redact any embedded URL before logging: the APNs
                             // URL carries the device token (#172). The send
@@ -352,7 +352,7 @@ impl PushDispatcher {
                         Err(e) => {
                             // Permanent send errors include provider auth
                             // rejections (revoked key, expired credentials),
-                            // so they count toward the hard-failure streak.
+                            // so they increase the hard-failure score.
                             delivery_health.record_hard_failure(platform);
                             // Uniform with APNs: strip any embedded URL before
                             // logging (#172). FCM's URL carries no token, but
@@ -682,17 +682,19 @@ impl PushDispatcher {
         &self.delivery_health
     }
 
-    /// Whether APNs is currently delivering: it is not in a sustained streak
-    /// of consecutive hard send failures (auth rejections, permanent errors,
-    /// exhausted retries). Always `true` until failures are observed.
+    /// Whether APNs is currently delivering: its bounded failure score is below
+    /// the threshold. Authentication rejections, permanent errors, and
+    /// exhausted retries increase the score. Always `true` until failures are
+    /// observed.
     #[must_use]
     pub fn is_apns_delivering(&self) -> bool {
         self.delivery_health.is_delivering(Platform::Apns)
     }
 
-    /// Whether FCM is currently delivering: it is not in a sustained streak
-    /// of consecutive hard send failures (auth rejections, permanent errors,
-    /// exhausted retries). Always `true` until failures are observed.
+    /// Whether FCM is currently delivering: its bounded failure score is below
+    /// the threshold. Authentication rejections, permanent errors, and
+    /// exhausted retries increase the score. Always `true` until failures are
+    /// observed.
     #[must_use]
     pub fn is_fcm_delivering(&self) -> bool {
         self.delivery_health.is_delivering(Platform::Fcm)
@@ -969,7 +971,7 @@ mod tests {
         }
         assert!(
             health.is_delivering(Platform::Apns),
-            "a streak below the threshold must not flag the provider"
+            "a score below the threshold must not flag the provider"
         );
 
         health.record_hard_failure(Platform::Apns);
@@ -984,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_health_processed_request_ends_streak() {
+    fn delivery_health_processed_request_decays_score() {
         let health = DeliveryHealth::default();
 
         for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD.div_ceil(2) {
@@ -1004,6 +1006,30 @@ mod tests {
     }
 
     #[test]
+    fn delivery_health_recovery_is_bounded_after_long_outage() {
+        let health = DeliveryHealth::default();
+
+        for _ in 0..10_000 {
+            health.record_hard_failure(Platform::Apns);
+        }
+        assert!(!health.is_delivering(Platform::Apns));
+
+        for _ in 0..DELIVERY_FAILURE_STREAK_THRESHOLD {
+            health.record_processed(Platform::Apns);
+        }
+        assert!(
+            !health.is_delivering(Platform::Apns),
+            "the bounded score must retain outage evidence through the threshold"
+        );
+
+        health.record_processed(Platform::Apns);
+        assert!(
+            health.is_delivering(Platform::Apns),
+            "recovery must be bounded independently of outage duration"
+        );
+    }
+
+    #[test]
     fn record_send_outcome_updates_delivery_health() {
         let metrics = Metrics::disabled();
         let delivery_health = DeliveryHealth::default();
@@ -1019,7 +1045,7 @@ mod tests {
         }
         assert!(
             !delivery_health.is_delivering(Platform::Apns),
-            "consecutive exhausted-retry outcomes must flag the provider"
+            "sustained exhausted-retry outcomes must flag the provider"
         );
 
         // An invalid-token verdict proves the provider processed a request and

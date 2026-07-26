@@ -2343,9 +2343,9 @@ mod tests {
         // Reconciliation invariant with the push-provider rework (#233): a token
         // dropped by the #177 pre-filter in process_inner never reaches the send
         // path, so it is NOT a delivery attempt and must not touch the provider's
-        // DeliveryHealth streak (which gates /ready). No streak increment (would
-        // wrongly flag a healthy provider) and no reset (would wrongly clear a
-        // real failure streak).
+        // DeliveryHealth score (which gates /ready). No score increase (would
+        // wrongly flag a healthy provider) and no decay (would wrongly clear
+        // real outage evidence).
         use crate::push::FcmClient;
         use crate::test_vectors::{
             GiftWrapBuilder, NotificationContentBuilder, TestToken, TokenEncryptor,
@@ -2379,9 +2379,9 @@ mod tests {
             .metrics(metrics.clone())
             .build();
 
-        // Seed a real hard-failure streak on FCM just below the flagging
+        // Seed a real hard-failure score on FCM just below the flagging
         // threshold (a genuine prior outage), so we can prove a pre-filtered APNs
-        // drop neither resets FCM's streak nor touches APNs's.
+        // drop neither decays FCM's score nor touches APNs's.
         use crate::push::dispatcher::DELIVERY_FAILURE_STREAK_THRESHOLD;
         let failures_to_trip = DELIVERY_FAILURE_STREAK_THRESHOLD.div_ceil(2);
         for _ in 0..failures_to_trip - 1 {
@@ -2403,13 +2403,13 @@ mod tests {
 
         assert!(processor.process(&event).await.unwrap());
 
-        // APNs was never a delivery attempt: its streak is untouched (still 0 →
+        // APNs was never a delivery attempt: its score is untouched (still 0 →
         // delivering), so the pre-filter did not spuriously flag it.
         assert!(
             dispatcher_handle.is_apns_delivering(),
-            "a pre-filtered APNs drop must not increment APNs delivery-health streak"
+            "a pre-filtered APNs drop must not increase APNs delivery-health score"
         );
-        // FCM's genuine prior streak was NOT reset by the unrelated APNs drop.
+        // FCM's genuine prior score was NOT decayed by the unrelated APNs drop.
         assert_eq!(
             counter_value(
                 &metrics,
@@ -2420,17 +2420,17 @@ mod tests {
         );
         assert!(
             dispatcher_handle.is_fcm_delivering(),
-            "streak just below threshold is still delivering"
+            "score just below threshold is still delivering"
         );
         // One more FCM hard failure reaches the threshold — which only holds if
-        // the seeded streak survived, proving the APNs pre-filter drop did not
-        // silently reset FCM's real hard-failure streak.
+        // the seeded score survived, proving the APNs pre-filter drop did not
+        // silently decay FCM's real outage evidence.
         dispatcher_handle
             .delivery_health()
             .record_hard_failure(Platform::Fcm);
         assert!(
             !dispatcher_handle.is_fcm_delivering(),
-            "pre-filter drop must not have reset FCM's real hard-failure streak"
+            "pre-filter drop must not have decayed FCM's real hard-failure score"
         );
     }
 
