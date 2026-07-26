@@ -84,6 +84,7 @@ shutdown_timeout_secs = 10
 # max_dedup_cache_size = 100000
 
 # Short-lived volatile content-hash retention (default: 300 seconds).
+# This controls decoded-trigger deduplication only, not relay catch-up.
 # Trigger/replay material is never persisted.
 # dedup_retention_secs = 300
 
@@ -507,6 +508,8 @@ Under cache pressure, below-limit keys may be evicted to admit new keys. That re
 | `transponder_relays_configured` | Gauge | `type` | Configured relays |
 | `transponder_relay_notifications_lagged_total` | Counter | - | Number of times the relay notification receiver reported lag |
 | `transponder_relay_notifications_dropped_total` | Counter | - | Total relay notifications dropped because the receiver lagged |
+| `transponder_relay_backlog_events_ignored_total` | Counter | - | Stored, pre-EOSE, or stale-subscription relay events ignored before processing |
+| `transponder_relay_subscription_lookback_seconds` | Gauge | - | Timestamp-filter lookback retained for the NIP-59 timestamp randomization window |
 
 #### Server Info
 
@@ -537,7 +540,7 @@ To preserve the server's privacy guarantees, only `ERROR`-level events emitted b
 
 ## How It Works
 
-1. **Subscribe**: Transponder connects to configured Nostr relays and subscribes to `kind:1059` (gift-wrapped) events addressed to its public key.
+1. **Subscribe**: Transponder connects to configured Nostr relays and opens a live-only `kind:1059` subscription addressed to its public key. Each relay gets a fresh subscription ID with `limit:0`; events are admitted only after that relay's matching EOSE.
 
 2. **Unwrap**: When an event arrives, it unwraps the NIP-59 gift wrap to extract the inner `kind:446` notification trigger.
 
@@ -546,6 +549,12 @@ To preserve the server's privacy guarantees, only `ERROR`-level events emitted b
 4. **Dispatch**: Tokens are routed to APNs or FCM based on platform identifier, sending content-free push notifications. APNs uses the configured `silent`, `generic_alert`, or `mutable_alert` payload mode. `mutable_alert` includes Apple's `mutable-content` flag so an iOS Notification Service Extension can fetch and replace the product-neutral fallback alert.
 
 5. **Wake**: Client apps wake up, fetch messages from relays, and display notifications locally.
+
+Push hints are advisory. Transponder intentionally does not recover hints
+published while it was offline or while a relay was disconnected, and it
+ignores any stored events returned before EOSE. Normal Marmot message
+synchronization is independent of this push path and still recovers messages
+from relays when the client wakes or reconnects.
 
 ```
 Nostr Relays (ClearNet/Tor)

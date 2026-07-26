@@ -30,7 +30,8 @@ shutdown_timeout_secs = 10
 # Default: 100000
 # max_dedup_cache_size = 100000
 
-# Short-lived decoded-content hash retention, in seconds. Trigger material is
+# Short-lived decoded-content hash retention, in seconds. This controls
+# decoded-trigger deduplication only, not relay catch-up. Trigger material is
 # volatile and is never written to disk. Default: 5 minutes.
 # dedup_retention_secs = 300
 

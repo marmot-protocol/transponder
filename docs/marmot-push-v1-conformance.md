@@ -21,6 +21,22 @@ whose `marmot-app` notification implementation emits the adopted token and rumor
 - ChaCha20-Poly1305 token encryption with the fixed-size platform, length, token, and padding plaintext layout
 - short-lived in-memory replay suppression keyed by SHA-256 of decoded kind `446` content
 
+## Live-Only Relay Delivery
+
+Push hints are advisory and are not a message-recovery mechanism. Transponder
+opens a fresh, unregistered subscription for every relay connection with kind
+`1059`, the server public-key tag, the full NIP-59 timestamp-randomization
+window, and `limit:0`. Event processing begins only after the matching EOSE.
+Stored events returned before EOSE and events from superseded subscription IDs
+are ignored.
+
+Consequently, push hints published while Transponder is offline or a relay is
+disconnected are intentionally not recovered. Normal Marmot message
+synchronization is unaffected: clients still fetch the underlying messages
+from their relays after waking or reconnecting. `dedup_retention_secs` remains
+solely the short-lived, in-memory decoded-content-hash replay window and does
+not control relay subscription history.
+
 ## Executable Evidence
 
 The independent test-side encoder in `src/test_vectors.rs` constructs full Marmot Push v1 triggers and NIP-59 envelopes. It is exercised through the event processor and provider mocks. The production decoder is additionally covered by:
@@ -28,6 +44,7 @@ The independent test-side encoder in `src/test_vectors.rs` constructs full Marmo
 - the fixed HKDF vector in `crypto::token::tests::marmot_push_v1_hkdf_conformance_vector`
 - positive and negative kind/tag/base64/token-size cases in `crypto::nip59::tests`
 - rewrapping and decoded-content-hash replay cases in `nostr::events::processor::tests`
+- live-only filter, EOSE admission, reconnect rotation, and mock-relay backlog cases in `nostr::client::tests` and `app::tests`
 - end-to-end application startup, dispatch, and shutdown cases in `app::tests`
 
 Run the release-candidate gate with:

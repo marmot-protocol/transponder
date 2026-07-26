@@ -162,7 +162,10 @@ pub struct Metrics {
     /// Total number of relay notifications dropped because the receiver lagged.
     pub relay_notifications_dropped_total: IntCounter,
 
-    /// Relay subscription lookback window in seconds.
+    /// Total stored or stale relay events ignored before live admission.
+    pub relay_backlog_events_ignored_total: IntCounter,
+
+    /// Relay subscription timestamp-filter lookback in seconds.
     pub relay_subscription_lookback_seconds: IntGauge,
 
     /// Total number of kind-10050 inbox-relay-list publications that failed to
@@ -582,9 +585,15 @@ impl Metrics {
         ))?;
         registry.register(Box::new(relay_notifications_dropped_total.clone()))?;
 
+        let relay_backlog_events_ignored_total = IntCounter::with_opts(Opts::new(
+            "transponder_relay_backlog_events_ignored_total",
+            "Total number of stored or stale relay events ignored before live admission",
+        ))?;
+        registry.register(Box::new(relay_backlog_events_ignored_total.clone()))?;
+
         let relay_subscription_lookback_seconds = IntGauge::with_opts(Opts::new(
             "transponder_relay_subscription_lookback_seconds",
-            "Relay subscription lookback window in seconds",
+            "Relay subscription timestamp-filter lookback in seconds",
         ))?;
         registry.register(Box::new(relay_subscription_lookback_seconds.clone()))?;
 
@@ -655,6 +664,7 @@ impl Metrics {
             relays_configured,
             relay_notifications_lagged_total,
             relay_notifications_dropped_total,
+            relay_backlog_events_ignored_total,
             relay_subscription_lookback_seconds,
             inbox_relay_publish_failed_total,
             server_start_time_seconds,
@@ -1104,7 +1114,15 @@ impl Metrics {
         self.relay_notifications_dropped_total.inc_by(count);
     }
 
-    /// Set the relay subscription lookback window.
+    /// Record a stored or stale relay event ignored before live admission.
+    pub fn record_relay_backlog_event_ignored(&self) {
+        if !self.enabled {
+            return;
+        }
+        self.relay_backlog_events_ignored_total.inc();
+    }
+
+    /// Set the relay subscription timestamp-filter lookback.
     pub fn set_relay_subscription_lookback(&self, seconds: u64) {
         if !self.enabled {
             return;
@@ -1417,6 +1435,7 @@ mod tests {
         metrics.set_relays_connected("onion", 1);
         metrics.record_relay_notifications_lagged();
         metrics.record_relay_notifications_dropped(4);
+        metrics.record_relay_backlog_event_ignored();
         metrics.set_relay_subscription_lookback(172_800);
         metrics.record_inbox_relay_publish_failed();
 
@@ -1467,6 +1486,14 @@ mod tests {
                 &[]
             ),
             4.0
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "transponder_relay_backlog_events_ignored_total",
+                &[]
+            ),
+            1.0
         );
         assert_eq!(
             gauge_value(
