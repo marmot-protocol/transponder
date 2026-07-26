@@ -1,14 +1,14 @@
 # Marmot Push v1 Conformance
 
-This release candidate targets the adopted Marmot protocol at commit
-[`7f2f5fac4b0e8648d820b20d27d670a6c139e717`](https://github.com/marmot-protocol/marmot/tree/7f2f5fac4b0e8648d820b20d27d670a6c139e717).
+Transponder 0.2.0 targets the adopted Marmot protocol at commit
+[`dedeaf429a6f52a4f1c62f3e992be012dab61b7b`](https://github.com/marmot-protocol/marmot/tree/dedeaf429a6f52a4f1c62f3e992be012dab61b7b).
 The normative server surfaces are:
 
-- [`features/push-notifications.md`](https://github.com/marmot-protocol/marmot/blob/7f2f5fac4b0e8648d820b20d27d670a6c139e717/features/push-notifications.md)
-- [`transports/nostr.md`](https://github.com/marmot-protocol/marmot/blob/7f2f5fac4b0e8648d820b20d27d670a6c139e717/transports/nostr.md)
+- [`features/push-notifications.md`](https://github.com/marmot-protocol/marmot/blob/dedeaf429a6f52a4f1c62f3e992be012dab61b7b/features/push-notifications.md)
+- [`transports/nostr.md`](https://github.com/marmot-protocol/marmot/blob/dedeaf429a6f52a4f1c62f3e992be012dab61b7b/transports/nostr.md)
 
 Client interoperability was checked against MDK commit
-[`479e868f5a58d4b794270ddee498ea69a52d767f`](https://github.com/marmot-protocol/mdk/tree/479e868f5a58d4b794270ddee498ea69a52d767f),
+[`1d6b9f1d65f8deb897d15a4e300a2443c9179e86`](https://github.com/marmot-protocol/mdk/tree/1d6b9f1d65f8deb897d15a4e300a2443c9179e86),
 whose `marmot-app` notification implementation emits the adopted token and rumor formats.
 
 ## Implemented Wire Contract
@@ -16,7 +16,7 @@ whose `marmot-app` notification implementation emits the adopted token and rumor
 - NIP-59 kind `1059` gift wrap containing a kind `13` seal and unsigned kind `446` rumor
 - exactly one rumor tag: `["v", "marmot-push-v1"]`
 - RFC 4648 standard padded base64 content, with no encoding tag
-- one or more concatenated encrypted tokens, each exactly `1084` decoded bytes
+- 1 to 32 concatenated chunks, each exactly `1084` decoded bytes and containing either an encrypted token or optional random padding
 - ECDH over secp256k1 followed by HKDF-SHA256 with salt `marmot-push-token-v1` and info `marmot-push-token-encryption`
 - ChaCha20-Poly1305 token encryption with the fixed-size platform, length, token, and padding plaintext layout
 - short-lived in-memory replay suppression keyed by SHA-256 of decoded kind `446` content
@@ -47,7 +47,7 @@ The independent test-side encoder in `src/test_vectors.rs` constructs full Marmo
 - live-only filter, EOSE admission, reconnect rotation, and mock-relay backlog cases in `nostr::client::tests` and `app::tests`
 - end-to-end application startup, dispatch, and shutdown cases in `app::tests`
 
-Run the release-candidate gate with:
+Run the release gate with:
 
 ```bash
 just ci
@@ -60,6 +60,6 @@ At the pinned MDK commit, the corresponding client-side contract is exercised by
 cargo test -p marmot-app notifications::tests::
 ```
 
-That suite covers APNs and FCM token encryption, raw shared-point X-coordinate derivation, concatenated-token base64, and the exact version-only kind `446` rumor inside NIP-59.
+That suite covers APNs and FCM token encryption, raw shared-point X-coordinate derivation, the 32-chunk trigger ceiling, concatenated-token base64, and the exact version-only kind `446` rumor inside NIP-59.
 
 MIP-05 is intentionally not accepted by this line. Its historical implementation remains on `release/mip05-v1` and in the immutable `transponder-mip05-v1.0.0` release.
