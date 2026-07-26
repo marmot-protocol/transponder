@@ -308,14 +308,18 @@ async fn run_live_subscription_monitor(
     subscriptions: LiveGiftWrapSubscriptions,
     server_pubkey: PublicKey,
 ) {
+    let rebuild_request = subscriptions.wait_for_rebuild_request();
+    tokio::pin!(rebuild_request);
+
     loop {
         tokio::select! {
-            _ = subscriptions.wait_for_rebuild_request() => {
+            _ = &mut rebuild_request => {
                 warn!("Relay notifications were lost; rebuilding live gift-wrap subscriptions");
                 // The event loop clears state before signaling, but clear again
                 // here so a concurrent install cannot leave an old ID eligible.
                 subscriptions.clear().await;
                 install_for_connected_relays(&client, &subscriptions, server_pubkey).await;
+                rebuild_request.set(subscriptions.wait_for_rebuild_request());
             }
             result = notifications.recv() => match result {
                 Ok(MonitorNotification::StatusChanged { relay_url, status }) => match status {
