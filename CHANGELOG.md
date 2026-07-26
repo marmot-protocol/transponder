@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Bound each provider's delivery-health failure score so `/ready` recovers after a fixed number of processed requests instead of remaining at 503 in proportion to the duration and traffic volume of a prior outage ([#372](https://github.com/marmot-protocol/transponder/issues/372)).
 - Drain every admitted push notification before closing the outbound concurrency semaphore during graceful shutdown, preventing a backlogged queue from being silently shed.
 - Protect in-flight Marmot Push deduplication reservations from LRU eviction so a waiting relay redelivery cannot re-acquire and dispatch the same trigger concurrently.
 - Made the deduplication reservation lifecycle unwind-safe: the owning task now holds an RAII guard, so a panic (or a task dropped mid-processing) gives the reservation up instead of stranding the content hash in flight forever. Previously such a reservation was never evicted or expired, every later delivery of that content blocked on it permanently while holding an event-processing permit, and enough redeliveries could exhaust the permit pool into a silent notification outage ([#370](https://github.com/marmot-protocol/transponder/issues/370)).
@@ -23,6 +24,7 @@
 
 ### Security
 
+- Redact truncated or unterminated PEM private keys from GlitchTip events by scrubbing from the private-key BEGIN marker through the end of the captured text when no END marker is present ([#376](https://github.com/marmot-protocol/transponder/issues/376)).
 - Changed `generate-keys` to hide the private key by default, write secrets with `0600` file permissions via `--output`, and require `--show-private-key` for explicit display, addressing marmot-security#77 ([#51](https://github.com/marmot-protocol/transponder/pull/51)).
 - Removed the unwrapped notification sender public key from event processing state and trace logs, addressing marmot-security#79.
 - Store the server secp256k1 secret key in zeroizing memory and erase temporary `SecretKey` values used during token decryption, addressing the long-term key retention risk reported in marmot-security#24 ([#36](https://github.com/marmot-protocol/transponder/pull/36)).
