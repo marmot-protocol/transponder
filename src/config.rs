@@ -37,6 +37,7 @@ use crate::defaults::{
     DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE, DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING,
     DEFAULT_MAX_DEDUP_CACHE_SIZE, DEFAULT_MAX_SIZE as DEFAULT_MAX_RATE_LIMIT_CACHE_SIZE,
     DEFAULT_MAX_TOKENS_PER_EVENT, DEFAULT_RATE_LIMIT_PER_HOUR, DEFAULT_RATE_LIMIT_PER_MINUTE,
+    MAX_TOKENS_PER_EVENT,
 };
 use crate::error::Result;
 
@@ -156,7 +157,8 @@ pub struct ServerConfig {
 
     /// Maximum encrypted tokens accepted in a single notification event.
     ///
-    /// Default: 100.
+    /// Marmot Push v1 permits at most 32 chunks. This setting may lower that
+    /// operational limit but cannot raise the protocol ceiling. Default: 32.
     #[serde(default = "default_max_tokens_per_event")]
     pub max_tokens_per_event: usize,
 
@@ -308,7 +310,6 @@ pub struct RelayConfig {
 /// the process, so anything larger is rejected at load time.
 const MAX_RELAY_DURATION_SECS: u64 = 300;
 const MAX_CACHE_ENTRIES: usize = 1_000_000;
-const MAX_TOKENS_PER_EVENT: usize = 10_000;
 
 /// Upper bound for [`ServerConfig::max_concurrent_event_processing`].
 ///
@@ -1048,8 +1049,9 @@ impl AppConfig {
 impl ServerConfig {
     /// Rejects rate-limit count fields, the cache sizes, and
     /// `max_tokens_per_event` set to `0`, `shutdown_timeout_secs` set to `0`,
-    /// `max_concurrent_event_processing` set to `0`, and
-    /// `max_concurrent_event_processing` above [`MAX_CONCURRENT_EVENT_PROCESSING`].
+    /// `max_concurrent_event_processing` set to `0`,
+    /// `max_concurrent_event_processing` above [`MAX_CONCURRENT_EVENT_PROCESSING`],
+    /// and `max_tokens_per_event` above the Marmot Push v1 protocol ceiling.
     ///
     /// A `0` per-minute/per-hour limit blocks every request for that limiter
     /// dimension, a `0` `max_tokens_per_event` rejects every notification
@@ -2504,7 +2506,7 @@ mod tests {
         assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 5000);
         assert_eq!(config.server.device_token_rate_limit_per_minute, 240);
         assert_eq!(config.server.device_token_rate_limit_per_hour, 5000);
-        assert_eq!(config.server.max_tokens_per_event, 100);
+        assert_eq!(config.server.max_tokens_per_event, MAX_TOKENS_PER_EVENT);
         assert_eq!(config.server.max_concurrent_event_processing, 64);
         assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 600);
         assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 30_000);
@@ -2986,6 +2988,38 @@ mod tests {
         assert!(
             error.to_string().contains("server.max_tokens_per_event"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn test_max_tokens_per_event_above_protocol_ceiling_rejected_from_file() {
+        let file = create_temp_config(&format!(
+            r#"
+            [server]
+            private_key = "test"
+            max_tokens_per_event = {}
+        "#,
+            MAX_TOKENS_PER_EVENT + 1
+        ));
+        let error = load_with_test_env(file.path(), &[]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("server.max_tokens_per_event"), "{message}");
+        assert!(
+            message.contains(&format!("must be at most {MAX_TOKENS_PER_EVENT}")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_max_tokens_per_event_above_protocol_ceiling_rejected_from_env() {
+        let value = (MAX_TOKENS_PER_EVENT + 1).to_string();
+        let error =
+            from_test_env(&[("TRANSPONDER_SERVER_MAX_TOKENS_PER_EVENT", &value)]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("server.max_tokens_per_event"), "{message}");
+        assert!(
+            message.contains(&format!("must be at most {MAX_TOKENS_PER_EVENT}")),
+            "{message}"
         );
     }
 
