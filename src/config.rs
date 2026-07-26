@@ -3024,6 +3024,14 @@ mod tests {
     }
 
     #[test]
+    fn test_max_tokens_per_event_protocol_ceiling_accepted_from_env() {
+        let value = MAX_TOKENS_PER_EVENT.to_string();
+        let config = from_test_env(&[("TRANSPONDER_SERVER_MAX_TOKENS_PER_EVENT", &value)]).unwrap();
+
+        assert_eq!(config.server.max_tokens_per_event, MAX_TOKENS_PER_EVENT);
+    }
+
+    #[test]
     fn test_zero_max_rate_limit_cache_size_rejected() {
         // #166: previously coerced to 100k inside RateLimiter::new.
         let error =
