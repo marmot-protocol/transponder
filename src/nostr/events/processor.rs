@@ -250,9 +250,22 @@ impl EventProcessor {
         // gift-wrap ID. A racing duplicate waits for the owner to finish. If
         // the owner releases a transient result, the waiter retries the
         // reservation itself instead of silently losing the only redelivery.
-        loop {
+        //
+        // The guard is bound for the rest of this call: dropping it is what
+        // gives the reservation up, so an unwind past the explicit resolution
+        // calls below (a panic inside `process_inner`) still hands the content
+        // hash back instead of stranding it in flight forever (#370).
+        let _reservation = loop {
             match self.try_reserve(content_hash).await {
-                Reservation::Acquired => break,
+                Reservation::Acquired { guard, reclaimed } => {
+                    if reclaimed {
+                        // The previous owner of this hash vanished without
+                        // resolving its reservation. Pairs with the panic
+                        // counter recorded by the spawning task.
+                        warn!("Reclaimed a dedup reservation abandoned by an unfinished owner");
+                    }
+                    break guard;
+                }
                 Reservation::Duplicate => {
                     trace!("Skipping duplicate trigger content");
                     self.metrics.record_event_deduplicated();
@@ -263,6 +276,9 @@ impl EventProcessor {
                     return Ok(false);
                 }
                 Reservation::Wait(mut completed) => {
+                    // Resolves when the owner drops its reservation guard,
+                    // which closes the channel. The error that close produces
+                    // is the expected wake-up, not a failure.
                     let _ = completed.changed().await;
                 }
                 Reservation::AtCapacity => {
@@ -277,7 +293,7 @@ impl EventProcessor {
                     return Ok(false);
                 }
             }
-        }
+        };
 
         match self.process_inner(token_bytes).await {
             Ok(ProcessOutcome::Admitted) => {
@@ -699,6 +715,10 @@ impl EventProcessor {
     /// so the event remains eligible for retry. This is the inverse of the
     /// reservation and preserves the prior "not marked seen on transient
     /// failure" semantics.
+    ///
+    /// Only removes the entry: waiting duplicates are woken by the reservation
+    /// guard dropping, so an owner that never reaches this call still releases
+    /// them.
     async fn release_reservation(&self, content_hash: &EventId) {
         let mut seen = self.seen_events.write().await;
         seen.release(content_hash);
@@ -882,9 +902,7 @@ mod tests {
     use crate::crypto::token::ENCRYPTED_TOKEN_SIZE;
     use crate::defaults::DEFAULT_MAX_TOKENS_PER_EVENT;
     use crate::metrics::{EventOutcome, Metrics, OperationOutcome};
-    use crate::nostr::events::dedup::{
-        CLEANUP_BATCH_SIZE, DEDUP_WINDOW, SeenEvent, instant_to_unix_secs,
-    };
+    use crate::nostr::events::dedup::{CLEANUP_BATCH_SIZE, DEDUP_WINDOW, instant_to_unix_secs};
     use crate::push::{ApnsClient, PushDispatcher};
     use crate::test_metrics::{
         counter_value, gauge_value as metric_gauge_value,
@@ -1906,7 +1924,7 @@ mod tests {
                 let mut bytes = [0u8; 32];
                 bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
                 let event_id = EventId::from_byte_array(bytes);
-                seen.put(event_id, SeenEvent::terminal(old_time));
+                seen.put_terminal(event_id, old_time);
             }
         }
 
@@ -1957,10 +1975,10 @@ mod tests {
         {
             let mut seen = processor.seen_events.write().await;
             for event_id in &stale_ids {
-                seen.put(*event_id, SeenEvent::terminal(old_time));
+                seen.put_terminal(*event_id, old_time);
             }
             for event_id in &recent_ids {
-                seen.put(*event_id, SeenEvent::terminal(recent_time));
+                seen.put_terminal(*event_id, recent_time);
             }
         }
 
@@ -1999,7 +2017,7 @@ mod tests {
                 let mut bytes = [0u8; 32];
                 bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
                 let event_id = EventId::from_byte_array(bytes);
-                seen.put(event_id, SeenEvent::terminal(old_time));
+                seen.put_terminal(event_id, old_time);
             }
 
             // Add some recent entries
@@ -2007,7 +2025,7 @@ mod tests {
                 let mut bytes = [0u8; 32];
                 bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
                 let event_id = EventId::from_byte_array(bytes);
-                seen.put(event_id, SeenEvent::terminal(recent_time));
+                seen.put_terminal(event_id, recent_time);
             }
         }
 
@@ -2700,6 +2718,167 @@ mod tests {
         );
         // The completion refresh kept the entry terminal (a replay dedups).
         assert!(!processor.process(&event).await.unwrap());
+    }
+
+    // === Abandoned-Reservation Recovery Tests (issue #370) ===
+
+    /// A panic unwinding out of the task that holds a reservation must give the
+    /// reservation up. This is the mechanism the fix rests on, exercised in the
+    /// same shape `app.rs` runs processing in: a spawned task whose panic is
+    /// caught by the join handle.
+    #[tokio::test]
+    async fn test_panic_while_holding_a_reservation_gives_it_up() {
+        let server_keys = Keys::generate();
+        let processor = Arc::new(create_processor(&server_keys));
+        let content_hash = EventId::from_byte_array([7u8; 32]);
+
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let (unwind_tx, unwind_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn({
+            let processor = Arc::clone(&processor);
+            async move {
+                // Held across an await, so the guard lives in the task's
+                // state machine exactly as it does across `process_inner`.
+                let _reservation = match processor.try_reserve(content_hash).await {
+                    Reservation::Acquired { guard, .. } => guard,
+                    _ => panic!("the first reservation of a fresh hash must be acquired"),
+                };
+                acquired_tx.send(()).expect("the test awaits this signal");
+                unwind_rx.await.expect("the test signals before dropping");
+                panic!("simulated panic between acquiring the reservation and resolving it");
+            }
+        });
+
+        acquired_rx.await.expect("the owner reserves the hash");
+        let Reservation::Wait(mut waiter) = processor.try_reserve(content_hash).await else {
+            panic!("a concurrent delivery must wait on the reservation");
+        };
+
+        unwind_tx.send(()).expect("the owner awaits this signal");
+        let joined = owner.await;
+        assert!(
+            joined.is_err_and(|error| error.is_panic()),
+            "the owner task must have panicked"
+        );
+
+        assert!(
+            waiter.changed().await.is_err(),
+            "the unwind must wake the parked duplicate"
+        );
+        assert!(
+            matches!(
+                processor.try_reserve(content_hash).await,
+                Reservation::Acquired {
+                    reclaimed: true,
+                    ..
+                }
+            ),
+            "the reservation the panic abandoned must be reclaimable"
+        );
+    }
+
+    /// Simulate an owner that vanished mid-reservation: `try_reserve` succeeds
+    /// and its guard is dropped without `mark_seen`/`release_reservation`, the
+    /// state a panic inside `process_inner` leaves behind. A later redelivery
+    /// of the same content must reclaim the reservation and process, not block
+    /// forever on a completion channel nobody will ever send on.
+    #[tokio::test]
+    async fn test_redelivery_reclaims_a_reservation_whose_owner_vanished() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        let (processor, _metrics) = create_processor_with_metrics(&server_keys);
+
+        let (content_hash, _tokens) = processor
+            .parse_trigger(&event)
+            .await
+            .expect("the scenario builds a valid trigger");
+        match processor.try_reserve(content_hash).await {
+            Reservation::Acquired { guard, reclaimed } => {
+                assert!(!reclaimed);
+                // The owner unwinds without resolving the reservation.
+                drop(guard);
+            }
+            _ => panic!("the first reservation of a fresh hash must be acquired"),
+        }
+        assert_eq!(
+            processor.cache_len(),
+            1,
+            "the abandoned reservation is still resident"
+        );
+
+        let processed = tokio::time::timeout(Duration::from_secs(5), processor.process(&event))
+            .await
+            .expect("a redelivery must not block on an abandoned reservation")
+            .expect("processing must not error");
+
+        assert!(
+            processed,
+            "the redelivery owns the reclaimed reservation and dispatches"
+        );
+        assert!(
+            processor.contains_seen(&content_hash).await,
+            "the reclaimed reservation completes terminally"
+        );
+    }
+
+    /// A concurrent duplicate already parked on the reservation must be woken
+    /// when the owner vanishes, then reclaim and process. Without the guard the
+    /// waiter blocks forever while holding an event-processing permit.
+    #[tokio::test]
+    async fn test_waiter_is_woken_when_the_reservation_owner_vanishes() {
+        let server_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let device_token = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
+
+        let event =
+            scenarios::single_apns_notification(&server_keys, &sender_keys, device_token).await;
+        let (processor, _metrics) = create_processor_with_metrics(&server_keys);
+        let processor = Arc::new(processor);
+
+        let content_hash = processor
+            .parse_trigger(&event)
+            .await
+            .expect("the scenario builds a valid trigger")
+            .0;
+        let guard = match processor.try_reserve(content_hash).await {
+            Reservation::Acquired { guard, .. } => guard,
+            _ => panic!("the first reservation of a fresh hash must be acquired"),
+        };
+
+        let waiter = tokio::spawn({
+            let processor = Arc::clone(&processor);
+            let event = event.clone();
+            async move { processor.process(&event).await }
+        });
+
+        // Let the redelivery reach its wait on the live reservation. This only
+        // shortens the window it parks in; the assertion below cannot pass
+        // early because the reservation is still held.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "a delivery racing a live reservation must wait for its owner"
+        );
+
+        // The owner unwinds without resolving the reservation.
+        drop(guard);
+
+        let processed = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the vanished owner must wake its waiter")
+            .expect("the waiting task must not panic")
+            .expect("processing must not error");
+
+        assert!(
+            processed,
+            "the woken waiter reclaims the reservation and dispatches"
+        );
     }
 
     // === Per-Token Rate-Limit Shed Tests (issue #195) ===
