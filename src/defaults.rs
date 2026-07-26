@@ -33,8 +33,11 @@ pub const DEFAULT_MAX_DEDUP_CACHE_SIZE: usize = 100_000;
 /// Default duration to keep decoded trigger-content hashes in memory.
 pub const DEFAULT_DEDUP_RETENTION_SECS: u64 = 300;
 
+/// Marmot Push v1 maximum number of encrypted-token or padding chunks in one trigger.
+pub const MAX_TOKENS_PER_EVENT: usize = 32;
+
 /// Default maximum number of encrypted tokens accepted in one notification event.
-pub const DEFAULT_MAX_TOKENS_PER_EVENT: usize = 100;
+pub const DEFAULT_MAX_TOKENS_PER_EVENT: usize = MAX_TOKENS_PER_EVENT;
 
 /// Default maximum number of events processed concurrently.
 pub const DEFAULT_MAX_CONCURRENT_EVENT_PROCESSING: usize = 64;

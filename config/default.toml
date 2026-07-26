@@ -51,8 +51,10 @@ shutdown_timeout_secs = 10
 # Maximum encrypted tokens accepted in a single notification event.
 # Must be >= 1; a value of 0 is rejected at startup (it would reject every
 # notification event — a total, silent push outage).
-# Default: 100
-# max_tokens_per_event = 100
+# Marmot Push v1 permits at most 32 chunks. This setting may lower that
+# operational limit but cannot raise the protocol ceiling.
+# Default: 32
+# max_tokens_per_event = 32
 
 # Rate limit: max notifications per encrypted token per minute.
 # Limits identical encrypted blobs to prevent replay attacks.

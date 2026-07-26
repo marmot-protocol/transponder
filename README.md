@@ -91,7 +91,7 @@ shutdown_timeout_secs = 10
 # a value of 0 is rejected at startup (it previously either silently swapped in
 # the default or rejected every event).
 # max_rate_limit_cache_size = 100000           # Tracked keys per limiter, not total timestamps
-# max_tokens_per_event = 100                   # Per notification event
+# max_tokens_per_event = 32                    # Per trigger; may be lowered, protocol max is 32
 # encrypted_token_rate_limit_per_minute = 240  # Per encrypted token (replay protection)
 # encrypted_token_rate_limit_per_hour = 5000
 # device_token_rate_limit_per_minute = 240     # Per device (spam protection)

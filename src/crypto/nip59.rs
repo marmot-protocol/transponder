@@ -15,6 +15,7 @@ const TAG_VERSION: &str = "v";
 const VERSION_MARMOT_PUSH_V1: &str = "marmot-push-v1";
 
 pub use crate::defaults::DEFAULT_MAX_TOKENS_PER_EVENT;
+use crate::defaults::MAX_TOKENS_PER_EVENT;
 
 /// Maximum number of characters of attacker-controlled tag content included in
 /// error messages.
@@ -236,6 +237,9 @@ impl UnwrappedNotification {
 
         self.validate_tags()?;
 
+        // Configuration may lower the operational limit, but no internal
+        // caller may raise the adopted Marmot Push v1 ceiling of 32 chunks.
+        let max_tokens = max_tokens.min(MAX_TOKENS_PER_EVENT);
         let max_encoded_len = max_encoded_token_blob_len(max_tokens);
         if self.content.len() > max_encoded_len {
             return Err(Error::InvalidToken(format!(
@@ -695,6 +699,17 @@ mod tests {
         let result = over_limit.parse_tokens_with_limit(MAX_TOKENS);
         assert!(result.is_err());
         let expected_error = exceeds_max_tokens_message(MAX_TOKENS);
+        assert!(result.unwrap_err().to_string().contains(&expected_error));
+    }
+
+    #[test]
+    fn test_parse_custom_limit_cannot_raise_protocol_ceiling() {
+        let concatenated = vec![0x42; (MAX_TOKENS_PER_EVENT + 1) * ENCRYPTED_TOKEN_SIZE];
+        let notification = notification(BASE64_STANDARD.encode(&concatenated));
+
+        let result = notification.parse_tokens_with_limit(MAX_TOKENS_PER_EVENT + 1);
+        assert!(result.is_err());
+        let expected_error = exceeds_max_tokens_message(MAX_TOKENS_PER_EVENT);
         assert!(result.unwrap_err().to_string().contains(&expected_error));
     }
 

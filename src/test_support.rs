@@ -57,8 +57,8 @@ mod tests {
     #[test]
     fn server_config_with_applies_override() {
         let config = server_config_with(default_server_config(), |c| {
-            c.max_tokens_per_event = 42;
+            c.max_tokens_per_event = 12;
         });
-        assert_eq!(config.max_tokens_per_event, 42);
+        assert_eq!(config.max_tokens_per_event, 12);
     }
 }
