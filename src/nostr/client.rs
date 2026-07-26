@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::config::RelayConfig;
@@ -43,6 +43,7 @@ struct LiveGiftWrapSubscription {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LiveGiftWrapSubscriptions {
     subscriptions: Arc<RwLock<BTreeMap<RelayUrl, LiveGiftWrapSubscription>>>,
+    rebuild: Arc<Notify>,
 }
 
 impl LiveGiftWrapSubscriptions {
@@ -72,6 +73,19 @@ impl LiveGiftWrapSubscriptions {
 
     async fn clear(&self) {
         self.subscriptions.write().await.clear();
+    }
+
+    /// Fail closed after relay-pool notification loss and request fresh
+    /// subscriptions for every relay that is still connected.
+    pub(crate) async fn recover_after_notification_lag(&self) {
+        self.clear().await;
+        self.rebuild.notify_one();
+    }
+
+    /// Wait until the event loop requests a rebuild after losing relay-pool
+    /// notifications.
+    pub(crate) async fn wait_for_rebuild_request(&self) {
+        self.rebuild.notified().await;
     }
 
     /// Mark a relay/subscription pair live after receiving its matching EOSE.
@@ -228,13 +242,23 @@ async fn install_live_gift_wrap_subscription(
         .await;
 
     let filter = live_gift_wrap_subscription_filter(server_pubkey, Timestamp::now().as_secs());
-    let output = client
+    let output = match client
         .send_msg_to(
             [relay_url.clone()],
             ClientMessage::req(subscription_id.clone(), filter),
         )
         .await
-        .map_err(|e| Error::Nostr(format!("Failed to send live subscription: {e}")))?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            subscriptions
+                .invalidate_if_current(&relay_url, &subscription_id)
+                .await;
+            return Err(Error::Nostr(format!(
+                "Failed to send live subscription: {error}"
+            )));
+        }
+    };
 
     if output.success.contains(&relay_url) {
         return Ok(());
@@ -285,46 +309,55 @@ async fn run_live_subscription_monitor(
     server_pubkey: PublicKey,
 ) {
     loop {
-        match notifications.recv().await {
-            Ok(MonitorNotification::StatusChanged { relay_url, status }) => match status {
-                NostrRelayStatus::Connected => {
-                    if let Err(error) = install_live_gift_wrap_subscription(
-                        &client,
-                        &subscriptions,
-                        relay_url,
-                        server_pubkey,
-                    )
-                    .await
-                    {
-                        warn!(
-                            error = %error,
-                            "Failed to install live gift-wrap subscription after relay connection"
-                        );
-                    }
-                }
-                NostrRelayStatus::Initialized
-                | NostrRelayStatus::Pending
-                | NostrRelayStatus::Connecting
-                | NostrRelayStatus::Disconnected
-                | NostrRelayStatus::Sleeping
-                | NostrRelayStatus::Terminated
-                | NostrRelayStatus::Banned => {
-                    subscriptions.invalidate(&relay_url).await;
-                }
-            },
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(
-                    skipped,
-                    "Relay live-subscription monitor lagged; rebuilding current relay subscriptions"
-                );
-
-                // A lost status transition may hide a complete connection
-                // flap. Fail closed by invalidating every old ID, then install
-                // fresh raw subscriptions only on relays connected now.
+        tokio::select! {
+            _ = subscriptions.wait_for_rebuild_request() => {
+                warn!("Relay notifications were lost; rebuilding live gift-wrap subscriptions");
+                // The event loop clears state before signaling, but clear again
+                // here so a concurrent install cannot leave an old ID eligible.
                 subscriptions.clear().await;
                 install_for_connected_relays(&client, &subscriptions, server_pubkey).await;
             }
-            Err(broadcast::error::RecvError::Closed) => break,
+            result = notifications.recv() => match result {
+                Ok(MonitorNotification::StatusChanged { relay_url, status }) => match status {
+                    NostrRelayStatus::Connected => {
+                        if let Err(error) = install_live_gift_wrap_subscription(
+                            &client,
+                            &subscriptions,
+                            relay_url,
+                            server_pubkey,
+                        )
+                        .await
+                        {
+                            warn!(
+                                error = %error,
+                                "Failed to install live gift-wrap subscription after relay connection"
+                            );
+                        }
+                    }
+                    NostrRelayStatus::Initialized
+                    | NostrRelayStatus::Pending
+                    | NostrRelayStatus::Connecting
+                    | NostrRelayStatus::Disconnected
+                    | NostrRelayStatus::Sleeping
+                    | NostrRelayStatus::Terminated
+                    | NostrRelayStatus::Banned => {
+                        subscriptions.invalidate(&relay_url).await;
+                    }
+                },
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        skipped,
+                        "Relay live-subscription monitor lagged; rebuilding current relay subscriptions"
+                    );
+
+                    // A lost status transition may hide a complete connection
+                    // flap. Fail closed by invalidating every old ID, then install
+                    // fresh raw subscriptions only on relays connected now.
+                    subscriptions.clear().await;
+                    install_for_connected_relays(&client, &subscriptions, server_pubkey).await;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
     }
 }
@@ -436,20 +469,20 @@ impl RelayClient {
 
     /// Create a new relay client with metrics.
     pub async fn with_metrics(keys: Keys, config: RelayConfig, metrics: Metrics) -> Result<Self> {
-        Self::with_metrics_and_shutdown_trigger(keys, config, metrics, None).await
+        Self::with_optional_shutdown_trigger(keys, config, metrics, None).await
     }
 
-    pub async fn with_metrics_and_server_config(
+    /// Create a relay client with metrics and critical-task shutdown signaling.
+    pub async fn with_metrics_and_shutdown_trigger(
         keys: Keys,
         config: RelayConfig,
         metrics: Metrics,
-        _server: &crate::config::ServerConfig,
         shutdown_trigger: ShutdownTrigger,
     ) -> Result<Self> {
-        Self::with_metrics_and_shutdown_trigger(keys, config, metrics, Some(shutdown_trigger)).await
+        Self::with_optional_shutdown_trigger(keys, config, metrics, Some(shutdown_trigger)).await
     }
 
-    async fn with_metrics_and_shutdown_trigger(
+    async fn with_optional_shutdown_trigger(
         keys: Keys,
         config: RelayConfig,
         metrics: Metrics,
@@ -1832,6 +1865,7 @@ mod tests {
         let old_id = SubscriptionId::new("old");
         let new_id = SubscriptionId::new("new");
 
+        assert!(!subscriptions.mark_eose(&relay_url, &old_id).await);
         subscriptions
             .replace_pending(relay_url.clone(), old_id.clone())
             .await;
@@ -1865,6 +1899,12 @@ mod tests {
         sender
             .send(MonitorNotification::StatusChanged {
                 relay_url: relay_url.clone(),
+                status: NostrRelayStatus::Connected,
+            })
+            .unwrap();
+        sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: relay_url.clone(),
                 status: NostrRelayStatus::Disconnected,
             })
             .unwrap();
@@ -1882,6 +1922,50 @@ mod tests {
         .await
         .expect("closed notification channel must stop the monitor");
         assert!(!subscriptions.is_live(&relay_url, &subscription_id).await);
+    }
+
+    #[tokio::test]
+    async fn connected_rebuild_skips_disconnected_relays_and_invalidates_state() {
+        let client = Client::default();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        client.add_relay(&relay_url).await.unwrap();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let subscription_id = SubscriptionId::new("stale");
+        subscriptions
+            .replace_pending(relay_url.clone(), subscription_id.clone())
+            .await;
+        assert!(subscriptions.mark_eose(&relay_url, &subscription_id).await);
+
+        assert_eq!(
+            install_for_connected_relays(&client, &subscriptions, Keys::generate().public_key(),)
+                .await,
+            0
+        );
+        assert!(!subscriptions.is_live(&relay_url, &subscription_id).await);
+    }
+
+    #[tokio::test]
+    async fn failed_live_subscription_send_invalidates_pending_state() {
+        let client = Client::default();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        client.add_relay(&relay_url).await.unwrap();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+
+        let error = install_live_gift_wrap_subscription(
+            &client,
+            &subscriptions,
+            relay_url,
+            Keys::generate().public_key(),
+        )
+        .await
+        .expect_err("an unconnected relay must reject the raw subscription");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to send live subscription")
+        );
+        assert!(subscriptions.subscriptions.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -1954,6 +2038,50 @@ mod tests {
                 .await
         );
 
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn live_subscription_monitor_rebuilds_after_event_notification_lag() {
+        use nostr_relay_builder::MockRelay;
+
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+        let client = Client::default();
+        client.add_relay(&relay_url).await.unwrap();
+        client.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let server_pubkey = Keys::generate().public_key();
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let stale_id = SubscriptionId::new("stale");
+        subscriptions
+            .replace_pending(relay_url.clone(), stale_id.clone())
+            .await;
+        assert!(subscriptions.mark_eose(&relay_url, &stale_id).await);
+
+        let (_monitor_sender, monitor_notifications) = broadcast::channel(8);
+        let mut relay_notifications = client.notifications();
+        let monitor_handle = tokio::spawn(run_live_subscription_monitor(
+            monitor_notifications,
+            client.clone(),
+            subscriptions.clone(),
+            server_pubkey,
+        ));
+
+        subscriptions.recover_after_notification_lag().await;
+        assert!(!subscriptions.is_live(&relay_url, &stale_id).await);
+
+        let replacement_id =
+            receive_eose(&mut relay_notifications, &relay_url, Duration::from_secs(2))
+                .await
+                .expect("event-notification lag must install a fresh subscription");
+        assert_ne!(replacement_id, stale_id);
+        assert!(subscriptions.mark_eose(&relay_url, &replacement_id).await);
+        assert!(subscriptions.is_live(&relay_url, &replacement_id).await);
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
         client.disconnect().await;
     }
 

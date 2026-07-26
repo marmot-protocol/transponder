@@ -316,7 +316,17 @@ async fn run_event_loop(
 
                         match classify_notification_receive_error(&e) {
                             NotificationReceiveAction::Continue => {
-                                warn!(error = %e, "Lagged relay notifications, continuing");
+                                // The dropped range may contain an EOSE. Clear
+                                // every current ID immediately and ask the
+                                // relay monitor to install fresh subscriptions
+                                // on relays that are still connected.
+                                gift_wrap_subscriptions
+                                    .recover_after_notification_lag()
+                                    .await;
+                                warn!(
+                                    error = %e,
+                                    "Lagged relay notifications; rebuilding live subscriptions"
+                                );
                             }
                             NotificationReceiveAction::Shutdown => {
                                 error!(error = %e, "Notification channel closed");
@@ -558,11 +568,10 @@ pub async fn run(mut config: AppConfig) -> Result<()> {
 
     // Initialize relay client
     let relay_client = Arc::new(
-        RelayClient::with_metrics_and_server_config(
+        RelayClient::with_metrics_and_shutdown_trigger(
             keys.clone(),
             config.relays.clone(),
             metrics.clone(),
-            &config.server,
             shutdown.trigger_handle(),
         )
         .await
@@ -1336,6 +1345,13 @@ mod tests {
     }
 
     async fn test_event_notification(server_keys: &Keys) -> RelayPoolNotification {
+        test_event_notification_with_subscription(server_keys, test_subscription_id()).await
+    }
+
+    async fn test_event_notification_with_subscription(
+        server_keys: &Keys,
+        subscription_id: SubscriptionId,
+    ) -> RelayPoolNotification {
         let sender_keys = Keys::generate();
         let event = crate::test_vectors::scenarios::single_apns_notification(
             server_keys,
@@ -1345,7 +1361,7 @@ mod tests {
         .await;
         RelayPoolNotification::Event {
             relay_url: test_relay_url(),
-            subscription_id: test_subscription_id(),
+            subscription_id,
             event: Box::new(event),
         }
     }
@@ -1665,21 +1681,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_event_loop_continues_after_lagged_notifications() {
-        // Capacity 1: the second pre-loop send overwrites the first, so the
-        // loop's first recv yields `Lagged` and must keep consuming.
+    async fn run_event_loop_rebuilds_after_lagged_eose() {
+        // Capacity 1: the filler overwrites EOSE before the loop starts, so the
+        // first recv reports `Lagged`. Recovery must invalidate the pending ID
+        // and request a fresh subscription instead of blackholing it forever.
         let (notification_tx, notifications) = broadcast::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let metrics = Metrics::new().unwrap();
         let (processor, server_keys) = test_event_processor_with_keys();
         let event_tasks = TaskTracker::new();
-        let subscriptions = test_live_subscriptions().await;
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        subscriptions
+            .replace_pending(test_relay_url(), test_subscription_id())
+            .await;
 
         notification_tx
-            .send(test_event_notification(&server_keys).await)
+            .send(RelayPoolNotification::Message {
+                relay_url: test_relay_url(),
+                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                    test_subscription_id(),
+                )),
+            })
             .unwrap();
         notification_tx
-            .send(test_event_notification(&server_keys).await)
+            .send(RelayPoolNotification::Shutdown)
             .unwrap();
 
         let loop_handle = tokio::spawn(run_event_loop(
@@ -1688,17 +1713,59 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             Arc::clone(&processor),
             event_tasks.clone(),
-            subscriptions,
+            subscriptions.clone(),
             metrics.clone(),
         ));
 
-        // The surviving (newest) event is still processed after the lag.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            subscriptions.wait_for_rebuild_request(),
+        )
+        .await
+        .expect("losing EOSE must request a live-subscription rebuild");
         assert!(
-            wait_for_cache_len(&processor, 1).await,
-            "the loop must keep processing after a lag"
+            !subscriptions
+                .is_live(&test_relay_url(), &test_subscription_id())
+                .await
         );
         assert_eq!(metrics.relay_notifications_lagged_total.get(), 1);
         assert_eq!(metrics.relay_notifications_dropped_total.get(), 1);
+
+        let replacement_id = SubscriptionId::new("replacement");
+        subscriptions
+            .replace_pending(test_relay_url(), replacement_id.clone())
+            .await;
+        notification_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: test_relay_url(),
+                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                    replacement_id.clone(),
+                )),
+            })
+            .unwrap();
+        for _ in 0..100 {
+            if subscriptions
+                .is_live(&test_relay_url(), &replacement_id)
+                .await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            subscriptions
+                .is_live(&test_relay_url(), &replacement_id)
+                .await,
+            "replacement EOSE must establish a new live boundary"
+        );
+
+        notification_tx
+            .send(test_event_notification_with_subscription(&server_keys, replacement_id).await)
+            .unwrap();
+        assert!(
+            wait_for_cache_len(&processor, 1).await,
+            "events must resume after the replacement subscription reaches EOSE"
+        );
 
         shutdown_tx.send(true).unwrap();
         let exit = tokio::time::timeout(Duration::from_secs(1), loop_handle)
