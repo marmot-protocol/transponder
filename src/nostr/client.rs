@@ -163,6 +163,16 @@ impl LiveGiftWrapSubscriptions {
 
     /// Return whether this is the current relay/subscription pair and its EOSE
     /// boundary has been observed.
+    /// Whether `id` is the relay's current live gift-wrap subscription, in any
+    /// state (pending before EOSE included).
+    pub(crate) async fn is_current(&self, relay_url: &RelayUrl, id: &SubscriptionId) -> bool {
+        self.subscriptions
+            .read()
+            .await
+            .get(relay_url)
+            .is_some_and(|subscription| subscription.id == *id)
+    }
+
     pub(crate) async fn is_live(&self, relay_url: &RelayUrl, id: &SubscriptionId) -> bool {
         self.subscriptions
             .read()

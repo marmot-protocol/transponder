@@ -58,6 +58,10 @@ const TOR_FEATURE_ENABLED: bool = false;
 /// interval behind real connection changes for typical orchestrator probe
 /// periods (10s+) while enumerating the relay pool rarely.
 const RELAY_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// Grace period before rebuilding a live gift-wrap subscription that a relay closed
+/// with `auth-required`, so the client's NIP-42 response can land first. A rebuild
+/// that still races authentication is closed again and retried the same way.
+const AUTH_REQUIRED_RESUBSCRIBE_DELAY: Duration = Duration::from_secs(2);
 
 fn validate_startup_config(
     server_private_key: &str,
@@ -255,6 +259,32 @@ async fn run_event_loop(
                                 gift_wrap_subscriptions
                                     .mark_eose(&relay_url, subscription_id.as_ref())
                                     .await;
+                                continue;
+                            }
+                            // A relay that gates kind 1059 behind NIP-42 (e.g. wok with
+                            // restricted_read_kinds) CLOSEs the raw live REQ with
+                            // "auth-required" before the client has answered AUTH; the
+                            // pool only re-sends subscriptions it tracks, so without this
+                            // the server never receives a trigger on such a relay.
+                            RelayPoolNotification::Message {
+                                relay_url,
+                                message: RelayMessage::Closed { subscription_id, message },
+                            } => {
+                                if message.starts_with("auth-required")
+                                    && gift_wrap_subscriptions
+                                        .is_current(&relay_url, subscription_id.as_ref())
+                                        .await
+                                {
+                                    warn!(
+                                        relay = %relay_url,
+                                        "Live gift-wrap subscription closed (auth-required); re-subscribing after NIP-42"
+                                    );
+                                    let subscriptions = gift_wrap_subscriptions.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(AUTH_REQUIRED_RESUBSCRIBE_DELAY).await;
+                                        subscriptions.recover_after_notification_lag().await;
+                                    });
+                                }
                                 continue;
                             }
                             RelayPoolNotification::Event {
@@ -1546,6 +1576,113 @@ mod tests {
             .await
             .expect("tracked processing tasks must drain");
         assert_eq!(semaphore.available_permits(), 2);
+    }
+
+    fn closed_notification(id: SubscriptionId, message: &str) -> RelayPoolNotification {
+        RelayPoolNotification::Message {
+            relay_url: test_relay_url(),
+            message: RelayMessage::Closed {
+                subscription_id: std::borrow::Cow::Owned(id),
+                message: std::borrow::Cow::Owned(message.to_string()),
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_event_loop_rebuilds_after_auth_required_close() {
+        // A relay that gates kind 1059 behind NIP-42 closes the raw live REQ before
+        // the client has authenticated; nostr-sdk does not re-send raw REQs, so the
+        // loop must request a rebuild or the server never receives a trigger.
+        let (notification_tx, notifications) = broadcast::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        subscriptions
+            .replace_pending(test_relay_url(), test_subscription_id())
+            .await;
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            notifications,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+            test_event_processor(),
+            TaskTracker::new(),
+            subscriptions.clone(),
+            Metrics::disabled(),
+        ));
+
+        notification_tx
+            .send(closed_notification(
+                test_subscription_id(),
+                "auth-required: requested filter requires authentication",
+            ))
+            .unwrap();
+        tokio::time::timeout(
+            AUTH_REQUIRED_RESUBSCRIBE_DELAY + Duration::from_secs(1),
+            subscriptions.wait_for_rebuild_request(),
+        )
+        .await
+        .expect("an auth-required close of the live subscription must request a rebuild");
+
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), loop_handle)
+                .await
+                .expect("loop must exit on shutdown")
+                .expect("loop task must not panic"),
+            EventLoopExit::ShutdownRequested
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_event_loop_ignores_unrelated_closes() {
+        let (notification_tx, notifications) = broadcast::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        subscriptions
+            .replace_pending(test_relay_url(), test_subscription_id())
+            .await;
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            notifications,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+            test_event_processor(),
+            TaskTracker::new(),
+            subscriptions.clone(),
+            Metrics::disabled(),
+        ));
+
+        // another subscription's auth-required close, and our own close for another reason
+        notification_tx
+            .send(closed_notification(
+                SubscriptionId::new("other"),
+                "auth-required: no",
+            ))
+            .unwrap();
+        notification_tx
+            .send(closed_notification(
+                test_subscription_id(),
+                "error: shutting down",
+            ))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                AUTH_REQUIRED_RESUBSCRIBE_DELAY * 3,
+                subscriptions.wait_for_rebuild_request(),
+            )
+            .await
+            .is_err(),
+            "unrelated closes must not trigger a rebuild"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), loop_handle)
+                .await
+                .expect("loop must exit on shutdown")
+                .expect("loop task must not panic"),
+            EventLoopExit::ShutdownRequested
+        );
     }
 
     #[tokio::test]
