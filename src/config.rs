@@ -2371,8 +2371,8 @@ mod tests {
         assert_eq!(default_max_dedup_cache_size(), 100_000);
         assert_eq!(default_max_rate_limit_cache_size(), 100_000);
         assert_eq!(default_max_tokens_per_event(), DEFAULT_MAX_TOKENS_PER_EVENT);
-        assert_eq!(default_rate_limit_per_minute(), 240);
-        assert_eq!(default_rate_limit_per_hour(), 5000);
+        assert_eq!(default_rate_limit_per_minute(), 20);
+        assert_eq!(default_rate_limit_per_hour(), 300);
         assert_eq!(default_max_concurrent_event_processing(), 64);
         assert_eq!(default_global_unwrap_rate_limit_per_minute(), 600);
         assert_eq!(default_global_unwrap_rate_limit_per_hour(), 30_000);
@@ -2502,10 +2502,10 @@ mod tests {
         let file = create_temp_config(config_content);
         let config = load_with_test_env(file.path(), &[]).unwrap();
 
-        assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 240);
-        assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 5000);
-        assert_eq!(config.server.device_token_rate_limit_per_minute, 240);
-        assert_eq!(config.server.device_token_rate_limit_per_hour, 5000);
+        assert_eq!(config.server.encrypted_token_rate_limit_per_minute, 20);
+        assert_eq!(config.server.encrypted_token_rate_limit_per_hour, 300);
+        assert_eq!(config.server.device_token_rate_limit_per_minute, 20);
+        assert_eq!(config.server.device_token_rate_limit_per_hour, 300);
         assert_eq!(config.server.max_tokens_per_event, MAX_TOKENS_PER_EVENT);
         assert_eq!(config.server.max_concurrent_event_processing, 64);
         assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 600);

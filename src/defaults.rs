@@ -13,11 +13,15 @@ pub const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP
 /// Default maximum cache size (100,000 entries).
 pub const DEFAULT_MAX_SIZE: usize = 100_000;
 
-/// Default rate limit per minute (240 = 4 per second).
-pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 240;
+/// Default per-token rate limit per minute (20 = one every 3 seconds).
+///
+/// Kept low because push-token records are gossiped to every group member, so
+/// anyone holding one (including a removed member) can trigger pushes to that
+/// device. Pushes are wake hints, so a faster rate adds nothing for users.
+pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 20;
 
-/// Default rate limit per hour.
-pub const DEFAULT_RATE_LIMIT_PER_HOUR: u32 = 5000;
+/// Default per-token rate limit per hour (300 = one every 12 seconds sustained).
+pub const DEFAULT_RATE_LIMIT_PER_HOUR: u32 = 300;
 
 /// Default global pre-unwrap admission limit per minute.
 pub const DEFAULT_GLOBAL_UNWRAP_LIMIT_PER_MINUTE: u32 = 600;
