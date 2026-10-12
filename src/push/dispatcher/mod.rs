@@ -203,9 +203,20 @@ impl PushDispatcher {
     }
 
     fn decrement_queue_depth(queue_depth: &AtomicUsize) {
-        let _ = queue_depth.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            current.checked_sub(1)
-        });
+        // Manual CAS loop: `fetch_update` is deprecated on current stable and
+        // its replacement, `try_update`, is newer than the crate's MSRV.
+        let mut current = queue_depth.load(Ordering::SeqCst);
+        while let Some(next) = current.checked_sub(1) {
+            match queue_depth.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn update_semaphore_available_metric(metrics: &Metrics, semaphore: &Semaphore) {
