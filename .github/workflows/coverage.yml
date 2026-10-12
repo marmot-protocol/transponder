@@ -118,6 +118,48 @@ jobs:
             echo "diff=0.00" >> "$GITHUB_OUTPUT"
           fi
 
+      # Fork PRs get a read-only token and cannot receive the PR comment, so
+      # the job summary is where every contributor can see the numbers.
+      - name: Write coverage job summary
+        env:
+          COVERAGE_PERCENT: ${{ steps.coverage.outputs.percentage }}
+          COVERED_LINES: ${{ steps.coverage.outputs.covered }}
+          TOTAL_LINES: ${{ steps.coverage.outputs.total }}
+          BASELINE_PERCENT: ${{ steps.compare.outputs.baseline }}
+          COVERAGE_DECREASED: ${{ steps.compare.outputs.decreased }}
+        run: |
+          if [ "$COVERAGE_DECREASED" = "true" ]; then
+            STATUS=":x:"
+          else
+            STATUS=":white_check_mark:"
+          fi
+
+          # Match the PR comment: two decimals, `+` only for a positive change.
+          PERCENT=$(awk -v p="$COVERAGE_PERCENT" 'BEGIN {printf "%.2f", p}')
+
+          {
+            echo "## ${STATUS} Code Coverage Report"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Line Coverage | **${PERCENT}%** |"
+            echo "| Lines Covered | ${COVERED_LINES} / ${TOTAL_LINES} |"
+            if [ -n "$BASELINE_PERCENT" ] && [ "$BASELINE_PERCENT" != "N/A" ]; then
+              CHANGE=$(awk -v c="$COVERAGE_PERCENT" -v b="$BASELINE_PERCENT" 'BEGIN {
+                d = sprintf("%.2f", c - b)
+                if (d == "-0.00") d = "0.00"
+                printf "%s%s", (d + 0 > 0) ? "+" : "", d
+              }')
+              echo "| Change from master | **${CHANGE}%** ${STATUS} |"
+            fi
+            if [ "$COVERAGE_DECREASED" = "true" ]; then
+              echo ""
+              echo "> :warning: **Coverage has decreased!** Please add tests to maintain or improve coverage."
+            fi
+            echo ""
+            echo "Download the \`coverage-html\` artifact from this run for the detailed report."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Generate HTML report
         run: cargo llvm-cov --all-features --html
 
@@ -139,7 +181,12 @@ jobs:
     name: Coverage Comment
     runs-on: ubuntu-latest
     needs: coverage
-    if: github.event_name == 'pull_request' && always()
+    # Fork PRs receive a read-only GITHUB_TOKEN on `pull_request`, so posting
+    # would 403 and mark the PR failing. Forks get the coverage job summary.
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       pull-requests: write
     steps:
