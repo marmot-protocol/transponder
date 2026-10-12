@@ -28,6 +28,10 @@ const TOR_FEATURE_ENABLED: bool = true;
 const TOR_FEATURE_ENABLED: bool = false;
 const RELAY_MONITOR_CHANNEL_SIZE: usize = 64;
 const DEGRADED_RELAY_CLASS_WARNING_GRACE: Duration = Duration::from_secs(10);
+/// Delay before retrying relays whose replacement live subscription failed to
+/// send. Without a retry, a relay whose REQ never left stays connected but deaf
+/// until it disconnects, since no CLOSED or EOSE arrives to trigger recovery.
+const LIVE_SUBSCRIPTION_INSTALL_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 struct LiveGiftWrapSubscription {
@@ -138,6 +142,15 @@ impl LiveGiftWrapSubscriptions {
     /// subscriptions.
     pub(crate) async fn wait_for_rebuild_request(&self) {
         self.rebuild.notified().await;
+    }
+
+    /// Return whether any relay still waits for a replacement subscription.
+    async fn has_invalidated(&self) -> bool {
+        self.subscriptions
+            .read()
+            .await
+            .values()
+            .any(|subscription| subscription.state == LiveGiftWrapSubscriptionState::Invalidated)
     }
 
     /// Mark a relay/subscription pair live after receiving its matching EOSE.
@@ -414,9 +427,17 @@ async fn run_live_subscription_monitor(
 ) {
     let rebuild_request = subscriptions.wait_for_rebuild_request();
     tokio::pin!(rebuild_request);
+    let mut install_retry_at: Option<tokio::time::Instant> = None;
 
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(
+                install_retry_at.unwrap_or_else(tokio::time::Instant::now)
+            ), if install_retry_at.is_some() => {
+                install_retry_at = None;
+                debug!("Retrying failed live gift-wrap subscription installs");
+                install_for_connected_relays(&client, &subscriptions, server_pubkey).await;
+            }
             _ = &mut rebuild_request => {
                 // The event loop logs why it asked for a rebuild.
                 debug!("Rebuilding invalidated live gift-wrap subscriptions");
@@ -468,6 +489,16 @@ async fn run_live_subscription_monitor(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+
+        // A failed install restores the relay's invalidated entry. Keep one
+        // pending retry while any remain so the relay is not left deaf.
+        install_retry_at = if subscriptions.has_invalidated().await {
+            install_retry_at.or_else(|| {
+                Some(tokio::time::Instant::now() + LIVE_SUBSCRIPTION_INSTALL_RETRY_DELAY)
+            })
+        } else {
+            None
+        };
     }
 }
 
@@ -2398,6 +2429,60 @@ mod tests {
             .is_none(),
             "the healthy relay must not be re-subscribed"
         );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn live_subscription_monitor_retries_relays_left_invalidated() {
+        use nostr_relay_builder::MockRelay;
+
+        // A replacement REQ that fails to send restores the invalidated entry.
+        // No CLOSED or rebuild request follows, so the monitor must retry on its
+        // own or the relay stays connected but deaf.
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await;
+        let client = Client::default();
+        client.add_relay(&relay_url).await.unwrap();
+        client.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let stale_id = SubscriptionId::new("stale");
+        subscriptions
+            .replace_pending(relay_url.clone(), stale_id.clone())
+            .await;
+        subscriptions.invalidate_all_for_rebuild().await;
+
+        let (monitor_sender, monitor_notifications) = broadcast::channel(8);
+        let mut relay_notifications = client.notifications();
+        let monitor_handle = tokio::spawn(run_live_subscription_monitor(
+            monitor_notifications,
+            client.clone(),
+            subscriptions.clone(),
+            Keys::generate().public_key(),
+        ));
+
+        // Any monitor wakeup that leaves an invalidated entry arms the retry.
+        monitor_sender
+            .send(MonitorNotification::StatusChanged {
+                relay_url: RelayUrl::parse("ws://127.0.0.1:1").unwrap(),
+                status: NostrRelayStatus::Disconnected,
+            })
+            .unwrap();
+
+        let replacement_id = receive_eose(
+            &mut relay_notifications,
+            &relay_url,
+            LIVE_SUBSCRIPTION_INSTALL_RETRY_DELAY + Duration::from_secs(2),
+        )
+        .await
+        .expect("the monitor must retry a relay left invalidated");
+        assert_ne!(replacement_id, stale_id);
+        assert!(subscriptions.mark_eose(&relay_url, &replacement_id).await);
+        assert!(!subscriptions.has_invalidated().await);
 
         monitor_handle.abort();
         let _ = monitor_handle.await;

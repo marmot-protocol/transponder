@@ -68,6 +68,45 @@ const AUTH_REQUIRED_RESUBSCRIBE_DELAY: Duration = Duration::from_secs(2);
 /// subscription with `auth-required`, e.g. because NIP-42 never succeeds.
 const AUTH_REQUIRED_RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(60);
 
+/// Consecutive `auth-required` closes from one relay and the subscription
+/// whose delayed retry is pending.
+struct AuthRequiredRetry {
+    attempts: u32,
+    subscription_id: SubscriptionId,
+}
+
+/// Record an `auth-required` close of a relay's current live subscription and
+/// return its 1-based attempt number, or `None` when a retry for this exact
+/// subscription is already pending.
+///
+/// Relays may repeat CLOSED for one REQ, and the pool forwards every copy.
+/// Only distinct rejected subscriptions advance the backoff or schedule a
+/// retry, so duplicates cannot pile up sleeping tasks.
+fn record_auth_required_close(
+    retries: &mut BTreeMap<RelayUrl, AuthRequiredRetry>,
+    relay_url: &RelayUrl,
+    subscription_id: &SubscriptionId,
+) -> Option<u32> {
+    match retries.get_mut(relay_url) {
+        Some(retry) if retry.subscription_id == *subscription_id => None,
+        Some(retry) => {
+            retry.attempts = retry.attempts.saturating_add(1);
+            retry.subscription_id = subscription_id.clone();
+            Some(retry.attempts)
+        }
+        None => {
+            retries.insert(
+                relay_url.clone(),
+                AuthRequiredRetry {
+                    attempts: 1,
+                    subscription_id: subscription_id.clone(),
+                },
+            );
+            Some(1)
+        }
+    }
+}
+
 /// Delay before re-subscribing after the `attempt`-th consecutive
 /// `auth-required` close from one relay (1-based).
 fn auth_required_resubscribe_delay(attempt: u32) -> Duration {
@@ -257,7 +296,7 @@ async fn run_event_loop(
 ) -> EventLoopExit {
     // Consecutive `auth-required` closes per relay, cleared once the relay
     // delivers EOSE. Keyed only by relays with a current live subscription.
-    let mut auth_required_closes: BTreeMap<RelayUrl, u32> = BTreeMap::new();
+    let mut auth_required_retries: BTreeMap<RelayUrl, AuthRequiredRetry> = BTreeMap::new();
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -276,7 +315,7 @@ async fn run_event_loop(
                                     .mark_eose(&relay_url, subscription_id.as_ref())
                                     .await
                                 {
-                                    auth_required_closes.remove(&relay_url);
+                                    auth_required_retries.remove(&relay_url);
                                 }
                                 continue;
                             }
@@ -290,17 +329,20 @@ async fn run_event_loop(
                                 relay_url,
                                 message: RelayMessage::Closed { subscription_id, message },
                             } => {
-                                if message.starts_with("auth-required")
-                                    && gift_wrap_subscriptions
+                                if !message.starts_with("auth-required")
+                                    || !gift_wrap_subscriptions
                                         .is_current(&relay_url, subscription_id.as_ref())
                                         .await
                                 {
-                                    let attempt = auth_required_closes
-                                        .entry(relay_url.clone())
-                                        .or_default();
-                                    *attempt = attempt.saturating_add(1);
-                                    let delay = auth_required_resubscribe_delay(*attempt);
-                                    if *attempt == 1 {
+                                    continue;
+                                }
+                                if let Some(attempt) = record_auth_required_close(
+                                    &mut auth_required_retries,
+                                    &relay_url,
+                                    subscription_id.as_ref(),
+                                ) {
+                                    let delay = auth_required_resubscribe_delay(attempt);
+                                    if attempt == 1 {
                                         warn!(
                                             relay = %relay_url,
                                             "Live gift-wrap subscription closed (auth-required); re-subscribing after NIP-42"
@@ -308,7 +350,7 @@ async fn run_event_loop(
                                     } else {
                                         debug!(
                                             relay = %relay_url,
-                                            attempt = *attempt,
+                                            attempt,
                                             delay_secs = delay.as_secs(),
                                             "Live gift-wrap subscription closed (auth-required) again; retrying"
                                         );
@@ -1685,6 +1727,74 @@ mod tests {
             auth_required_resubscribe_delay(u32::MAX),
             AUTH_REQUIRED_RESUBSCRIBE_MAX_DELAY
         );
+    }
+
+    #[test]
+    fn record_auth_required_close_counts_distinct_subscriptions_only() {
+        let mut retries = BTreeMap::new();
+        let relay_url = test_relay_url();
+        let first = SubscriptionId::new("first");
+        let second = SubscriptionId::new("second");
+
+        assert_eq!(
+            record_auth_required_close(&mut retries, &relay_url, &first),
+            Some(1)
+        );
+        assert_eq!(
+            record_auth_required_close(&mut retries, &relay_url, &first),
+            None,
+            "a duplicate close must not schedule another retry"
+        );
+        assert_eq!(
+            record_auth_required_close(&mut retries, &relay_url, &second),
+            Some(2)
+        );
+        assert_eq!(
+            record_auth_required_close(&mut retries, &relay_url, &second),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_event_loop_coalesces_duplicate_auth_required_closes() {
+        // The pool forwards every CLOSED copy. Duplicates for one REQ must not
+        // stack retries or inflate the backoff for the next real rejection.
+        let (notification_tx, notifications) = broadcast::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let subscriptions = LiveGiftWrapSubscriptions::default();
+        let first = SubscriptionId::new("first");
+        subscriptions
+            .replace_pending(test_relay_url(), first.clone())
+            .await;
+        let loop_handle = spawn_test_event_loop(notifications, shutdown_rx, &subscriptions);
+
+        for _ in 0..6 {
+            notification_tx
+                .send(closed_notification(first.clone(), "auth-required: no"))
+                .unwrap();
+        }
+        tokio::time::timeout(
+            AUTH_REQUIRED_RESUBSCRIBE_DELAY + Duration::from_millis(100),
+            subscriptions.wait_for_rebuild_request(),
+        )
+        .await
+        .expect("the first close schedules a retry");
+
+        let second = SubscriptionId::new("second");
+        subscriptions
+            .replace_pending(test_relay_url(), second.clone())
+            .await;
+        notification_tx
+            .send(closed_notification(second, "auth-required: no"))
+            .unwrap();
+        tokio::time::timeout(
+            auth_required_resubscribe_delay(2) + Duration::from_millis(100),
+            subscriptions.wait_for_rebuild_request(),
+        )
+        .await
+        .expect("duplicates must not push the next retry past the second-attempt delay");
+
+        shut_down_test_event_loop(shutdown_tx, loop_handle).await;
     }
 
     #[tokio::test(start_paused = true)]
