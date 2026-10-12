@@ -202,11 +202,8 @@ impl PushDispatcher {
         queue_depth.fetch_add(count, Ordering::SeqCst);
     }
 
-    // `fetch_update` is deprecated on Rust 1.99 in favor of `try_update`, which
-    // is newer than the 1.90 MSRV; switch once the MSRV allows it.
-    #[allow(deprecated)]
     fn decrement_queue_depth(queue_depth: &AtomicUsize) {
-        let _ = queue_depth.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        let _ = queue_depth.try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             current.checked_sub(1)
         });
     }

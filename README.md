@@ -28,7 +28,7 @@ The maintained MIP-05 implementation is preserved in the [`release/mip05-v1`](ht
 
 ## Requirements
 
-- Rust 1.90+
+- Rust 1.95+
 - APNs credentials (for iOS notifications)
 - FCM service account (for Android notifications)
 - Optional: build with `--features tor` only if you need onion relay support

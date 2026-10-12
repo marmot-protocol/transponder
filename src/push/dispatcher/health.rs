@@ -53,13 +53,10 @@ impl DeliveryHealth {
 
     /// Record that the provider processed a request (successful send, or a
     /// definitive invalid-token verdict), decaying the failure score.
-    // `fetch_update` is deprecated on Rust 1.99 in favor of `try_update`, which
-    // is newer than the 1.90 MSRV; switch once the MSRV allows it.
-    #[allow(deprecated)]
     pub(crate) fn record_processed(&self, platform: Platform) {
         let _ = self
             .score(platform)
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |score| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |score| {
                 Some(score.saturating_sub(1))
             });
     }
@@ -68,13 +65,10 @@ impl DeliveryHealth {
     ///
     /// Caps the score so an arbitrarily long outage cannot wrap it or make
     /// recovery time grow with the outage duration.
-    // `fetch_update` is deprecated on Rust 1.99 in favor of `try_update`, which
-    // is newer than the 1.90 MSRV; switch once the MSRV allows it.
-    #[allow(deprecated)]
     pub(crate) fn record_hard_failure(&self, platform: Platform) {
         let _ = self
             .score(platform)
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |score| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |score| {
                 Some(score.saturating_add(2).min(DELIVERY_FAILURE_SCORE_MAX))
             });
     }
