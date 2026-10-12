@@ -43,19 +43,6 @@ pub struct DeliveryHealth {
     fcm_failure_score: AtomicU32,
 }
 
-/// Atomically replace `score` with `f(score)`.
-///
-/// A manual CAS loop rather than `fetch_update`, which current stable
-/// deprecates in favor of `try_update` (newer than the crate's MSRV).
-fn update_score(score: &AtomicU32, f: impl Fn(u32) -> u32) {
-    let mut current = score.load(Ordering::SeqCst);
-    while let Err(actual) =
-        score.compare_exchange_weak(current, f(current), Ordering::SeqCst, Ordering::SeqCst)
-    {
-        current = actual;
-    }
-}
-
 impl DeliveryHealth {
     fn score(&self, platform: Platform) -> &AtomicU32 {
         match platform {
@@ -66,18 +53,30 @@ impl DeliveryHealth {
 
     /// Record that the provider processed a request (successful send, or a
     /// definitive invalid-token verdict), decaying the failure score.
+    // `fetch_update` is deprecated on Rust 1.99 in favor of `try_update`, which
+    // is newer than the 1.90 MSRV; switch once the MSRV allows it.
+    #[allow(deprecated)]
     pub(crate) fn record_processed(&self, platform: Platform) {
-        update_score(self.score(platform), |score| score.saturating_sub(1));
+        let _ = self
+            .score(platform)
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |score| {
+                Some(score.saturating_sub(1))
+            });
     }
 
     /// Record a hard send failure (permanent error or exhausted retries).
     ///
     /// Caps the score so an arbitrarily long outage cannot wrap it or make
     /// recovery time grow with the outage duration.
+    // `fetch_update` is deprecated on Rust 1.99 in favor of `try_update`, which
+    // is newer than the 1.90 MSRV; switch once the MSRV allows it.
+    #[allow(deprecated)]
     pub(crate) fn record_hard_failure(&self, platform: Platform) {
-        update_score(self.score(platform), |score| {
-            score.saturating_add(2).min(DELIVERY_FAILURE_SCORE_MAX)
-        });
+        let _ = self
+            .score(platform)
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |score| {
+                Some(score.saturating_add(2).min(DELIVERY_FAILURE_SCORE_MAX))
+            });
     }
 
     /// Whether the provider's accumulated hard-failure score is below
