@@ -127,7 +127,6 @@ jobs:
           TOTAL_LINES: ${{ steps.coverage.outputs.total }}
           BASELINE_PERCENT: ${{ steps.compare.outputs.baseline }}
           COVERAGE_DECREASED: ${{ steps.compare.outputs.decreased }}
-          COVERAGE_DIFF: ${{ steps.compare.outputs.diff }}
         run: |
           if [ "$COVERAGE_DECREASED" = "true" ]; then
             STATUS=":x:"
@@ -135,19 +134,23 @@ jobs:
             STATUS=":white_check_mark:"
           fi
 
+          # Match the PR comment: two decimals, `+` only for a positive change.
+          PERCENT=$(awk -v p="$COVERAGE_PERCENT" 'BEGIN {printf "%.2f", p}')
+
           {
             echo "## ${STATUS} Code Coverage Report"
             echo ""
             echo "| Metric | Value |"
             echo "|--------|-------|"
-            echo "| Line Coverage | **${COVERAGE_PERCENT}%** |"
+            echo "| Line Coverage | **${PERCENT}%** |"
             echo "| Lines Covered | ${COVERED_LINES} / ${TOTAL_LINES} |"
             if [ -n "$BASELINE_PERCENT" ] && [ "$BASELINE_PERCENT" != "N/A" ]; then
-              if [ "$COVERAGE_DECREASED" = "true" ]; then
-                echo "| Change from master | **-${COVERAGE_DIFF}%** :x: |"
-              else
-                echo "| Change from master | **+${COVERAGE_DIFF}%** :white_check_mark: |"
-              fi
+              CHANGE=$(awk -v c="$COVERAGE_PERCENT" -v b="$BASELINE_PERCENT" 'BEGIN {
+                d = sprintf("%.2f", c - b)
+                if (d == "-0.00") d = "0.00"
+                printf "%s%s", (d + 0 > 0) ? "+" : "", d
+              }')
+              echo "| Change from master | **${CHANGE}%** ${STATUS} |"
             fi
             if [ "$COVERAGE_DECREASED" = "true" ]; then
               echo ""
