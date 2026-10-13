@@ -6,7 +6,8 @@
 //! `TRANSPONDER_SERVER_PRIVATE_KEY` maps to `server.private_key`.
 //! Relay lists must use comma-separated strings such as
 //! `TRANSPONDER_RELAYS_CLEARNET="a,b,c"`; bracketed syntax like `"[a, b, c]"`
-//! is rejected.
+//! is rejected. Overrides that contain no nonempty entries are ignored,
+//! preserving any file-configured relay list.
 //!
 //! Prefixed variables that are malformed or map to an unknown config key are
 //! ignored rather than treated as errors, so ambient service-discovery
@@ -722,13 +723,14 @@ where
         }
 
         builder = if is_string_list_key(&config_key) {
-            // An empty deployment variable is normally an unset optional
-            // override. Preserve any file-configured relay list instead of
-            // silently replacing it with an empty list.
-            if value.trim().is_empty() {
+            let relays = parse_string_list_env(&env_key, &value)?;
+            // A deployment variable with no relay entries is an unset optional
+            // override, including separator-only values. Preserve any
+            // file-configured relay list instead of clearing it.
+            if relays.is_empty() {
                 continue;
             }
-            builder.set_override(&config_key, parse_string_list_env(&env_key, &value)?)?
+            builder.set_override(&config_key, relays)?
         } else {
             builder.set_override(&config_key, value)?
         };
@@ -1034,7 +1036,8 @@ impl AppConfig {
     /// `TRANSPONDER_SERVER_PRIVATE_KEY` maps to `server.private_key`.
     /// Relay lists must use comma-separated strings such as
     /// `TRANSPONDER_RELAYS_CLEARNET="a,b,c"`; bracketed syntax like `"[a, b, c]"`
-    /// is rejected.
+    /// is rejected. Overrides that contain no nonempty entries are ignored,
+    /// preserving any file-configured relay list.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::load_with_env_iter(path, env::vars_os())
     }
@@ -1877,20 +1880,53 @@ mod tests {
 
     #[test]
     fn test_empty_relay_env_preserves_file_values() {
+        let clearnet = ["wss://relay.example.com".to_string()];
+        let onion = ["ws://relay.onion".to_string()];
+        for (file_clearnet, file_onion) in [
+            (clearnet.as_slice(), &[][..]),
+            (&[][..], onion.as_slice()),
+            (clearnet.as_slice(), onion.as_slice()),
+        ] {
+            let file = create_temp_config(&format!(
+                "[relays]\nclearnet = {file_clearnet:?}\nonion = {file_onion:?}\n"
+            ));
+            for env_key in ["TRANSPONDER_RELAYS_CLEARNET", "TRANSPONDER_RELAYS_ONION"] {
+                for value in ["", "  \n\t ", ",", ",,,", " , , ", "\t,\n, "] {
+                    let config = load_with_test_env(file.path(), &[(env_key, value)]).unwrap();
+                    assert_eq!(config.relays.clearnet, file_clearnet, "{env_key}={value:?}");
+                    assert_eq!(config.relays.onion, file_onion, "{env_key}={value:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nonempty_relay_env_replaces_only_matching_file_list() {
         let file = create_temp_config(
             r#"
             [relays]
-            clearnet = ["wss://relay.example.com"]
+            clearnet = ["wss://file.example.com"]
+            onion = ["ws://file.onion"]
         "#,
         );
-
-        let config =
-            load_with_test_env(file.path(), &[("TRANSPONDER_RELAYS_CLEARNET", "  \n\t ")]).unwrap();
-
-        assert_eq!(
-            config.relays.clearnet,
-            vec!["wss://relay.example.com".to_string()]
-        );
+        for (env_key, value, expected_clearnet, expected_onion) in [
+            (
+                "TRANSPONDER_RELAYS_CLEARNET",
+                " , wss://env.example.com, wss://env2.example.com, , ",
+                vec!["wss://env.example.com", "wss://env2.example.com"],
+                vec!["ws://file.onion"],
+            ),
+            (
+                "TRANSPONDER_RELAYS_ONION",
+                " , ws://env.onion, ws://env2.onion, , ",
+                vec!["wss://file.example.com"],
+                vec!["ws://env.onion", "ws://env2.onion"],
+            ),
+        ] {
+            let config = load_with_test_env(file.path(), &[(env_key, value)]).unwrap();
+            assert_eq!(config.relays.clearnet, expected_clearnet, "{env_key}");
+            assert_eq!(config.relays.onion, expected_onion, "{env_key}");
+        }
     }
 
     #[test]
