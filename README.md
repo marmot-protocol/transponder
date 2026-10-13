@@ -18,7 +18,7 @@ Transponder implements the adopted `marmot-push-v1` server interop surface: toke
 
 The release-candidate protocol checklist and executable evidence are recorded in [Marmot Push v1 Conformance](docs/marmot-push-v1-conformance.md).
 
-The maintained MIP-05 implementation is preserved in the [`release/mip05-v1`](https://github.com/marmot-protocol/transponder/tree/release/mip05-v1) branch and the immutable [`transponder-mip05-v1.0.0`](https://github.com/marmot-protocol/transponder/releases/tag/transponder-mip05-v1.0.0) release. Existing MIP-05 services should build from that release line rather than from `master`; `master` is the forward-looking Marmot Push development line.
+MIP-05 support was retired on October 13, 2026. The [`release/mip05-v1`](https://github.com/marmot-protocol/transponder/tree/release/mip05-v1) branch and immutable [`transponder-mip05-v1.0.0`](https://github.com/marmot-protocol/transponder/releases/tag/transponder-mip05-v1.0.0) release are preserved for historical reference, but the line is no longer maintained and receives no security, provider-compatibility, or operational fixes. Existing MIP-05 services and clients should migrate to the adopted `marmot-push-v1` protocol. `master` is the maintained Marmot Push v1 line and does not accept MIP-05 triggers.
 
 ### Privacy Properties
 
