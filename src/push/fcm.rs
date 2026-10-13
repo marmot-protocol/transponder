@@ -35,8 +35,8 @@ const TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
 /// Safety margin subtracted from provider-reported OAuth token lifetimes.
 const TOKEN_REFRESH_SAFETY_MARGIN_SECS: u64 = 60;
 
-/// Minimum cache lifetime for provider-reported OAuth tokens after applying the
-/// refresh safety margin.
+/// Preferred minimum cache lifetime after applying the safety margin, capped
+/// by the provider's reported lifetime.
 const TOKEN_LIFETIME_MIN: Duration = Duration::from_secs(30);
 
 /// Maximum cache lifetime accepted from provider-reported OAuth token expiry.
@@ -115,6 +115,7 @@ fn token_cache_lifetime(expires_in: Option<u64>) -> Duration {
             Duration::from_secs(seconds.saturating_sub(TOKEN_REFRESH_SAFETY_MARGIN_SECS))
                 .max(TOKEN_LIFETIME_MIN)
                 .min(TOKEN_LIFETIME_MAX)
+                .min(Duration::from_secs(seconds))
         })
         .unwrap_or(TOKEN_LIFETIME)
 }
@@ -1006,6 +1007,13 @@ mod tests {
             token_cache_lifetime(Some(TOKEN_REFRESH_SAFETY_MARGIN_SECS)),
             TOKEN_LIFETIME_MIN
         );
+    }
+
+    #[test]
+    fn test_short_provider_lifetime_is_never_extended() {
+        for seconds in 0..=120 {
+            assert!(token_cache_lifetime(Some(seconds)) <= Duration::from_secs(seconds));
+        }
     }
 
     #[test]
@@ -2953,6 +2961,31 @@ LTP/MQIxLydQxT4+jx2NBu0=
             .expect("expiry in the future");
         assert!(remaining <= Duration::from_secs(60));
         assert!(remaining >= Duration::from_secs(50));
+    }
+
+    #[tokio::test]
+    async fn test_short_lived_oauth_credentials_reuse_sequentially() {
+        for seconds in [30, 90, 120] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "short-lived-token",
+                    "expires_in": seconds
+                })))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let mut client = mock_client_with_rsa_service_account("test-project");
+            client.set_test_oauth_token_url(mock_server.uri());
+            for _ in 0..3 {
+                assert_eq!(
+                    client.get_access_token().await.unwrap().as_str(),
+                    "short-lived-token"
+                );
+            }
+            mock_server.verify().await;
+        }
     }
 
     #[tokio::test]

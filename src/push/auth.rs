@@ -94,6 +94,22 @@ struct CachedToken {
     token: Zeroizing<String>,
     #[zeroize(skip)]
     expires_at: SystemTime,
+    #[zeroize(skip)]
+    refresh_at: SystemTime,
+}
+
+impl CachedToken {
+    fn new(minted: MintedToken, now: SystemTime) -> Self {
+        let lifetime = minted.expires_at.duration_since(now).unwrap_or_default();
+        // Keep at least half of a short credential's remaining lifetime
+        // available for reuse. Long-lived credentials retain the 60s window.
+        let window = PROACTIVE_REFRESH_WINDOW.min(lifetime / 2);
+        Self {
+            token: minted.token,
+            expires_at: minted.expires_at,
+            refresh_at: minted.expires_at.checked_sub(window).unwrap_or(now),
+        }
+    }
 }
 
 /// Cached-credential store shared by the push clients.
@@ -149,13 +165,11 @@ impl<G> TokenCache<G> {
     }
 
     async fn read_fresh(&self) -> Option<Zeroizing<String>> {
-        let refresh_deadline = SystemTime::now()
-            .checked_add(PROACTIVE_REFRESH_WINDOW)
-            .unwrap_or(SystemTime::now());
+        let now = SystemTime::now();
         let cached = self.cached.read().await;
         cached
             .as_ref()
-            .filter(|token| token.expires_at > refresh_deadline)
+            .filter(|token| token.expires_at > now && token.refresh_at > now)
             .map(|token| token.token.clone())
     }
 
@@ -196,10 +210,7 @@ impl<G> TokenCache<G> {
         *self.recent_failure.lock().await = None;
         let outbound = minted.token.clone();
         let mut cached = self.cached.write().await;
-        *cached = Some(CachedToken {
-            token: minted.token,
-            expires_at: minted.expires_at,
-        });
+        *cached = Some(CachedToken::new(minted, SystemTime::now()));
         Ok(outbound)
     }
 
@@ -230,6 +241,8 @@ impl<G: AuthTokenGenerator> TokenCache<G> {
     ///
     /// A transient proactive-refresh failure falls back to a credential that
     /// remains cached and valid after the refresh attempt.
+    /// The refresh window is at most 60 seconds and at most half the remaining
+    /// lifetime when a credential is cached, allowing short lifetimes to be reused.
     ///
     /// The caller receives a short-lived zeroizing clone for request
     /// construction while the cache owns the reusable copy.
@@ -285,12 +298,16 @@ impl<G> TokenCache<G> {
         &mut self.generator
     }
 
-    /// Seed the cache with a credential (test setup).
+    /// Seed a credential using the standard 60s refresh window (test setup).
+    /// This can represent an older credential already due for refresh.
     pub(crate) async fn seed(&self, token: &str, expires_at: SystemTime) {
         let mut cached = self.cached.write().await;
         *cached = Some(CachedToken {
             token: Zeroizing::new(token.to_owned()),
             expires_at,
+            refresh_at: expires_at
+                .checked_sub(PROACTIVE_REFRESH_WINDOW)
+                .unwrap_or(SystemTime::UNIX_EPOCH),
         });
     }
 
@@ -374,6 +391,7 @@ mod tests {
         let cached = CachedToken {
             token: Zeroizing::new("cached-credential".to_string()),
             expires_at: SystemTime::now(),
+            refresh_at: SystemTime::now(),
         };
 
         assert_zeroizing_string(&minted.token);
@@ -409,6 +427,120 @@ mod tests {
         assert_eq!(token.as_str(), "token-1");
         assert_eq!(mints.load(Ordering::SeqCst), 1);
         assert_eq!(cache.cached_token_value().await.as_deref(), Some("token-1"));
+    }
+
+    #[tokio::test]
+    async fn test_short_lived_credentials_reuse_sequentially() {
+        for seconds in [1, 30, 60, 90, 120] {
+            let mut generator = StubGenerator::new();
+            generator.ttl = Duration::from_secs(seconds);
+            let mints = generator.mints.clone();
+            let cache = TokenCache::new(generator);
+
+            for _ in 0..3 {
+                assert_eq!(cache.get().await.unwrap().as_str(), "token-1");
+            }
+            assert_eq!(mints.load(Ordering::SeqCst), 1, "TTL {seconds}s");
+        }
+    }
+
+    #[test]
+    fn test_refresh_window_is_capped_at_half_the_lifetime_and_sixty_seconds() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        for (seconds, window_ms) in [
+            (0, 0),
+            (1, 500),
+            (30, 15_000),
+            (60, 30_000),
+            (120, 60_000),
+            (3600, 60_000),
+        ] {
+            let minted = MintedToken {
+                token: Zeroizing::new("test-token".to_owned()),
+                expires_at: now + Duration::from_secs(seconds),
+            };
+            let cached = CachedToken::new(minted, now);
+            assert_eq!(cached.expires_at, now + Duration::from_secs(seconds));
+            assert_eq!(
+                cached.refresh_at,
+                cached.expires_at - Duration::from_millis(window_ms)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_short_lived_proactive_refresh_serves_readers_and_reuses_result() {
+        let mut generator = StubGenerator::new();
+        generator.ttl = Duration::from_secs(30);
+        let mints = generator.mints.clone();
+        let mut cache = TokenCache::new(generator);
+        assert_eq!(cache.get().await.unwrap().as_str(), "token-1");
+
+        // Model arrival at this entry's refresh deadline, with time remaining
+        // before expiry, and pause the second mint for concurrent readers.
+        cache.cached.write().await.as_mut().unwrap().refresh_at =
+            SystemTime::now() - Duration::from_secs(1);
+        let gate = Arc::new(Semaphore::new(0));
+        let started = Arc::new(Semaphore::new(0));
+        cache.generator_mut().gate = Some(gate.clone());
+        cache.generator_mut().started = Some(started.clone());
+        let cache = Arc::new(cache);
+        let refresher = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.get().await })
+        };
+        wait_for_refresh_start(&started).await;
+        assert_eq!(cache.get().await.unwrap().as_str(), "token-1");
+        gate.add_permits(1);
+        assert_eq!(refresher.await.unwrap().unwrap().as_str(), "token-2");
+        let reused = tokio::time::timeout(Duration::from_secs(2), cache.get())
+            .await
+            .expect("the refreshed short-lived entry must not immediately mint again")
+            .unwrap();
+        assert_eq!(reused.as_str(), "token-2");
+        assert_eq!(mints.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_short_lived_credential_is_reminted_at_actual_expiry() {
+        let mut generator = StubGenerator::new();
+        generator.ttl = Duration::from_secs(30);
+        let mints = generator.mints.clone();
+        let cache = TokenCache::new(generator);
+        assert_eq!(cache.get().await.unwrap().as_str(), "token-1");
+        assert_eq!(cache.get().await.unwrap().as_str(), "token-1");
+
+        // SystemTime is not advanced by Tokio's test clock. Expire the actual
+        // cached entry directly instead of waiting on the wall clock.
+        cache.cached.write().await.as_mut().unwrap().expires_at =
+            SystemTime::now() - Duration::from_secs(1);
+        assert_eq!(cache.get().await.unwrap().as_str(), "token-2");
+        assert_eq!(cache.get().await.unwrap().as_str(), "token-2");
+        assert_eq!(mints.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_short_lived_concurrent_misses_and_later_reads_coalesce() {
+        let gate = Arc::new(Semaphore::new(0));
+        let started = Arc::new(Semaphore::new(0));
+        let mut generator = StubGenerator::new();
+        generator.ttl = Duration::from_secs(30);
+        generator.gate = Some(gate.clone());
+        generator.started = Some(started.clone());
+        let mints = generator.mints.clone();
+        let cache = Arc::new(TokenCache::new(generator));
+        let mut tasks = Vec::new();
+        for _ in 0..5 {
+            let cache = cache.clone();
+            tasks.push(tokio::spawn(async move { cache.get().await }));
+        }
+        wait_for_refresh_start(&started).await;
+        gate.add_permits(5);
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap().as_str(), "token-1");
+        }
+        assert_eq!(cache.get().await.unwrap().as_str(), "token-1");
+        assert_eq!(mints.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
