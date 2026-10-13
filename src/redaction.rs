@@ -28,8 +28,10 @@ use regex::Regex;
 ///
 /// Order matters: the APNs path pattern runs before the generic hex-run
 /// pattern so device tokens shorter than 64 hex chars are still caught when
-/// they appear in a request URL, and `ws(s)://` runs before `.onion` so an onion
-/// relay URL is redacted as a whole.
+/// they appear in a request URL. Relay URLs run before bearer credentials,
+/// nsec keys, and FCM tokens so a greedy credential pattern cannot consume an
+/// adjacent `ws(s)://` scheme and expose the host. URLs also run before `.onion`
+/// so an onion relay URL is redacted as a whole.
 static REDACTIONS: LazyLock<[(Regex, &'static str); 8]> = LazyLock::new(|| {
     [
         (
@@ -44,13 +46,13 @@ static REDACTIONS: LazyLock<[(Regex, &'static str); 8]> = LazyLock::new(|| {
             "[REDACTED-PRIVATE-KEY]",
         ),
         (
+            Regex::new(r#"(?i)(wss?)://[^\s"']+"#).expect("static redaction regex is valid"),
+            "[REDACTED-RELAY-URL]",
+        ),
+        (
             Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{20,}")
                 .expect("static redaction regex is valid"),
             "Bearer [REDACTED]",
-        ),
-        (
-            Regex::new(r#"(?i)(wss?)://[^\s"']+"#).expect("static redaction regex is valid"),
-            "[REDACTED-RELAY-URL]",
         ),
         (
             Regex::new(r"(?i)nsec1[0-9a-z]+").expect("static redaction regex is valid"),
@@ -223,6 +225,28 @@ mod tests {
 
         assert!(!output.contains(token));
         assert_eq!(output, "authorization: Bearer [REDACTED]");
+    }
+
+    #[test]
+    fn adjacent_bearer_token_does_not_hide_relay_url() {
+        let token = "AAAAAAAAAAAAAAAAAAAA";
+        for scheme in ["wss", "ws", "WSS", "WS"] {
+            let input = format!("Bearer {token}{scheme}://relay.secret.example/path");
+
+            let output = redact(&input);
+
+            assert_eq!(output, "Bearer [REDACTED][REDACTED-RELAY-URL]");
+        }
+    }
+
+    #[test]
+    fn adjacent_fcm_token_does_not_hide_relay_url() {
+        let token = format!("{}:APA91{}", "fzd".repeat(12), "AbC_-.123".repeat(8));
+        let input = format!("{token}wss://relay.secret.example/path");
+
+        let output = redact(&input);
+
+        assert_eq!(output, "[REDACTED-FCM][REDACTED-RELAY-URL]");
     }
 
     #[test]
