@@ -2815,8 +2815,7 @@ LTP/MQIxLydQxT4+jx2NBu0=
         let mut client = mock_client_with_rsa_service_account("test-project");
         client.set_test_oauth_token_url(mock_server.uri());
         client
-            .token_cache
-            .seed(
+            .seed_token(
                 "cached-access-token",
                 SystemTime::now() + Duration::from_secs(30),
             )
