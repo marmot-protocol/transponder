@@ -2803,6 +2803,29 @@ LTP/MQIxLydQxT4+jx2NBu0=
         ));
     }
 
+    #[tokio::test]
+    async fn test_proactive_refresh_oauth_503_uses_valid_cached_access_token() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "5"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut client = mock_client_with_rsa_service_account("test-project");
+        client.set_test_oauth_token_url(mock_server.uri());
+        client
+            .token_cache
+            .seed(
+                "cached-access-token",
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .await;
+
+        let token = client.get_access_token().await.unwrap();
+        assert_eq!(token.as_str(), "cached-access-token");
+    }
+
     /// Build an FCM token generator whose service-account `token_uri` is
     /// `token_uri` and with no OAuth-URL test override, so `mint()` POSTs to
     /// the signed audience (issue #153).

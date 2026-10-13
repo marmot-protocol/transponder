@@ -228,6 +228,9 @@ impl<G: AuthTokenGenerator> TokenCache<G> {
     /// Get a valid credential, minting a fresh one if the cache is empty or
     /// expired.
     ///
+    /// A transient proactive-refresh failure falls back to a credential that
+    /// remains cached and valid after the refresh attempt.
+    ///
     /// The caller receives a short-lived zeroizing clone for request
     /// construction while the cache owns the reusable copy.
     pub(crate) async fn get(&self) -> Result<Zeroizing<String>, TokenAcquisitionError> {
@@ -248,7 +251,14 @@ impl<G: AuthTokenGenerator> TokenCache<G> {
             if self.recent_failure().await.is_some() {
                 return Ok(still_valid);
             }
-            return self.mint_and_store().await;
+            return match self.mint_and_store().await {
+                // Re-read after the mint: the earlier clone may have expired
+                // or been invalidated by a concurrent provider rejection.
+                Err(error @ TokenAcquisitionError::Retriable { .. }) => {
+                    self.read_valid().await.ok_or(error)
+                }
+                result => result,
+            };
         }
 
         // Slow path: single-flight refresh. Concurrent misses queue on the
@@ -305,7 +315,9 @@ mod tests {
     struct StubGenerator {
         mints: Arc<AtomicU32>,
         gate: Option<Arc<Semaphore>>,
+        started: Option<Arc<Semaphore>>,
         fail_first: u32,
+        retriable_failure: bool,
         ttl: Duration,
     }
 
@@ -314,7 +326,9 @@ mod tests {
             Self {
                 mints: Arc::new(AtomicU32::new(0)),
                 gate: None,
+                started: None,
                 fail_first: 0,
+                retriable_failure: false,
                 ttl: Duration::from_secs(3600),
             }
         }
@@ -322,12 +336,21 @@ mod tests {
 
     impl AuthTokenGenerator for StubGenerator {
         async fn mint(&self) -> Result<MintedToken, TokenAcquisitionError> {
+            if let Some(started) = &self.started {
+                started.add_permits(1);
+            }
             if let Some(gate) = &self.gate {
                 let permit = gate.acquire().await.expect("gate closed");
                 permit.forget();
             }
             let n = self.mints.fetch_add(1, Ordering::SeqCst) + 1;
             if n <= self.fail_first {
+                if self.retriable_failure {
+                    return Err(TokenAcquisitionError::Retriable {
+                        status_code: 503,
+                        retry_after: Some(Duration::from_secs(5)),
+                    });
+                }
                 return Err(TokenAcquisitionError::permanent(Error::Fcm(format!(
                     "mint failure {n}"
                 ))));
@@ -487,6 +510,123 @@ mod tests {
         let token = cache.get().await.unwrap();
         assert_eq!(token.as_str(), "token-2");
         assert_eq!(mints.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_proactive_refresh_retriable_failure_reuses_valid_cached_token() {
+        let mut generator = StubGenerator::new();
+        generator.fail_first = 1;
+        generator.retriable_failure = true;
+        let mints = generator.mints.clone();
+        let cache = TokenCache::new(generator);
+        cache
+            .seed("cached-token", SystemTime::now() + Duration::from_secs(30))
+            .await;
+
+        let token = cache.get().await.unwrap();
+        assert_eq!(token.as_str(), "cached-token");
+        assert_eq!(mints.load(Ordering::SeqCst), 1);
+
+        // The mint failure still enters cooldown; a subsequent reader also
+        // reuses the valid cache instead of issuing another OAuth request.
+        let token = cache.get().await.unwrap();
+        assert_eq!(token.as_str(), "cached-token");
+        assert_eq!(mints.load(Ordering::SeqCst), 1);
+    }
+
+    fn gated_retriable_refresh() -> (
+        Arc<TokenCache<StubGenerator>>,
+        Arc<Semaphore>,
+        Arc<Semaphore>,
+    ) {
+        let gate = Arc::new(Semaphore::new(0));
+        let started = Arc::new(Semaphore::new(0));
+        let mut generator = StubGenerator::new();
+        generator.gate = Some(gate.clone());
+        generator.started = Some(started.clone());
+        generator.fail_first = 1;
+        generator.retriable_failure = true;
+        (Arc::new(TokenCache::new(generator)), gate, started)
+    }
+
+    async fn wait_for_refresh_start(started: &Semaphore) {
+        tokio::time::timeout(Duration::from_secs(2), started.acquire())
+            .await
+            .expect("refresh must reach the mint gate")
+            .expect("start signal must remain open")
+            .forget();
+    }
+
+    #[tokio::test]
+    async fn test_proactive_refresh_failure_after_expiry_preserves_retry_error() {
+        let (cache, gate, started) = gated_retriable_refresh();
+        cache
+            .seed("cached-token", SystemTime::now() + Duration::from_secs(30))
+            .await;
+        let refresher = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.get().await })
+        };
+        wait_for_refresh_start(&started).await;
+
+        // Move the cache deadline into the past while mint is paused. Cache
+        // expiry uses SystemTime, so this avoids wall-clock sleeps.
+        cache
+            .seed("cached-token", SystemTime::now() - Duration::from_secs(1))
+            .await;
+        gate.add_permits(1);
+
+        assert!(matches!(
+            refresher.await.unwrap(),
+            Err(TokenAcquisitionError::Retriable {
+                status_code: 503,
+                retry_after: Some(delay),
+            }) if delay == Duration::from_secs(5)
+        ));
+        assert!(cache.read_valid().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_proactive_refresh_failure_does_not_reuse_invalidated_token() {
+        let (cache, gate, started) = gated_retriable_refresh();
+        cache
+            .seed("cached-token", SystemTime::now() + Duration::from_secs(30))
+            .await;
+        let refresher = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.get().await })
+        };
+        wait_for_refresh_start(&started).await;
+
+        // Concurrent readers can use the credential during refresh, but a
+        // provider rejection must remove it from the fallback path.
+        assert_eq!(cache.get().await.unwrap().as_str(), "cached-token");
+        cache.invalidate_if_matches("cached-token").await;
+        gate.add_permits(1);
+
+        assert!(matches!(
+            refresher.await.unwrap(),
+            Err(TokenAcquisitionError::Retriable {
+                status_code: 503,
+                retry_after: Some(delay),
+            }) if delay == Duration::from_secs(5)
+        ));
+        assert_eq!(cache.cached_token_value().await, None);
+    }
+
+    #[tokio::test]
+    async fn test_proactive_refresh_permanent_failure_is_not_masked() {
+        let mut generator = StubGenerator::new();
+        generator.fail_first = 1;
+        let cache = TokenCache::new(generator);
+        cache
+            .seed("cached-token", SystemTime::now() + Duration::from_secs(30))
+            .await;
+
+        assert!(matches!(
+            cache.get().await,
+            Err(TokenAcquisitionError::Permanent(_))
+        ));
     }
 
     #[tokio::test]
