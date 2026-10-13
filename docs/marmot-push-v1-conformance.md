@@ -62,4 +62,4 @@ cargo test -p marmot-app notifications::tests::
 
 That suite covers APNs and FCM token encryption, raw shared-point X-coordinate derivation, the 32-chunk trigger ceiling, concatenated-token base64, and the exact version-only kind `446` rumor inside NIP-59.
 
-MIP-05 is intentionally not accepted by this line. Its historical implementation remains on `release/mip05-v1` and in the immutable `transponder-mip05-v1.0.0` release.
+MIP-05 is intentionally not accepted by this line. MIP-05 support was retired on October 13, 2026; `release/mip05-v1` and the immutable `transponder-mip05-v1.0.0` release remain available for historical reference only. The legacy line is no longer maintained and receives no security, provider-compatibility, or operational fixes. Existing MIP-05 services and clients should migrate to the adopted `marmot-push-v1` protocol.

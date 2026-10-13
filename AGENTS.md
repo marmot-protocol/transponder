@@ -6,7 +6,7 @@ Transponder is a privacy-preserving push notification server targeting the adopt
 
 The Marmot repository's adopted surface documents are normative. The MIP-era documents are deprecated; use [mip-coverage.md](https://github.com/marmot-protocol/marmot/blob/master/mip-coverage.md) only as a historical map. The current source implements the `marmot-push-v1` server surface and must retain exact wire compatibility with those adopted documents.
 
-The maintained MIP-05 line is [`release/mip05-v1`](https://github.com/marmot-protocol/transponder/tree/release/mip05-v1), anchored by [`transponder-mip05-v1.0.0`](https://github.com/marmot-protocol/transponder/releases/tag/transponder-mip05-v1.0.0). Target MIP-05-only fixes to that branch; `master` is the Marmot Push v1 line.
+MIP-05 support was retired on October 13, 2026. The [`release/mip05-v1`](https://github.com/marmot-protocol/transponder/tree/release/mip05-v1) branch and immutable [`transponder-mip05-v1.0.0`](https://github.com/marmot-protocol/transponder/releases/tag/transponder-mip05-v1.0.0) release are preserved for historical reference only. The line is no longer maintained and receives no security, provider-compatibility, or operational fixes. Treat MIP-05-only issues as retired legacy work; do not target new fixes to that branch. `master` is the maintained Marmot Push v1 line and must not regain MIP-05 wire compatibility.
 
 Key properties:
 - **No persisted secrets or message/user content**: Device tokens, trigger plaintext, content hashes, message content, group identifiers, and recipient linkage are never persisted.
