@@ -603,13 +603,17 @@ fn default_glitchtip_dsn() -> Zeroizing<String> {
 
 /// GlitchTip (Sentry-compatible) error-reporting configuration.
 ///
-/// Reporting is enabled by the presence of a non-empty `dsn`; there is no
+/// Reporting is enabled by the presence of a non-blank `dsn`; there is no
 /// separate on/off flag, so there is no way to configure an enabled-but-unusable
 /// state.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlitchtipConfig {
-    /// GlitchTip DSN. Empty disables error reporting.
+    /// GlitchTip DSN. Empty or whitespace-only values disable error reporting.
+    ///
+    /// `TRANSPONDER_GLITCHTIP_DSN` takes precedence over the file value even
+    /// when blank, allowing deployments to explicitly disable reporting.
+    /// Unset the environment variable to use the file DSN.
     ///
     /// Like `server.private_key`, this is extracted before the config document
     /// reaches the un-zeroized `config` value tree because the DSN embeds a
@@ -718,6 +722,8 @@ where
         }
 
         if config_key == GLITCHTIP_DSN_CONFIG_KEY {
+            // Presence is an explicit override, including blank values that
+            // disable reporting. Only an absent variable preserves a file DSN.
             sensitive.glitchtip_dsn = Some(Zeroizing::new(value));
             continue;
         }
@@ -3302,6 +3308,43 @@ mod tests {
             config.glitchtip.dsn.as_str(),
             "https://env-key@glitch.example/1"
         );
+    }
+
+    #[test]
+    fn test_glitchtip_dsn_env_override_contract() {
+        let file = create_temp_config(
+            r#"
+            [server]
+            private_key = "test"
+
+            [glitchtip]
+            dsn = "https://file-key@glitch.example/1"
+        "#,
+        );
+
+        for (name, override_value, expected_dsn) in [
+            ("absent", None, "https://file-key@glitch.example/1"),
+            ("empty", Some(""), ""),
+            ("whitespace", Some(" \n\t "), " \n\t "),
+            (
+                "nonempty",
+                Some("https://env-key@glitch.example/1"),
+                "https://env-key@glitch.example/1",
+            ),
+        ] {
+            let overrides: Vec<_> = override_value
+                .map(|value| ("TRANSPONDER_GLITCHTIP_DSN", value))
+                .into_iter()
+                .collect();
+            let config = load_with_test_env(file.path(), &overrides).unwrap();
+            assert_eq!(config.glitchtip.dsn.as_str(), expected_dsn, "{name}");
+
+            // Check actual telemetry disablement without initializing a client
+            // or making network requests for the nonempty cases.
+            if expected_dsn.trim().is_empty() {
+                assert!(crate::telemetry::init(&config.glitchtip).unwrap().is_none());
+            }
+        }
     }
 
     #[test]

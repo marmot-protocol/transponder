@@ -198,8 +198,9 @@ format = "json"
 
 [glitchtip]
 # Error and panic reporting to a GlitchTip (Sentry-compatible) instance.
-# Disabled while dsn is empty. Prefer TRANSPONDER_GLITCHTIP_DSN over committing
+# Disabled while dsn is blank. Prefer TRANSPONDER_GLITCHTIP_DSN over committing
 # the DSN. Only transponder's own ERROR events and panics are sent.
+# A blank environment override disables reporting even if a file DSN is set.
 dsn = ""
 environment = "production"
 # traces_sample_rate = 0.0   # 0.0..=1.0; 0.0 = errors only (recommended)
@@ -541,6 +542,10 @@ Typical patterns:
 ### Error reporting (GlitchTip)
 
 Transponder can report errors and panics to a [GlitchTip](https://glitchtip.com/) instance (or any Sentry-compatible endpoint). It is disabled unless you set a DSN via the `[glitchtip]` config section or `TRANSPONDER_GLITCHTIP_DSN`.
+
+`TRANSPONDER_GLITCHTIP_DSN` overrides the file DSN whenever the variable is present. An empty or whitespace-only override explicitly disables reporting, even when the file contains a nonempty DSN. To use the file DSN, leave the environment variable unset; deployment templates must omit it rather than emit a blank value when reporting should remain enabled. To deliberately disable reporting for a deployment, set `TRANSPONDER_GLITCHTIP_DSN=''`.
+
+The production Compose template passes this variable through only when supplied by the host or `--env-file`. Omit it from both sources to use the file DSN. Run `python3 scripts/test-compose-glitchtip-env.py` to check these cases without starting containers (requires Docker Compose).
 
 To preserve the server's privacy guarantees, only `ERROR`-level events emitted by Transponder's own code, plus panics, are sent — dependency-crate errors (which can embed URLs and device tokens) and all lower log levels are dropped before transmission. Transponder never puts tokens, keys, or message content into log or panic messages (an invariant enforced in review; see AGENTS.md), so none reach GlitchTip. TLS trusts bundled roots, so reporting does not depend on the runtime's system CA store. A malformed DSN fails startup rather than silently disabling reporting.
 
