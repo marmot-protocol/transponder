@@ -204,6 +204,8 @@ format = "json"
 # Error and panic reporting to a GlitchTip (Sentry-compatible) instance.
 # Reporting is OFF until a DSN is set. Prefer supplying the DSN via the
 # TRANSPONDER_GLITCHTIP_DSN environment variable rather than committing it here.
+# An empty or whitespace-only environment override explicitly disables reporting,
+# even when this file sets a DSN. Unset the variable to use the file value.
 # Only transponder's own ERROR events and panics are sent; no tokens, keys, or
 # message content leave the process.
 dsn = ""

@@ -97,8 +97,10 @@ format = "json"
 
 [glitchtip]
 # Error and panic reporting to a GlitchTip instance. Disabled while the DSN is
-# empty. In production, supply the DSN via TRANSPONDER_GLITCHTIP_DSN (see
-# compose.prod.yml) rather than committing it to this file.
+# empty or whitespace-only. In production, supply the DSN via
+# TRANSPONDER_GLITCHTIP_DSN (see compose.prod.yml) rather than committing it here.
+# Compose preserves this file value when that variable is absent from the host
+# and --env-file. A supplied blank variable explicitly disables reporting.
 dsn = ""
 environment = "production"
 # traces_sample_rate = 0.0
