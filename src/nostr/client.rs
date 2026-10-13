@@ -362,13 +362,14 @@ async fn install_live_gift_wrap_subscription(
     };
 
     let filter = live_gift_wrap_subscription_filter(server_pubkey, Timestamp::now().as_secs());
-    let mut messages = Vec::with_capacity(usize::from(previous.is_some()) + 1);
-    if let Some(previous) = previous.as_ref() {
-        messages.push(ClientMessage::close(previous.id.clone()));
-    }
-    messages.push(ClientMessage::req(subscription_id.clone(), filter));
-
-    let output = match send_live_subscription_messages(client, &relay_url, messages).await {
+    let output = match send_live_subscription_messages(
+        client,
+        &relay_url,
+        previous.as_ref().map(|previous| &previous.id),
+        ClientMessage::req(subscription_id.clone(), filter),
+    )
+    .await
+    {
         Ok(output) => output,
         Err(error) => {
             subscriptions
@@ -400,18 +401,20 @@ async fn install_live_gift_wrap_subscription(
 async fn send_live_subscription_messages(
     client: &Client,
     relay_url: &RelayUrl,
-    messages: Vec<ClientMessage<'_>>,
+    previous: Option<&SubscriptionId>,
+    request: ClientMessage<'_>,
 ) -> std::result::Result<nostr_sdk::client::Output<()>, nostr_sdk::error::Error> {
     // CLOSE must precede REQ; abort and restore state if either send fails.
-    let mut last = None;
-    for message in messages {
-        let output = client.send_msg(message).to([relay_url]).await?;
+    if let Some(previous) = previous {
+        let output = client
+            .send_msg(ClientMessage::close(previous.clone()))
+            .to([relay_url])
+            .await?;
         if !output.success.contains_key(relay_url) {
             return Ok(output);
         }
-        last = Some(output);
     }
-    Ok(last.expect("live subscription installation always sends REQ"))
+    client.send_msg(request).to([relay_url]).await
 }
 
 async fn install_for_connected_relays(
@@ -975,7 +978,7 @@ impl RelayClient {
 
         let relay_tags: Vec<Tag> = relay_urls
             .iter()
-            .map(|url| Tag::parse(["relay", url.as_str()]).expect("relay tag has a name"))
+            .map(|url| Tag::custom("relay", [url.as_str()]))
             .collect();
         let builder = EventBuilder::new(Kind::Custom(10050), "").tags(relay_tags);
 

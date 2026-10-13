@@ -308,62 +308,62 @@ async fn run_event_loop(
                     Ok(notification) => {
                         let event = match notification {
                             ClientNotification::Message { relay_url, message } => match *message {
-                            RelayMessage::EndOfStoredEvents(subscription_id) => {
-                                if gift_wrap_subscriptions
-                                    .mark_eose(&relay_url, subscription_id.as_ref())
-                                    .await
-                                {
-                                    auth_required_retries.remove(&relay_url);
-                                }
-                                continue;
-                            }
-                            // A relay that gates kind 1059 behind NIP-42 (e.g. wok with
-                            // restricted_read_kinds) CLOSEs the raw live REQ with
-                            // "auth-required" before the client has answered AUTH; the
-                            // pool only re-sends subscriptions it tracks, so without this
-                            // the server never receives a trigger on such a relay. Only
-                            // the closing relay is rebuilt; other relays stay live.
-                            RelayMessage::Closed { subscription_id, message } => {
-                                if !message.starts_with("auth-required")
-                                    || !gift_wrap_subscriptions
-                                        .is_current(&relay_url, subscription_id.as_ref())
+                                RelayMessage::EndOfStoredEvents(subscription_id) => {
+                                    if gift_wrap_subscriptions
+                                        .mark_eose(&relay_url, subscription_id.as_ref())
                                         .await
-                                {
+                                    {
+                                        auth_required_retries.remove(&relay_url);
+                                    }
                                     continue;
                                 }
-                                if let Some(attempt) = record_auth_required_close(
-                                    &mut auth_required_retries,
-                                    &relay_url,
-                                    subscription_id.as_ref(),
-                                ) {
-                                    let delay = auth_required_resubscribe_delay(attempt);
-                                    if attempt == 1 {
-                                        warn!(
-                                            relay = %relay_url,
-                                            "Live gift-wrap subscription closed (auth-required); re-subscribing after NIP-42"
-                                        );
-                                    } else {
-                                        debug!(
-                                            relay = %relay_url,
-                                            attempt,
-                                            delay_secs = delay.as_secs(),
-                                            "Live gift-wrap subscription closed (auth-required) again; retrying"
-                                        );
+                                // A relay that gates kind 1059 behind NIP-42 (e.g. wok with
+                                // restricted_read_kinds) CLOSEs the raw live REQ with
+                                // "auth-required" before the client has answered AUTH; the
+                                // pool only re-sends subscriptions it tracks, so without this
+                                // the server never receives a trigger on such a relay. Only
+                                // the closing relay is rebuilt; other relays stay live.
+                                RelayMessage::Closed { subscription_id, message } => {
+                                    if !message.starts_with("auth-required")
+                                        || !gift_wrap_subscriptions
+                                            .is_current(&relay_url, subscription_id.as_ref())
+                                            .await
+                                    {
+                                        continue;
                                     }
-                                    let subscriptions = gift_wrap_subscriptions.clone();
-                                    let subscription_id = subscription_id.into_owned();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(delay).await;
-                                        // Re-checks ownership now: a subscription that
-                                        // replaced this one during the delay is kept.
-                                        subscriptions
-                                            .resubscribe_relay(&relay_url, &subscription_id)
-                                            .await;
-                                    });
+                                    if let Some(attempt) = record_auth_required_close(
+                                        &mut auth_required_retries,
+                                        &relay_url,
+                                        subscription_id.as_ref(),
+                                    ) {
+                                        let delay = auth_required_resubscribe_delay(attempt);
+                                        if attempt == 1 {
+                                            warn!(
+                                                relay = %relay_url,
+                                                "Live gift-wrap subscription closed (auth-required); re-subscribing after NIP-42"
+                                            );
+                                        } else {
+                                            debug!(
+                                                relay = %relay_url,
+                                                attempt,
+                                                delay_secs = delay.as_secs(),
+                                                "Live gift-wrap subscription closed (auth-required) again; retrying"
+                                            );
+                                        }
+                                        let subscriptions = gift_wrap_subscriptions.clone();
+                                        let subscription_id = subscription_id.into_owned();
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(delay).await;
+                                            // Re-checks ownership now: a subscription that
+                                            // replaced this one during the delay is kept.
+                                            subscriptions
+                                                .resubscribe_relay(&relay_url, &subscription_id)
+                                                .await;
+                                        });
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
-                            _ => continue,
+                                _ => continue,
                             },
                             ClientNotification::Event {
                                 relay_url,
