@@ -22,7 +22,7 @@ use nostr_sdk::transport::websocket::{
     DefaultWebsocketTransport, WebSocketSink, WebSocketStream, WebSocketTransport,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 use tokio_tungstenite::{Connector, client_async_tls_with_config};
 use tokio_util::sync::CancellationToken;
@@ -64,6 +64,7 @@ trait TorConnector: fmt::Debug + Send + Sync {
 
 struct ArtiRuntime {
     client: Arc<TorClient<TokioRustlsRuntime>>,
+    ready: watch::Receiver<bool>,
     // Abort bootstrap on final drop as well as explicit server shutdown.
     _bootstrap: AbortOnDropHandle<()>,
 }
@@ -110,32 +111,66 @@ impl ArtiConnector {
                     .map_err(|_| transport_error("Tor state initialization failed"))?;
                 let bootstrap_client = client.clone();
                 let shutdown = self.shutdown.clone();
-                let bootstrap = tokio::spawn(async move {
-                    // Independent of SDK handshake deadlines. A cold bootstrap must
-                    // not restart every time a relay connection attempt times out.
-                    loop {
-                        let result = tokio::select! {
-                            biased;
-                            _ = shutdown.cancelled() => return,
-                            result = bootstrap_client.bootstrap() => result,
-                        };
-                        if result.is_ok() {
-                            return;
+                let (ready_tx, ready) = watch::channel(false);
+                let bootstrap = tokio::spawn(bootstrap_until_ready(
+                    move || {
+                        let client = bootstrap_client.clone();
+                        async move {
+                            client
+                                .bootstrap()
+                                .await
+                                .map_err(|_| transport_error("Tor bootstrap failed"))
                         }
-                        tracing::debug!("Tor bootstrap failed; retrying");
-                        tokio::select! {
-                            _ = shutdown.cancelled() => return,
-                            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                        }
-                    }
-                });
+                    },
+                    shutdown,
+                    ready_tx,
+                    Duration::from_secs(5),
+                ));
                 Ok(ArtiRuntime {
                     client,
+                    ready,
                     _bootstrap: AbortOnDropHandle::new(bootstrap),
                 })
             })
             .await
     }
+}
+
+// Keep bootstrap outside the SDK dial future, so a handshake deadline cannot
+// cancel shared initialization. Only successful bootstrap releases waiters.
+async fn bootstrap_until_ready<F, Fut>(
+    mut attempt: F,
+    shutdown: CancellationToken,
+    ready: watch::Sender<bool>,
+    retry_interval: Duration,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), Error>>,
+{
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            result = attempt() => result,
+        };
+        if result.is_ok() {
+            ready.send_replace(true);
+            return;
+        }
+        tracing::debug!("Tor bootstrap failed; retrying");
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(retry_interval) => {}
+        }
+    }
+}
+
+async fn wait_for_bootstrap(mut ready: watch::Receiver<bool>) -> Result<(), Error> {
+    ready
+        .wait_for(|value| *value)
+        .await
+        .map(|_| ())
+        .map_err(|_| transport_error("Tor bootstrap stopped"))
 }
 
 impl TorConnector for ArtiConnector {
@@ -146,6 +181,7 @@ impl TorConnector for ArtiConnector {
                 _ = self.shutdown.cancelled() => Err(transport_error("Tor transport is shutting down")),
                 result = async {
                     let runtime = self.runtime().await?;
+                    wait_for_bootstrap(runtime.ready.clone()).await?;
                     let stream = runtime.client.connect((host, port)).await
                         .map_err(|_| transport_error("Tor connection failed"))?;
                     Ok(Box::new(stream) as TorStream)
@@ -243,7 +279,7 @@ impl WebSocketTransport for TorTransport {
                 .map_err(|_| transport_error("Invalid onion WebSocket request"))?;
             request.headers_mut().insert(
                 "user-agent",
-                concat!("transponder/", env!("CARGO_PKG_VERSION"))
+                "nostr-sdk/0.45.4"
                     .parse()
                     .map_err(|_| transport_error("Invalid WebSocket user agent"))?,
             );
@@ -425,10 +461,11 @@ mod tests {
     async fn failed_onion_dial_never_falls_back_to_direct() {
         let url = Url::parse("ws://example.onion").unwrap();
         let (transport, connector) = fake_transport(&url, None);
-        let error = match transport.connect(&url, None).await {
-            Err(error) => error,
-            Ok(_) => panic!("failed Tor dial unexpectedly connected"),
-        };
+        let error = transport
+            .connect(&url, None)
+            .await
+            .err()
+            .expect("failed Tor dial unexpectedly connected");
         assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
         assert_eq!(error.to_string(), "Tor connection failed");
         assert!(!format!("{transport:?}").contains("example.onion"));
@@ -495,5 +532,311 @@ mod tests {
         connector.shutdown.cancel();
         assert!(connector.connect("example.onion", 80).await.is_err());
         assert!(connector.runtime.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn first_dial_waits_for_bootstrap_and_shutdown_cancels_it() {
+        let data = tempfile::tempdir().unwrap();
+        let connector = ArtiConnector {
+            data_dir: data.path().to_string_lossy().into_owned(),
+            runtime: OnceCell::new(),
+            shutdown: CancellationToken::new(),
+        };
+        connector.runtime().await.unwrap();
+        // Poll the first dial before the spawned bootstrap task can run.
+        // No network is needed: it must wait for readiness, not immediately
+        // return BootstrapRequired from Arti's manual-bootstrap mode.
+        let mut dial = Box::pin(connector.connect("example.onion", 80));
+        assert!(
+            futures::poll!(dial.as_mut()).is_pending(),
+            "first onion dial must wait for bootstrap readiness"
+        );
+        connector.shutdown.cancel();
+        assert!(dial.await.is_err());
+        assert!(data.path().join("cache").is_dir());
+        assert!(data.path().join("state").is_dir());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_retries_failures_then_releases_all_waiters() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(bootstrap_until_ready(
+            move || {
+                let number = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if number == 0 {
+                        Err(transport_error("bootstrap failed"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            CancellationToken::new(),
+            tx,
+            Duration::from_millis(1),
+        ));
+        let (first, second) = tokio::join!(wait_for_bootstrap(rx.clone()), wait_for_bootstrap(rx));
+        assert!(first.is_ok() && second.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dial_deadline_does_not_cancel_shared_bootstrap() {
+        let complete = Arc::new(tokio::sync::Notify::new());
+        let pending = complete.clone();
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(bootstrap_until_ready(
+            move || {
+                let pending = pending.clone();
+                async move {
+                    pending.notified().await;
+                    Ok(())
+                }
+            },
+            CancellationToken::new(),
+            tx,
+            Duration::from_millis(1),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), wait_for_bootstrap(rx.clone()))
+                .await
+                .is_err()
+        );
+        assert!(!task.is_finished());
+        complete.notify_one();
+        assert!(wait_for_bootstrap(rx).await.is_ok());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_bootstrap_in_progress() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let attempt_started = started.clone();
+        let shutdown = CancellationToken::new();
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(bootstrap_until_ready(
+            move || {
+                attempt_started.notify_one();
+                futures::future::pending::<Result<(), Error>>()
+            },
+            shutdown.clone(),
+            tx,
+            Duration::from_secs(5),
+        ));
+        started.notified().await;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(wait_for_bootstrap(rx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_bootstrap_retry_backoff() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let attempt_started = started.clone();
+        let shutdown = CancellationToken::new();
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(bootstrap_until_ready(
+            move || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                attempt_started.notify_one();
+                futures::future::ready(Err(transport_error("bootstrap failed")))
+            },
+            shutdown.clone(),
+            tx,
+            Duration::from_secs(60),
+        ));
+        started.notified().await;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!*rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn arti_initialization_failure_is_redacted_and_can_retry() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("arti");
+        std::fs::write(&root, b"not a directory").unwrap();
+        let connector = ArtiConnector {
+            data_dir: root.to_string_lossy().into_owned(),
+            runtime: OnceCell::new(),
+            shutdown: CancellationToken::new(),
+        };
+        assert!(!format!("{connector:?}").contains(connector.data_dir.as_str()));
+        assert!(connector.runtime().await.is_err());
+        assert!(connector.runtime.get().is_none());
+        std::fs::remove_file(&root).unwrap();
+        let runtime = connector.runtime().await.unwrap();
+        let again = connector.runtime().await.unwrap();
+        assert!(Arc::ptr_eq(&runtime.client, &again.client));
+        connector.shutdown.cancel();
+        assert!(root.join("cache").is_dir() && root.join("state").is_dir());
+    }
+
+    #[tokio::test]
+    async fn cancelled_runtime_cannot_start_bootstrap() {
+        let connector = ArtiConnector {
+            data_dir: String::new(),
+            runtime: OnceCell::new(),
+            shutdown: CancellationToken::new(),
+        };
+        connector.shutdown.cancel();
+        assert!(connector.runtime().await.is_err());
+        assert!(connector.runtime.get().is_none());
+    }
+
+    #[tokio::test]
+    // Tungstenite fixes the callback error type to a full HTTP response.
+    #[allow(clippy::result_large_err)]
+    async fn websocket_close_flushes_the_tor_stream() {
+        let url = Url::parse("ws://example.onion").unwrap();
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (transport, _) = fake_transport(&url, Some(client_io));
+        let server = tokio::spawn(async move {
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                server_io,
+                |request: &tungstenite::handshake::server::Request, response| {
+                    assert_eq!(request.headers()["user-agent"], "nostr-sdk/0.45.4");
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                tungstenite::Message::Close(_)
+            ));
+        });
+        assert!(transport.support_ping());
+        let (mut tx, _) = transport.connect(&url, None).await.unwrap();
+        tx.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn inbound_websocket_messages_preserve_text_pong_and_close_reason() {
+        assert_eq!(
+            from_native_message(tungstenite::Message::Text("event".into())).unwrap(),
+            Message::Text("event".into())
+        );
+        assert_eq!(
+            from_native_message(tungstenite::Message::Pong(vec![1].into())).unwrap(),
+            Message::Pong(vec![1])
+        );
+        let close = tungstenite::protocol::CloseFrame {
+            code: tungstenite::protocol::frame::coding::CloseCode::Normal,
+            reason: "done".into(),
+        };
+        assert_eq!(
+            from_native_message(tungstenite::Message::Close(Some(close))).unwrap(),
+            Message::Close(Some(async_wsocket::message::CloseFrame {
+                code: 1000,
+                reason: "done".into()
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_onion_is_rejected_before_any_dial() {
+        let configured = Url::parse("ws://example.onion").unwrap();
+        let (transport, connector) = fake_transport(&configured, None);
+        let unexpected = Url::parse("ws://unexpected.onion").unwrap();
+        assert!(transport.connect(&unexpected, None).await.is_err());
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn raw_frames_are_rejected_without_panicking() {
+        let frame = tungstenite::protocol::frame::Frame::message(
+            Vec::<u8>::new(),
+            tungstenite::protocol::frame::coding::OpCode::Data(
+                tungstenite::protocol::frame::coding::Data::Binary,
+            ),
+            true,
+        );
+        assert!(from_native_message(tungstenite::Message::Frame(frame)).is_err());
+    }
+
+    #[test]
+    fn invalid_relay_schemes_are_rejected() {
+        let url = Url::parse("https://example.onion").unwrap();
+        assert!(route_url(&url, &BTreeSet::new()).is_err());
+        let config: RelayConfig = serde_json::from_value(serde_json::json!({
+            "onion": ["not a relay URL"],
+        }))
+        .unwrap();
+        assert!(TorTransport::new(&config).is_err());
+    }
+
+    struct FailingSink;
+    impl Sink<tungstenite::Message> for FailingSink {
+        type Error = io::Error;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Err(io::Error::other("sensitive destination.onion")))
+        }
+        fn start_send(self: Pin<&mut Self>, _: tungstenite::Message) -> Result<(), io::Error> {
+            Err(io::Error::other("sensitive destination.onion"))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Err(io::Error::other("sensitive destination.onion")))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Err(io::Error::other("sensitive destination.onion")))
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_errors_never_expose_upstream_destinations() {
+        let mut sink = MessageSink(FailingSink);
+        let messages = [
+            futures::future::poll_fn(|cx| Pin::new(&mut sink).poll_ready(cx))
+                .await
+                .unwrap_err()
+                .to_string(),
+            Pin::new(&mut sink)
+                .start_send(Message::Text("event".into()))
+                .unwrap_err()
+                .to_string(),
+            futures::future::poll_fn(|cx| Pin::new(&mut sink).poll_flush(cx))
+                .await
+                .unwrap_err()
+                .to_string(),
+            futures::future::poll_fn(|cx| Pin::new(&mut sink).poll_close(cx))
+                .await
+                .unwrap_err()
+                .to_string(),
+        ];
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("destination.onion"))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_bootstrap_task_stops_without_waiting_for_network_success() {
+        let data = tempfile::tempdir().unwrap();
+        let mut connector = ArtiConnector {
+            data_dir: data.path().to_string_lossy().into_owned(),
+            runtime: OnceCell::new(),
+            shutdown: CancellationToken::new(),
+        };
+        connector.runtime().await.unwrap();
+        // Exercise the real bootstrap future, then cancel it. This works with
+        // Tor unreachable and never requires a directory download to succeed.
+        tokio::task::yield_now().await;
+        assert!(!connector.runtime.get().unwrap()._bootstrap.is_finished());
+        connector.shutdown.cancel();
+        let runtime = connector.runtime.take().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), runtime._bootstrap)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!*runtime.ready.borrow());
     }
 }

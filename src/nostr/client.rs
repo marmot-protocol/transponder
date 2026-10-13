@@ -555,7 +555,7 @@ async fn run_reconnect_attempt_monitor(
     }
 }
 
-fn relay_options_for_config(config: &RelayConfig, _kind: RelayKind) -> RelayOptions {
+fn relay_options_for_config(config: &RelayConfig) -> RelayOptions {
     RelayOptions::default()
         .retry_interval(Duration::from_secs(config.reconnect_interval_secs))
         .connect_timeout(Duration::from_secs(config.connection_timeout_secs))
@@ -652,8 +652,7 @@ impl RelayClient {
         let client_builder = Client::builder()
             .authenticator(SignerAuthenticator::new(keys.clone()))
             .admit_policy(reconnect_attempt_limiter.clone())
-            .monitor(relay_monitor.clone())
-            .connect_timeout(Duration::from_secs(config.connection_timeout_secs));
+            .monitor(relay_monitor.clone());
         #[cfg(feature = "tor")]
         let tor_transport = if config.onion.is_empty() {
             None
@@ -727,7 +726,7 @@ impl RelayClient {
             }
         }
 
-        // Add Tor relays (nostr-sdk handles Tor via arti automatically)
+        // Add onion relays; Transponder owns their direct embedded-Arti transport.
         for url in &self.config.onion {
             match self.add_configured_relay(url, RelayKind::Onion).await {
                 Ok(_) => {
@@ -931,7 +930,7 @@ impl RelayClient {
         let added = self
             .client
             .add_relay(url)
-            .opts(relay_options_for_config(&self.config, kind))
+            .opts(relay_options_for_config(&self.config))
             .await
             .map_err(|e| e.to_string())?;
 
@@ -976,7 +975,7 @@ impl RelayClient {
 
         let relay_tags: Vec<Tag> = relay_urls
             .iter()
-            .map(|url| Tag::parse(["r", url.as_str()]).expect("relay tag has a name"))
+            .map(|url| Tag::parse(["relay", url.as_str()]).expect("relay tag has a name"))
             .collect();
         let builder = EventBuilder::new(Kind::Custom(10050), "").tags(relay_tags);
 
@@ -1010,7 +1009,7 @@ impl RelayClient {
 
     /// The configured relay URLs to advertise, as raw config strings.
     ///
-    /// The `r`-tag values published in the kind-10050 event preserve the
+    /// The `relay`-tag values published in the kind-10050 event preserve the
     /// operator's exact spelling; change-detection normalizes separately (see
     /// [`Self::inbox_relay_event_is_current`]).
     fn configured_inbox_relays(&self) -> BTreeSet<String> {
@@ -1102,18 +1101,11 @@ where
         .collect()
 }
 
-/// Collect the `r`-tag relay URLs from an event, normalized through
+/// Collect the `relay`-tag relay URLs from an event, normalized through
 /// [`RelayUrl`]. Unparseable tag values are skipped rather than failing the
 /// comparison, since the event is network-supplied.
 fn normalize_relay_tags(event: &Event) -> BTreeSet<RelayUrl> {
-    event
-        .tags
-        .as_slice()
-        .iter()
-        .filter(|tag| tag.kind() == "r")
-        .filter_map(|tag| tag.content())
-        .filter_map(|content| RelayUrl::parse(content).ok())
-        .collect()
+    nip17::extract_relay_list(event).collect()
 }
 
 fn warn_on_degraded_relay_classes(config: &RelayConfig, status: &RelayStatus) {
@@ -1560,7 +1552,7 @@ mod tests {
         let mut config = test_relay_config(vec![]);
         config.reconnect_interval_secs = 17;
 
-        let opts = relay_options_for_config(&config, RelayKind::Clearnet);
+        let opts = relay_options_for_config(&config);
         let debug = format!("{opts:?}");
 
         assert!(
@@ -2784,7 +2776,7 @@ mod tests {
 
         let keys = Keys::generate();
         let original_event = EventBuilder::new(Kind::Custom(10050), "")
-            .tag(Tag::custom("r", [relay_url_string.as_str()]))
+            .tag(Tag::custom("relay", [relay_url_string.as_str()]))
             .custom_created_at(Timestamp::from_secs(1_700_000_000))
             .finalize(&keys)
             .unwrap();
@@ -3049,7 +3041,7 @@ mod tests {
     fn kind_10050_event(keys: &Keys, created_at: Timestamp, relay_urls: &[&str]) -> Event {
         let tags: Vec<Tag> = relay_urls
             .iter()
-            .map(|url| Tag::custom("r", [*url]))
+            .map(|url| Tag::custom("relay", [*url]))
             .collect();
         EventBuilder::new(Kind::Custom(10050), "")
             .tags(tags)
