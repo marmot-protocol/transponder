@@ -59,21 +59,21 @@ shutdown_timeout_secs = 10
 
 # Rate limit: max notifications per encrypted token per minute.
 # Limits identical encrypted blobs to prevent replay attacks.
-# Default: 240 (4 per second)
-# encrypted_token_rate_limit_per_minute = 240
+# Default: 20 (one every 3 seconds)
+# encrypted_token_rate_limit_per_minute = 20
 
 # Rate limit: max notifications per encrypted token per hour.
-# Default: 5000
-# encrypted_token_rate_limit_per_hour = 5000
+# Default: 300
+# encrypted_token_rate_limit_per_hour = 300
 
 # Rate limit: max notifications per device token per minute.
 # Limits notifications to the same device to prevent spam.
-# Default: 240 (4 per second)
-# device_token_rate_limit_per_minute = 240
+# Default: 20 (one every 3 seconds)
+# device_token_rate_limit_per_minute = 20
 
 # Rate limit: max notifications per device token per hour.
-# Default: 5000
-# device_token_rate_limit_per_hour = 5000
+# Default: 300
+# device_token_rate_limit_per_hour = 300
 
 # Maximum number of events processed concurrently.
 # Bounds total in-flight gift-wrap unwrap (ECDH) work. The relay event loop

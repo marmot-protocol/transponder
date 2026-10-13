@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Lowered the default per-token rate limits (`encrypted_token_rate_limit_*` and `device_token_rate_limit_*`) from 240/minute and 5,000/hour to 20/minute and 300/hour. Push-token records are gossiped to every group member, so anyone holding one, including a removed member, could previously trigger about four pushes a second to that device. Pushes are wake hints, so the lower rate costs users nothing, and the worst-case memory of a saturated limiter drops from about 12 GB to about 720 MB. Operators who relied on the old defaults can set them explicitly.
+
 ## 0.2.0 - 2026-07-26
 
 ### Added

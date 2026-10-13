@@ -29,10 +29,10 @@ dedup_retention_secs = 300
 # max_rate_limit_cache_size = 100000
 # Marmot Push v1 permits at most 32 chunks; this may be lowered but not raised.
 # max_tokens_per_event = 32
-# encrypted_token_rate_limit_per_minute = 240
-# encrypted_token_rate_limit_per_hour = 5000
-# device_token_rate_limit_per_minute = 240
-# device_token_rate_limit_per_hour = 5000
+# encrypted_token_rate_limit_per_minute = 20
+# encrypted_token_rate_limit_per_hour = 300
+# device_token_rate_limit_per_minute = 20
+# device_token_rate_limit_per_hour = 300
 
 [relays]
 clearnet = [

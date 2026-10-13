@@ -93,10 +93,10 @@ shutdown_timeout_secs = 10
 # the default or rejected every event).
 # max_rate_limit_cache_size = 100000           # Tracked keys per limiter, not total timestamps
 # max_tokens_per_event = 32                    # Per trigger; may be lowered, protocol max is 32
-# encrypted_token_rate_limit_per_minute = 240  # Per encrypted token (replay protection)
-# encrypted_token_rate_limit_per_hour = 5000
-# device_token_rate_limit_per_minute = 240     # Per device (spam protection)
-# device_token_rate_limit_per_hour = 5000
+# encrypted_token_rate_limit_per_minute = 20   # Per encrypted token (replay protection)
+# encrypted_token_rate_limit_per_hour = 300
+# device_token_rate_limit_per_minute = 20      # Per device (spam protection)
+# device_token_rate_limit_per_hour = 300
 
 # CPU-exhaustion DoS protection (admission control before gift-wrap unwrap)
 # max_concurrent_event_processing = 64            # Bounds in-flight unwrap (ECDH) work

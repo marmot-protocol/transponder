@@ -265,13 +265,13 @@ impl Default for RateLimitConfig {
 ///
 /// Each active entry stores admitted request hit records for true
 /// sliding-window enforcement, so memory scales with the number of admitted hits
-/// per key. With the defaults, a hot key can hold up to roughly 5,240 records
+/// per key. With the defaults, a hot key can hold up to roughly 320 records
 /// across the minute and hour windows before older hits are pruned.
 ///
 /// The aggregate memory bound is the per-key bound multiplied by the configured
 /// cache size: `max_entries * max_per_hour` hit records per limiter. With the
-/// default 100,000-key cache and 5,000/hour limit, one fully saturated limiter
-/// can retain roughly 500,000,000 `(Instant, u64)` records (about 12 GB at 24
+/// default 100,000-key cache and 300/hour limit, one fully saturated limiter
+/// can retain roughly 30,000,000 `(Instant, u64)` records (about 720 MB at 24
 /// bytes per record, before deque/map overhead). Production owns two such
 /// limiters, so size `max_entries` and host memory for both caches.
 ///
