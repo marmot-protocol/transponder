@@ -32,8 +32,9 @@ use crate::push::retry::SendAttemptResult;
 pub(crate) struct MintedToken {
     /// The credential material.
     pub(crate) token: Zeroizing<String>,
-    /// Cache eviction deadline (already including any provider-reported
-    /// lifetime and safety margin).
+    /// Cache eviction deadline after the provider-specific lifetime policy.
+    /// Any expiry safety margin is applied by the generator; the cache also
+    /// schedules proactive refresh separately from this deadline.
     pub(crate) expires_at: SystemTime,
 }
 

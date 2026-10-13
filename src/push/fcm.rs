@@ -106,8 +106,10 @@ struct TokenResponse {
 
 /// Return how long an FCM OAuth token should stay cached.
 ///
-/// Google is authoritative for issued token lifetimes; keep a small local
-/// safety margin so Transponder refreshes before the provider-side expiry.
+/// Use the provider-reported lifetime as an upper bound. Prefer a 60s expiry
+/// margin and a 30s cache lifetime, reducing the margin for short-lived tokens
+/// instead of extending their lifetime. The shared cache separately schedules
+/// proactive refresh before this local eviction deadline.
 #[must_use]
 fn token_cache_lifetime(expires_in: Option<u64>) -> Duration {
     expires_in
