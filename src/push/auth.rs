@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(mints.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_proactive_refresh_retriable_failure_reuses_valid_cached_token() {
         let mut generator = StubGenerator::new();
         generator.fail_first = 1;
