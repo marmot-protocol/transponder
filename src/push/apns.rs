@@ -242,6 +242,9 @@ pub struct ApnsClient {
     /// Test-only override for the APNs base URL (scheme + host + port).
     #[cfg(test)]
     pub(crate) test_base_url: Option<String>,
+    /// Inject a send-path panic without involving the provider in dispatcher tests.
+    #[cfg(test)]
+    pub(crate) test_panic_on_send: bool,
 }
 
 impl ApnsClient {
@@ -307,6 +310,8 @@ impl ApnsClient {
             metrics,
             #[cfg(test)]
             test_base_url: None,
+            #[cfg(test)]
+            test_panic_on_send: false,
         })
     }
 
@@ -327,6 +332,11 @@ impl ApnsClient {
         device_token: Zeroizing<String>,
         backoff_permit: Option<&mut crate::push::retry::BackoffPermit>,
     ) -> Result<PushSendOutcome> {
+        #[cfg(test)]
+        if self.test_panic_on_send {
+            panic!("injected push send panic");
+        }
+
         // Device-token well-formedness is guaranteed upstream: the dispatcher
         // feeds tokens produced by `TokenPayload::device_token_hex()`, which
         // always yields even-length lowercase hex within
@@ -646,6 +656,8 @@ impl ApnsClient {
             token_cache,
             metrics: Metrics::disabled(),
             test_base_url: None,
+            #[cfg(test)]
+            test_panic_on_send: false,
         }
     }
 

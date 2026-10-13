@@ -107,6 +107,34 @@ struct DispatchWorkerContext {
     metrics: Metrics,
 }
 
+/// Owns send-task resources until completion, cancellation, or panic.
+///
+/// Release permits before refreshing gauges, then let the in-flight guard
+/// signal idle only after cleanup finishes. Panics keep unwinding to Tokio;
+/// the existing global panic hook remains responsible for reporting them.
+struct SendTaskGuard {
+    backoff_permit: Option<crate::push::retry::BackoffPermit>,
+    live_task_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    semaphore: Arc<Semaphore>,
+    live_task_semaphore: Arc<Semaphore>,
+    metrics: Metrics,
+    _inflight_guard: inflight::InFlightGuard,
+}
+
+impl Drop for SendTaskGuard {
+    fn drop(&mut self) {
+        drop(self.backoff_permit.take());
+        drop(self.live_task_permit.take());
+        PushDispatcher::update_semaphore_available_metric(&self.metrics, &self.semaphore);
+        PushDispatcher::update_live_task_available_metric(&self.metrics, &self.live_task_semaphore);
+        if std::thread::panicking() {
+            // Aggregate only: never inspect or log the panic payload, which
+            // may contain provider URLs or device tokens.
+            self.metrics.record_push_send_task_panic();
+        }
+    }
+}
+
 /// Push notification dispatcher.
 pub struct PushDispatcher {
     apns_client: Option<Arc<ApnsClient>>,
@@ -443,43 +471,34 @@ impl PushDispatcher {
                         // the task and dropped only when the task body finishes
                         // (after all retries/backoff), independent of whether the
                         // task currently holds a concurrency permit.
-                        let inflight_guard = ctx.inflight.enter();
+                        let task_guard = SendTaskGuard {
+                            // Backoff can release the active-HTTP slot while
+                            // the live-task permit remains held throughout.
+                            backoff_permit: Some(crate::push::retry::BackoffPermit::new(
+                                semaphore.clone(),
+                                permit,
+                            )),
+                            live_task_permit: Some(live_task_permit),
+                            semaphore,
+                            live_task_semaphore,
+                            metrics: task_metrics.clone(),
+                            _inflight_guard: ctx.inflight.enter(),
+                        };
 
                         tokio::spawn(async move {
-                            // Decrements the in-flight count when this task
-                            // completes, signalling idle to any shutdown waiter.
-                            let _inflight_guard = inflight_guard;
-
-                            // Wrap the permit so the send's internal backoff
-                            // can release the in-flight slot during sleeps and
-                            // re-acquire it before the next attempt.
-                            let mut backoff_permit =
-                                crate::push::retry::BackoffPermit::new(semaphore.clone(), permit);
-
+                            let mut task_guard = task_guard;
                             Self::send_push(
                                 platform,
                                 token,
                                 apns_client,
                                 fcm_client,
-                                task_metrics.clone(),
+                                task_metrics,
                                 &delivery_health,
-                                Some(&mut backoff_permit),
+                                task_guard.backoff_permit.as_mut(),
                             )
                             .await;
-
-                            // Release the held permit (owned by backoff_permit)
-                            // before reading available permits for the metric.
-                            drop(backoff_permit);
-
-                            Self::update_semaphore_available_metric(&task_metrics, &semaphore);
-                            // Held until the send task has finished all
-                            // attempts/backoff, bounding live token-holding
-                            // tasks even across backoff sleeps (#160).
-                            drop(live_task_permit);
-                            Self::update_live_task_available_metric(
-                                &task_metrics,
-                                &live_task_semaphore,
-                            );
+                            // Task resources and gauges are cleaned up by Drop
+                            // on normal completion, cancellation, or unwind.
                         });
                     }
                     Some(PushMessage::Shutdown) => {
@@ -830,6 +849,101 @@ mod tests {
             "transponder_push_success_total",
             &[("platform", platform)],
         ) as u64
+    }
+
+    // Stop the queue loop and drain its tasks without shutdown's final gauge
+    // refresh, which would mask a missing update in the send task itself.
+    async fn drain_send_tasks(dispatcher: &PushDispatcher) {
+        dispatcher.sender.send(PushMessage::Shutdown).await.unwrap();
+        let handle = dispatcher.dispatcher_handle.lock().await.take().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            handle.await.unwrap();
+            dispatcher.inflight.wait_idle().await;
+        })
+        .await
+        .expect("send tasks should drain even after a panic");
+        assert_eq!(dispatcher.inflight.in_flight_count(), 0);
+    }
+
+    async fn dispatcher_after_mock_send(panic_on_send: bool) -> (PushDispatcher, Metrics) {
+        let config = crate::config::ApnsConfig {
+            enabled: true,
+            private_key_path: String::new(),
+            key_id: "TEST123".to_string(),
+            team_id: "TEAM123".to_string(),
+            environment: crate::config::ApnsEnvironment::Sandbox,
+            bundle_id: "com.example.app".to_string(),
+            payload_mode: Default::default(),
+            alert_title: String::new(),
+            alert_body: String::new(),
+            collapse_id: String::new(),
+        };
+        let mut client = ApnsClient::mock(config, false);
+        client.test_panic_on_send = panic_on_send;
+        let metrics = Metrics::new().unwrap();
+        let dispatcher = PushDispatcher::with_metrics(Some(client), None, metrics.clone());
+        assert_eq!(
+            dispatcher
+                .dispatch(vec![apns_test_payload()])
+                .await
+                .unwrap(),
+            1
+        );
+        drain_send_tasks(&dispatcher).await;
+        assert_eq!(
+            dispatcher.semaphore.available_permits(),
+            MAX_CONCURRENT_PUSHES
+        );
+        assert_eq!(
+            dispatcher.available_live_task_permits(),
+            MAX_LIVE_SEND_TASKS
+        );
+        (dispatcher, metrics)
+    }
+
+    #[tokio::test]
+    async fn send_task_panic_resynchronizes_capacity_gauges() {
+        let (dispatcher, metrics) = dispatcher_after_mock_send(true).await;
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_semaphore_available"),
+            MAX_CONCURRENT_PUSHES as i64,
+        );
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_live_tasks_available"),
+            MAX_LIVE_SEND_TASKS as i64,
+        );
+        tokio::time::timeout(Duration::from_secs(2), dispatcher.wait_for_completion())
+            .await
+            .expect("shutdown should complete after a send panic");
+    }
+
+    #[tokio::test]
+    async fn send_task_normal_error_resynchronizes_gauges_without_counting_a_panic() {
+        // The mock has no encoding key, so authentication returns an error
+        // before contacting a provider.
+        let (_, metrics) = dispatcher_after_mock_send(false).await;
+        assert_eq!(
+            counter_metric_value(&metrics, "transponder_push_send_task_panicked_total"),
+            0,
+        );
+        assert_eq!(push_failed_metric_value(&metrics, "apns", "error"), 1);
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_semaphore_available"),
+            MAX_CONCURRENT_PUSHES as i64,
+        );
+        assert_eq!(
+            gauge_metric_value(&metrics, "transponder_push_live_tasks_available"),
+            MAX_LIVE_SEND_TASKS as i64,
+        );
+    }
+
+    #[tokio::test]
+    async fn send_task_panic_records_dedicated_metric() {
+        let (_, metrics) = dispatcher_after_mock_send(true).await;
+        assert_eq!(
+            counter_metric_value(&metrics, "transponder_push_send_task_panicked_total"),
+            1,
+        );
     }
 
     #[tokio::test]

@@ -111,6 +111,9 @@ pub struct Metrics {
     /// Total number of failed push notifications (by platform and reason).
     pub push_failed_total: IntCounterVec,
 
+    /// Total number of push send tasks that panicked.
+    pub push_send_task_panicked_total: IntCounter,
+
     /// Current number of items in the push queue.
     pub push_queue_size: IntGauge,
 
@@ -464,6 +467,12 @@ impl Metrics {
         )?;
         registry.register(Box::new(push_failed_total.clone()))?;
 
+        let push_send_task_panicked_total = IntCounter::with_opts(Opts::new(
+            "transponder_push_send_task_panicked_total",
+            "Total number of push send tasks that panicked",
+        ))?;
+        registry.register(Box::new(push_send_task_panicked_total.clone()))?;
+
         let push_queue_size = IntGauge::with_opts(Opts::new(
             "transponder_push_queue_size",
             "Current number of notifications waiting in the push queue",
@@ -648,6 +657,7 @@ impl Metrics {
             push_dispatched_total,
             push_success_total,
             push_failed_total,
+            push_send_task_panicked_total,
             push_queue_size,
             push_queue_capacity,
             push_semaphore_available,
@@ -958,6 +968,14 @@ impl Metrics {
             .inc();
     }
 
+    /// Record a panic in a push send task without retaining its payload.
+    pub fn record_push_send_task_panic(&self) {
+        if !self.enabled {
+            return;
+        }
+        self.push_send_task_panicked_total.inc();
+    }
+
     /// Record a successful push notification.
     pub fn record_push_success(&self, platform: &str) {
         if !self.enabled {
@@ -1171,6 +1189,8 @@ mod tests {
     fn test_disabled_metrics_observers_are_no_ops() {
         let metrics = Metrics::new().unwrap().with_enabled(false);
         assert!(!metrics.is_enabled());
+        metrics.record_push_send_task_panic();
+        assert_eq!(metrics.push_send_task_panicked_total.get(), 0);
 
         metrics.observe_notification_parse_duration(OperationOutcome::Success, 0.001);
         metrics.observe_push_dispatch_admission_duration(OperationOutcome::Success, 0.001);
