@@ -24,7 +24,7 @@ Why these numbers make sense today:
 - the push queue is bounded at 10,000 pending notifications
 - the event deduplication and rate-limit caches default to 100,000 entries each
 - replay suppression retains only decoded-content hashes in memory for the configured short window; it intentionally resets on restart
-- rate-limit cache entries retain one deque of admitted-hit timestamps for sliding-window precision; worst-case timestamp storage is `max_rate_limit_cache_size × per_hour` per limiter (about 12 GB at 24 bytes per record with the defaults, before `VecDeque` overhead), and Transponder runs separate encrypted-token and device-token limiters
+- global crypto rates control aggregate admitted traffic, while token rates and cache sizes bound individual hit deques and tracked keys; see the [README rate-limit memory model](../README.md#configuration-file-reference) for sizing and allocation caveats
 - under cache pressure, new rate-limit keys evict stale or below-limit entries from their routed shard when possible; if no safe same-shard victim exists they are rate limited even when other shards have room, so size these caches with headroom and monitor `transponder_rate_limit_admission_evictions_total` plus `transponder_tokens_rate_limited_total{reason="capacity"}`
 - Tor adds noticeable memory and connection-management overhead, which is why the default build leaves it disabled
 

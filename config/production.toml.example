@@ -18,10 +18,9 @@ shutdown_timeout_secs = 20
 # Short-lived volatile SHA-256 deduplication of decoded trigger content.
 # Marmot Push v1 never persists trigger or replay material.
 dedup_retention_secs = 300
-# Rate-limit cache size caps tracked keys, not stored timestamps. Worst-case
-# timestamps per limiter are max_rate_limit_cache_size * (per_minute + per_hour),
-# or ~524M Instant values with the defaults (~8.4 GB at 16 B/timestamp before
-# overhead); Transponder has two limiters.
+# Caps key cardinality separately from admitted-hit storage. Global crypto
+# rates control aggregate traffic; token rates bound each key's hit deque.
+# See the README rate-limit memory model for sizing and allocation caveats.
 # Large caches are sharded for lock locality. At shard capacity, new keys evict
 # stale or below-limit entries from their routed shard when possible. If no safe
 # same-shard eviction candidate exists, the new key is rate limited even if
@@ -29,9 +28,13 @@ dedup_retention_secs = 300
 # max_rate_limit_cache_size = 100000
 # Marmot Push v1 permits at most 32 chunks; this may be lowered but not raised.
 # max_tokens_per_event = 32
+# Allowed: 1..=1000; larger overrides are rejected at startup.
 # encrypted_token_rate_limit_per_minute = 240
+# Allowed: 1..=10000; larger overrides are rejected at startup.
 # encrypted_token_rate_limit_per_hour = 5000
+# Allowed: 1..=1000; larger overrides are rejected at startup.
 # device_token_rate_limit_per_minute = 240
+# Allowed: 1..=10000; larger overrides are rejected at startup.
 # device_token_rate_limit_per_hour = 5000
 
 [relays]

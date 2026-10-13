@@ -242,9 +242,9 @@ an approximate working set of `5 × G` records, where
 or 12 MB at the global ceilings, at 24 bytes per `(Instant, u64)` record.
 This estimate excludes in-flight reservations and allocation overhead; it is
 not a hard byte limit. Cleanup runs every 60 seconds and scans at most 1,000
-entries per shard, so stale records can await a later scan. Pruning also keeps
-a deque's spare capacity until its key is evicted. Map nodes and retained deque
-capacity depend on cache sizes, per-token rates, traffic history, and scheduling.
+entries per shard, so stale records can await a later scan. Pruning shrinks
+substantially oversized deques, but map nodes and spare deque capacity still add
+allocation overhead.
 Lower global rates to reduce aggregate growth, and lower cache sizes/per-token
 rates to reduce metadata and individual deque capacity on smaller hosts.
 
