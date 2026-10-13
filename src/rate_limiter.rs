@@ -263,20 +263,11 @@ impl Default for RateLimitConfig {
 
 /// Sliding-window rate limiter with per-minute and per-hour limits.
 ///
-/// Each active entry stores admitted request hit records for true
-/// sliding-window enforcement, so memory scales with the number of admitted hits
-/// per key. With the defaults, a hot key can hold up to 5,000 records in the
-/// shared minute/hour deque before older hits are pruned.
-///
-/// The conservative retained-record bound per limiter is
-/// `max_entries * min(max_per_hour, 60 * max_per_minute)`: the minute count
-/// shares the hour deque. With the default 100,000-key cache and 5,000/hour
-/// limit, one limiter can retain at most 500,000,000 `(Instant, u64)` records
-/// (about 12 GB at 24 bytes per record before spare deque capacity/map overhead).
-/// Production owns two token limiters plus a one-key global crypto limiter.
-/// Config validation caps all six rates. Actual growth also depends on global
-/// admission, which charges both unwraps and token decrypts; see the README
-/// for the aggregate model rather than treating key count as a byte budget.
+/// Each key uses one deque for admitted-hit records in both windows, retaining
+/// at most `min(max_per_hour, 60 * max_per_minute)` records. Production also
+/// couples the two token limiters to a shared global crypto-admission budget.
+/// See the README rate-limit memory model for aggregate sizing and allocation
+/// caveats; key cardinality alone is not a byte budget.
 ///
 /// Uses a bounded, striped cache to limit tracked key cardinality. The
 /// configured `max_entries` is a hard aggregate budget divided across stripes,

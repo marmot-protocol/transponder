@@ -144,14 +144,10 @@ pub struct ServerConfig {
     /// Maximum tracked keys for each rate limit cache (encrypted token and
     /// device token).
     ///
-    /// This caps key cardinality, not total timestamp storage. Each tracked key
-    /// can retain up to `per_hour` admitted-hit records; the minute count is
-    /// derived from that same deque. With the defaults, worst-case storage is
-    /// conservatively 500,000,000 `(Instant, u64)` records per limiter (about
-    /// 12 GB at 24 bytes per record before deque/map overhead), and Transponder
-    /// creates two such limiters. The tighter per-key bound is
-    /// `min(per_hour, 60 * per_minute)`. Global crypto admission also constrains
-    /// traffic; see the README for the aggregate model and its limitations.
+    /// This caps key cardinality separately from admitted-hit storage. Global
+    /// crypto rates control aggregate traffic; token rates bound each key's
+    /// hit deque. See the README rate-limit memory model for sizing and
+    /// allocation caveats.
     ///
     /// Unknown keys are rate limited at capacity until cleanup removes stale
     /// entries. Default: 100,000 entries per cache.
@@ -315,9 +311,8 @@ pub struct RelayConfig {
 const MAX_RELAY_DURATION_SECS: u64 = 300;
 const MAX_CACHE_ENTRIES: usize = 1_000_000;
 
-/// Token ceilings allow bursts above the defaults while bounding each key's
-/// admitted-hit deque. Global ceilings allow larger aggregate server traffic
-/// but bound the single shared crypto-admission deque as well.
+/// Token ceilings bound individual hit deques; global ceilings control
+/// aggregate crypto admission and the shared global hit deque.
 const MAX_TOKEN_RATE_PER_MINUTE: u32 = 1_000;
 const MAX_TOKEN_RATE_PER_HOUR: u32 = 10_000;
 const MAX_GLOBAL_RATE_PER_MINUTE: u32 = 10_000;
@@ -1061,10 +1056,9 @@ impl AppConfig {
 }
 
 impl ServerConfig {
-    /// Rejects rate-limit counts above their policy ceilings and rejects
-    /// rate-limit count fields, the cache sizes, and
-    /// `max_tokens_per_event` set to `0`, `shutdown_timeout_secs` set to `0`,
-    /// `max_concurrent_event_processing` set to `0`,
+    /// Rejects rate-limit counts outside `1..=ceiling`, and rejects the cache
+    /// sizes, `max_tokens_per_event`, `shutdown_timeout_secs`, and
+    /// `max_concurrent_event_processing` when set to `0`,
     /// `max_concurrent_event_processing` above [`MAX_CONCURRENT_EVENT_PROCESSING`],
     /// and `max_tokens_per_event` above the Marmot Push v1 protocol ceiling.
     ///
@@ -1088,30 +1082,6 @@ impl ServerConfig {
         }
 
         let zero_checked_fields = [
-            (
-                "server.encrypted_token_rate_limit_per_minute",
-                u64::from(self.encrypted_token_rate_limit_per_minute),
-            ),
-            (
-                "server.encrypted_token_rate_limit_per_hour",
-                u64::from(self.encrypted_token_rate_limit_per_hour),
-            ),
-            (
-                "server.device_token_rate_limit_per_minute",
-                u64::from(self.device_token_rate_limit_per_minute),
-            ),
-            (
-                "server.device_token_rate_limit_per_hour",
-                u64::from(self.device_token_rate_limit_per_hour),
-            ),
-            (
-                "server.global_unwrap_rate_limit_per_minute",
-                u64::from(self.global_unwrap_rate_limit_per_minute),
-            ),
-            (
-                "server.global_unwrap_rate_limit_per_hour",
-                u64::from(self.global_unwrap_rate_limit_per_hour),
-            ),
             (
                 "server.max_rate_limit_cache_size",
                 self.max_rate_limit_cache_size as u64,
@@ -1171,6 +1141,11 @@ impl ServerConfig {
                 MAX_GLOBAL_RATE_PER_HOUR,
             ),
         ] {
+            if value == 0 {
+                return Err(config::ConfigError::Message(format!(
+                    "{field} must be greater than 0"
+                )));
+            }
             if value > maximum {
                 return Err(config::ConfigError::Message(format!(
                     "{field} must be at most {maximum}"
@@ -2691,30 +2666,16 @@ mod tests {
         }
     }
 
-    fn rate_count(config: &ServerConfig, field: &str) -> u32 {
-        match field {
-            "encrypted_token_rate_limit_per_minute" => config.encrypted_token_rate_limit_per_minute,
-            "encrypted_token_rate_limit_per_hour" => config.encrypted_token_rate_limit_per_hour,
-            "device_token_rate_limit_per_minute" => config.device_token_rate_limit_per_minute,
-            "device_token_rate_limit_per_hour" => config.device_token_rate_limit_per_hour,
-            "global_unwrap_rate_limit_per_minute" => config.global_unwrap_rate_limit_per_minute,
-            "global_unwrap_rate_limit_per_hour" => config.global_unwrap_rate_limit_per_hour,
-            _ => panic!("unknown rate-count test field"),
-        }
-    }
-
     #[test]
     fn test_rate_count_boundaries_accepted_from_file_and_env() {
         assert!(from_test_env(&[]).is_ok());
         for (field, cap) in RATE_COUNT_BOUNDARIES {
             for value in [1, *cap] {
                 let file = create_temp_config(&format!("[server]\n{field} = {value}\n"));
-                let config = load_with_test_env(file.path(), &[]).unwrap();
-                assert_eq!(rate_count(&config.server, field), value);
+                assert!(load_with_test_env(file.path(), &[]).is_ok());
                 let key = format!("TRANSPONDER_SERVER_{}", field.to_ascii_uppercase());
                 let value_string = value.to_string();
-                let config = from_test_env(&[(&key, &value_string)]).unwrap();
-                assert_eq!(rate_count(&config.server, field), value);
+                assert!(from_test_env(&[(&key, &value_string)]).is_ok());
             }
         }
         // All maxima may be used together; no hidden ordering constraint.

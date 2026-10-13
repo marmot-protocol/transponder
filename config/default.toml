@@ -36,14 +36,9 @@ shutdown_timeout_secs = 10
 # dedup_retention_secs = 300
 
 # Maximum tracked keys for each rate limit cache (encrypted_token and device_token).
-# Each key retains at most min(per_hour, 60 * per_minute) (Instant, u64)
-# records in one deque shared by both windows. A conservative aggregate bound
-# is K * (E + D) + G records, where K is this cache size and E/D/G are the
-# encrypted-token/device-token/global per-key bounds. With defaults this is
-# ~1 billion records (~24 GB at 24 B/record before spare capacity/map overhead).
-# Growth depends on admitted traffic; global admission charges both unwrap and
-# each token decrypt, so 32-chunk fan-out does not bypass its budget. See the
-# README for policy ceilings and memory sizing; this is not preallocated.
+# Caps key cardinality separately from admitted-hit storage. Global crypto
+# rates control aggregate traffic; token rates bound each key's hit deque.
+# See the README rate-limit memory model for sizing and allocation caveats.
 # Large caches are sharded for lock locality. At shard capacity, new keys evict
 # stale or below-limit entries from their routed shard when possible. If no safe
 # same-shard eviction candidate exists, the new key is rate limited even if
