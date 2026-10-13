@@ -262,6 +262,12 @@ export TRANSPONDER_LOGGING_FORMAT="pretty"
 export RUST_LOG="info,transponder=info,nostr_relay_pool=info,nostr_sdk=info,nostr=info,reqwest=warn,hyper=warn,hyper_util=warn,h2=warn,tower=warn,rustls=warn,tungstenite=warn,tokio_tungstenite=warn"
 ```
 
+Relay overrides trim whitespace and ignore empty comma-separated entries.
+An override with no relay entries (empty, whitespace-only, or separator-only,
+such as `" , , "`) is ignored, preserving the file-configured list. To clear a
+relay class, set its list to `[]` in the TOML file and leave its environment
+override unset. Bracketed environment values such as `"[]"` are rejected.
+
 ### Generating a Server Key Pair
 
 The server requires a secp256k1 private key for Nostr identity and token decryption. Use the built-in command to generate a new key pair and write the secret directly to a restricted file:
