@@ -284,6 +284,11 @@ pub struct RelayConfig {
     #[serde(default)]
     pub onion: Vec<String>,
 
+    /// Root for Arti's cache and state directories; empty uses Arti platform defaults.
+    /// This stores Tor network state only, never notification data.
+    #[serde(default)]
+    pub tor_data_dir: String,
+
     /// Base relay reconnection interval in seconds.
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval_secs: u64,
@@ -910,6 +915,7 @@ fn is_supported_config_key(config_key: &str) -> bool {
                 | "relays.reconnect_interval_secs"
                 | "relays.max_reconnect_attempts"
                 | "relays.connection_timeout_secs"
+                | "relays.tor_data_dir"
                 | "apns.enabled"
                 | "apns.key_id"
                 | "apns.team_id"
@@ -1740,6 +1746,19 @@ mod tests {
     }
 
     #[test]
+    fn tor_data_dir_supports_file_and_environment_overrides() {
+        let file = create_temp_config("[relays]\ntor_data_dir = '/srv/arti'\n");
+        let config = load_with_test_env(file.path(), &[]).unwrap();
+        assert_eq!(config.relays.tor_data_dir, "/srv/arti");
+        let config = load_with_test_env(
+            file.path(),
+            &[("TRANSPONDER_RELAYS_TOR_DATA_DIR", "/var/lib/arti")],
+        )
+        .unwrap();
+        assert_eq!(config.relays.tor_data_dir, "/var/lib/arti");
+    }
+
+    #[test]
     fn test_default_values() {
         // Config with only required fields - should use defaults for others
         let config_content = r#"
@@ -1758,6 +1777,7 @@ mod tests {
         );
         assert!(config.relays.clearnet.is_empty());
         assert!(config.relays.onion.is_empty());
+        assert!(config.relays.tor_data_dir.is_empty());
         assert!(!config.relays.allow_unencrypted_clearnet_relays);
         assert_eq!(config.relays.reconnect_interval_secs, 5);
         assert_eq!(config.relays.max_reconnect_attempts, 10);

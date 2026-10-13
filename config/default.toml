@@ -119,6 +119,11 @@ allow_unencrypted_clearnet_relays = false
 # than silently degrading to clearnet.
 onion = []
 
+# Embedded Arti cache/state root. Empty uses Arti's platform defaults.
+# For read-only containers, set a private writable directory owned by UID 65532.
+# Only Tor network state is stored here, never notification data.
+tor_data_dir = ""
+
 # Reconnection settings. reconnect_interval_secs must be between 1 and 300 seconds.
 # max_reconnect_attempts is a warning threshold; retries continue indefinitely.
 reconnect_interval_secs = 5

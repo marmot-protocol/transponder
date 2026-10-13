@@ -286,7 +286,7 @@ async fn supervise_critical_task_handle<E: std::fmt::Display>(
 /// dispatcher, so notifications mid-unwrap at shutdown are delivered instead
 /// of aborted (#84, #173).
 async fn run_event_loop(
-    mut notifications: broadcast::Receiver<RelayPoolNotification>,
+    mut notifications: broadcast::Receiver<ClientNotification>,
     mut shutdown: watch::Receiver<bool>,
     event_semaphore: Arc<Semaphore>,
     processor: Arc<EventProcessor>,
@@ -307,68 +307,65 @@ async fn run_event_loop(
                 match result {
                     Ok(notification) => {
                         let event = match notification {
-                            RelayPoolNotification::Message {
-                                relay_url,
-                                message: RelayMessage::EndOfStoredEvents(subscription_id),
-                            } => {
-                                if gift_wrap_subscriptions
-                                    .mark_eose(&relay_url, subscription_id.as_ref())
-                                    .await
-                                {
-                                    auth_required_retries.remove(&relay_url);
-                                }
-                                continue;
-                            }
-                            // A relay that gates kind 1059 behind NIP-42 (e.g. wok with
-                            // restricted_read_kinds) CLOSEs the raw live REQ with
-                            // "auth-required" before the client has answered AUTH; the
-                            // pool only re-sends subscriptions it tracks, so without this
-                            // the server never receives a trigger on such a relay. Only
-                            // the closing relay is rebuilt; other relays stay live.
-                            RelayPoolNotification::Message {
-                                relay_url,
-                                message: RelayMessage::Closed { subscription_id, message },
-                            } => {
-                                if !message.starts_with("auth-required")
-                                    || !gift_wrap_subscriptions
-                                        .is_current(&relay_url, subscription_id.as_ref())
+                            ClientNotification::Message { relay_url, message } => match *message {
+                                RelayMessage::EndOfStoredEvents(subscription_id) => {
+                                    if gift_wrap_subscriptions
+                                        .mark_eose(&relay_url, subscription_id.as_ref())
                                         .await
-                                {
+                                    {
+                                        auth_required_retries.remove(&relay_url);
+                                    }
                                     continue;
                                 }
-                                if let Some(attempt) = record_auth_required_close(
-                                    &mut auth_required_retries,
-                                    &relay_url,
-                                    subscription_id.as_ref(),
-                                ) {
-                                    let delay = auth_required_resubscribe_delay(attempt);
-                                    if attempt == 1 {
-                                        warn!(
-                                            relay = %relay_url,
-                                            "Live gift-wrap subscription closed (auth-required); re-subscribing after NIP-42"
-                                        );
-                                    } else {
-                                        debug!(
-                                            relay = %relay_url,
-                                            attempt,
-                                            delay_secs = delay.as_secs(),
-                                            "Live gift-wrap subscription closed (auth-required) again; retrying"
-                                        );
+                                // A relay that gates kind 1059 behind NIP-42 (e.g. wok with
+                                // restricted_read_kinds) CLOSEs the raw live REQ with
+                                // "auth-required" before the client has answered AUTH; the
+                                // pool only re-sends subscriptions it tracks, so without this
+                                // the server never receives a trigger on such a relay. Only
+                                // the closing relay is rebuilt; other relays stay live.
+                                RelayMessage::Closed { subscription_id, message } => {
+                                    if !message.starts_with("auth-required")
+                                        || !gift_wrap_subscriptions
+                                            .is_current(&relay_url, subscription_id.as_ref())
+                                            .await
+                                    {
+                                        continue;
                                     }
-                                    let subscriptions = gift_wrap_subscriptions.clone();
-                                    let subscription_id = subscription_id.into_owned();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(delay).await;
-                                        // Re-checks ownership now: a subscription that
-                                        // replaced this one during the delay is kept.
-                                        subscriptions
-                                            .resubscribe_relay(&relay_url, &subscription_id)
-                                            .await;
-                                    });
+                                    if let Some(attempt) = record_auth_required_close(
+                                        &mut auth_required_retries,
+                                        &relay_url,
+                                        subscription_id.as_ref(),
+                                    ) {
+                                        let delay = auth_required_resubscribe_delay(attempt);
+                                        if attempt == 1 {
+                                            warn!(
+                                                relay = %relay_url,
+                                                "Live gift-wrap subscription closed (auth-required); re-subscribing after NIP-42"
+                                            );
+                                        } else {
+                                            debug!(
+                                                relay = %relay_url,
+                                                attempt,
+                                                delay_secs = delay.as_secs(),
+                                                "Live gift-wrap subscription closed (auth-required) again; retrying"
+                                            );
+                                        }
+                                        let subscriptions = gift_wrap_subscriptions.clone();
+                                        let subscription_id = subscription_id.into_owned();
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(delay).await;
+                                            // Re-checks ownership now: a subscription that
+                                            // replaced this one during the delay is kept.
+                                            subscriptions
+                                                .resubscribe_relay(&relay_url, &subscription_id)
+                                                .await;
+                                        });
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
-                            RelayPoolNotification::Event {
+                                _ => continue,
+                            },
+                            ClientNotification::Event {
                                 relay_url,
                                 subscription_id,
                                 event,
@@ -1455,14 +1452,14 @@ mod tests {
         )
     }
 
-    async fn test_event_notification(server_keys: &Keys) -> RelayPoolNotification {
+    async fn test_event_notification(server_keys: &Keys) -> ClientNotification {
         test_event_notification_with_subscription(server_keys, test_subscription_id()).await
     }
 
     async fn test_event_notification_with_subscription(
         server_keys: &Keys,
         subscription_id: SubscriptionId,
-    ) -> RelayPoolNotification {
+    ) -> ClientNotification {
         let sender_keys = Keys::generate();
         let event = crate::test_vectors::scenarios::single_apns_notification(
             server_keys,
@@ -1470,7 +1467,7 @@ mod tests {
             "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678",
         )
         .await;
-        RelayPoolNotification::Event {
+        ClientNotification::Event {
             relay_url: test_relay_url(),
             subscription_id,
             event: Box::new(event),
@@ -1501,6 +1498,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -1569,7 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_event_loop_exits_when_shutdown_signal_fires() {
-        let (_notification_tx, notifications) = broadcast::channel::<RelayPoolNotification>(4);
+        let (_notification_tx, notifications) = broadcast::channel::<ClientNotification>(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         shutdown_tx.send(true).unwrap();
 
@@ -1593,7 +1591,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_event_loop_reports_channel_close_as_unexpected_exit() {
-        let (notification_tx, notifications) = broadcast::channel::<RelayPoolNotification>(4);
+        let (notification_tx, notifications) = broadcast::channel::<ClientNotification>(4);
         drop(notification_tx);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1659,7 +1657,7 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 2);
     }
 
-    fn closed_notification(id: SubscriptionId, message: &str) -> RelayPoolNotification {
+    fn closed_notification(id: SubscriptionId, message: &str) -> ClientNotification {
         closed_notification_from(test_relay_url(), id, message)
     }
 
@@ -1667,25 +1665,25 @@ mod tests {
         relay_url: RelayUrl,
         id: SubscriptionId,
         message: &str,
-    ) -> RelayPoolNotification {
-        RelayPoolNotification::Message {
+    ) -> ClientNotification {
+        ClientNotification::Message {
             relay_url,
-            message: RelayMessage::Closed {
+            message: Box::new(RelayMessage::Closed {
                 subscription_id: std::borrow::Cow::Owned(id),
                 message: std::borrow::Cow::Owned(message.to_string()),
-            },
+            }),
         }
     }
 
-    fn eose_notification(relay_url: RelayUrl, id: SubscriptionId) -> RelayPoolNotification {
-        RelayPoolNotification::Message {
+    fn eose_notification(relay_url: RelayUrl, id: SubscriptionId) -> ClientNotification {
+        ClientNotification::Message {
             relay_url,
-            message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(id)),
+            message: Box::new(RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(id))),
         }
     }
 
     fn spawn_test_event_loop(
-        notifications: broadcast::Receiver<RelayPoolNotification>,
+        notifications: broadcast::Receiver<ClientNotification>,
         shutdown_rx: watch::Receiver<bool>,
         subscriptions: &LiveGiftWrapSubscriptions,
     ) -> tokio::task::JoinHandle<EventLoopExit> {
@@ -2043,11 +2041,11 @@ mod tests {
         assert_eq!(metrics.relay_backlog_events_ignored_total.get(), 1);
 
         notification_tx
-            .send(RelayPoolNotification::Message {
+            .send(ClientNotification::Message {
                 relay_url: test_relay_url(),
-                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                message: Box::new(RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
                     test_subscription_id(),
-                )),
+                ))),
             })
             .unwrap();
         notification_tx
@@ -2125,9 +2123,7 @@ mod tests {
             Metrics::disabled(),
         ));
 
-        notification_tx
-            .send(RelayPoolNotification::Shutdown)
-            .unwrap();
+        notification_tx.send(ClientNotification::Shutdown).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         shutdown_tx.send(true).unwrap();
@@ -2161,16 +2157,14 @@ mod tests {
             .await;
 
         notification_tx
-            .send(RelayPoolNotification::Message {
+            .send(ClientNotification::Message {
                 relay_url: test_relay_url(),
-                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                message: Box::new(RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
                     test_subscription_id(),
-                )),
+                ))),
             })
             .unwrap();
-        notification_tx
-            .send(RelayPoolNotification::Shutdown)
-            .unwrap();
+        notification_tx.send(ClientNotification::Shutdown).unwrap();
 
         let loop_handle = tokio::spawn(run_event_loop(
             notifications,
@@ -2201,11 +2195,11 @@ mod tests {
             .replace_pending(test_relay_url(), replacement_id.clone())
             .await;
         notification_tx
-            .send(RelayPoolNotification::Message {
+            .send(ClientNotification::Message {
                 relay_url: test_relay_url(),
-                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                message: Box::new(RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
                     replacement_id.clone(),
-                )),
+                ))),
             })
             .unwrap();
         for _ in 0..100 {
@@ -2520,6 +2514,7 @@ mod tests {
             clearnet: vec!["wss://relay.example.com".to_string()],
             allow_unencrypted_clearnet_relays: false,
             onion: Vec::new(),
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 30,
@@ -2534,6 +2529,7 @@ mod tests {
             clearnet: vec!["wss://relay.example.com".to_string()],
             allow_unencrypted_clearnet_relays: false,
             onion: Vec::new(),
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 30,
@@ -2550,6 +2546,7 @@ mod tests {
             clearnet: Vec::new(),
             allow_unencrypted_clearnet_relays: false,
             onion: Vec::new(),
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 30,
@@ -2567,6 +2564,7 @@ mod tests {
             clearnet: vec!["wss://relay.example.com".to_string()],
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 30,
@@ -2584,6 +2582,7 @@ mod tests {
             clearnet: Vec::new(),
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 30,

@@ -1,0 +1,314 @@
+use std::borrow::Cow;
+use std::future::IntoFuture;
+use std::time::Duration;
+
+use nostr::types::url::RelayUrl;
+
+use crate::client::Client;
+use crate::client::url::RelayUrlArg;
+use crate::error::Error;
+use crate::future::BoxedFuture;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::proxy::Proxy;
+use crate::relay::{RelayCapabilities, RelayLimits, RelayOptions, SleepWhenIdle};
+
+/// Add new relay to the pool
+#[must_use = "Does nothing unless you await!"]
+pub struct AddRelay<'client, 'url> {
+    client: &'client Client,
+    url: RelayUrlArg<'url>,
+    capabilities: RelayCapabilities,
+    connect: bool,
+    opts: RelayOptions,
+}
+
+impl<'client, 'url> AddRelay<'client, 'url> {
+    pub(crate) fn new(client: &'client Client, url: RelayUrlArg<'url>) -> Self {
+        Self {
+            client,
+            url,
+            capabilities: RelayCapabilities::default(),
+            connect: false,
+            opts: RelayOptions::default(),
+        }
+    }
+
+    /// Set capabilities
+    ///
+    /// If the relay already exists, the capabilities will be added to the existing one.
+    #[inline]
+    pub fn capabilities(mut self, capabilities: RelayCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Connection timeout (default: 15 sec)
+    ///
+    /// This is the default timeout use when attempting to establish a connection with the relay
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.opts.connect_timeout = timeout;
+        self
+    }
+
+    /// Set proxy
+    #[inline]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn proxy(mut self, proxy: Proxy) -> Self {
+        self.opts.proxy = Some(proxy);
+        self
+    }
+
+    /// Enable or disable ping
+    #[inline]
+    pub fn ping(mut self, enable: bool) -> Self {
+        self.opts.ping = enable;
+        self
+    }
+
+    /// Enable/disable auto reconnection (default: true)
+    pub fn reconnect(mut self, reconnect: bool) -> Self {
+        self.opts.reconnect = reconnect;
+        self
+    }
+
+    /// Retry connection time (default: 10 sec)
+    pub fn retry_interval(mut self, interval: Duration) -> Self {
+        self.opts.retry_interval = interval;
+        self
+    }
+
+    /// Automatically adjust retry interval based on success/attempts (default: true)
+    pub fn adjust_retry_interval(mut self, adjust_retry_interval: bool) -> Self {
+        self.opts.adjust_retry_interval = adjust_retry_interval;
+        self
+    }
+
+    /// Verify that received events belong to a subscription and match the filter.
+    pub fn verify_subscriptions(mut self, enable: bool) -> Self {
+        self.opts.verify_subscriptions = enable;
+        self
+    }
+
+    /// If true, ban a relay when it sends an event that doesn't match the subscription filter.
+    pub fn ban_relay_on_mismatch(mut self, ban_relay: bool) -> Self {
+        self.opts.ban_relay_on_mismatch = ban_relay;
+        self
+    }
+
+    /// Set custom limits
+    pub fn limits(mut self, limits: RelayLimits) -> Self {
+        self.opts.limits = limits;
+        self
+    }
+
+    /// Set max latency (default: None)
+    ///
+    /// Relay with an avg. latency greater that this value will be skipped.
+    #[inline]
+    pub fn max_avg_latency(mut self, max: Option<Duration>) -> Self {
+        self.opts.max_avg_latency = max;
+        self
+    }
+
+    /// Notification channel size (default: 4096)
+    #[inline]
+    pub fn notification_channel_size(mut self, size: usize) -> Self {
+        self.opts.notification_channel_size = size;
+        self
+    }
+
+    /// Sleep when idle (default: disabled)
+    #[inline]
+    pub fn sleep_when_idle(mut self, config: SleepWhenIdle) -> Self {
+        self.opts.sleep_when_idle = config;
+        self
+    }
+
+    /// Connect to the relay after adding it to the client
+    #[inline]
+    pub fn and_connect(mut self) -> Self {
+        self.connect = true;
+        self
+    }
+
+    /// Set relay options.
+    ///
+    /// **Warning**: this method overrides any previously set options.
+    #[inline]
+    pub fn opts(mut self, opts: RelayOptions) -> Self {
+        self.opts = opts;
+        self
+    }
+}
+
+impl<'client, 'url> IntoFuture for AddRelay<'client, 'url>
+where
+    'url: 'client,
+{
+    type Output = Result<bool, Error>;
+    type IntoFuture = BoxedFuture<'client, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            // Convert into relay URL
+            let url: Cow<RelayUrl> = self.url.try_into_relay_url()?;
+
+            // Add relay to the pool
+            self.client
+                .pool()
+                .add_relay(url, self.capabilities, self.connect, self.opts)
+                .await
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    use super::*;
+    use crate::policy::{AdmitPolicy, AdmitStatus};
+
+    #[derive(Debug)]
+    struct RejectRelayPolicy {
+        rejected_relays: HashSet<RelayUrl>,
+    }
+
+    impl AdmitPolicy for RejectRelayPolicy {
+        fn admit_relay<'a>(
+            &'a self,
+            relay_url: &'a RelayUrl,
+        ) -> BoxedFuture<'a, Result<AdmitStatus, Error>> {
+            Box::pin(async move {
+                if self.rejected_relays.contains(relay_url) {
+                    Ok(AdmitStatus::rejected("relay rejected"))
+                } else {
+                    Ok(AdmitStatus::Success)
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_relay() {
+        let client = Client::default();
+
+        let res = client.add_relay("wss://relay.damus.io").await.unwrap();
+        assert!(res);
+
+        // Try to re-add it
+        let res = client.add_relay("wss://relay.damus.io").await.unwrap();
+        assert!(!res);
+    }
+
+    #[tokio::test]
+    async fn test_add_relay_default_capabilities() {
+        let client = Client::default();
+
+        // Add relay
+        let res = client.add_relay("wss://relay.damus.io").await.unwrap();
+        assert!(res);
+
+        // Verify capabilities
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
+        assert_eq!(
+            relay.capabilities().load(),
+            RelayCapabilities::READ | RelayCapabilities::WRITE
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_relay_with_capability() {
+        let client = Client::default();
+
+        // Add relay with READ capability
+        let res = client
+            .add_relay("wss://relay.damus.io")
+            .capabilities(RelayCapabilities::READ)
+            .await
+            .unwrap();
+        assert!(res);
+
+        // Verify capabilities
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
+        assert_eq!(relay.capabilities().load(), RelayCapabilities::READ);
+
+        // Try to re-add relay with GOSSIP capability
+        let res = client
+            .add_relay("wss://relay.damus.io")
+            .capabilities(RelayCapabilities::GOSSIP)
+            .await
+            .unwrap();
+        assert!(!res); // Already exists, so must return false
+
+        // Verify capabilities
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
+        assert_eq!(
+            relay.capabilities().load(),
+            RelayCapabilities::READ | RelayCapabilities::GOSSIP
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_relay_rejected_by_policy() {
+        let rejected = RelayUrl::parse("wss://relay.damus.io").unwrap();
+        let client = Client::builder()
+            .admit_policy(RejectRelayPolicy {
+                rejected_relays: HashSet::from([rejected.clone()]),
+            })
+            .build();
+
+        let res = client.add_relay(&rejected).await.unwrap();
+        assert!(!res);
+
+        let relay = client.relay(&rejected).await.unwrap();
+        assert!(relay.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_add_relay_with_proxy_all() {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9050));
+        let proxy: Proxy = Proxy::all(addr);
+        let client = Client::builder().proxy(proxy).build();
+
+        client.add_relay("wss://relay.damus.io").await.unwrap();
+        client
+            .add_relay("ws://oxtrdevav64z64yb7x6rjg4ntzqjhedm5b5zjqulugknhzr46ny2qbad.onion")
+            .await
+            .unwrap();
+
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
+        assert_eq!(relay.proxy(), Some(addr));
+
+        let relay = client
+            .relay("ws://oxtrdevav64z64yb7x6rjg4ntzqjhedm5b5zjqulugknhzr46ny2qbad.onion")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(relay.proxy(), Some(addr));
+    }
+
+    #[tokio::test]
+    async fn test_add_relay_with_proxy_onion() {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9050));
+        let proxy: Proxy = Proxy::onion(addr);
+        let client = Client::builder().proxy(proxy).build();
+
+        client.add_relay("wss://relay.damus.io").await.unwrap();
+        client
+            .add_relay("ws://oxtrdevav64z64yb7x6rjg4ntzqjhedm5b5zjqulugknhzr46ny2qbad.onion")
+            .await
+            .unwrap();
+
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
+        assert!(relay.proxy().is_none());
+
+        let relay = client
+            .relay("ws://oxtrdevav64z64yb7x6rjg4ntzqjhedm5b5zjqulugknhzr46ny2qbad.onion")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(relay.proxy(), Some(addr));
+    }
+}

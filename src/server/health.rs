@@ -344,6 +344,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -456,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_endpoint() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         // Start mock relay
         let mock = MockRelay::run().await.unwrap();
@@ -467,6 +468,7 @@ mod tests {
             clearnet: vec![relay_url.to_string()],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -507,7 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ready_endpoint_not_ready() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         // Start mock relay
         let mock = MockRelay::run().await.unwrap();
@@ -518,6 +520,7 @@ mod tests {
             clearnet: vec![relay_url.to_string()],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -562,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_disabled() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -572,6 +575,7 @@ mod tests {
             clearnet: vec![relay_url.to_string()],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -605,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_error_contains_address() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -615,6 +619,7 @@ mod tests {
             clearnet: vec![relay_url.to_string()],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -660,6 +665,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 1,
             connection_timeout_secs: 1,
@@ -707,6 +713,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 1,
             connection_timeout_secs: 1,
@@ -747,7 +754,7 @@ mod tests {
     async fn test_ready_endpoint_ready() {
         use crate::config::ApnsConfig;
         use crate::push::ApnsClient;
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         // Start mock relay
         let mock = MockRelay::run().await.unwrap();
@@ -758,6 +765,7 @@ mod tests {
             clearnet: vec![relay_url.to_string()],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -824,7 +832,7 @@ mod tests {
         use crate::crypto::Platform;
         use crate::push::dispatcher::DELIVERY_FAILURE_STREAK_THRESHOLD;
         use crate::push::{ApnsClient, FcmClient};
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -834,6 +842,7 @@ mod tests {
             clearnet: vec![relay_url.to_string()],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -913,6 +922,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 1,
             connection_timeout_secs: 1,
@@ -971,6 +981,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -1019,6 +1030,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 1,
             connection_timeout_secs: 1,
@@ -1041,7 +1053,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_body_limit_rejects_oversized_bodies() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -1051,6 +1063,7 @@ mod tests {
             clearnet: vec![relay_url.to_string()],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
