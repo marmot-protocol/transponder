@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.2.1 - 2026-10-13
+
+### Added
+
+- Added `relays.tor_data_dir` / `TRANSPONDER_RELAYS_TOR_DATA_DIR` to select a private writable root for Arti's network cache and state. Read-only containers must mount a writable directory owned by the runtime user; keeping this state across restarts preserves Tor guard selection.
+
+### Changed
+
+- Migrated to `nostr-sdk` 0.45.4 and `nostr` 0.45.5 while retaining optional embedded Tor support through a direct Arti 0.47 transport ([#401](https://github.com/marmot-protocol/transponder/pull/401)). Onion connections share a lazily initialized Tor client and wait for bootstrap; failed onion connections never fall back to ClearNet. Build with `--features tor` to enable Tor. Marmot Push v1 wire compatibility is unchanged.
+- Vendored a narrowly patched Nostr SDK snapshot to expose its fallible notification receiver, preserving detection and recovery when relay notifications overflow.
+- Raised the minimum supported Rust version to 1.95 and updated the Docker builder accordingly ([#392](https://github.com/marmot-protocol/transponder/pull/392)).
+- Retired maintenance of the historical MIP-05 line. Existing MIP-05 services and clients should migrate to `marmot-push-v1`; the historical branch and immutable release remain available for reference ([#393](https://github.com/marmot-protocol/transponder/pull/393)).
+
+### Fixed
+
+- Re-subscribe live gift-wrap notifications on relays that require NIP-42 authentication, with relay-local recovery, duplicate-close suppression, and bounded retry backoff ([#387](https://github.com/marmot-protocol/transponder/pull/387)).
+- Reuse still-valid provider credentials after transient proactive refresh failures, and scale refresh margins to short credential lifetimes ([#394](https://github.com/marmot-protocol/transponder/pull/394), [#395](https://github.com/marmot-protocol/transponder/pull/395)).
+- Preserve configured relay lists when environment overrides contain only empty entries ([#396](https://github.com/marmot-protocol/transponder/pull/396)).
+- Preserve file-configured GlitchTip DSNs in Docker Compose unless an explicit environment override is supplied; an explicit blank override disables reporting ([#398](https://github.com/marmot-protocol/transponder/pull/398)).
+- Bound configured rates to limit admitted-hit storage growth and clarify shared global rate-limit sizing ([#399](https://github.com/marmot-protocol/transponder/pull/399)).
+- Keep push-task panic metrics and capacity gauges accurate when a task unwinds ([#400](https://github.com/marmot-protocol/transponder/pull/400)).
+- Pass the Docker Tor build argument into the builder stage, preserving Tor-enabled image builds ([#401](https://github.com/marmot-protocol/transponder/pull/401)).
+- Allow coverage checks on fork pull requests to succeed without permission to post a PR comment ([#391](https://github.com/marmot-protocol/transponder/pull/391)).
+
+### Security
+
+- Updated Nostr, TLS, and cache dependencies to address security advisories and restored the dependency audit gate ([#390](https://github.com/marmot-protocol/transponder/pull/390), [#393](https://github.com/marmot-protocol/transponder/pull/393), [#401](https://github.com/marmot-protocol/transponder/pull/401)).
+- Preserve relay URL redaction beside bearer credentials in outgoing error reports ([#397](https://github.com/marmot-protocol/transponder/pull/397)).
+
 ## 0.2.0 - 2026-07-26
 
 ### Added

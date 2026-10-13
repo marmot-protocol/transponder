@@ -1,6 +1,6 @@
 [package]
 name = "transponder"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Privacy-preserving push notification server implementing Marmot Push v1"
