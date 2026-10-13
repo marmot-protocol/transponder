@@ -147,9 +147,11 @@ pub struct ServerConfig {
     /// This caps key cardinality, not total timestamp storage. Each tracked key
     /// can retain up to `per_hour` admitted-hit records; the minute count is
     /// derived from that same deque. With the defaults, worst-case storage is
-    /// roughly 500,000,000 `(Instant, u64)` records per limiter (about 12 GB at
-    /// 24 bytes per record before deque/map overhead), and Transponder creates
-    /// two such limiters.
+    /// conservatively 500,000,000 `(Instant, u64)` records per limiter (about
+    /// 12 GB at 24 bytes per record before deque/map overhead), and Transponder
+    /// creates two such limiters. The tighter per-key bound is
+    /// `min(per_hour, 60 * per_minute)`. Global crypto admission also constrains
+    /// traffic; see the README for the aggregate model and its limitations.
     ///
     /// Unknown keys are rate limited at capacity until cleanup removes stale
     /// entries. Default: 100,000 entries per cache.
@@ -166,26 +168,26 @@ pub struct ServerConfig {
     /// Maximum notifications per encrypted token per minute.
     ///
     /// Rate limits identical encrypted blobs to prevent replay attacks.
-    /// Default: 240 (4 per second).
+    /// Allowed: 1..=1,000. Default: 240 (4 per second).
     #[serde(default = "default_rate_limit_per_minute")]
     pub encrypted_token_rate_limit_per_minute: u32,
 
     /// Maximum notifications per encrypted token per hour.
     ///
-    /// Default: 5,000.
+    /// Allowed: 1..=10,000. Default: 5,000.
     #[serde(default = "default_rate_limit_per_hour")]
     pub encrypted_token_rate_limit_per_hour: u32,
 
     /// Maximum notifications per device token per minute.
     ///
     /// Rate limits notifications to the same device to prevent spam.
-    /// Default: 240 (4 per second).
+    /// Allowed: 1..=1,000. Default: 240 (4 per second).
     #[serde(default = "default_rate_limit_per_minute")]
     pub device_token_rate_limit_per_minute: u32,
 
     /// Maximum notifications per device token per hour.
     ///
-    /// Default: 5,000.
+    /// Allowed: 1..=10,000. Default: 5,000.
     #[serde(default = "default_rate_limit_per_hour")]
     pub device_token_rate_limit_per_hour: u32,
 
@@ -199,18 +201,19 @@ pub struct ServerConfig {
     #[serde(default = "default_max_concurrent_event_processing")]
     pub max_concurrent_event_processing: usize,
 
-    /// Global maximum gift-wrap unwraps (ECDH) per minute, across all senders.
+    /// Global maximum gift-wrap unwraps plus token decrypts per minute.
     ///
     /// Cheap admission control checked BEFORE the gift-wrap unwrap. The server
     /// pubkey is public and gift wraps are sender-anonymous, so this global
-    /// throttle sheds floods before spending asymmetric-crypto cycles.
-    /// Default: 600 (10 per second).
+    /// throttle sheds floods before spending asymmetric-crypto cycles. Each
+    /// token decrypt also charges this shared budget.
+    /// Allowed: 1..=10,000. Default: 600 (10 per second).
     #[serde(default = "default_global_unwrap_rate_limit_per_minute")]
     pub global_unwrap_rate_limit_per_minute: u32,
 
-    /// Global maximum gift-wrap unwraps (ECDH) per hour, across all senders.
+    /// Global maximum gift-wrap unwraps plus token decrypts per hour.
     ///
-    /// Default: 30,000.
+    /// Allowed: 1..=100,000. Default: 30,000.
     #[serde(default = "default_global_unwrap_rate_limit_per_hour")]
     pub global_unwrap_rate_limit_per_hour: u32,
 }
@@ -311,6 +314,14 @@ pub struct RelayConfig {
 /// the process, so anything larger is rejected at load time.
 const MAX_RELAY_DURATION_SECS: u64 = 300;
 const MAX_CACHE_ENTRIES: usize = 1_000_000;
+
+/// Token ceilings allow bursts above the defaults while bounding each key's
+/// admitted-hit deque. Global ceilings allow larger aggregate server traffic
+/// but bound the single shared crypto-admission deque as well.
+const MAX_TOKEN_RATE_PER_MINUTE: u32 = 1_000;
+const MAX_TOKEN_RATE_PER_HOUR: u32 = 10_000;
+const MAX_GLOBAL_RATE_PER_MINUTE: u32 = 10_000;
+const MAX_GLOBAL_RATE_PER_HOUR: u32 = 100_000;
 
 /// Upper bound for [`ServerConfig::max_concurrent_event_processing`].
 ///
@@ -1050,7 +1061,8 @@ impl AppConfig {
 }
 
 impl ServerConfig {
-    /// Rejects rate-limit count fields, the cache sizes, and
+    /// Rejects rate-limit counts above their policy ceilings and rejects
+    /// rate-limit count fields, the cache sizes, and
     /// `max_tokens_per_event` set to `0`, `shutdown_timeout_secs` set to `0`,
     /// `max_concurrent_event_processing` set to `0`,
     /// `max_concurrent_event_processing` above [`MAX_CONCURRENT_EVENT_PROCESSING`],
@@ -1123,6 +1135,45 @@ impl ServerConfig {
             if value == 0 {
                 return Err(config::ConfigError::Message(format!(
                     "{field} must be greater than 0"
+                )));
+            }
+        }
+
+        for (field, value, maximum) in [
+            (
+                "server.encrypted_token_rate_limit_per_minute",
+                self.encrypted_token_rate_limit_per_minute,
+                MAX_TOKEN_RATE_PER_MINUTE,
+            ),
+            (
+                "server.encrypted_token_rate_limit_per_hour",
+                self.encrypted_token_rate_limit_per_hour,
+                MAX_TOKEN_RATE_PER_HOUR,
+            ),
+            (
+                "server.device_token_rate_limit_per_minute",
+                self.device_token_rate_limit_per_minute,
+                MAX_TOKEN_RATE_PER_MINUTE,
+            ),
+            (
+                "server.device_token_rate_limit_per_hour",
+                self.device_token_rate_limit_per_hour,
+                MAX_TOKEN_RATE_PER_HOUR,
+            ),
+            (
+                "server.global_unwrap_rate_limit_per_minute",
+                self.global_unwrap_rate_limit_per_minute,
+                MAX_GLOBAL_RATE_PER_MINUTE,
+            ),
+            (
+                "server.global_unwrap_rate_limit_per_hour",
+                self.global_unwrap_rate_limit_per_hour,
+                MAX_GLOBAL_RATE_PER_HOUR,
+            ),
+        ] {
+            if value > maximum {
+                return Err(config::ConfigError::Message(format!(
+                    "{field} must be at most {maximum}"
                 )));
             }
         }
@@ -2594,6 +2645,86 @@ mod tests {
         assert_eq!(config.server.max_concurrent_event_processing, 16);
         assert_eq!(config.server.global_unwrap_rate_limit_per_minute, 120);
         assert_eq!(config.server.global_unwrap_rate_limit_per_hour, 7200);
+    }
+
+    // Policy boundaries are literal here so a change to a validation constant
+    // cannot silently weaken the regression contract.
+    const RATE_COUNT_BOUNDARIES: &[(&str, u32)] = &[
+        ("encrypted_token_rate_limit_per_minute", 1_000),
+        ("encrypted_token_rate_limit_per_hour", 10_000),
+        ("device_token_rate_limit_per_minute", 1_000),
+        ("device_token_rate_limit_per_hour", 10_000),
+        ("global_unwrap_rate_limit_per_minute", 10_000),
+        ("global_unwrap_rate_limit_per_hour", 100_000),
+    ];
+
+    #[test]
+    fn test_rate_count_upper_bounds_rejected_from_file() {
+        for (field, cap) in RATE_COUNT_BOUNDARIES {
+            for value in [cap + 1, u32::MAX] {
+                let file = create_temp_config(&format!("[server]\n{field} = {value}\n"));
+                let error = load_with_test_env(file.path(), &[]).unwrap_err();
+                let message = error.to_string();
+                assert!(message.contains(&format!("server.{field}")), "{message}");
+                assert!(
+                    message.contains(&format!("must be at most {cap}")),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_count_upper_bounds_rejected_from_env() {
+        for (field, cap) in RATE_COUNT_BOUNDARIES {
+            for value in [cap + 1, u32::MAX] {
+                let key = format!("TRANSPONDER_SERVER_{}", field.to_ascii_uppercase());
+                let value = value.to_string();
+                let error = from_test_env(&[(&key, &value)]).unwrap_err();
+                let message = error.to_string();
+                assert!(message.contains(&format!("server.{field}")), "{message}");
+                assert!(
+                    message.contains(&format!("must be at most {cap}")),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    fn rate_count(config: &ServerConfig, field: &str) -> u32 {
+        match field {
+            "encrypted_token_rate_limit_per_minute" => config.encrypted_token_rate_limit_per_minute,
+            "encrypted_token_rate_limit_per_hour" => config.encrypted_token_rate_limit_per_hour,
+            "device_token_rate_limit_per_minute" => config.device_token_rate_limit_per_minute,
+            "device_token_rate_limit_per_hour" => config.device_token_rate_limit_per_hour,
+            "global_unwrap_rate_limit_per_minute" => config.global_unwrap_rate_limit_per_minute,
+            "global_unwrap_rate_limit_per_hour" => config.global_unwrap_rate_limit_per_hour,
+            _ => panic!("unknown rate-count test field"),
+        }
+    }
+
+    #[test]
+    fn test_rate_count_boundaries_accepted_from_file_and_env() {
+        assert!(from_test_env(&[]).is_ok());
+        for (field, cap) in RATE_COUNT_BOUNDARIES {
+            for value in [1, *cap] {
+                let file = create_temp_config(&format!("[server]\n{field} = {value}\n"));
+                let config = load_with_test_env(file.path(), &[]).unwrap();
+                assert_eq!(rate_count(&config.server, field), value);
+                let key = format!("TRANSPONDER_SERVER_{}", field.to_ascii_uppercase());
+                let value_string = value.to_string();
+                let config = from_test_env(&[(&key, &value_string)]).unwrap();
+                assert_eq!(rate_count(&config.server, field), value);
+            }
+        }
+        // All maxima may be used together; no hidden ordering constraint.
+        let content = RATE_COUNT_BOUNDARIES
+            .iter()
+            .fold("[server]\n".to_string(), |content, (field, cap)| {
+                format!("{content}{field} = {cap}\n")
+            });
+        let file = create_temp_config(&content);
+        assert!(load_with_test_env(file.path(), &[]).is_ok());
     }
 
     /// Server config fields that must reject a `0` value at load time, paired

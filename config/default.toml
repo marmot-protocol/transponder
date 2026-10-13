@@ -36,10 +36,14 @@ shutdown_timeout_secs = 10
 # dedup_retention_secs = 300
 
 # Maximum tracked keys for each rate limit cache (encrypted_token and device_token).
-# This caps key count, not timestamp storage: worst-case timestamps per limiter
-# are max_rate_limit_cache_size * (per_minute + per_hour), or ~524M Instant
-# values with the defaults (~8.4 GB at 16 B/timestamp before overhead).
-# Transponder has two such limiters.
+# Each key retains at most min(per_hour, 60 * per_minute) (Instant, u64)
+# records in one deque shared by both windows. A conservative aggregate bound
+# is K * (E + D) + G records, where K is this cache size and E/D/G are the
+# encrypted-token/device-token/global per-key bounds. With defaults this is
+# ~1 billion records (~24 GB at 24 B/record before spare capacity/map overhead).
+# Growth depends on admitted traffic; global admission charges both unwrap and
+# each token decrypt, so 32-chunk fan-out does not bypass its budget. See the
+# README for policy ceilings and memory sizing; this is not preallocated.
 # Large caches are sharded for lock locality. At shard capacity, new keys evict
 # stale or below-limit entries from their routed shard when possible. If no safe
 # same-shard eviction candidate exists, the new key is rate limited even if
@@ -60,19 +64,23 @@ shutdown_timeout_secs = 10
 # Rate limit: max notifications per encrypted token per minute.
 # Limits identical encrypted blobs to prevent replay attacks.
 # Default: 240 (4 per second)
+# Allowed: 1..=1000; larger overrides are rejected at startup.
 # encrypted_token_rate_limit_per_minute = 240
 
 # Rate limit: max notifications per encrypted token per hour.
 # Default: 5000
+# Allowed: 1..=10000; larger overrides are rejected at startup.
 # encrypted_token_rate_limit_per_hour = 5000
 
 # Rate limit: max notifications per device token per minute.
 # Limits notifications to the same device to prevent spam.
 # Default: 240 (4 per second)
+# Allowed: 1..=1000; larger overrides are rejected at startup.
 # device_token_rate_limit_per_minute = 240
 
 # Rate limit: max notifications per device token per hour.
 # Default: 5000
+# Allowed: 1..=10000; larger overrides are rejected at startup.
 # device_token_rate_limit_per_hour = 5000
 
 # Maximum number of events processed concurrently.
@@ -83,16 +91,19 @@ shutdown_timeout_secs = 10
 # Default: 64
 # max_concurrent_event_processing = 64
 
-# Global pre-unwrap admission control (CPU-exhaustion DoS protection).
+# Global crypto admission control (CPU-exhaustion DoS protection).
 # Checked BEFORE the gift-wrap unwrap (ECDH), across ALL senders, using a single
 # global budget. The server pubkey is public and gift wraps are sender-anonymous,
 # so a cheap global throttle sheds floods before spending asymmetric-crypto
-# cycles. Set well above legitimate single-server load.
+# cycles. Each token decrypt charges the same budget once more.
+# Set well above legitimate single-server load.
 # Default: 600 (10 per second)
+# Allowed: 1..=10000; larger overrides are rejected at startup.
 # global_unwrap_rate_limit_per_minute = 600
 
-# Global pre-unwrap admission control: max unwraps per hour across all senders.
+# Global crypto admission control: max unwraps + token decrypts per hour.
 # Default: 30000
+# Allowed: 1..=100000; larger overrides are rejected at startup.
 # global_unwrap_rate_limit_per_hour = 30000
 
 [relays]

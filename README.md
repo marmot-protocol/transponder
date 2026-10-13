@@ -205,14 +205,41 @@ environment = "production"
 # traces_sample_rate = 0.0   # 0.0..=1.0; 0.0 = errors only (recommended)
 ```
 
-Rate-limit memory scales with admitted hits, not just tracked keys. Each active
-key can retain up to `per_minute + per_hour` `Instant` timestamps for precise
-sliding-window enforcement. Worst-case timestamp storage is therefore
-`max_rate_limit_cache_size × (per_minute + per_hour)` per limiter: with the
-defaults, `100000 × (240 + 5000) ≈ 524M` timestamps for the encrypted-token
-limiter (about 8.4 GB at 16 bytes per timestamp, before `VecDeque` overhead),
-and the same bound again for the device-token limiter. Lower
-`max_rate_limit_cache_size` on memory-constrained deployments.
+Rate-count settings are validated before the limiters are constructed:
+
+| Settings | Minimum | Maximum | Defaults |
+| --- | ---: | ---: | ---: |
+| `encrypted_token_rate_limit_per_minute`, `device_token_rate_limit_per_minute` | 1 | 1,000 | 240 |
+| `encrypted_token_rate_limit_per_hour`, `device_token_rate_limit_per_hour` | 1 | 10,000 | 5,000 |
+| `global_unwrap_rate_limit_per_minute` | 1 | 10,000 | 600 |
+| `global_unwrap_rate_limit_per_hour` | 1 | 100,000 | 30,000 |
+
+The token ceilings allow roughly four times the default minute burst and twice
+its hourly volume. The larger global ceilings leave room for aggregate server
+traffic. TOML and environment overrides above these ceilings fail at startup
+with the offending field's name.
+
+Rate-limit memory scales with admitted hits, not just tracked keys. Each key
+uses one deque of `(Instant, u64)` records for both sliding windows. Its retained
+record count is bounded by `min(per_hour, 60 × per_minute)`; the minute window
+does not allocate a second deque. Let `K = max_rate_limit_cache_size`, and let
+`E`, `D`, and `G` be that record bound for the encrypted-token, device-token,
+and global limiters. A conservative aggregate bound is `K × (E + D) + G` records.
+With defaults this is `100000 × (5000 + 5000) + 30000`, about 24 GB at 24 bytes
+per record before spare deque capacity and map/allocator overhead. At all
+allowed maxima, including the 1,000,000-key ceiling, the bound is
+20,000,100,000 records (about 480 GB before overhead). These policy limits bound
+record growth; they do not promise a small fixed byte budget or preallocate
+this storage. Lower cache sizes and rates on memory-constrained deployments.
+
+Actual growth requires admitted traffic and is also constrained by global
+minute/hour admission. The global budget charges once before gift-wrap unwrap
+and once per token decrypt, so the maximum 32 chunks per trigger cannot amplify
+one global charge into 32 retained hits in each token limiter. Successful token
+admission can retain a hit in **both** token limiters; rejected downstream
+admission refunds reservations. The conservative formula above does not assume
+all keys can be saturated under the global budget: stale records awaiting
+cleanup and deque capacity retained after pruning also affect allocated memory.
 
 `max_rate_limit_cache_size` is an aggregate key budget per limiter. Large
 caches are sharded for lock locality, and a new key can be rejected when its

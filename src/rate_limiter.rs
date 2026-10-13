@@ -265,15 +265,18 @@ impl Default for RateLimitConfig {
 ///
 /// Each active entry stores admitted request hit records for true
 /// sliding-window enforcement, so memory scales with the number of admitted hits
-/// per key. With the defaults, a hot key can hold up to roughly 5,240 records
-/// across the minute and hour windows before older hits are pruned.
+/// per key. With the defaults, a hot key can hold up to 5,000 records in the
+/// shared minute/hour deque before older hits are pruned.
 ///
-/// The aggregate memory bound is the per-key bound multiplied by the configured
-/// cache size: `max_entries * max_per_hour` hit records per limiter. With the
-/// default 100,000-key cache and 5,000/hour limit, one fully saturated limiter
-/// can retain roughly 500,000,000 `(Instant, u64)` records (about 12 GB at 24
-/// bytes per record, before deque/map overhead). Production owns two such
-/// limiters, so size `max_entries` and host memory for both caches.
+/// The conservative retained-record bound per limiter is
+/// `max_entries * min(max_per_hour, 60 * max_per_minute)`: the minute count
+/// shares the hour deque. With the default 100,000-key cache and 5,000/hour
+/// limit, one limiter can retain at most 500,000,000 `(Instant, u64)` records
+/// (about 12 GB at 24 bytes per record before spare deque capacity/map overhead).
+/// Production owns two token limiters plus a one-key global crypto limiter.
+/// Config validation caps all six rates. Actual growth also depends on global
+/// admission, which charges both unwraps and token decrypts; see the README
+/// for the aggregate model rather than treating key count as a byte budget.
 ///
 /// Uses a bounded, striped cache to limit tracked key cardinality. The
 /// configured `max_entries` is a hard aggregate budget divided across stripes,
