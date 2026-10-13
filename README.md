@@ -495,6 +495,7 @@ Under cache pressure, below-limit keys may be evicted to admit new keys. That re
 | `transponder_push_dispatched_total` | Counter | `platform` | Notifications dispatched to push services |
 | `transponder_push_success_total` | Counter | `platform` | Successful push notifications |
 | `transponder_push_failed_total` | Counter | `platform`, `reason` | Failed push notifications |
+| `transponder_push_send_task_panicked_total` | Counter | - | Push send tasks that panicked; aggregate only, with panic reporting handled by the existing global hook |
 | `transponder_push_queue_size` | Gauge | - | Current push queue size |
 | `transponder_push_queue_capacity` | Gauge | - | Maximum number of notifications the push queue can hold |
 | `transponder_push_semaphore_available` | Gauge | - | Available concurrent push permits |
