@@ -3,10 +3,9 @@
 //! Single source of truth for serde defaults in [`crate::config`] and for
 //! runtime components that share the same tuning knobs.
 
-use nostr_sdk::prelude::nip59;
-
 /// Maximum NIP-59 timestamp randomization window for gift wraps (seconds).
-pub const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = nip59::RANGE_RANDOM_TIMESTAMP_TWEAK.end;
+/// NIP-59 specifies up to two days; the SDK 0.45 implementation constant is private.
+pub const NIP59_TIMESTAMP_TWEAK_WINDOW_SECS: u64 = 48 * 60 * 60;
 
 // === Rate limiting ===
 

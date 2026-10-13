@@ -154,7 +154,8 @@ src/
 
 | Crate | Purpose |
 |-------|---------|
-| `nostr-sdk` | Nostr protocol client with built-in Tor support via arti |
+| `nostr-sdk` | Nostr protocol client; optional direct Arti transport is owned by Transponder |
+| `arti-client`, `tor-rtcompat` | Optional embedded Tor runtime for onion relay connections |
 | `chacha20poly1305` | ChaCha20-Poly1305 AEAD encryption |
 | `hmac`, `sha2` | HKDF-SHA256 key derivation (manual extract/expand so the PRK is zeroizable; `hkdf` remains a dev-dependency for the test-vector encryption side) |
 | `secp256k1` | ECDH key agreement |

@@ -49,7 +49,9 @@ cp config/default.toml config/local.toml
 ./target/release/transponder --config config/local.toml
 ```
 
-Tor relay support is disabled in the default build. If you need `.onion` relays, build and run with `--features tor`.
+Tor relay support is disabled in the default build. If you need `.onion` relays, build and run with `--features tor`. The server embeds Arti directly: no Tor daemon or SOCKS proxy is needed. ClearNet relays and APNs/FCM requests keep their existing transport.
+
+Configure `relays.tor_data_dir` (or `TRANSPONDER_RELAYS_TOR_DATA_DIR`) to choose a private writable root for Arti's `cache` and `state` directories; an empty value uses Arti's platform defaults. Arti stores Tor network state there, never notification data. Keep the state across restarts to preserve Tor guard selection. In read-only containers, mount a dedicated directory owned by UID/GID `65532:65532` with mode `0700`, for example at `/var/lib/transponder/tor`, and set the configuration to that path. A cold Tor bootstrap can take longer than a normal relay handshake; onion-only deployments may need to increase `relays.connection_timeout_secs` (up to 300).
 
 ## Configuration
 
@@ -449,7 +451,7 @@ or directly:
 cargo audit
 ```
 
-`just audit` uses the repository audit policy for the optional Tor dependency tree. The default build does not enable Tor, and the remaining ignored advisories are upstream in that optional graph. Use `just audit-strict` if you want the raw unfiltered report.
+`just audit` uses the repository audit policy for the optional Arti dependency tree. The default build does not enable Tor. Use `just audit-strict` for the raw unfiltered report. SDK 0.45.4 is vendored with one additive receiver API so dropped notification ranges remain visible and live subscriptions can recover after overflow; see `vendor/nostr-sdk/TRANSPONDER-PATCH.md`.
 
 ## Health Checks
 
@@ -673,6 +675,10 @@ cargo test
 
 # Run the optional Tor relay build
 cargo test --features tor
+
+# Optional: verify an operator-supplied live onion relay (needs Tor connectivity)
+TRANSPONDER_TEST_ONION_RELAY="ws://your-relay.onion" \
+  cargo test --features tor --test tor_smoke -- --ignored
 
 # Run with verbose Transponder logging without dependency debug chatter
 RUST_LOG=info,transponder=debug,nostr_relay_pool=info,reqwest=warn,hyper_util=warn,h2=warn cargo run -- --config config/local.toml

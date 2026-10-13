@@ -8,7 +8,7 @@ license = "MIT"
 
 [features]
 default = []
-tor = ["nostr-sdk/tor"]
+tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:async-wsocket", "dep:tokio-tungstenite", "dep:futures"]
 
 [dependencies]
 # Async runtime
@@ -18,7 +18,15 @@ tokio = { version = "1.49", features = ["full", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Nostr
-nostr-sdk = { version = "0.44", default-features = false, features = ["nip59"] }
+nostr-sdk = { version = "=0.45.4", default-features = false, features = ["ring", "rustls-tls-webpki-roots"] }
+nostr = { version = "0.45.5", features = ["nip59"] }
+
+# Optional embedded Tor transport. Keep the runtime and TLS backend explicit.
+arti-client = { version = "0.47", optional = true, default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "static-sqlite"] }
+tor-rtcompat = { version = "0.47", optional = true, default-features = false, features = ["tokio", "rustls"] }
+async-wsocket = { version = "0.17", optional = true, default-features = false }
+tokio-tungstenite = { version = "0.28", optional = true, default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+futures = { version = "0.3", optional = true }
 
 # Cryptography
 chacha20poly1305 = "0.10.1"
@@ -115,6 +123,10 @@ rand = "0.9"
 hkdf = "0.12.4"
 tokio-test = "0.4.5"
 tempfile = "3"
-nostr-relay-builder = "0.44"
+nostr-sdk = { version = "=0.45.4", default-features = false, features = ["local-relay"] }
 getrandom = "0.3"
 wiremock = "0.6"
+
+# Preserve loss reporting until upstream exposes a fallible notification API.
+[patch.crates-io]
+nostr-sdk = { path = "vendor/nostr-sdk" }

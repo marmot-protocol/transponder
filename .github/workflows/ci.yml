@@ -137,6 +137,9 @@ jobs:
       - name: Check with tor feature
         run: cargo check --all-targets --features tor
 
+      - name: Lint with tor feature
+        run: cargo clippy --all-targets --features tor -- -D warnings
+
       - name: Run tests with tor feature
         run: cargo test --all-targets --features tor
 

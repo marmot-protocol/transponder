@@ -20,7 +20,8 @@ use crate::metrics::Metrics;
 use crate::shutdown::ShutdownTrigger;
 
 // Type alias to avoid confusion with our RelayStatus
-use nostr_sdk::RelayStatus as NostrRelayStatus;
+use nostr_sdk::relay::RelayStatus as NostrRelayStatus;
+type BoxedFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 #[cfg(feature = "tor")]
 const TOR_FEATURE_ENABLED: bool = true;
@@ -278,7 +279,7 @@ impl AdmitPolicy for ReconnectAttemptLimiter {
     fn admit_connection<'a>(
         &'a self,
         relay_url: &'a RelayUrl,
-    ) -> BoxedFuture<'a, std::result::Result<AdmitStatus, PolicyError>> {
+    ) -> BoxedFuture<'a, std::result::Result<AdmitStatus, nostr_sdk::error::Error>> {
         Box::pin(future::ready(Ok(self.admit_relay_connection(relay_url))))
     }
 }
@@ -309,7 +310,9 @@ where
     for (relay_url, status) in relays {
         match status {
             NostrRelayStatus::Connected => limiter.reset(&relay_url),
-            NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
+            NostrRelayStatus::Shutdown
+            | NostrRelayStatus::Terminated
+            | NostrRelayStatus::Banned => {
                 limiter.remove(&relay_url);
             }
             NostrRelayStatus::Initialized
@@ -365,7 +368,7 @@ async fn install_live_gift_wrap_subscription(
     }
     messages.push(ClientMessage::req(subscription_id.clone(), filter));
 
-    let output = match client.batch_msg_to([relay_url.clone()], messages).await {
+    let output = match send_live_subscription_messages(client, &relay_url, messages).await {
         Ok(output) => output,
         Err(error) => {
             subscriptions
@@ -377,7 +380,7 @@ async fn install_live_gift_wrap_subscription(
         }
     };
 
-    if output.success.contains(&relay_url) {
+    if output.success.contains_key(&relay_url) {
         return Ok(());
     }
 
@@ -392,6 +395,23 @@ async fn install_live_gift_wrap_subscription(
     Err(Error::Nostr(format!(
         "Failed to send live subscription: {reason}"
     )))
+}
+
+async fn send_live_subscription_messages(
+    client: &Client,
+    relay_url: &RelayUrl,
+    messages: Vec<ClientMessage<'_>>,
+) -> std::result::Result<nostr_sdk::client::Output<()>, nostr_sdk::error::Error> {
+    // CLOSE must precede REQ; abort and restore state if either send fails.
+    let mut last = None;
+    for message in messages {
+        let output = client.send_msg(message).to([relay_url]).await?;
+        if !output.success.contains_key(relay_url) {
+            return Ok(output);
+        }
+        last = Some(output);
+    }
+    Ok(last.expect("live subscription installation always sends REQ"))
 }
 
 async fn install_for_connected_relays(
@@ -470,7 +490,8 @@ async fn run_live_subscription_monitor(
                     | NostrRelayStatus::Disconnected
                     | NostrRelayStatus::Sleeping
                     | NostrRelayStatus::Terminated
-                    | NostrRelayStatus::Banned => {
+                    | NostrRelayStatus::Banned
+                    | NostrRelayStatus::Shutdown => {
                         subscriptions.invalidate(&relay_url).await;
                     }
                 },
@@ -511,7 +532,9 @@ async fn run_reconnect_attempt_monitor(
         match notifications.recv().await {
             Ok(MonitorNotification::StatusChanged { relay_url, status }) => match status {
                 NostrRelayStatus::Connected => limiter.reset(&relay_url),
-                NostrRelayStatus::Terminated | NostrRelayStatus::Banned => {
+                NostrRelayStatus::Shutdown
+                | NostrRelayStatus::Terminated
+                | NostrRelayStatus::Banned => {
                     limiter.remove(&relay_url);
                 }
                 NostrRelayStatus::Initialized
@@ -532,21 +555,10 @@ async fn run_reconnect_attempt_monitor(
     }
 }
 
-fn relay_options_for_config(config: &RelayConfig, kind: RelayKind) -> RelayOptions {
-    let opts =
-        RelayOptions::default().retry_interval(Duration::from_secs(config.reconnect_interval_secs));
-
-    #[cfg(feature = "tor")]
-    {
-        if matches!(kind, RelayKind::Onion) {
-            return opts.connection_mode(ConnectionMode::tor());
-        }
-    }
-
-    #[cfg(not(feature = "tor"))]
-    let _ = kind;
-
-    opts
+fn relay_options_for_config(config: &RelayConfig, _kind: RelayKind) -> RelayOptions {
+    RelayOptions::default()
+        .retry_interval(Duration::from_secs(config.reconnect_interval_secs))
+        .connect_timeout(Duration::from_secs(config.connection_timeout_secs))
 }
 
 /// Status of relay connections.
@@ -587,6 +599,9 @@ fn classify_relay_kind(url: &RelayUrl, origins: &BTreeMap<RelayUrl, RelayKind>) 
 /// Nostr relay client with support for ClearNet and optional Tor relays.
 pub struct RelayClient {
     client: Client,
+    keys: Keys,
+    #[cfg(feature = "tor")]
+    tor_transport: Option<Arc<super::tor_transport::TorTransport>>,
     config: RelayConfig,
     monitor: Monitor,
     status: Arc<RwLock<RelayStatus>>,
@@ -634,11 +649,27 @@ impl RelayClient {
         let relay_monitor = Monitor::new(RELAY_MONITOR_CHANNEL_SIZE);
         let shutting_down = Arc::new(AtomicBool::new(false));
 
-        let client = Client::builder()
-            .signer(keys)
+        let client_builder = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
             .admit_policy(reconnect_attempt_limiter.clone())
             .monitor(relay_monitor.clone())
-            .build();
+            .connect_timeout(Duration::from_secs(config.connection_timeout_secs));
+        #[cfg(feature = "tor")]
+        let tor_transport = if config.onion.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                super::tor_transport::TorTransport::new(&config)
+                    .map_err(|_| Error::Nostr("Failed to configure embedded Tor".into()))?,
+            ))
+        };
+        #[cfg(feature = "tor")]
+        let client_builder = if let Some(transport) = &tor_transport {
+            client_builder.websocket_transport(transport.clone())
+        } else {
+            client_builder
+        };
+        let client = client_builder.build();
         spawn_reconnect_attempt_monitor(
             relay_monitor.clone(),
             reconnect_attempt_limiter.clone(),
@@ -654,6 +685,9 @@ impl RelayClient {
 
         Ok(Self {
             client,
+            keys,
+            #[cfg(feature = "tor")]
+            tor_transport,
             config,
             monitor: relay_monitor,
             status: Arc::new(RwLock::new(RelayStatus {
@@ -819,8 +853,8 @@ impl RelayClient {
     }
 
     /// Get the event stream for handling incoming events.
-    pub fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification> {
-        self.client.notifications()
+    pub fn notifications(&self) -> broadcast::Receiver<ClientNotification> {
+        self.client.notification_receiver()
     }
 
     /// Recompute the relay connection status and publish it.
@@ -880,6 +914,10 @@ impl RelayClient {
     /// Disconnect from all relays.
     pub async fn disconnect(&self) -> Result<()> {
         self.shutting_down.store(true, Ordering::SeqCst);
+        #[cfg(feature = "tor")]
+        if let Some(transport) = &self.tor_transport {
+            transport.shutdown();
+        }
         info!("Disconnecting from all relays");
         self.client.disconnect().await;
         Ok(())
@@ -892,8 +930,8 @@ impl RelayClient {
     ) -> std::result::Result<bool, String> {
         let added = self
             .client
-            .pool()
-            .add_relay(url, relay_options_for_config(&self.config, kind))
+            .add_relay(url)
+            .opts(relay_options_for_config(&self.config, kind))
             .await
             .map_err(|e| e.to_string())?;
 
@@ -938,11 +976,14 @@ impl RelayClient {
 
         let relay_tags: Vec<Tag> = relay_urls
             .iter()
-            .map(|url| Tag::custom(TagKind::Relay, [url.as_str()]))
+            .map(|url| Tag::parse(["r", url.as_str()]).expect("relay tag has a name"))
             .collect();
         let builder = EventBuilder::new(Kind::Custom(10050), "").tags(relay_tags);
 
-        match self.client.send_event_builder(builder).await {
+        let event = builder
+            .finalize(&self.keys)
+            .map_err(|_| Error::Nostr("Failed to sign inbox relay list".into()))?;
+        match self.client.send_event(&event).await {
             Ok(output) if !output.success.is_empty() => {
                 debug!(event_id = %output.id(), "Published kind 10050 inbox relay list");
                 info!("Published kind 10050 inbox relay list");
@@ -982,11 +1023,7 @@ impl RelayClient {
     }
 
     async fn inbox_relay_event_is_current(&self, relay_urls: &BTreeSet<String>) -> Result<bool> {
-        let public_key = self
-            .client
-            .public_key()
-            .await
-            .map_err(|e| Error::Nostr(format!("Failed to get signer public key: {e}")))?;
+        let public_key = self.keys.public_key();
 
         let filter = Filter::new()
             .kind(Kind::Custom(10050))
@@ -997,10 +1034,8 @@ impl RelayClient {
             // Use the operator's relay timeout rather than a fixed two-second
             // window that routinely looks empty on Tor/high-latency relays and
             // causes a needless replaceable-event republish.
-            .fetch_events(
-                filter,
-                Duration::from_secs(self.config.connection_timeout_secs),
-            )
+            .fetch_events(filter)
+            .timeout(Duration::from_secs(self.config.connection_timeout_secs))
             .await
             .map_err(|e| Error::Nostr(format!("Failed to fetch existing kind 10050 event: {e}")))?;
 
@@ -1075,7 +1110,7 @@ fn normalize_relay_tags(event: &Event) -> BTreeSet<RelayUrl> {
         .tags
         .as_slice()
         .iter()
-        .filter(|tag| tag.kind() == TagKind::Relay)
+        .filter(|tag| tag.kind() == "r")
         .filter_map(|tag| tag.content())
         .filter_map(|content| RelayUrl::parse(content).ok())
         .collect()
@@ -1223,7 +1258,7 @@ mod tests {
     use super::*;
 
     async fn receive_gift_wrap(
-        notifications: &mut broadcast::Receiver<RelayPoolNotification>,
+        notifications: &mut broadcast::Receiver<ClientNotification>,
         timeout: std::time::Duration,
     ) -> Option<Box<Event>> {
         receive_gift_wrap_notification(notifications, timeout)
@@ -1232,13 +1267,13 @@ mod tests {
     }
 
     async fn receive_gift_wrap_notification(
-        notifications: &mut broadcast::Receiver<RelayPoolNotification>,
+        notifications: &mut broadcast::Receiver<ClientNotification>,
         timeout: std::time::Duration,
     ) -> Option<(SubscriptionId, Box<Event>)> {
         tokio::time::timeout(timeout, async {
             loop {
                 match notifications.recv().await {
-                    Ok(RelayPoolNotification::Event {
+                    Ok(ClientNotification::Event {
                         subscription_id,
                         event,
                         ..
@@ -1259,18 +1294,20 @@ mod tests {
     }
 
     async fn receive_eose(
-        notifications: &mut broadcast::Receiver<RelayPoolNotification>,
+        notifications: &mut broadcast::Receiver<ClientNotification>,
         relay_url: &RelayUrl,
         timeout: std::time::Duration,
     ) -> Option<SubscriptionId> {
         tokio::time::timeout(timeout, async {
             loop {
                 match notifications.recv().await {
-                    Ok(RelayPoolNotification::Message {
+                    Ok(ClientNotification::Message {
                         relay_url: received_url,
-                        message: RelayMessage::EndOfStoredEvents(subscription_id),
+                        message,
                     }) if received_url == *relay_url => {
-                        return Some(subscription_id.into_owned());
+                        if let RelayMessage::EndOfStoredEvents(subscription_id) = *message {
+                            return Some(subscription_id.into_owned());
+                        }
                     }
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1299,6 +1336,7 @@ mod tests {
             clearnet: vec!["wss://relay.example.com".to_string()],
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -1341,6 +1379,7 @@ mod tests {
             clearnet: vec!["wss://relay.example.com".to_string()],
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 30,
@@ -1376,6 +1415,7 @@ mod tests {
             clearnet: vec!["wss://relay.example.com".to_string()],
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 2,
@@ -1438,7 +1478,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_records_clearnet_provenance() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -1460,7 +1500,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_status_updates_gauges_on_refresh_not_on_reads() {
         use crate::test_metrics::gauge_value;
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -1508,6 +1548,7 @@ mod tests {
             clearnet,
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5, // Short timeout for tests
@@ -1529,23 +1570,21 @@ mod tests {
     }
 
     #[cfg(feature = "tor")]
-    #[test]
-    fn test_relay_options_use_relay_kind_for_tor_mode() {
+    #[tokio::test]
+    async fn test_embedded_tor_adapter_installed_only_for_onion_configuration() {
         let config = test_relay_config(vec![]);
-
-        let clearnet_opts = relay_options_for_config(&config, RelayKind::Clearnet);
-        let onion_opts = relay_options_for_config(&config, RelayKind::Onion);
-        let clearnet_debug = format!("{clearnet_opts:?}");
-        let onion_debug = format!("{onion_opts:?}");
-
-        assert!(
-            !clearnet_debug.contains("Tor"),
-            "clearnet provenance must not be forced over Tor, got: {clearnet_debug}"
-        );
-        assert!(
-            onion_debug.contains("Tor"),
-            "onion provenance must select Tor connection mode, got: {onion_debug}"
-        );
+        let direct = RelayClient::new(Keys::generate(), config.clone())
+            .await
+            .unwrap();
+        assert!(direct.tor_transport.is_none());
+        let mut onion_config = config;
+        onion_config.onion = vec!["ws://example.onion".into()];
+        let onion = RelayClient::new(Keys::generate(), onion_config)
+            .await
+            .unwrap();
+        assert!(onion.tor_transport.is_some());
+        onion.disconnect().await.unwrap();
+        direct.disconnect().await.unwrap();
     }
 
     #[test]
@@ -1743,7 +1782,7 @@ mod tests {
             .await
             .unwrap();
 
-        let relay = client.client.relay(relay_url).await.unwrap();
+        let relay = client.client.relay(relay_url).await.unwrap().unwrap();
         let debug = format!("{:?}", relay.opts());
         assert!(
             debug.contains("retry_interval: 23s"),
@@ -1758,6 +1797,7 @@ mod tests {
             clearnet: vec!["ws://relay.example.com".to_string()],
             allow_unencrypted_clearnet_relays: false,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -1826,7 +1866,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_client_connects_to_mock_relay() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
         // Start a mock relay
@@ -1866,7 +1906,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_client_subscribe_to_gift_wrap() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
         // Start a mock relay
@@ -1894,7 +1934,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_client_receives_nip59_backdated_gift_wraps() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
         let mock = MockRelay::run().await.unwrap();
@@ -1910,14 +1950,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let sender_keys = Keys::generate();
-        let sender = Client::builder().signer(sender_keys.clone()).build();
+        let sender = Client::builder()
+            .authenticator(SignerAuthenticator::new(sender_keys.clone()))
+            .build();
         sender.add_relay(&relay_url).await.unwrap();
         sender.connect().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let stored = EventBuilder::new(Kind::GiftWrap, "stored")
             .tags([Tag::public_key(server_pubkey)])
-            .sign_with_keys(&sender_keys)
+            .finalize(&sender_keys)
             .unwrap();
         sender.send_event(&stored).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1948,7 +1990,7 @@ mod tests {
         let gift_wrap = EventBuilder::new(Kind::GiftWrap, "ignored")
             .tags([Tag::public_key(server_pubkey)])
             .custom_created_at(backdated)
-            .sign_with_keys(&sender_keys)
+            .finalize(&sender_keys)
             .unwrap();
 
         sender.send_event(&gift_wrap).await.unwrap();
@@ -2007,7 +2049,7 @@ mod tests {
 
         let after_rotation = EventBuilder::new(Kind::GiftWrap, "after-rotation")
             .tags([Tag::public_key(server_pubkey)])
-            .sign_with_keys(&sender_keys)
+            .finalize(&sender_keys)
             .unwrap();
         sender.send_event(&after_rotation).await.unwrap();
 
@@ -2050,7 +2092,7 @@ mod tests {
         let matching_event = EventBuilder::new(Kind::GiftWrap, "ignored")
             .tags([Tag::public_key(server_pubkey)])
             .custom_created_at(Timestamp::from_secs(now))
-            .sign_with_keys(&Keys::generate())
+            .finalize(&Keys::generate())
             .unwrap();
         assert!(filter.match_event(&matching_event, MatchEventOptions::default()));
     }
@@ -2201,7 +2243,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_subscription_monitor_rebuilds_after_lag() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -2218,7 +2260,7 @@ mod tests {
             .await;
         assert!(subscriptions.mark_eose(&relay_url, &subscription_id).await);
         let (sender, receiver) = broadcast::channel(1);
-        let mut relay_notifications = client.notifications();
+        let mut relay_notifications = client.notification_receiver();
 
         for status in [
             NostrRelayStatus::Disconnected,
@@ -2274,7 +2316,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_subscription_monitor_rebuilds_after_event_notification_lag() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -2292,7 +2334,7 @@ mod tests {
         assert!(subscriptions.mark_eose(&relay_url, &stale_id).await);
 
         let (monitor_sender, monitor_notifications) = broadcast::channel(8);
-        let mut relay_notifications = client.notifications();
+        let mut relay_notifications = client.notification_receiver();
         let monitor_handle = tokio::spawn(run_live_subscription_monitor(
             monitor_notifications,
             client.clone(),
@@ -2368,7 +2410,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_subscription_monitor_resubscribes_only_the_requested_relay() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let closed_mock = MockRelay::run().await.unwrap();
         let healthy_mock = MockRelay::run().await.unwrap();
@@ -2392,7 +2434,7 @@ mod tests {
         }
 
         let (_monitor_sender, monitor_notifications) = broadcast::channel(8);
-        let mut relay_notifications = client.notifications();
+        let mut relay_notifications = client.notification_receiver();
         let monitor_handle = tokio::spawn(run_live_subscription_monitor(
             monitor_notifications,
             client.clone(),
@@ -2437,7 +2479,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_subscription_monitor_retries_relays_left_invalidated() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         // A replacement REQ that fails to send restores the invalidated entry.
         // No CLOSED or rebuild request follows, so the monitor must retry on its
@@ -2457,7 +2499,7 @@ mod tests {
         subscriptions.invalidate_all_for_rebuild().await;
 
         let (monitor_sender, monitor_notifications) = broadcast::channel(8);
-        let mut relay_notifications = client.notifications();
+        let mut relay_notifications = client.notification_receiver();
         let monitor_handle = tokio::spawn(run_live_subscription_monitor(
             monitor_notifications,
             client.clone(),
@@ -2496,6 +2538,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 1, // Very short timeout for test
@@ -2516,7 +2559,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_client_multiple_relays() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
         // Start multiple mock relays
@@ -2546,7 +2589,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_client_receives_events() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
         // Start a mock relay
@@ -2569,26 +2612,31 @@ mod tests {
 
         // Subscribe to text notes (kind 1) for testing
         let filter = Filter::new().kind(Kind::TextNote).limit(10);
-        receiver.client.subscribe(filter, None).await.unwrap();
+        receiver.client.subscribe(filter).await.unwrap();
 
         // Get notification receiver before sending
         let mut notifications = receiver.notifications();
 
         // Setup sender client
-        let sender = Client::builder().signer(sender_keys).build();
+        let sender = Client::builder()
+            .authenticator(SignerAuthenticator::new(sender_keys.clone()))
+            .build();
         sender.add_relay(&relay_url).await.unwrap();
         sender.connect().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Send a text note
-        let event_builder = EventBuilder::text_note("Hello from mock relay test!");
-        sender.send_event_builder(event_builder).await.unwrap();
+        let event_builder = EventBuilder::new(Kind::TextNote, "Hello from mock relay test!");
+        sender
+            .send_event(&event_builder.finalize(&sender_keys).unwrap())
+            .await
+            .unwrap();
 
         // Wait for the event to arrive
         let received = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match notifications.recv().await {
-                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                    Ok(ClientNotification::Event { event, .. }) => {
                         if event.kind == Kind::TextNote {
                             return Some(event);
                         }
@@ -2627,6 +2675,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -2650,7 +2699,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_inbox_relays_with_configured_relays() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         // Start a mock relay
         let mock = MockRelay::run().await.unwrap();
@@ -2661,6 +2710,7 @@ mod tests {
             clearnet: vec![relay_url.to_string()],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -2686,7 +2736,7 @@ mod tests {
     #[tokio::test]
     async fn test_publish_inbox_relays_records_metric_when_publish_reaches_no_relays() {
         use crate::test_metrics::counter_value;
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -2726,7 +2776,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_inbox_relays_skips_when_existing_relay_list_matches() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         let mock = MockRelay::run().await.unwrap();
         let relay_url = mock.url().await;
@@ -2734,12 +2784,14 @@ mod tests {
 
         let keys = Keys::generate();
         let original_event = EventBuilder::new(Kind::Custom(10050), "")
-            .tag(Tag::custom(TagKind::Relay, [relay_url_string.as_str()]))
+            .tag(Tag::custom("r", [relay_url_string.as_str()]))
             .custom_created_at(Timestamp::from_secs(1_700_000_000))
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
-        let publisher = Client::builder().signer(keys.clone()).build();
+        let publisher = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .build();
         publisher.add_relay(&relay_url).await.unwrap();
         publisher.connect().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2750,6 +2802,7 @@ mod tests {
             clearnet: vec![relay_url_string],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -2764,7 +2817,9 @@ mod tests {
         assert!(result.is_ok());
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let observer = Client::builder().signer(Keys::generate()).build();
+        let observer = Client::builder()
+            .authenticator(SignerAuthenticator::new(Keys::generate()))
+            .build();
         observer.add_relay(&relay_url).await.unwrap();
         observer.connect().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2775,8 +2830,8 @@ mod tests {
                     .kind(Kind::Custom(10050))
                     .author(keys.public_key())
                     .limit(1),
-                Duration::from_secs(2),
             )
+            .timeout(Duration::from_secs(2))
             .await
             .unwrap();
         let latest = events.first().expect("kind 10050 event should exist");
@@ -2800,6 +2855,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["ws://example.onion".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -2821,6 +2877,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -2840,6 +2897,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["wss://example.onion".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -2851,7 +2909,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_client_connect_waits_for_connection() {
-        use nostr_relay_builder::MockRelay;
+        use nostr_sdk::local_relay::MockRelay;
 
         // Start a mock relay
         let mock = MockRelay::run().await.unwrap();
@@ -2862,6 +2920,7 @@ mod tests {
             clearnet: vec![relay_url.to_string()],
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 10, // Generous timeout
@@ -2888,6 +2947,7 @@ mod tests {
             clearnet: vec!["ws://192.0.2.1:9999".to_string()], // TEST-NET address, won't route
             allow_unencrypted_clearnet_relays: true,
             onion: vec![],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 2, // Short timeout for test
@@ -2960,6 +3020,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["ws://plaintext.example.com".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -2975,6 +3036,7 @@ mod tests {
             clearnet: vec![],
             allow_unencrypted_clearnet_relays: false,
             onion: vec!["ws://abcabcabcabcabcd.onion".to_string()],
+            tor_data_dir: String::new(),
             reconnect_interval_secs: 5,
             max_reconnect_attempts: 10,
             connection_timeout_secs: 5,
@@ -2987,12 +3049,12 @@ mod tests {
     fn kind_10050_event(keys: &Keys, created_at: Timestamp, relay_urls: &[&str]) -> Event {
         let tags: Vec<Tag> = relay_urls
             .iter()
-            .map(|url| Tag::custom(TagKind::Relay, [*url]))
+            .map(|url| Tag::custom("r", [*url]))
             .collect();
         EventBuilder::new(Kind::Custom(10050), "")
             .tags(tags)
             .custom_created_at(created_at)
-            .sign_with_keys(keys)
+            .finalize(keys)
             .unwrap()
     }
 

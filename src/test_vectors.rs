@@ -320,18 +320,13 @@ impl GiftWrapBuilder {
         }
 
         // Build the unsigned event (rumor)
-        let rumor = rumor_builder.build(self.sender_keys.public_key());
+        let rumor = rumor_builder.finalize_unsigned(self.sender_keys.public_key());
 
         // Gift wrap it to the server using EventBuilder::gift_wrap
         // This creates the seal internally and wraps it
-        EventBuilder::gift_wrap(
-            &self.sender_keys,
-            &self.server_keys.public_key(),
-            rumor,
-            Vec::<Tag>::new(),
-        )
-        .await
-        .expect("gift wrap creation should not fail")
+        nostr_sdk::prelude::GiftWrapBuilder::new(self.server_keys.public_key(), rumor)
+            .finalize(&self.sender_keys)
+            .expect("gift wrap creation should not fail")
     }
 
     /// Build a gift-wrapped notification request with the given tokens.
@@ -485,7 +480,7 @@ mod tests {
         assert_eq!(event.kind, Kind::GiftWrap);
 
         // Verify it's addressed to the server
-        let p_tag = event.tags.iter().find(|t| t.kind() == TagKind::p());
+        let p_tag = event.tags.iter().find(|t| t.kind() == "p");
         assert!(p_tag.is_some());
     }
 

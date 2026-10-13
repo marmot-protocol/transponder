@@ -99,7 +99,6 @@ impl Nip59Handler {
         let seal_json = self
             .keys
             .nip44_decrypt(&event.pubkey, &event.content)
-            .await
             .map_err(|e| {
                 Error::Crypto(format!(
                     "Failed to decrypt gift wrap: {}",
@@ -135,7 +134,6 @@ impl Nip59Handler {
         let rumor_json = self
             .keys
             .nip44_decrypt(&seal.pubkey, &seal.content)
-            .await
             .map_err(|e| {
                 Error::Crypto(format!(
                     "Failed to decrypt seal: {}",
@@ -199,7 +197,7 @@ impl UnwrappedNotification {
             ));
         };
 
-        if tag.kind() != TagKind::custom(TAG_VERSION) {
+        if tag.kind() != TAG_VERSION {
             return Err(Error::InvalidToken(
                 "Notification rumor contains an unsupported tag".to_string(),
             ));
@@ -327,7 +325,8 @@ mod tests {
 
     /// Build a kind 446 rumor claiming the given author.
     fn notification_rumor(author: PublicKey) -> UnsignedEvent {
-        EventBuilder::new(Kind::Custom(KIND_NOTIFICATION_REQUEST), "token-blob").build(author)
+        EventBuilder::new(Kind::Custom(KIND_NOTIFICATION_REQUEST), "token-blob")
+            .finalize_unsigned(author)
     }
 
     /// Gift-wrap the given seal JSON to `receiver` with an ephemeral key,
@@ -336,12 +335,10 @@ mod tests {
         let ephemeral = Keys::generate();
         let content = ephemeral
             .nip44_encrypt(&receiver.public_key(), seal_json)
-            .await
             .unwrap();
         EventBuilder::new(Kind::GiftWrap, content)
             .tag(Tag::public_key(receiver.public_key()))
-            .sign(&ephemeral)
-            .await
+            .finalize(&ephemeral)
             .unwrap()
     }
 
@@ -355,11 +352,9 @@ mod tests {
         rumor.ensure_id();
         let seal_content = seal_signer
             .nip44_encrypt(&receiver.public_key(), &rumor.as_json())
-            .await
             .unwrap();
         let seal = EventBuilder::new(seal_kind, seal_content)
-            .sign(seal_signer)
-            .await
+            .finalize(seal_signer)
             .unwrap();
         wrap_seal_json(receiver, &seal.as_json()).await
     }
@@ -371,14 +366,9 @@ mod tests {
         let handler = Nip59Handler::new(server_keys.clone());
 
         let rumor = notification_rumor(sender_keys.public_key());
-        let gift_wrap = EventBuilder::gift_wrap(
-            &sender_keys,
-            &server_keys.public_key(),
-            rumor,
-            Vec::<Tag>::new(),
-        )
-        .await
-        .unwrap();
+        let gift_wrap = GiftWrapBuilder::new(server_keys.public_key(), rumor)
+            .finalize(&sender_keys)
+            .unwrap();
 
         let unwrapped = handler.unwrap(&gift_wrap).await.unwrap();
         assert_eq!(unwrapped.content, "token-blob");
@@ -405,9 +395,8 @@ mod tests {
         let sender_keys = Keys::generate();
         let handler = Nip59Handler::new(server_keys);
 
-        let event = EventBuilder::text_note("not a gift wrap")
-            .sign(&sender_keys)
-            .await
+        let event = EventBuilder::new(Kind::TextNote, "not a gift wrap")
+            .finalize(&sender_keys)
             .unwrap();
 
         let error = handler.unwrap(&event).await.unwrap_err().to_string();
@@ -422,14 +411,9 @@ mod tests {
         let handler = Nip59Handler::new(server_keys);
 
         let rumor = notification_rumor(sender_keys.public_key());
-        let gift_wrap = EventBuilder::gift_wrap(
-            &sender_keys,
-            &other_keys.public_key(),
-            rumor,
-            Vec::<Tag>::new(),
-        )
-        .await
-        .unwrap();
+        let gift_wrap = GiftWrapBuilder::new(other_keys.public_key(), rumor)
+            .finalize(&sender_keys)
+            .unwrap();
 
         let error = handler.unwrap(&gift_wrap).await.unwrap_err().to_string();
         assert!(error.contains("Failed to decrypt gift wrap"));
@@ -456,11 +440,9 @@ mod tests {
         rumor.ensure_id();
         let seal_content = sender_keys
             .nip44_encrypt(&server_keys.public_key(), &rumor.as_json())
-            .await
             .unwrap();
         let seal = EventBuilder::new(Kind::Seal, seal_content)
-            .sign(&sender_keys)
-            .await
+            .finalize(&sender_keys)
             .unwrap();
 
         // Tamper with a signed field after signing: id/signature no longer match.
@@ -492,8 +474,7 @@ mod tests {
         let handler = Nip59Handler::new(server_keys.clone());
 
         let seal = EventBuilder::new(Kind::Seal, "not a nip44 payload")
-            .sign(&sender_keys)
-            .await
+            .finalize(&sender_keys)
             .unwrap();
         let gift_wrap = wrap_seal_json(&server_keys, &seal.as_json()).await;
 
@@ -509,11 +490,9 @@ mod tests {
 
         let seal_content = sender_keys
             .nip44_encrypt(&server_keys.public_key(), "not a rumor")
-            .await
             .unwrap();
         let seal = EventBuilder::new(Kind::Seal, seal_content)
-            .sign(&sender_keys)
-            .await
+            .finalize(&sender_keys)
             .unwrap();
         let gift_wrap = wrap_seal_json(&server_keys, &seal.as_json()).await;
 
@@ -531,14 +510,9 @@ mod tests {
         // Seal signed by the sender, but the (unsigned) rumor claims another
         // author. The rumor pubkey is attacker-chosen and must be rejected.
         let rumor = notification_rumor(impersonated_keys.public_key());
-        let gift_wrap = EventBuilder::gift_wrap(
-            &sender_keys,
-            &server_keys.public_key(),
-            rumor,
-            Vec::<Tag>::new(),
-        )
-        .await
-        .unwrap();
+        let gift_wrap = GiftWrapBuilder::new(server_keys.public_key(), rumor)
+            .finalize(&sender_keys)
+            .unwrap();
 
         let error = handler.unwrap(&gift_wrap).await.unwrap_err().to_string();
         assert!(error.contains("Rumor author does not match seal signer"));
@@ -550,15 +524,11 @@ mod tests {
         let sender_keys = Keys::generate();
         let handler = Nip59Handler::new(server_keys.clone());
 
-        let rumor = EventBuilder::text_note("wrong kind").build(sender_keys.public_key());
-        let gift_wrap = EventBuilder::gift_wrap(
-            &sender_keys,
-            &server_keys.public_key(),
-            rumor,
-            Vec::<Tag>::new(),
-        )
-        .await
-        .unwrap();
+        let rumor = EventBuilder::new(Kind::TextNote, "wrong kind")
+            .finalize_unsigned(sender_keys.public_key());
+        let gift_wrap = GiftWrapBuilder::new(server_keys.public_key(), rumor)
+            .finalize(&sender_keys)
+            .unwrap();
 
         let error = handler.unwrap(&gift_wrap).await.unwrap_err().to_string();
         assert!(error.contains("Expected notification request (kind 446), got kind 1"));

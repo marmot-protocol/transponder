@@ -1783,8 +1783,8 @@ mod tests {
         let server_keys = Keys::generate();
         let some_keys = Keys::generate();
 
-        let event = EventBuilder::text_note("Hello, world!")
-            .sign_with_keys(&some_keys)
+        let event = EventBuilder::new(Kind::TextNote, "Hello, world!")
+            .finalize(&some_keys)
             .unwrap();
 
         let processor = create_processor(&server_keys);
@@ -1802,19 +1802,31 @@ mod tests {
         let processor = create_processor(&server_keys);
 
         // Add an event
-        processor.mark_seen(EventId::all_zeros()).await;
-        assert!(processor.is_duplicate(&EventId::all_zeros()).await);
+        processor.mark_seen(EventId::from_byte_array([0; 32])).await;
+        assert!(
+            processor
+                .is_duplicate(&EventId::from_byte_array([0; 32]))
+                .await
+        );
 
         // Cleanup shouldn't remove it (it's recent)
         processor.cleanup().await;
-        assert!(processor.is_duplicate(&EventId::all_zeros()).await);
+        assert!(
+            processor
+                .is_duplicate(&EventId::from_byte_array([0; 32]))
+                .await
+        );
 
         // Advance time past the dedup window
         tokio::time::advance(DEDUP_WINDOW + Duration::from_secs(1)).await;
 
         // Now cleanup should remove it
         processor.cleanup().await;
-        assert!(!processor.is_duplicate(&EventId::all_zeros()).await);
+        assert!(
+            !processor
+                .is_duplicate(&EventId::from_byte_array([0; 32]))
+                .await
+        );
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ ARG CARGO_FEATURES=
 
 # Build stage
 FROM ${DHI_RUST_IMAGE} AS builder
+ARG CARGO_FEATURES
 
 # Install build dependencies
 RUN apk add --no-cache musl-dev pkgconfig sqlite-dev
@@ -12,6 +13,8 @@ WORKDIR /app
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
+# SDK patch preserves observable notification-channel overflow.
+COPY vendor/nostr-sdk ./vendor/nostr-sdk
 
 # Create a dummy main.rs to build dependencies
 RUN mkdir -p src && \

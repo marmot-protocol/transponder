@@ -2,3 +2,6 @@
 
 pub mod client;
 pub mod events;
+
+#[cfg(feature = "tor")]
+mod tor_transport;
